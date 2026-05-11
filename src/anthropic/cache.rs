@@ -490,43 +490,37 @@ fn plan_cache_mutations(
 }
 
 /// 查询或创建缓存
-fn apply_cache_read_ratio_limit(
-    breakpoints: &[CacheBreakpoint],
-    cached_tokens: &mut [Option<i32>],
-    total_input_tokens: i32,
-) {
+fn effective_breakpoint_count(breakpoints: &[CacheBreakpoint], total_input_tokens: i32) -> usize {
     let ratio = cache_max_read_ratio();
-    apply_cache_read_ratio_limit_with_ratio(breakpoints, cached_tokens, total_input_tokens, ratio);
+    effective_breakpoint_count_with_ratio(breakpoints, total_input_tokens, ratio)
 }
 
-fn apply_cache_read_ratio_limit_with_ratio(
+fn effective_breakpoint_count_with_ratio(
     breakpoints: &[CacheBreakpoint],
-    cached_tokens: &mut [Option<i32>],
     total_input_tokens: i32,
     ratio: f64,
-) {
+) -> usize {
     if ratio >= 1.0 {
-        return;
+        return breakpoints.len();
     }
 
-    let max_read_tokens = ((total_input_tokens.max(0) as f64) * ratio).floor() as i32;
-    for (index, cached) in cached_tokens.iter_mut().enumerate() {
-        let Some(tokens) = *cached else {
-            continue;
-        };
+    let max_cached_tokens = ((total_input_tokens.max(0) as f64) * ratio).floor() as i32;
+    let count = breakpoints
+        .iter()
+        .take_while(|bp| bp.tokens <= max_cached_tokens)
+        .count();
 
-        let read_tokens = tokens.clamp(0, breakpoints[index].tokens);
-        if read_tokens > max_read_tokens {
-            tracing::debug!(
-                "Cache hit ignored by max read ratio: breakpoint_tokens={}, cached_tokens={}, max_read_tokens={}, ratio={:.3}",
-                breakpoints[index].tokens,
-                tokens,
-                max_read_tokens,
-                ratio
-            );
-            *cached = None;
-        }
+    if count < breakpoints.len() {
+        tracing::debug!(
+            "Cache breakpoints limited by max read ratio: enabled={}, total={}, max_cached_tokens={}, ratio={:.3}",
+            count,
+            breakpoints.len(),
+            max_cached_tokens,
+            ratio
+        );
     }
+
+    count
 }
 
 pub async fn lookup_or_create(
@@ -562,6 +556,22 @@ pub async fn lookup_or_create(
         };
     }
 
+    let effective_count = effective_breakpoint_count(breakpoints, total_input_tokens);
+    if effective_count == 0 {
+        tracing::debug!("Cache lookup skipped: no breakpoints within max read ratio");
+        if cache_debug_logging_enabled() {
+            tracing::info!(
+                "Cache lookup skipped: no breakpoints within max read ratio, total_input_tokens={}",
+                total_input_tokens
+            );
+        }
+        return CacheResult {
+            uncached_input_tokens: total_input_tokens,
+            ..Default::default()
+        };
+    }
+
+    let breakpoints = &breakpoints[..effective_count];
     let mut conn = conn.clone();
     let keys: Vec<String> = breakpoints
         .iter()
@@ -586,8 +596,6 @@ pub async fn lookup_or_create(
 
         cached_tokens.push(cached);
     }
-
-    apply_cache_read_ratio_limit(breakpoints, &mut cached_tokens, total_input_tokens);
 
     let (result, mutations) = plan_cache_mutations(breakpoints, &cached_tokens, total_input_tokens);
     log_breakpoints(breakpoints, Some(total_input_tokens));
@@ -651,15 +659,31 @@ mod tests {
     }
 
     #[test]
-    fn cache_read_ratio_limit_ignores_hits_above_request_ratio() {
+    fn cache_ratio_limit_excludes_breakpoints_above_request_ratio() {
         let breakpoints = vec![breakpoint(3_000), breakpoint(7_500), breakpoint(9_200)];
-        let mut cached_tokens = vec![Some(3_000), Some(7_500), Some(9_200)];
 
-        apply_cache_read_ratio_limit_with_ratio(&breakpoints, &mut cached_tokens, 10_000, 0.8);
+        let count = effective_breakpoint_count_with_ratio(&breakpoints, 10_000, 0.8);
 
-        assert_eq!(cached_tokens, vec![Some(3_000), Some(7_500), None]);
-        let (result, _) = plan_cache_mutations(&breakpoints, &cached_tokens, 10_000);
+        assert_eq!(count, 2);
+        let cached_tokens = vec![Some(3_000), Some(7_500)];
+        let (result, _) = plan_cache_mutations(&breakpoints[..count], &cached_tokens, 10_000);
         assert_eq!(result.cache_read_input_tokens, 7_500);
+        assert_eq!(result.cache_creation_input_tokens, 0);
+        assert_eq!(result.uncached_input_tokens, 2_500);
+    }
+
+    #[test]
+    fn cache_ratio_limit_keeps_uncached_tokens_when_creating_cache() {
+        let breakpoints = vec![breakpoint(3_000), breakpoint(7_500), breakpoint(9_200)];
+
+        let count = effective_breakpoint_count_with_ratio(&breakpoints, 10_000, 0.8);
+
+        assert_eq!(count, 2);
+        let cached_tokens = vec![None, None];
+        let (result, _) = plan_cache_mutations(&breakpoints[..count], &cached_tokens, 10_000);
+        assert_eq!(result.cache_read_input_tokens, 0);
+        assert_eq!(result.cache_creation_input_tokens, 7_500);
+        assert_eq!(result.uncached_input_tokens, 2_500);
     }
 
     #[test]
