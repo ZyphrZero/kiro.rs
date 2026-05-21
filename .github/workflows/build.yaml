@@ -143,7 +143,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
+      - name: Setup mold linker
+        if: contains(matrix.target, 'linux-gnu')
+        uses: rui314/setup-mold@v1
+
       - name: Build app
+        env:
+          RUSTFLAGS: ${{ contains(matrix.target, 'linux-gnu') && '-C link-arg=-fuse-ld=mold' || '' }}
         run: cargo build --release --locked --target ${{ matrix.target }} ${{ contains(matrix.target, 'musl') && '--no-default-features' || '' }}
 
       - name: Upload build artifacts
