@@ -34,8 +34,47 @@ jobs:
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
 
-  build:
+  build-frontend:
     needs: pre-check
+    if: needs.pre-check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3'
+
+      - name: Cache bun install
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-${{ runner.arch }}-bun-${{ hashFiles('admin-ui/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-bun-
+
+      - name: Install admin-ui dependencies
+        working-directory: admin-ui
+        run: bun install --frozen-lockfile
+
+      - name: Build admin-ui
+        working-directory: admin-ui
+        run: bun run build
+
+      - name: Upload admin-ui dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-ui-dist
+          path: admin-ui/dist
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    needs:
+      - pre-check
+      - build-frontend
     if: needs.pre-check.outputs.should_build == 'true'
     strategy:
       fail-fast: false
@@ -81,26 +120,11 @@ jobs:
             echo "version=beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+      - name: Download admin-ui dist
+        uses: actions/download-artifact@v4
         with:
-          bun-version: '1.3'
-
-      - name: Cache bun install
-        uses: actions/cache@v4
-        with:
-          path: ~/.bun/install/cache
-          key: ${{ runner.os }}-${{ runner.arch }}-bun-${{ hashFiles('admin-ui/bun.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-bun-
-
-      - name: Install admin-ui dependencies
-        working-directory: admin-ui
-        run: bun install --frozen-lockfile
-
-      - name: Build admin-ui
-        working-directory: admin-ui
-        run: bun run build
+          name: admin-ui-dist
+          path: admin-ui/dist
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -120,7 +144,7 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Build app
-        run: cargo build --release --target ${{ matrix.target }} ${{ contains(matrix.target, 'musl') && '--no-default-features' || '' }}
+        run: cargo build --release --locked --target ${{ matrix.target }} ${{ contains(matrix.target, 'musl') && '--no-default-features' || '' }}
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

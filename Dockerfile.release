@@ -1,0 +1,21 @@
+# Used by .github/workflows/release.yaml only.
+# Expects pre-built static binaries placed at:
+#   artifacts/linux/amd64/kiro-rs
+#   artifacts/linux/arm64/kiro-rs
+# Build with: docker buildx build --platform linux/amd64 --build-arg TARGETARCH=amd64 -f Dockerfile.release .
+
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates docker-cli docker-cli-compose
+
+WORKDIR /app
+
+ARG TARGETARCH
+COPY artifacts/linux/${TARGETARCH}/kiro-rs /app/kiro-rs
+RUN chmod +x /app/kiro-rs
+
+VOLUME ["/app/config"]
+
+EXPOSE 8990
+
+CMD ["./kiro-rs", "-c", "/app/config/config.json", "--credentials", "/app/config/credentials.json"]
