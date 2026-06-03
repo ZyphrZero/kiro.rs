@@ -69,6 +69,17 @@ pub trait KiroEndpoint: Send + Sync {
     fn is_account_throttled(&self, body: &str) -> bool {
         default_is_account_throttled(body)
     }
+
+    /// 判断响应体是否表示"客户端请求格式错误"（messages 数组本身违反协议）
+    ///
+    /// 这类错误（tool_use↔tool_result 不配对、消息序列非法等）的根因是调用方的
+    /// 请求体，而非上游故障。无论上游以 4xx 还是 5xx 返回，重试都不可能成功；
+    /// 尤其当上游以 5xx 返回时，若按瞬态错误重试，会把一个永不可能成功的坏请求
+    /// 放大成多次 503（503 风暴）并无谓占用重试预算。识别后应立即终止，
+    /// 不重试、不切换凭据。
+    fn is_client_validation_error(&self, body: &str) -> bool {
+        default_is_client_validation_error(body)
+    }
 }
 
 /// 装饰请求时可用的上下文
@@ -137,6 +148,50 @@ pub fn default_is_account_throttled(body: &str) -> bool {
         && body.contains("temporary limits")
 }
 
+/// 触发"客户端请求格式错误 → 立即终止、不重试"的精确 reason 取值集合
+///
+/// 这些都是上游对 messages 数组本身的协议校验失败（根因在调用方请求体，
+/// 而非上游故障）。仅收录**精确 reason 值**，不收录 `ValidationException`
+/// 这类宽泛异常类型——后者语义过宽，裸子串匹配会把恰好携带该词的真实上游
+/// 瞬态故障误判为"不可重试"，反而杀掉本可重试恢复的请求。
+const CLIENT_VALIDATION_REASONS: &[&str] = &["TOOL_USE_RESULT_MISMATCH"];
+
+/// 触发同类判定的 message 级特征短语（用于无结构化 reason、仅文本报文的场景）
+///
+/// 例如 Bedrock 的 "Expected toolResult blocks ..." 纯文本错误。短语需具备
+/// 足够特异性，不会与正常响应内容冲突。
+const CLIENT_VALIDATION_MESSAGE_MARKERS: &[&str] = &["Expected toolResult blocks"];
+
+/// 默认的"客户端请求格式错误"判断逻辑
+///
+/// 与 [`default_is_monthly_request_limit`] 同构：先做廉价子串快扫，命中后再用
+/// JSON 解析确认 `reason`（顶层与嵌套 `error.reason`）字段，避免把偶然出现在
+/// 普通字段里的关键词误判。结构化确认失败时，回退到 message 级特异短语匹配，
+/// 以覆盖非 JSON 的纯文本错误报文。
+pub fn default_is_client_validation_error(body: &str) -> bool {
+    let reason_hit = CLIENT_VALIDATION_REASONS.iter().any(|r| body.contains(r));
+    if reason_hit {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+            let top = value.get("reason").and_then(|v| v.as_str());
+            let nested = value.pointer("/error/reason").and_then(|v| v.as_str());
+            if [top, nested]
+                .into_iter()
+                .flatten()
+                .any(|r| CLIENT_VALIDATION_REASONS.contains(&r))
+            {
+                return true;
+            }
+        } else {
+            // 非 JSON 但含精确 reason 关键词（兼容简单文本响应）
+            return true;
+        }
+    }
+    // message 级兜底：纯文本错误报文（无结构化 reason）
+    CLIENT_VALIDATION_MESSAGE_MARKERS
+        .iter()
+        .any(|m| body.contains(m))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +253,40 @@ mod tests {
         ));
         // 仅有一半关键词时也不命中
         assert!(!default_is_account_throttled("suspicious activity detected"));
+    }
+
+    #[test]
+    fn test_default_is_client_validation_error() {
+        // 顶层 reason 命中（结构化确认）
+        assert!(default_is_client_validation_error(
+            r#"{"reason":"TOOL_USE_RESULT_MISMATCH"}"#
+        ));
+        // 嵌套 error.reason 命中
+        assert!(default_is_client_validation_error(
+            r#"{"error":{"reason":"TOOL_USE_RESULT_MISMATCH"}}"#
+        ));
+        // 非 JSON 但含精确 reason 关键词
+        assert!(default_is_client_validation_error(
+            "upstream error: TOOL_USE_RESULT_MISMATCH"
+        ));
+        // message 级特异短语（纯文本，无结构化 reason）
+        assert!(default_is_client_validation_error(
+            "Expected toolResult blocks but found none"
+        ));
+
+        // 普通上游错误不应被误判（否则会跳过应有的重试）
+        assert!(!default_is_client_validation_error(
+            r#"{"message":"Internal server error"}"#
+        ));
+        assert!(!default_is_client_validation_error("connection reset by peer"));
+        // 关键回归：reason 关键词偶然出现在普通字段，但真实 reason 是别的值 —— 不应命中
+        // （否则会把一个本可重试恢复的真实上游故障误杀）
+        assert!(!default_is_client_validation_error(
+            r#"{"message":"trace mentions TOOL_USE_RESULT_MISMATCH internally","reason":"INTERNAL_SERVER_ERROR"}"#
+        ));
+        // 宽泛的 ValidationException 不再单独命中（无精确 reason / 无特异短语时）
+        assert!(!default_is_client_validation_error(
+            r#"{"__type":"ValidationException","message":"some other validation"}"#
+        ));
     }
 }

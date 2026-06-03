@@ -596,6 +596,23 @@ impl KiroProvider {
                 continue;
             }
 
+            // 客户端请求格式错误（messages 数组违反协议）：根因在调用方，重试无意义
+            // 上游常以 5xx 返回，必须在下方"瞬态错误重试"分支之前拦截，否则会被当作
+            // 上游故障重试 max_retries 次，把一个坏请求放大成多次 503（503 风暴）。
+            // 直接终止：不重试、不切换凭据、不计入凭据失败。
+            if endpoint.is_client_validation_error(&body) {
+                tracing::warn!(
+                    "API 请求失败（客户端请求格式错误，不重试）: {} {}",
+                    status,
+                    body
+                );
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                    outcome::BAD_REQUEST, Some(&body), attempt_start,
+                );
+                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+            }
+
             // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
             // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {

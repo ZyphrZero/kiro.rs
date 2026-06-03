@@ -273,11 +273,10 @@ pub(super) fn map_provider_error(err: Error) -> Response {
 
     // Bedrock client-side validation errors (tool_use <-> tool_result mismatch, invalid message sequence, etc.)
     // The root cause is the client's own messages array, not an upstream failure, so it must not map to 5xx
-    // otherwise it triggers an upstream cooldown that amplifies one client error into a 30+ burst of 503s
-    if err_str.contains("TOOL_USE_RESULT_MISMATCH")
-        || err_str.contains("ValidationException")
-        || err_str.contains("Expected toolResult blocks")
-    {
+    // otherwise it triggers an upstream cooldown that amplifies one client error into a 30+ burst of 503s.
+    // Detection is centralized in the endpoint layer (single source of truth for the markers); the provider
+    // already bails out without retry on these, and this mapping is the client-facing safety net.
+    if crate::kiro::endpoint::default_is_client_validation_error(&err_str) {
         tracing::warn!(
             error = %err,
             "client messages array violates the protocol (Bedrock validation; mapped to 400 to avoid a false cooldown)"
@@ -1493,12 +1492,13 @@ mod tests {
 
     #[test]
     fn bedrock_client_validation_errors_map_to_400() {
-        // 三种 Bedrock 客户端校验错误必须映射为 400（而非 5xx），
-        // 否则会被 provider 当作上游瞬态错误触发冷却，放大成 503 风暴。
+        // 客户端校验错误必须映射为 400（而非 5xx），否则会被 provider 当作上游
+        // 瞬态错误触发冷却，放大成 503 风暴。识别逻辑集中在 endpoint 层。
         for needle in [
-            "TOOL_USE_RESULT_MISMATCH",
-            "ValidationException: Improperly formed request.",
-            "Expected toolResult blocks",
+            // 精确 reason（provider 错误串里嵌着上游 body）
+            "非流式 API 请求失败: 500 {\"reason\":\"TOOL_USE_RESULT_MISMATCH\"}",
+            // message 级特异短语（纯文本报文）
+            "Expected toolResult blocks but found none",
         ] {
             let resp = map_provider_error(anyhow::anyhow!(needle.to_string()));
             assert_eq!(
@@ -1513,6 +1513,12 @@ mod tests {
     fn generic_upstream_error_still_maps_to_502() {
         // 回归：普通上游错误不应被新分支误伤，仍应是 502 BAD_GATEWAY。
         let resp = map_provider_error(anyhow::anyhow!("connection reset by peer"));
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // 回归：宽泛的 ValidationException 不再被当作客户端校验错误而误判为 400，
+        // 仍按上游错误走 502（避免把可重试故障误杀）。
+        let resp = map_provider_error(anyhow::anyhow!(
+            "ValidationException: transient backend issue".to_string()
+        ));
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
