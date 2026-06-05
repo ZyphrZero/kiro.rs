@@ -389,7 +389,10 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             expiresAt: normalizeExpiresAt(cred.expiresAt),
             authMethod,
             provider,
+            // KAM 的 region 代表账号所属区域，需同时用于 token 刷新与 API 请求；
+            // 仅映射 authRegion 会导致 API 请求回退到全局默认 region，跨 region 403
             authRegion: cred.region?.trim() || undefined,
+            apiRegion: cred.region?.trim() || undefined,
             clientId,
             clientSecret,
             machineId: account.machineId?.trim() || undefined,

@@ -250,7 +250,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               kiroApiKey: cred.kiroApiKey?.trim(),
               priority: cred.priority || 0,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
-              apiRegion: cred.apiRegion?.trim() || undefined,
+              apiRegion: cred.apiRegion?.trim() || cred.region?.trim() || undefined,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
               email: cred.email?.trim() || undefined,
@@ -301,7 +301,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             refreshToken: token,
             authMethod,
             authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
-            apiRegion: cred.apiRegion?.trim() || undefined,
+            apiRegion: cred.apiRegion?.trim() || cred.region?.trim() || undefined,
             clientId,
             clientSecret,
             priority: cred.priority || 0,
@@ -451,7 +451,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\nregion 字段会同时映射为 authRegion 与 apiRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
