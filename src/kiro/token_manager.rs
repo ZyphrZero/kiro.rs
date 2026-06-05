@@ -19,6 +19,7 @@ use std::time::{Duration as StdDuration, Instant};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
+use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
@@ -459,6 +460,82 @@ pub(crate) async fn get_available_models(
     }
 
     let data: ListAvailableModelsResponse = response.json().await?;
+    Ok(data)
+}
+
+/// 获取当前凭据可访问的 Profile 列表
+///
+/// 上游接口（AWS JSON 1.0 协议，区别于其余 REST 接口）：
+/// `POST https://q.{api_region}.amazonaws.com/`
+/// Header: `x-amz-target: AmazonCodeWhispererService.ListAvailableProfiles`
+/// Body: `{"maxResults": N}`
+///
+/// 用于企业 IdC 账号导入时获取**真实** profileArn——这类账号的 KAM 导出与
+/// IdC 刷新响应均不含 profileArn，若回退到硬编码占位 ARN 会因账号不匹配
+/// 被上游拒绝（403 "The bearer token included in the request is invalid."）。
+pub(crate) async fn list_available_profiles(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<ListAvailableProfilesResponse> {
+    tracing::debug!("正在获取可用 Profile 列表...");
+
+    // 优先级：凭据.api_region > config.api_region > config.region
+    let region = credentials.effective_api_region(config);
+    let host = format!("q.{}.amazonaws.com", region);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let kiro_version = &config.kiro_version;
+    let os_name = &config.system_version;
+    let node_version = &config.node_version;
+
+    // AWS JSON 1.0 协议：POST 根路径 + x-amz-target，不走 query string
+    let url = format!("https://{}/", host);
+
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        os_name, node_version, kiro_version, machine_id
+    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+
+    let mut request = client
+        .post(&url)
+        .header("content-type", "application/x-amz-json-1.0")
+        .header(
+            "x-amz-target",
+            "AmazonCodeWhispererService.ListAvailableProfiles",
+        )
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Connection", "close")
+        .json(&serde_json::json!({ "maxResults": 10 }));
+
+    if credentials.is_api_key_credential() {
+        request = request.header("tokentype", "API_KEY");
+    }
+
+    let response = request.send().await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        let error_msg = match status.as_u16() {
+            401 => "认证失败，Token 无效或已过期",
+            403 => "权限不足，无法获取 Profile 列表",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "服务器错误，AWS 服务暂时不可用",
+            _ => "获取 Profile 列表失败",
+        };
+        bail!("{}: {} {}", error_msg, status, body_text);
+    }
+
+    let data: ListAvailableProfilesResponse = response.json().await?;
     Ok(data)
 }
 
@@ -2397,7 +2474,6 @@ impl MultiTokenManager {
             validated_cred.profile_arn = new_cred.profile_arn;
         }
         validated_cred.provider = new_cred.provider;
-        validated_cred.fill_default_profile_arn();
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
         validated_cred.region = new_cred.region;
@@ -2409,6 +2485,22 @@ impl MultiTokenManager {
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
+
+        // 6. 解析 profileArn（在上述字段就位后，因获取真实 ARN 依赖 region / proxy / token）
+        //    - 用户/KAM 已显式提供：上一步已采用，无需处理
+        //    - IdC（企业）账号且未提供：调上游 ListAvailableProfiles 获取真实 ARN
+        //      （企业 IdC 账号的占位 ARN 会导致对话/测活 403）
+        //    - Social 账号或获取失败：回退到硬编码占位 ARN（保守降级，不阻断导入）
+        if validated_cred.profile_arn.is_none() && !validated_cred.is_api_key_credential() {
+            // IdC 的充要特征：同时具备 clientId / clientSecret
+            let is_idc =
+                validated_cred.client_id.is_some() && validated_cred.client_secret.is_some();
+            if is_idc {
+                self.resolve_profile_arn(&mut validated_cred).await;
+            } else {
+                validated_cred.fill_default_profile_arn();
+            }
+        }
 
         {
             let mut entries = self.entries.lock();
@@ -2426,12 +2518,64 @@ impl MultiTokenManager {
             });
         }
 
-        // 6. 升级为多凭据格式（确保后续 token rotation 能写盘）并持久化
+        // 7. 升级为多凭据格式（确保后续 token rotation 能写盘）并持久化
         self.is_multiple_format.store(true, Ordering::Relaxed);
         self.persist_credentials()?;
 
         tracing::info!("成功添加凭据 #{}", new_id);
         Ok(new_id)
+    }
+
+    /// 为 IdC 凭据解析真实 profileArn（就地修改 `cred`）
+    ///
+    /// 企业 IdC 账号的真实 profileArn 既不在 KAM 导出里，也不由 IdC 刷新响应下发，
+    /// 只能通过上游 `ListAvailableProfiles` 获取。拿到后顺带从 ARN 解析真实 region
+    /// 写入 `api_region`，避免凭据 auth/api region 不一致导致跨 region 403。
+    ///
+    /// 任何失败（无 token / 网络错误 / 空列表）都降级为硬编码占位 ARN：保证导入
+    /// 流程不被阻断，与历史行为保持一致。调用前提：`cred` 为非 API Key 的 IdC 凭据，
+    /// 且 token 已刷新就绪。
+    async fn resolve_profile_arn(&self, cred: &mut KiroCredentials) {
+        let token = match cred.access_token.clone() {
+            Some(t) if !t.is_empty() => t,
+            _ => {
+                tracing::warn!("IdC 凭据无 access_token，无法获取真实 profileArn，回退占位 ARN");
+                cred.fill_default_profile_arn();
+                return;
+            }
+        };
+
+        let global_proxy = self.proxy.lock().clone();
+        let effective_proxy = cred.effective_proxy(global_proxy.as_ref());
+
+        match list_available_profiles(cred, &self.config, &token, effective_proxy.as_ref()).await {
+            Ok(resp) => {
+                if let Some(profile) = resp.profiles.into_iter().next() {
+                    // 从 ARN 解析真实 region，修正 api_region（仅在用户未显式指定时）
+                    if cred.api_region.is_none() {
+                        if let Some(region) = profile.region_from_arn() {
+                            if region != cred.effective_api_region(&self.config) {
+                                tracing::info!(
+                                    "根据 profileArn 修正 api_region: {} -> {}",
+                                    cred.effective_api_region(&self.config),
+                                    region
+                                );
+                                cred.api_region = Some(region.to_string());
+                            }
+                        }
+                    }
+                    tracing::info!("已获取真实 profileArn: {}", profile.arn);
+                    cred.profile_arn = Some(profile.arn);
+                } else {
+                    tracing::warn!("ListAvailableProfiles 返回空列表，回退占位 ARN");
+                    cred.fill_default_profile_arn();
+                }
+            }
+            Err(e) => {
+                tracing::warn!("获取真实 profileArn 失败（回退占位 ARN）: {}", e);
+                cred.fill_default_profile_arn();
+            }
+        }
     }
 
     /// 更新凭据的可编辑字段（Admin API）
