@@ -127,7 +127,26 @@ pub(crate) struct RequestTracer {
     model: String,
     is_stream: bool,
     started_at: Instant,
+    /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
+    first_token_at: parking_lot::Mutex<Option<Instant>>,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
+}
+
+/// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TraceUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub credits: f64,
+}
+
+impl TraceUsage {
+    /// 错误早退等无用量场景
+    pub fn zero() -> Self {
+        Self::default()
+    }
 }
 
 impl RequestTracer {
@@ -140,7 +159,16 @@ impl RequestTracer {
             model,
             is_stream,
             started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// 标记首个上游 chunk 到达（幂等，仅记录第一次）
+    pub fn mark_first_token(&self) {
+        let mut slot = self.first_token_at.lock();
+        if slot.is_none() {
+            *slot = Some(Instant::now());
         }
     }
 
@@ -151,11 +179,16 @@ impl RequestTracer {
         error_type: Option<&str>,
         error_message: Option<&str>,
         interrupted_after_bytes: Option<u64>,
+        usage: TraceUsage,
     ) {
         let Some(store) = &self.store else { return };
         let attempts = std::mem::take(&mut *self.attempts.lock());
         // 最终凭据：最后一跳的命中凭据（成功跳即命中凭据，失败跳即最后尝试的凭据）
         let final_credential_id = attempts.last().map(|a| a.credential_id).unwrap_or(0);
+        let first_token_ms = self
+            .first_token_at
+            .lock()
+            .map(|t| t.duration_since(self.started_at).as_millis() as u64);
         let rec = TraceRecord {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
@@ -169,6 +202,12 @@ impl RequestTracer {
             total_attempts: attempts.len() as u32,
             duration_ms: self.started_at.elapsed().as_millis() as u64,
             interrupted_after_bytes,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            credits: usage.credits,
+            first_token_ms,
             attempts,
         };
         store.insert(&rec);
@@ -692,7 +731,7 @@ async fn handle_stream_request(
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
             // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
-            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None);
+            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
         }
     };
@@ -760,6 +799,7 @@ fn create_sse_stream(
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
+                            tracer.mark_first_token();
                             sent_bytes += chunk.len() as u64;
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
@@ -800,6 +840,7 @@ fn create_sse_stream(
                                 Some(outcome::STREAM_INTERRUPTED),
                                 Some(&e.to_string()),
                                 Some(sent_bytes),
+                                stream_trace_usage(&ctx),
                             );
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
@@ -811,7 +852,7 @@ fn create_sse_stream(
                             // 流结束，发送最终事件
                             let final_events = ctx.generate_final_events();
                             record_stream_usage(&hook, &ctx, credential_id, "success");
-                            tracer.finalize("success", None, None, None);
+                            tracer.finalize("success", None, None, None, stream_trace_usage(&ctx));
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -853,6 +894,18 @@ fn record_stream_usage(
     );
 }
 
+/// 从 StreamContext 提取用量，转成 trace 行用量（与 record_stream_usage 同源）
+fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
+    let input = ctx.context_input_tokens.unwrap_or(ctx.input_tokens);
+    TraceUsage {
+        input_tokens: input.max(0) as u64,
+        output_tokens: ctx.output_tokens.max(0) as u64,
+        cache_creation_tokens: ctx.cache_creation_input_tokens.max(0) as u64,
+        cache_read_tokens: ctx.cache_read_input_tokens.max(0) as u64,
+        credits: if ctx.credits.is_finite() && ctx.credits > 0.0 { ctx.credits } else { 0.0 },
+    }
+}
+
 use super::converter::get_context_window_size;
 
 /// 处理非流式请求
@@ -874,7 +927,7 @@ async fn handle_non_stream_request(
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None);
+            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
         }
     };
@@ -892,6 +945,7 @@ async fn handle_non_stream_request(
                 Some(outcome::STREAM_INTERRUPTED),
                 Some(&e.to_string()),
                 None,
+                TraceUsage::zero(),
             );
             return (
                 StatusCode::BAD_GATEWAY,
@@ -1080,7 +1134,19 @@ async fn handle_non_stream_request(
         credits,
         "success",
     );
-    tracer.finalize("success", None, None, None);
+    tracer.finalize(
+        "success",
+        None,
+        None,
+        None,
+        TraceUsage {
+            input_tokens: final_input_tokens.max(0) as u64,
+            output_tokens: output_tokens.max(0) as u64,
+            cache_creation_tokens: cache_creation_tokens.max(0) as u64,
+            cache_read_tokens: cache_read_tokens.max(0) as u64,
+            credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+        },
+    );
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
@@ -1351,7 +1417,7 @@ async fn handle_stream_request_buffered(
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None);
+            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
         }
     };
@@ -1430,6 +1496,7 @@ fn create_buffered_sse_stream(
                     chunk_result = body_stream.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
+                                tracer.mark_first_token();
                                 sent_bytes += chunk.len() as u64;
                                 // 解码事件
                                 if let Err(e) = decoder.feed(&chunk) {
@@ -1463,6 +1530,13 @@ fn create_buffered_sse_stream(
                                     Some(outcome::STREAM_INTERRUPTED),
                                     Some(&e.to_string()),
                                     Some(sent_bytes),
+                                    TraceUsage {
+                                        input_tokens: i.max(0) as u64,
+                                        output_tokens: o.max(0) as u64,
+                                        cache_creation_tokens: cc.max(0) as u64,
+                                        cache_read_tokens: cr.max(0) as u64,
+                                        credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+                                    },
                                 );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
@@ -1475,7 +1549,19 @@ fn create_buffered_sse_stream(
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 hook.record(credential_id, i, o, cc, cr, credits, "success");
-                                tracer.finalize("success", None, None, None);
+                                tracer.finalize(
+                                    "success",
+                                    None,
+                                    None,
+                                    None,
+                                    TraceUsage {
+                                        input_tokens: i.max(0) as u64,
+                                        output_tokens: o.max(0) as u64,
+                                        cache_creation_tokens: cc.max(0) as u64,
+                                        cache_read_tokens: cr.max(0) as u64,
+                                        credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+                                    },
+                                );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
