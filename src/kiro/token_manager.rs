@@ -728,6 +728,9 @@ pub struct CredentialEntrySnapshot {
     /// 账号所属分组（可属于多个分组）
     #[serde(default)]
     pub groups: Vec<String>,
+    /// 账号来源渠道（纯备注）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_channel: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -972,6 +975,17 @@ impl MultiTokenManager {
     /// 获取凭据总数
     pub fn total_count(&self) -> usize {
         self.entries.lock().len()
+    }
+
+    /// 获取指定分组的凭据总数（group=None 时等于 total_count）
+    ///
+    /// 用于按分组计算 failover 重试预算，避免小分组按全局账号数获得过多无效重试。
+    pub fn total_count_in_group(&self, group: Option<&str>) -> usize {
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| group_matches(&e.credentials.groups, group))
+            .count()
     }
 
     /// 获取可用凭据数量
@@ -1926,6 +1940,7 @@ impl MultiTokenManager {
                         .filter(|s| *s > 0),
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
+                    source_channel: e.credentials.source_channel.clone(),
                 })
                 .collect(),
             current_id,
@@ -2610,6 +2625,7 @@ impl MultiTokenManager {
         proxy_username: Option<Option<String>>,
         proxy_password: Option<Option<String>>,
         groups: Option<Vec<String>>,
+        source_channel: Option<Option<String>>,
     ) -> anyhow::Result<()> {
         {
             let mut entries = self.entries.lock();
@@ -2633,6 +2649,10 @@ impl MultiTokenManager {
             if let Some(g) = groups {
                 entry.credentials.groups =
                     g.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            }
+            if let Some(v) = source_channel {
+                entry.credentials.source_channel =
+                    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
             }
         }
         self.persist_credentials()?;
@@ -3838,5 +3858,134 @@ mod tests {
         assert!(reloaded, "单凭据无 ID 时仍应能匹配并 reload");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ===== 账号分组隔离回归测试 =====
+
+    /// 构造一个带 token、属于指定分组的可用凭据
+    fn grouped_cred(token: &str, groups: &[&str]) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.access_token = Some(token.to_string());
+        c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        c.groups = groups.iter().map(|s| s.to_string()).collect();
+        c
+    }
+
+    #[test]
+    fn test_group_matches_helper() {
+        // 未绑定分组(None)匹配任何账号
+        assert!(group_matches(&[], None));
+        assert!(group_matches(&["g1".to_string()], None));
+        // 绑定分组时只匹配 groups 含该名的账号
+        assert!(group_matches(&["g1".to_string(), "g2".to_string()], Some("g1")));
+        assert!(!group_matches(&["g2".to_string()], Some("g1")));
+        assert!(!group_matches(&[], Some("g1")));
+    }
+
+    #[test]
+    fn test_select_next_credential_filters_by_group() {
+        // A∈g1, B∈g2, C∈无分组
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                grouped_cred("a", &["g1"]),
+                grouped_cred("b", &["g2"]),
+                grouped_cred("c", &[]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // g1 只能选到 A(id=1)
+        let g1 = manager.select_next_credential(None, Some("g1"));
+        assert_eq!(g1.map(|(id, _)| id), Some(1));
+        // g2 只能选到 B(id=2)
+        let g2 = manager.select_next_credential(None, Some("g2"));
+        assert_eq!(g2.map(|(id, _)| id), Some(2));
+        // 不存在的分组 → 无可用账号
+        assert!(manager.select_next_credential(None, Some("nope")).is_none());
+        // 未绑定分组(None) → 可选到账号
+        assert!(manager.select_next_credential(None, None).is_some());
+    }
+
+    #[test]
+    fn test_total_count_in_group() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                grouped_cred("a", &["g1"]),
+                grouped_cred("b", &["g1", "g2"]),
+                grouped_cred("c", &[]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(manager.total_count_in_group(Some("g1")), 2); // A,B
+        assert_eq!(manager.total_count_in_group(Some("g2")), 1); // B
+        assert_eq!(manager.total_count_in_group(None), 3); // 全部
+        assert_eq!(manager.total_count_in_group(Some("none")), 0);
+    }
+
+    #[test]
+    fn test_balanced_mode_independent_per_group() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        // g1: A(id1),B(id2)；g2: C(id3)
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                grouped_cred("a", &["g1"]),
+                grouped_cred("b", &["g1"]),
+                grouped_cred("c", &["g2"]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 让 A(id1) 成功若干次 → balanced 应转向 success_count 更小的 B(id2)
+        manager.report_success(1);
+        manager.report_success(1);
+        let pick = manager.select_next_credential(None, Some("g1"));
+        assert_eq!(pick.map(|(id, _)| id), Some(2), "balanced 应在 g1 内选 success_count 最小的 B");
+        // g2 不受 g1 计数影响，仍只会选到 C(id3)
+        let pick_g2 = manager.select_next_credential(None, Some("g2"));
+        assert_eq!(pick_g2.map(|(id, _)| id), Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_strict_isolation_fails_when_group_empty() {
+        // g1 只有一个账号 A(id1)，禁用后绑定 g1 的请求应直接失败，不回退到 g2/无分组
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                grouped_cred("a", &["g1"]),
+                grouped_cred("b", &["g2"]),
+                grouped_cred("c", &[]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 正常情况下 g1 能拿到 context
+        assert!(manager.acquire_context(None, Some("g1")).await.is_ok());
+
+        // 手动禁用 g1 内唯一账号 A(id1)
+        manager.set_disabled(1, true).unwrap();
+
+        // 严格隔离：g1 无可用账号 → Err，且不会选到 B/C
+        let res = manager.acquire_context(None, Some("g1")).await;
+        assert!(res.is_err(), "g1 内全部账号禁用后应失败，不回退到其他分组");
+
+        // 但 g2 仍可用
+        assert!(manager.acquire_context(None, Some("g2")).await.is_ok());
     }
 }

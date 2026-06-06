@@ -353,7 +353,8 @@ impl KiroProvider {
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        let total_credentials = self.token_manager.total_count();
+        // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
+        let total_credentials = self.token_manager.total_count_in_group(group).max(1);
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();

@@ -27,6 +27,7 @@ import {
   Copy,
   Wand2,
   Zap,
+  Tags,
 } from "lucide-react";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -67,6 +68,7 @@ import {
 import { CredentialCard } from "@/components/credential-card";
 import { AddCredentialDialog } from "@/components/add-credential-dialog";
 import { BatchImportDialog } from "@/components/batch-import-dialog";
+import { BatchEditCredentialDialog } from "@/components/batch-edit-credential-dialog";
 import { IdcLoginDialog } from "@/components/idc-login-dialog";
 import { SocialLoginDialog } from "@/components/social-login-dialog";
 import { KamImportDialog } from "@/components/kam-import-dialog";
@@ -127,6 +129,7 @@ interface DashboardProps {
 export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false);
+  const [batchEditDialogOpen, setBatchEditDialogOpen] = useState(false);
   const [idcLoginDialogOpen, setIdcLoginDialogOpen] = useState(false);
   const [socialLoginDialogOpen, setSocialLoginDialogOpen] = useState(false);
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false);
@@ -1150,6 +1153,15 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   恢复异常
                 </Button>
                 <Button
+                  onClick={() => setBatchEditDialogOpen(true)}
+                  size="sm"
+                  variant="outline"
+                  title="批量编辑分组 / 来源渠道"
+                >
+                  <Tags className="h-3.5 w-3.5" />
+                  分组/来源
+                </Button>
+                <Button
                   onClick={handleExportKam}
                   size="sm"
                   variant="outline"
@@ -1418,6 +1430,15 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       <BatchImportDialog
         open={batchImportDialogOpen}
         onOpenChange={setBatchImportDialogOpen}
+      />
+      <BatchEditCredentialDialog
+        open={batchEditDialogOpen}
+        onOpenChange={setBatchEditDialogOpen}
+        credentials={(data?.credentials ?? []).filter((c) => selectedIds.has(c.id))}
+        groupOptions={Array.from(
+          new Set((data?.credentials ?? []).flatMap((c) => c.groups ?? [])),
+        ).sort()}
+        onDone={deselectAll}
       />
       <SocialLoginDialog
         open={socialLoginDialogOpen}

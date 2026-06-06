@@ -15,6 +15,7 @@ import {
   useSetClientKeyDisabled, useResetClientKeyStats, useUpdateClientKey,
 } from '@/hooks/use-client-keys'
 import { useCredentials } from '@/hooks/use-credentials'
+import { GroupSingleSelect } from '@/components/group-select'
 import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 
@@ -148,11 +149,6 @@ export function ClientKeysPage() {
 
   return (
     <div>
-      <datalist id="client-key-groups">
-        {groupOptions.map((g) => (
-          <option key={g} value={g} />
-        ))}
-      </datalist>
       <div className="mb-6 flex items-end justify-between gap-4">
         <div>
           <h1 className="text-[28px] font-semibold tracking-tight leading-tight">客户端 Key</h1>
@@ -310,15 +306,15 @@ export function ClientKeysPage() {
             </div>
             <div>
               <label className="text-[12px] text-muted-foreground">绑定分组（可选）</label>
-              <Input
-                placeholder="留空 = 可使用全部账号；填写后仅调度该分组内账号"
+              <GroupSingleSelect
                 value={createGroup}
-                onChange={(e) => setCreateGroup(e.target.value)}
+                options={groupOptions}
+                onChange={setCreateGroup}
                 disabled={createKey.isPending}
-                list="client-key-groups"
+                noneLabel="（不绑定，可用全部账号）"
               />
               <p className="mt-1 text-[11px] text-muted-foreground">
-                绑定后该 Key 仅会使用 groups 含此分组名的账号（严格隔离，分组内无可用账号时请求会失败）。
+                绑定后该 Key 仅会使用含此分组的账号（严格隔离，分组内无可用账号时请求会失败）。
               </p>
             </div>
             <DialogFooter>
@@ -404,14 +400,15 @@ export function ClientKeysPage() {
             </div>
             <div>
               <label className="text-[12px] text-muted-foreground">绑定分组</label>
-              <Input
-                placeholder="留空 = 可使用全部账号"
+              <GroupSingleSelect
                 value={editGroup}
-                onChange={(e) => setEditGroup(e.target.value)}
-                list="client-key-groups"
+                options={groupOptions}
+                onChange={setEditGroup}
+                disabled={updateKey.isPending}
+                noneLabel="（不绑定，可用全部账号）"
               />
               <p className="mt-1 text-[11px] text-muted-foreground">
-                绑定后仅调度该分组内账号（严格隔离）。清空表示解除绑定。
+                绑定后仅调度该分组内账号（严格隔离）。选「不绑定」表示解除绑定。
               </p>
             </div>
             <DialogFooter>

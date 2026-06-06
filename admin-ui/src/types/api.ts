@@ -33,6 +33,8 @@ export interface CredentialStatusItem {
   endpoint: string
   /** 账号所属分组（可属于多个分组） */
   groups?: string[]
+  /** 账号来源渠道（纯备注） */
+  sourceChannel?: string
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
@@ -114,6 +116,7 @@ export interface AddCredentialRequest {
   endpoint?: string
   email?: string
   groups?: string[]
+  sourceChannel?: string
 }
 
 // 添加凭据响应
@@ -132,6 +135,8 @@ export interface UpdateCredentialRequest {
   proxyPassword?: string
   /** 账号所属分组（undefined 表示不修改，数组表示整体替换） */
   groups?: string[]
+  /** 账号来源渠道（undefined 表示不修改，空串表示清除） */
+  sourceChannel?: string
 }
 
 // 更新 refreshToken 请求
@@ -474,6 +479,8 @@ export interface TraceQuery {
   status?: string
   errorType?: string
   credentialId?: number
+  /** 按发起请求的客户端 Key 筛选（0 = master apiKey） */
+  keyId?: number
   /** 该凭据在某一跳失败过（即便 trace 最终成功）——用于凭据失败详情 */
   failedAttemptCredentialId?: number
   model?: string

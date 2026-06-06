@@ -461,6 +461,12 @@ export function CredentialCard({
                     {g}
                   </Badge>
                 ))}
+                {/* 账号来源渠道 */}
+                {credential.sourceChannel && (
+                  <Badge variant="outline" title="账号来源渠道">
+                    来源: {credential.sourceChannel}
+                  </Badge>
+                )}
               </div>
             </div>
             <Switch

@@ -68,6 +68,9 @@ pub struct CredentialStatusItem {
     /// 账号所属分组（可属于多个分组）
     #[serde(default)]
     pub groups: Vec<String>,
+    /// 账号来源渠道（纯备注）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_channel: Option<String>,
     /// 凭据余额（从缓存中读取的最近一次结果，可能为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,
@@ -169,6 +172,9 @@ pub struct AddCredentialRequest {
     /// 账号所属分组（可属于多个分组，可选）
     #[serde(default)]
     pub groups: Vec<String>,
+    /// 账号来源渠道（纯备注，可选）
+    #[serde(default)]
+    pub source_channel: Option<String>,
 }
 
 fn default_auth_method() -> String {
@@ -204,6 +210,9 @@ pub struct UpdateCredentialRequest {
     /// 账号所属分组（None 表示不修改，Some 表示整体替换）
     #[serde(default)]
     pub groups: Option<Vec<String>>,
+    /// 账号来源渠道（None 表示不修改，空串表示清除）
+    #[serde(default)]
+    pub source_channel: Option<String>,
 }
 
 /// 添加凭据成功响应

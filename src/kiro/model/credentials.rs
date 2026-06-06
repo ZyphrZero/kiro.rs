@@ -129,6 +129,13 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<String>,
+
+    /// 账号来源渠道（纯备注）
+    ///
+    /// 标记该账号的购买来源/渠道，便于运营追踪。不参与调度、导出或筛选。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_channel: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -172,6 +179,7 @@ impl std::fmt::Debug for KiroCredentials {
             .field("kiro_api_key", &fmt_redacted(&self.kiro_api_key))
             .field("endpoint", &self.endpoint)
             .field("groups", &self.groups)
+            .field("source_channel", &self.source_channel)
             .finish()
     }
 }
@@ -432,6 +440,7 @@ mod tests {
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
+            source_channel: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -552,6 +561,7 @@ mod tests {
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
+            source_channel: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -585,6 +595,7 @@ mod tests {
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
+            source_channel: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -701,6 +712,7 @@ mod tests {
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
+            source_channel: None,
         };
 
         let json = original.to_pretty_json().unwrap();

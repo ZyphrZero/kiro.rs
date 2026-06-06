@@ -9,8 +9,9 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { useAddCredential } from '@/hooks/use-credentials'
+import { useAddCredential, useCredentials } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import { GroupMultiSelect } from '@/components/group-select'
 
 interface AddCredentialDialogProps {
   open: boolean
@@ -33,7 +34,13 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
   const [endpoint, setEndpoint] = useState('')
-  const [groups, setGroups] = useState('')
+  const [groups, setGroups] = useState<string[]>([])
+  const [sourceChannel, setSourceChannel] = useState('')
+
+  const { data: credData } = useCredentials()
+  const groupOptions = Array.from(
+    new Set((credData?.credentials ?? []).flatMap((c) => c.groups ?? [])),
+  ).sort()
 
   const { mutate, isPending } = useAddCredential()
 
@@ -51,7 +58,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setProxyUsername('')
     setProxyPassword('')
     setEndpoint('')
-    setGroups('')
+    setGroups([])
+    setSourceChannel('')
   }
 
   const isApiKey = authMethod === 'api_key'
@@ -92,10 +100,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         proxyUsername: proxyUsername.trim() || undefined,
         proxyPassword: proxyPassword.trim() || undefined,
         endpoint: endpoint.trim() || undefined,
-        groups: groups
-          .split(',')
-          .map((g) => g.trim())
-          .filter((g) => g.length > 0),
+        groups: groups,
+        sourceChannel: sourceChannel.trim() || undefined,
       },
       {
         onSuccess: (data) => {
@@ -285,18 +291,32 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
             {/* 账号分组 */}
             <div className="space-y-2">
-              <label htmlFor="groups" className="text-sm font-medium">
-                账号分组
-              </label>
-              <Input
-                id="groups"
-                placeholder="多个用逗号分隔，如 teamA, vip（留空 = 不分组）"
+              <label className="text-sm font-medium">账号分组</label>
+              <GroupMultiSelect
                 value={groups}
-                onChange={(e) => setGroups(e.target.value)}
+                options={groupOptions}
+                onChange={setGroups}
                 disabled={isPending}
               />
               <p className="text-xs text-muted-foreground">
-                可选。绑定了某分组的客户端 Key 只会调度到 groups 含该分组名的账号
+                可选。绑定了某分组的客户端 Key 只会调度到含该分组的账号
+              </p>
+            </div>
+
+            {/* 账号来源渠道 */}
+            <div className="space-y-2">
+              <label htmlFor="sourceChannel" className="text-sm font-medium">
+                账号来源渠道（备注）
+              </label>
+              <Input
+                id="sourceChannel"
+                placeholder="例: 官方, 转售商A, 采购平台X"
+                value={sourceChannel}
+                onChange={(e) => setSourceChannel(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                可选。纯备注，标记账号来源/渠道，便于追踪
               </p>
             </div>
 

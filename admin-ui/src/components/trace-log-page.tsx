@@ -23,6 +23,7 @@ import {
   DropdownMenuLabel,
 } from '@/components/ui/dropdown-menu'
 import { useTraces } from '@/hooks/use-traces'
+import { useClientKeys } from '@/hooks/use-client-keys'
 import {
   useLogGovernanceConfig,
   useSetLogGovernanceConfig,
@@ -377,8 +378,16 @@ const PAGE_SIZE = 50
 export function TraceLogPage() {
   const [status, setStatus] = useState('')
   const [errorType, setErrorType] = useState('')
+  const [keyId, setKeyId] = useState('')
   const [onlyFailed, setOnlyFailed] = useState(false)
   const [page, setPage] = useState(0)
+
+  const { data: keysData } = useClientKeys()
+  const keyOptions = [
+    { value: '', label: '全部 Key' },
+    { value: '0', label: 'master' },
+    ...(keysData?.keys ?? []).map((k) => ({ value: String(k.id), label: k.name })),
+  ]
 
   // 筛选条件变化时回到第一页
   const resetTo = <T,>(setter: (v: T) => void) => (v: T) => {
@@ -389,6 +398,7 @@ export function TraceLogPage() {
   const query: TraceQuery = {
     status: status || undefined,
     errorType: errorType || undefined,
+    keyId: keyId ? Number(keyId) : undefined,
     onlyFailed: onlyFailed || undefined,
     limit: PAGE_SIZE,
     offset: page * PAGE_SIZE,
@@ -408,6 +418,7 @@ export function TraceLogPage() {
           {total > 0 && <Badge variant="secondary">{total}</Badge>}
         </div>
         <div className="ml-auto flex flex-wrap items-center gap-2">
+          <Select value={keyId} onChange={resetTo(setKeyId)} options={keyOptions} />
           <Select value={status} onChange={resetTo(setStatus)} options={STATUS_OPTIONS} />
           <Select
             value={errorType}
