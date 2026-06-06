@@ -93,6 +93,12 @@ function formatDuration(ms: number): string {
   return `${(ms / 1000).toFixed(2)}s`
 }
 
+function formatTokens(n: number): string {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K'
+  return String(n)
+}
+
 function credLabel(id: number, email?: string | null): string {
   if (id === 0) return '—'
   return email ? email : `#${id}`
@@ -186,6 +192,25 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
         <td className="py-2.5 pr-3 text-[13px]">
           {credLabel(rec.finalCredentialId, rec.finalEmail)}
         </td>
+        <td className="py-2.5 pr-3 text-[12px] tabular-nums">
+          <span className="text-emerald-600 dark:text-emerald-400" title="输入 token">
+            ↓{formatTokens(rec.inputTokens ?? 0)}
+          </span>
+          <span className="ml-1.5 text-violet-600 dark:text-violet-400" title="输出 token">
+            ↑{formatTokens(rec.outputTokens ?? 0)}
+          </span>
+          {((rec.cacheCreationTokens ?? 0) + (rec.cacheReadTokens ?? 0)) > 0 && (
+            <span className="ml-1.5 text-amber-600 dark:text-amber-400" title="缓存 token（创建+读取）">
+              ⚡{formatTokens((rec.cacheCreationTokens ?? 0) + (rec.cacheReadTokens ?? 0))}
+            </span>
+          )}
+        </td>
+        <td className="py-2.5 pr-3 text-[13px] tabular-nums">
+          {rec.credits != null && rec.credits > 0 ? rec.credits.toFixed(4) : '—'}
+        </td>
+        <td className="py-2.5 pr-3 text-[13px] tabular-nums text-muted-foreground">
+          {rec.firstTokenMs != null ? formatDuration(rec.firstTokenMs) : '—'}
+        </td>
         <td className="py-2.5 pr-3">
           {errStyle ? <Badge variant={errStyle.variant}>{errStyle.label}</Badge> : '—'}
         </td>
@@ -198,7 +223,7 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
       </tr>
       {open && (
         <tr className="border-b border-border/40 bg-secondary/20">
-          <td colSpan={9} className="px-3 py-3">
+          <td colSpan={12} className="px-3 py-3">
             <ExpandedDetail rec={rec} />
           </td>
         </tr>
@@ -462,6 +487,9 @@ export function TraceLogPage() {
                     <th className="py-2 pr-3 font-medium">客户端 Key</th>
                     <th className="py-2 pr-3 font-medium">状态</th>
                     <th className="py-2 pr-3 font-medium">最终凭据</th>
+                    <th className="py-2 pr-3 font-medium">Token</th>
+                    <th className="py-2 pr-3 font-medium">费用</th>
+                    <th className="py-2 pr-3 font-medium">首Token</th>
                     <th className="py-2 pr-3 font-medium">错误类型</th>
                     <th className="py-2 pr-3 font-medium">重试</th>
                     <th className="py-2 pr-3 font-medium">耗时</th>

@@ -71,6 +71,24 @@ pub struct TraceRecord {
     pub duration_ms: u64,
     /// 流式中断时已发送的字节数（区分完整失败 vs 半截中断）
     pub interrupted_after_bytes: Option<u64>,
+    /// 输入 token（Anthropic 口径）
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// 输出 token
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// 缓存创建 token
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
+    /// 缓存读取 token
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// 费用（上游 meteringEvent 累计的 credits）
+    #[serde(default)]
+    pub credits: f64,
+    /// 首 Token 延迟（毫秒，仅流式有值；非流式为 None）
+    #[serde(default)]
+    pub first_token_ms: Option<u64>,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
 }
@@ -163,6 +181,7 @@ impl TraceStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             enabled: AtomicBool::new(enabled),
@@ -174,11 +193,43 @@ impl TraceStore {
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             enabled: AtomicBool::new(true),
             retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
         })
+    }
+
+    /// 旧库迁移：为 traces 表补齐新增列（幂等，缺哪列加哪列）。
+    /// 老版本的 traces.db 只有基础列，新增的 token/credits/first_token_ms 需在此 ALTER。
+    fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+        let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(traces)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            for name in rows {
+                existing.insert(name?);
+            }
+        }
+        // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
+        let columns: [(&str, &str); 6] = [
+            ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("credits", "REAL NOT NULL DEFAULT 0"),
+            ("first_token_ms", "INTEGER"),
+        ];
+        for (name, def) in columns {
+            if !existing.contains(name) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE traces ADD COLUMN {} {};",
+                    name, def
+                ))?;
+            }
+        }
+        Ok(())
     }
 
     /// 是否启用 trace 写入
@@ -223,8 +274,10 @@ impl TraceStore {
             tx.execute(
                 "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, model, \
                  is_stream, final_status, final_credential_id, error_type, error_message, \
-                 total_attempts, duration_ms, interrupted_after_bytes) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                 total_attempts, duration_ms, interrupted_after_bytes, \
+                 input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
+                 credits, first_token_ms) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -239,6 +292,12 @@ impl TraceStore {
                     rec.total_attempts as i64,
                     rec.duration_ms as i64,
                     rec.interrupted_after_bytes.map(|v| v as i64),
+                    rec.input_tokens as i64,
+                    rec.output_tokens as i64,
+                    rec.cache_creation_tokens as i64,
+                    rec.cache_read_tokens as i64,
+                    rec.credits,
+                    rec.first_token_ms.map(|v| v as i64),
                 ],
             )?;
             for a in &rec.attempts {
@@ -353,7 +412,8 @@ impl TraceStore {
         };
         let sql = format!(
             "SELECT trace_id, ts, key_id, model, is_stream, final_status, final_credential_id, \
-             error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes \
+             error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
+             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -375,6 +435,12 @@ impl TraceStore {
                 interrupted_after_bytes: row
                     .get::<_, Option<i64>>(11)?
                     .map(|v| v as u64),
+                input_tokens: row.get::<_, i64>(12)? as u64,
+                output_tokens: row.get::<_, i64>(13)? as u64,
+                cache_creation_tokens: row.get::<_, i64>(14)? as u64,
+                cache_read_tokens: row.get::<_, i64>(15)? as u64,
+                credits: row.get::<_, f64>(16)?,
+                first_token_ms: row.get::<_, Option<i64>>(17)?.map(|v| v as u64),
                 attempts: Vec::new(),
             })
         })?;
@@ -506,7 +572,13 @@ CREATE TABLE IF NOT EXISTS traces (
     error_message     TEXT,
     total_attempts    INTEGER NOT NULL,
     duration_ms       INTEGER NOT NULL,
-    interrupted_after_bytes INTEGER
+    interrupted_after_bytes INTEGER,
+    input_tokens      INTEGER NOT NULL DEFAULT 0,
+    output_tokens     INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    credits           REAL NOT NULL DEFAULT 0,
+    first_token_ms    INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -552,6 +624,12 @@ mod tests {
             total_attempts: 2,
             duration_ms: 1200,
             interrupted_after_bytes: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 0.0,
+            first_token_ms: None,
             attempts: vec![
                 TraceAttempt {
                     attempt: 0,
