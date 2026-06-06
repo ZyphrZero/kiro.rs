@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { Input } from '@/components/ui/input'
+import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 
 const NEW_GROUP = '__new__'
@@ -117,6 +118,7 @@ export function GroupMultiSelect({
           value={newGroup}
           disabled={disabled}
           onChange={(e) => setNewGroup(e.target.value)}
+          onBlur={() => addNew()}
           onKeyDown={(e) => {
             if (e.key === 'Enter') {
               e.preventDefault()
@@ -124,6 +126,15 @@ export function GroupMultiSelect({
             }
           }}
         />
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={disabled || !newGroup.trim()}
+          onClick={addNew}
+        >
+          添加
+        </Button>
       </div>
       {value.length > 0 && (
         <p className="text-xs text-muted-foreground">
