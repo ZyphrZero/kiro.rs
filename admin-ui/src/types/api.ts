@@ -31,6 +31,8 @@ export interface CredentialStatusItem {
   /** 账号级风控冷却剩余秒数（>0 表示冷却中） */
   throttledRemainingSecs?: number
   endpoint: string
+  /** 账号所属分组（可属于多个分组） */
+  groups?: string[]
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
@@ -111,6 +113,7 @@ export interface AddCredentialRequest {
   kiroApiKey?: string
   endpoint?: string
   email?: string
+  groups?: string[]
 }
 
 // 添加凭据响应
@@ -127,6 +130,8 @@ export interface UpdateCredentialRequest {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
+  /** 账号所属分组（undefined 表示不修改，数组表示整体替换） */
+  groups?: string[]
 }
 
 // 更新 refreshToken 请求
@@ -351,6 +356,8 @@ export interface ClientKeyItem {
   totalOutputTokens: number
   totalCacheCreationTokens: number
   totalCacheReadTokens: number
+  /** 绑定的账号分组（未绑定时为 undefined） */
+  group?: string
 }
 
 export interface ClientKeysResponse {
@@ -361,6 +368,7 @@ export interface ClientKeysResponse {
 export interface CreateClientKeyRequest {
   name: string
   description?: string
+  group?: string
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -374,6 +382,7 @@ export interface CreateClientKeyResponse {
 export interface UpdateClientKeyRequest {
   name?: string
   description?: string
+  group?: string
 }
 
 // ============ 用量统计 ============
@@ -443,6 +452,8 @@ export interface TraceRecord {
   traceId: string
   ts: string
   keyId: number
+  /** 发起请求的客户端 Key 名称（master 表示主 apiKey） */
+  keyName?: string
   model: string
   isStream: boolean
   /** success / error / interrupted */

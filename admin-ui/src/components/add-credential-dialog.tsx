@@ -33,6 +33,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
   const [endpoint, setEndpoint] = useState('')
+  const [groups, setGroups] = useState('')
 
   const { mutate, isPending } = useAddCredential()
 
@@ -50,6 +51,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setProxyUsername('')
     setProxyPassword('')
     setEndpoint('')
+    setGroups('')
   }
 
   const isApiKey = authMethod === 'api_key'
@@ -90,6 +92,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         proxyUsername: proxyUsername.trim() || undefined,
         proxyPassword: proxyPassword.trim() || undefined,
         endpoint: endpoint.trim() || undefined,
+        groups: groups
+          .split(',')
+          .map((g) => g.trim())
+          .filter((g) => g.length > 0),
       },
       {
         onSuccess: (data) => {
@@ -274,6 +280,23 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               />
               <p className="text-xs text-muted-foreground">
                 可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
+              </p>
+            </div>
+
+            {/* 账号分组 */}
+            <div className="space-y-2">
+              <label htmlFor="groups" className="text-sm font-medium">
+                账号分组
+              </label>
+              <Input
+                id="groups"
+                placeholder="多个用逗号分隔，如 teamA, vip（留空 = 不分组）"
+                value={groups}
+                onChange={(e) => setGroups(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                可选。绑定了某分组的客户端 Key 只会调度到 groups 含该分组名的账号
               </p>
             </div>
 

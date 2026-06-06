@@ -30,6 +30,7 @@ export function EditCredentialDialog({
   const [proxyUrl, setProxyUrl] = useState(credential.proxyUrl ?? '')
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
+  const [groups, setGroups] = useState((credential.groups ?? []).join(', '))
   const [manualMode, setManualMode] = useState(false)
 
   const { data: proxyPool } = useQuery({
@@ -45,6 +46,7 @@ export function EditCredentialDialog({
       setProxyUrl(credential.proxyUrl ?? '')
       setProxyUsername('')
       setProxyPassword('')
+      setGroups((credential.groups ?? []).join(', '))
       setManualMode(false)
     }
   }, [open, credential])
@@ -62,6 +64,10 @@ export function EditCredentialDialog({
           proxyUrl: proxyUrl,
           proxyUsername: proxyUsername || undefined,
           proxyPassword: proxyPassword || undefined,
+          groups: groups
+            .split(',')
+            .map((g) => g.trim())
+            .filter((g) => g.length > 0),
         },
       },
       {
@@ -113,6 +119,23 @@ export function EditCredentialDialog({
               />
               <p className="text-xs text-muted-foreground">
                 留空则显示凭据 ID，清除请提交空值
+              </p>
+            </div>
+
+            {/* 账号分组 */}
+            <div className="space-y-2">
+              <label htmlFor="groups" className="text-sm font-medium">
+                账号分组（多个用逗号分隔）
+              </label>
+              <Input
+                id="groups"
+                placeholder="例: teamA, vip"
+                value={groups}
+                onChange={(e) => setGroups(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                绑定了某分组的客户端 Key 只会调度到 groups 含该分组名的账号。留空表示不属于任何分组。
               </p>
             </div>
 

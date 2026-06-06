@@ -725,6 +725,9 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 账号所属分组（可属于多个分组）
+    #[serde(default)]
+    pub groups: Vec<String>,
 }
 
 /// 凭据管理器状态快照
@@ -788,6 +791,17 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+}
+
+/// 判断某账号的分组集合是否匹配请求所属分组（严格隔离）
+///
+/// - `group = None`：Key 未绑定分组（含 master apiKey），匹配所有账号。
+/// - `group = Some(g)`：仅匹配 `cred_groups` 包含 `g` 的账号。
+fn group_matches(cred_groups: &[String], group: Option<&str>) -> bool {
+    match group {
+        None => true,
+        Some(g) => cred_groups.iter().any(|cg| cg == g),
+    }
 }
 
 impl MultiTokenManager {
@@ -977,7 +991,7 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    fn select_next_credential(&self, model: Option<&str>, group: Option<&str>) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
 
@@ -999,6 +1013,10 @@ impl MultiTokenManager {
                 }
                 // 如果是 opus 模型，需要检查订阅等级
                 if is_opus && !e.credentials.supports_opus() {
+                    return false;
+                }
+                // 账号分组隔离：Key 绑定分组时只用该分组内的账号
+                if !group_matches(&e.credentials.groups, group) {
                     return false;
                 }
                 true
@@ -1040,7 +1058,7 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+    pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1071,6 +1089,7 @@ impl MultiTokenManager {
                             e.id == current_id
                                 && !e.disabled
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                                && group_matches(&e.credentials.groups, group)
                         })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
@@ -1079,7 +1098,7 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model);
+                    let mut best = self.select_next_credential(model, group);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -1098,7 +1117,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model);
+                            best = self.select_next_credential(model, group);
                         }
                     }
 
@@ -1906,6 +1925,7 @@ impl MultiTokenManager {
                         .map(|d| d.as_secs())
                         .filter(|s| *s > 0),
                     endpoint: e.credentials.endpoint.clone(),
+                    groups: e.credentials.groups.clone(),
                 })
                 .collect(),
             current_id,
@@ -2589,6 +2609,7 @@ impl MultiTokenManager {
         proxy_url: Option<Option<String>>,
         proxy_username: Option<Option<String>>,
         proxy_password: Option<Option<String>>,
+        groups: Option<Vec<String>>,
     ) -> anyhow::Result<()> {
         {
             let mut entries = self.entries.lock();
@@ -2608,6 +2629,10 @@ impl MultiTokenManager {
             }
             if let Some(v) = proxy_password {
                 entry.credentials.proxy_password = v.filter(|s| !s.is_empty());
+            }
+            if let Some(g) = groups {
+                entry.credentials.groups =
+                    g.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
             }
         }
         self.persist_credentials()?;
@@ -3320,7 +3345,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -3343,7 +3368,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -3389,7 +3414,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None)
+            .acquire_context(None, None)
             .await
             .err()
             .unwrap()
@@ -3434,7 +3459,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None)
+            .acquire_context(None, None)
             .await
             .err()
             .unwrap()

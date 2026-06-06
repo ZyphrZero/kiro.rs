@@ -750,6 +750,7 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         total_output_tokens: k.total_output_tokens,
         total_cache_creation_tokens: k.total_cache_creation_tokens,
         total_cache_read_tokens: k.total_cache_read_tokens,
+        group: k.group.clone(),
     }
 }
 
@@ -785,6 +786,10 @@ pub async fn create_client_key(
             .description
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty()),
+        payload
+            .group
+            .map(|g| g.trim().to_string())
+            .filter(|g| !g.is_empty()),
     );
     Json(CreateClientKeyResponse {
         id: entry.id,
@@ -825,7 +830,13 @@ pub async fn update_client_key(
     let description = payload
         .description
         .map(|d| if d.is_empty() { None } else { Some(d) });
-    if state.client_keys.update_meta(id, payload.name, description) {
+    let group = payload
+        .group
+        .map(|g| {
+            let t = g.trim();
+            if t.is_empty() { None } else { Some(t.to_string()) }
+        });
+    if state.client_keys.update_meta(id, payload.name, description, group) {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {
         (
@@ -1008,10 +1019,29 @@ pub async fn list_traces(
         .map(|c| (c.id, c.email.clone()))
         .collect();
 
+    // 附加客户端 Key 名称：key_id -> name（0 表示 master apiKey）
+    let key_name_map: std::collections::HashMap<u64, String> = state
+        .client_keys
+        .list()
+        .into_iter()
+        .map(|k| (k.id, k.name))
+        .collect();
+    let key_label = |key_id: u64| -> String {
+        if key_id == 0 {
+            "master".to_string()
+        } else {
+            key_name_map
+                .get(&key_id)
+                .cloned()
+                .unwrap_or_else(|| format!("#{}", key_id))
+        }
+    };
+
     let enriched: Vec<serde_json::Value> = records
         .into_iter()
         .map(|r| {
             let final_email = email_map.get(&r.final_credential_id).cloned().flatten();
+            let key_name = key_label(r.key_id);
             // attempts 里每跳也附 email
             let attempts: Vec<serde_json::Value> = r
                 .attempts
@@ -1034,6 +1064,7 @@ pub async fn list_traces(
                 "traceId": r.trace_id,
                 "ts": r.ts,
                 "keyId": r.key_id,
+                "keyName": key_name,
                 "model": r.model,
                 "isStream": r.is_stream,
                 "finalStatus": r.final_status,

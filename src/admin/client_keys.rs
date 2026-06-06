@@ -49,6 +49,12 @@ pub struct ClientKey {
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
+    /// 绑定的账号分组名（可选）
+    ///
+    /// 设置后，用该 Key 发起的请求只会调度到 groups 包含此分组名的上游账号（严格隔离）。
+    /// None 表示不绑定分组，可使用全部账号（与 master apiKey 行为一致）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// 客户端 Key 管理器
@@ -140,7 +146,7 @@ impl ClientKeyManager {
     }
 
     /// 创建新 Key（生成明文随机串），返回新建条目
-    pub fn create(&self, name: String, description: Option<String>) -> ClientKey {
+    pub fn create(&self, name: String, description: Option<String>, group: Option<String>) -> ClientKey {
         let key = generate_client_key();
         let mut inner = self.inner.write();
         let id = inner.next_id;
@@ -159,6 +165,7 @@ impl ClientKeyManager {
             total_cache_creation_tokens: 0,
             total_cache_read_tokens: 0,
             total_credits: 0.0,
+            group: group.filter(|g| !g.trim().is_empty()),
         };
         inner.by_key.insert(key, id);
         inner.entries.insert(id, entry.clone());
@@ -201,6 +208,7 @@ impl ClientKeyManager {
         id: u64,
         name: Option<String>,
         description: Option<Option<String>>,
+        group: Option<Option<String>>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -211,6 +219,9 @@ impl ClientKeyManager {
                 if let Some(d) = description {
                     e.description = d;
                 }
+                if let Some(g) = group {
+                    e.group = g.filter(|s| !s.trim().is_empty());
+                }
                 true
             }
             None => false,
@@ -219,6 +230,11 @@ impl ClientKeyManager {
             self.save_locked(&inner);
         }
         updated
+    }
+
+    /// 返回指定 Key 绑定的分组名（None 表示未绑定或 Key 不存在）
+    pub fn group_of(&self, id: u64) -> Option<String> {
+        self.inner.read().entries.get(&id).and_then(|e| e.group.clone())
     }
 
     /// 重置计数（保留 Key 与名称）
@@ -343,7 +359,7 @@ mod tests {
     #[test]
     fn create_and_verify() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None);
+        let entry = mgr.create("test".to_string(), None, None);
         assert!(entry.key.starts_with(CLIENT_KEY_PREFIX));
         assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
         // 不带前缀的拒绝
@@ -353,7 +369,7 @@ mod tests {
     #[test]
     fn disabled_key_rejected() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None);
+        let entry = mgr.create("test".to_string(), None, None);
         mgr.set_disabled(entry.id, true);
         assert_eq!(mgr.verify_and_touch(&entry.key), None);
         mgr.set_disabled(entry.id, false);
@@ -363,7 +379,7 @@ mod tests {
     #[test]
     fn record_usage_accumulates() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None);
+        let entry = mgr.create("test".to_string(), None, None);
         mgr.record_usage(entry.id, 100, 50, 0, 0, 0.0);
         mgr.record_usage(entry.id, 200, 30, 5, 10, 1.5);
         let list = mgr.list();

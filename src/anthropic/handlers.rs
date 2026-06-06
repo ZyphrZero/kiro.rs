@@ -548,7 +548,7 @@ pub async fn post_messages(
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream)
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone())
             .await;
     }
 
@@ -643,6 +643,7 @@ pub async fn post_messages(
             cache_creation_tokens,
             cache_read_tokens,
             tracer,
+            key_ctx.group.clone(),
         )
         .await
     } else {
@@ -665,6 +666,7 @@ pub async fn post_messages(
             cache_creation_tokens,
             cache_read_tokens,
             tracer,
+            key_ctx.group.clone(),
         )
         .await
     }
@@ -682,9 +684,10 @@ async fn handle_stream_request(
     cache_creation_tokens: i32,
     cache_read_tokens: i32,
     tracer: std::sync::Arc<RequestTracer>,
+    group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref())).await {
+    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
@@ -864,9 +867,10 @@ async fn handle_non_stream_request(
     initial_cache_creation: i32,
     initial_cache_read: i32,
     tracer: std::sync::Arc<RequestTracer>,
+    group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api(request_body, Some(tracer.as_ref())).await {
+    let call_result = match provider.call_api(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
@@ -1201,7 +1205,7 @@ pub async fn post_messages_cc(
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream)
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone())
             .await;
     }
 
@@ -1296,6 +1300,7 @@ pub async fn post_messages_cc(
             cache_creation_tokens,
             cache_read_tokens,
             tracer,
+            key_ctx.group.clone(),
         )
         .await
     } else {
@@ -1318,6 +1323,7 @@ pub async fn post_messages_cc(
             cache_creation_tokens,
             cache_read_tokens,
             tracer,
+            key_ctx.group.clone(),
         )
         .await
     }
@@ -1338,9 +1344,10 @@ async fn handle_stream_request_buffered(
     cache_creation_tokens: i32,
     cache_read_tokens: i32,
     tracer: std::sync::Arc<RequestTracer>,
+    group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref())).await {
+    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");

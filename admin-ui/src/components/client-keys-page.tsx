@@ -14,6 +14,7 @@ import {
   useClientKeys, useCreateClientKey, useDeleteClientKey,
   useSetClientKeyDisabled, useResetClientKeyStats, useUpdateClientKey,
 } from '@/hooks/use-client-keys'
+import { useCredentials } from '@/hooks/use-credentials'
 import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 
@@ -35,15 +36,22 @@ function formatRelative(ts?: string): string {
 
 export function ClientKeysPage() {
   const { data, isLoading } = useClientKeys()
+  const { data: credData } = useCredentials()
   const createKey = useCreateClientKey()
   const deleteKey = useDeleteClientKey()
   const setDisabled = useSetClientKeyDisabled()
   const resetStats = useResetClientKeyStats()
   const updateKey = useUpdateClientKey()
 
+  // 现有分组名集合（从所有账号的 groups 聚合去重），供下拉建议
+  const groupOptions = Array.from(
+    new Set((credData?.credentials ?? []).flatMap((c) => c.groups ?? [])),
+  ).sort()
+
   const [createOpen, setCreateOpen] = useState(false)
   const [createName, setCreateName] = useState('')
   const [createDesc, setCreateDesc] = useState('')
+  const [createGroup, setCreateGroup] = useState('')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -51,6 +59,7 @@ export function ClientKeysPage() {
   const [editTarget, setEditTarget] = useState<ClientKeyItem | null>(null)
   const [editName, setEditName] = useState('')
   const [editDesc, setEditDesc] = useState('')
+  const [editGroup, setEditGroup] = useState('')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -60,11 +69,16 @@ export function ClientKeysPage() {
       return
     }
     try {
-      const res = await createKey.mutateAsync({ name, description: createDesc.trim() || undefined })
+      const res = await createKey.mutateAsync({
+        name,
+        description: createDesc.trim() || undefined,
+        group: createGroup.trim() || undefined,
+      })
       setCreatedKey(res)
       setCreateOpen(false)
       setCreateName('')
       setCreateDesc('')
+      setCreateGroup('')
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -104,6 +118,7 @@ export function ClientKeysPage() {
     setEditTarget(item)
     setEditName(item.name)
     setEditDesc(item.description ?? '')
+    setEditGroup(item.group ?? '')
     setEditOpen(true)
   }
 
@@ -113,7 +128,7 @@ export function ClientKeysPage() {
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
-        req: { name: editName.trim(), description: editDesc.trim() },
+        req: { name: editName.trim(), description: editDesc.trim(), group: editGroup.trim() },
       })
       toast.success('已更新')
       setEditOpen(false)
@@ -133,6 +148,11 @@ export function ClientKeysPage() {
 
   return (
     <div>
+      <datalist id="client-key-groups">
+        {groupOptions.map((g) => (
+          <option key={g} value={g} />
+        ))}
+      </datalist>
       <div className="mb-6 flex items-end justify-between gap-4">
         <div>
           <h1 className="text-[28px] font-semibold tracking-tight leading-tight">客户端 Key</h1>
@@ -168,6 +188,7 @@ export function ClientKeysPage() {
                 <tr>
                   <th className="text-left font-medium px-4 py-3">名称</th>
                   <th className="text-left font-medium px-4 py-3">Key</th>
+                  <th className="text-left font-medium px-4 py-3">分组</th>
                   <th className="text-left font-medium px-4 py-3">状态</th>
                   <th className="text-right font-medium px-4 py-3">总调用</th>
                   <th className="text-right font-medium px-4 py-3">输入</th>
@@ -189,6 +210,13 @@ export function ClientKeysPage() {
                     </td>
                     <td className="px-4 py-3">
                       <code className="text-[12px] font-mono text-muted-foreground">{k.maskedKey}</code>
+                    </td>
+                    <td className="px-4 py-3">
+                      {k.group ? (
+                        <Badge variant="outline">{k.group}</Badge>
+                      ) : (
+                        <span className="text-[12px] text-muted-foreground">全部账号</span>
+                      )}
                     </td>
                     <td className="px-4 py-3">
                       {k.disabled ? (
@@ -280,6 +308,19 @@ export function ClientKeysPage() {
                 disabled={createKey.isPending}
               />
             </div>
+            <div>
+              <label className="text-[12px] text-muted-foreground">绑定分组（可选）</label>
+              <Input
+                placeholder="留空 = 可使用全部账号；填写后仅调度该分组内账号"
+                value={createGroup}
+                onChange={(e) => setCreateGroup(e.target.value)}
+                disabled={createKey.isPending}
+                list="client-key-groups"
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                绑定后该 Key 仅会使用 groups 含此分组名的账号（严格隔离，分组内无可用账号时请求会失败）。
+              </p>
+            </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
                 取消
@@ -360,6 +401,18 @@ export function ClientKeysPage() {
             <div>
               <label className="text-[12px] text-muted-foreground">描述</label>
               <Input value={editDesc} onChange={(e) => setEditDesc(e.target.value)} />
+            </div>
+            <div>
+              <label className="text-[12px] text-muted-foreground">绑定分组</label>
+              <Input
+                placeholder="留空 = 可使用全部账号"
+                value={editGroup}
+                onChange={(e) => setEditGroup(e.target.value)}
+                list="client-key-groups"
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                绑定后仅调度该分组内账号（严格隔离）。清空表示解除绑定。
+              </p>
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>

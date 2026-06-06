@@ -97,6 +97,12 @@ function credLabel(id: number, email?: string | null): string {
   return email ? email : `#${id}`
 }
 
+function keyLabel(keyId: number, keyName?: string): string {
+  if (keyName) return keyName
+  if (keyId === 0) return 'master'
+  return `#${keyId}`
+}
+
 const STATUS_OPTIONS = [
   { value: '', label: '全部状态' },
   { value: 'success', label: '成功' },
@@ -166,6 +172,13 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
           <span className="truncate">{rec.model}</span>
           {rec.isStream && <Badge variant="outline" className="ml-1.5">流式</Badge>}
         </td>
+        <td className="py-2.5 pr-3 text-[13px]">
+          {rec.keyId === 0 ? (
+            <span className="text-muted-foreground">{keyLabel(rec.keyId, rec.keyName)}</span>
+          ) : (
+            <Badge variant="outline">{keyLabel(rec.keyId, rec.keyName)}</Badge>
+          )}
+        </td>
         <td className="py-2.5 pr-3">
           <StatusBadge status={rec.finalStatus} />
         </td>
@@ -184,7 +197,7 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
       </tr>
       {open && (
         <tr className="border-b border-border/40 bg-secondary/20">
-          <td colSpan={8} className="px-3 py-3">
+          <td colSpan={9} className="px-3 py-3">
             <ExpandedDetail rec={rec} />
           </td>
         </tr>
@@ -435,6 +448,7 @@ export function TraceLogPage() {
                     <th className="py-2 pl-3 pr-2 font-medium"></th>
                     <th className="py-2 pr-3 font-medium">时间</th>
                     <th className="py-2 pr-3 font-medium">模型</th>
+                    <th className="py-2 pr-3 font-medium">客户端 Key</th>
                     <th className="py-2 pr-3 font-medium">状态</th>
                     <th className="py-2 pr-3 font-medium">最终凭据</th>
                     <th className="py-2 pr-3 font-medium">错误类型</th>

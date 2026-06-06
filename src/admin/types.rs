@@ -65,6 +65,9 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 账号所属分组（可属于多个分组）
+    #[serde(default)]
+    pub groups: Vec<String>,
     /// 凭据余额（从缓存中读取的最近一次结果，可能为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,
@@ -162,6 +165,10 @@ pub struct AddCredentialRequest {
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 账号所属分组（可属于多个分组，可选）
+    #[serde(default)]
+    pub groups: Vec<String>,
 }
 
 fn default_auth_method() -> String {
@@ -194,6 +201,9 @@ pub struct UpdateCredentialRequest {
     pub proxy_username: Option<String>,
     /// 凭据级代理认证密码
     pub proxy_password: Option<String>,
+    /// 账号所属分组（None 表示不修改，Some 表示整体替换）
+    #[serde(default)]
+    pub groups: Option<Vec<String>>,
 }
 
 /// 添加凭据成功响应
@@ -643,6 +653,8 @@ pub struct ClientKeyItem {
     pub total_output_tokens: u64,
     pub total_cache_creation_tokens: u64,
     pub total_cache_read_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// 客户端 Key 列表响应
@@ -660,6 +672,8 @@ pub struct CreateClientKeyRequest {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -678,6 +692,8 @@ pub struct CreateClientKeyResponse {
 pub struct UpdateClientKeyRequest {
     pub name: Option<String>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 // ============ IdC 设备授权登录 ============

@@ -21,10 +21,12 @@ use super::prompt_cache::SharedPromptCache;
 use super::types::ErrorResponse;
 
 /// 命中的鉴权上下文（注入到请求扩展，供 handler 记录用量）
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct KeyContext {
     /// 命中的客户端 Key id；0 表示用 master apiKey 调用
     pub key_id: u64,
+    /// 该 Key 绑定的账号分组；None 表示未绑定（含 master apiKey），可使用全部账号
+    pub group: Option<String>,
 }
 
 /// 应用共享状态
@@ -134,14 +136,15 @@ pub async fn auth_middleware(
     // 1) master apiKey
     let master = state.api_key.read().clone();
     if auth::constant_time_eq(&presented, &master) {
-        request.extensions_mut().insert(KeyContext { key_id: 0 });
+        request.extensions_mut().insert(KeyContext { key_id: 0, group: None });
         return next.run(request).await;
     }
 
     // 2) 客户端 Key
     if let Some(mgr) = &state.client_keys {
         if let Some(id) = mgr.verify_and_touch(&presented) {
-            request.extensions_mut().insert(KeyContext { key_id: id });
+            let group = mgr.group_of(id);
+            request.extensions_mut().insert(KeyContext { key_id: id, group });
             return next.run(request).await;
         }
     }

@@ -192,6 +192,7 @@ async fn run_round(
     payload: &MessagesRequest,
     hook: &UsageRecordHook,
     fallback_input_tokens: i32,
+    group: Option<&str>,
 ) -> Result<(RoundOutcome, u64), Response> {
     let conversion = match convert_request(payload) {
         Ok(c) => c,
@@ -226,7 +227,7 @@ async fn run_round(
         }
     };
 
-    let call_result = match provider.call_api_stream(&request_body, None).await {
+    let call_result = match provider.call_api_stream(&request_body, None, group).await {
         Ok(r) => r,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
@@ -336,6 +337,7 @@ pub(super) async fn run_web_search_loop(
     mut payload: MessagesRequest,
     hook: UsageRecordHook,
     stream_client: bool,
+    group: Option<String>,
 ) -> Response {
     let fallback_input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -351,7 +353,7 @@ pub(super) async fn run_web_search_loop(
 
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
         let (round, credential_id) =
-            match run_round(&provider, &payload, &hook, fallback_input_tokens).await {
+            match run_round(&provider, &payload, &hook, fallback_input_tokens, group.as_deref()).await {
                 Ok(v) => v,
                 Err(resp) => return resp,
             };

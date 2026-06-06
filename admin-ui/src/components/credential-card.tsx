@@ -455,6 +455,12 @@ export function CredentialCard({
                       .join(" · ")}
                   </Badge>
                 )}
+                {/* 账号所属分组 */}
+                {(credential.groups ?? []).map((g) => (
+                  <Badge key={g} variant="outline" title="账号分组">
+                    {g}
+                  </Badge>
+                ))}
               </div>
             </div>
             <Switch
