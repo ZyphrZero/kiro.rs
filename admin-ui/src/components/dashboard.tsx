@@ -82,6 +82,7 @@ import {
 } from "@/components/batch-verify-dialog";
 import { ProxyPoolDialog } from "@/components/proxy-pool-dialog";
 import { ImageUpdateDialog } from "@/components/image-update-dialog";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import {
   useCredentials,
   useDeleteCredential,
@@ -135,6 +136,7 @@ interface DashboardProps {
 }
 
 export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
+  const confirm = useConfirm();
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false);
   const [batchEditDialogOpen, setBatchEditDialogOpen] = useState(false);
@@ -443,7 +445,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
     const ids = Array.from(selectedIds);
     if (
-      !confirm(`确定要删除 ${ids.length} 个凭据吗？此操作无法撤销。`)
+      !(await confirm({
+        title: "批量删除凭据",
+        description: `确定要删除 ${ids.length} 个凭据吗？此操作无法撤销。`,
+        confirmText: "删除",
+        destructive: true,
+      }))
     )
       return;
     let s = 0,
@@ -549,9 +556,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return;
     }
     if (
-      !confirm(
-        `确定要清除所有 ${disabled.length} 个已禁用凭据吗？此操作无法撤销。`,
-      )
+      !(await confirm({
+        title: "清除已禁用凭据",
+        description: `确定要清除所有 ${disabled.length} 个已禁用凭据吗？此操作无法撤销。`,
+        confirmText: "清除",
+        destructive: true,
+      }))
     )
       return;
     let s = 0,
@@ -713,7 +723,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       toast.info('当前没有已超额的凭据，可先点击"刷新当前页余额"');
       return;
     }
-    if (!confirm(`确定要把 ${quotaExceededCount} 个已超额的凭据全部禁用吗？`))
+    if (
+      !(await confirm({
+        title: "禁用已超额凭据",
+        description: `确定要把 ${quotaExceededCount} 个已超额的凭据全部禁用吗？`,
+        confirmText: "禁用",
+        destructive: true,
+      }))
+    )
       return;
     setDisablingQuota(true);
     try {
@@ -741,9 +758,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return;
     }
     if (
-      !confirm(
-        `确定要为 ${overageEnableableCount} 个凭据开启超额吗？开启后超出额度将按 overageRate 计费。`,
-      )
+      !(await confirm({
+        title: "开启超额",
+        description: `确定要为 ${overageEnableableCount} 个凭据开启超额吗？开启后超出额度将按 overageRate 计费。`,
+        confirmText: "开启",
+      }))
     )
       return;
     setEnablingOverage(true);

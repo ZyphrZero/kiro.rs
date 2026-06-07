@@ -390,29 +390,31 @@ impl KiroCredentials {
         }
     }
 
-    /// 返回流式聊天端点（`generateAssistantResponse`）应发送的 profileArn。
+    /// 返回流式聊天端点（`generateAssistantResponse` / `SendMessageStreaming`）
+    /// 应发送的 profileArn。
     ///
-    /// 与官方 Kiro IDE 行为一致：流式端点**始终**携带 profileArn，包括 BuilderID
-    /// 的占位符 ARN。新版上游对该端点强制要求该字段，缺失会返回
-    /// `HTTP 400 {"message":"profileArn is required for this request."}`，新模型
-    /// （如 claude-opus-4-8-thinking）同样命中。
+    /// 流式端点对 BuilderID 占位符 ARN 返回
+    /// `403 {"message":"User is not authorized to make this call."}`——占位符指向
+    /// 一个调用者无权访问的 profile。故仅发送真实 ARN 或 Social 共享 ARN：
     ///
-    /// 这与 [`effective_profile_arn`](Self::effective_profile_arn) 不同：后者用于
-    /// 用量类 REST 接口（getUsageLimits 等），那里发送占位符会被以 403 拒绝，
-    /// 故跳过占位符；而流式端点恰恰需要占位符。
-    ///
-    /// - 已有显式 profileArn（真实 ARN / Social ARN / 占位符）→ 原样返回；
-    /// - 尚未填充 → 按登录方式推断默认占位符（Social → Social ARN，其余 → BuilderID）；
+    /// - 真实 ARN（Enterprise/IdC 已由 `resolve_profile_arn_for` 回填）/ Social ARN
+    ///   → 原样返回；
+    /// - BuilderID 占位符 / 未填充的 BuilderID 账号 → 返回 `None`（不注入 profileArn，
+    ///   上游对该端点不强制此字段）；
     /// - API Key 凭据无 profileArn 概念 → 返回 `None`。
     pub fn streaming_profile_arn(&self) -> Option<String> {
         if self.is_api_key_credential() {
             return None;
         }
-        Some(
-            self.profile_arn
-                .clone()
-                .unwrap_or_else(|| self.default_profile_arn().to_string()),
-        )
+        let arn = self
+            .profile_arn
+            .clone()
+            .unwrap_or_else(|| self.default_profile_arn().to_string());
+        if is_placeholder_profile_arn(&arn) {
+            None
+        } else {
+            Some(arn)
+        }
     }
 }
 
@@ -543,30 +545,24 @@ mod tests {
     }
 
     #[test]
-    fn test_streaming_profile_arn_includes_placeholder() {
-        // 流式端点：显式占位符原样发送（与官方 IDE 一致，跳过会 400）
+    fn test_streaming_profile_arn_skips_placeholder() {
+        // 流式端点：显式 BuilderID 占位符 → None（占位符会被上游以 403 拒绝）
         let mut cred = KiroCredentials::default();
         cred.profile_arn = Some(BUILDER_ID_PROFILE_ARN.to_string());
-        assert_eq!(
-            cred.streaming_profile_arn().as_deref(),
-            Some(BUILDER_ID_PROFILE_ARN)
-        );
+        assert_eq!(cred.streaming_profile_arn(), None);
 
         // 真实 ARN 原样发送
         let real = "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123";
         cred.profile_arn = Some(real.to_string());
         assert_eq!(cred.streaming_profile_arn().as_deref(), Some(real));
 
-        // 未填充 + 非 social → 回退 BuilderID 占位符
+        // 未填充 + 非 social（BuilderID 账号）→ 回退占位符 → None
         let mut builder = KiroCredentials::default();
         builder.profile_arn = None;
         builder.refresh_token = Some("r".to_string());
-        assert_eq!(
-            builder.streaming_profile_arn().as_deref(),
-            Some(BUILDER_ID_PROFILE_ARN)
-        );
+        assert_eq!(builder.streaming_profile_arn(), None);
 
-        // 未填充 + social → 回退 Social 共享 ARN
+        // 未填充 + social → 回退 Social 共享 ARN（非占位符，原样发送）
         let mut social = KiroCredentials::default();
         social.profile_arn = None;
         social.auth_method = Some("social".to_string());

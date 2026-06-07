@@ -9,6 +9,15 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import {
+  Select,
+  SelectGroup,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
 import { useUpdateCredential, useCredentials } from '@/hooks/use-credentials'
 import { getProxyPool } from '@/api/credentials'
@@ -164,34 +173,38 @@ export function EditCredentialDialog({
               <label className="text-sm font-medium">代理配置</label>
 
               {/* 下拉选择代理 */}
-              <select
-                value={selectValue}
-                onChange={(e) => {
-                  const val = e.target.value
+              <Select
+                value={selectValue === '' ? '__global__' : selectValue}
+                onValueChange={(val) => {
                   if (val === '__custom__') {
                     setManualMode(true)
                     // 保留当前 proxyUrl 作为初始值让用户编辑
                   } else {
                     setManualMode(false)
-                    setProxyUrl(val)
+                    setProxyUrl(val === '__global__' ? '' : val)
                   }
                 }}
                 disabled={isPending}
-                className="flex h-10 w-full rounded-xl border border-input bg-background/60 px-3.5 py-2 text-sm transition-all duration-150 ease-apple placeholder:text-muted-foreground/70 hover:border-border focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                <option value="">使用全局代理配置</option>
-                <option value="direct">直连（不使用代理）</option>
-                {enabledProxies.length > 0 && (
-                  <optgroup label="代理池">
-                    {enabledProxies.map(p => (
-                      <option key={p.id} value={p.url}>
-                        {p.label ? `${p.label} | ${maskProxyUrl(p.url)}` : maskProxyUrl(p.url)}
-                      </option>
-                    ))}
-                  </optgroup>
-                )}
-                <option value="__custom__">手动输入...</option>
-              </select>
+                <SelectTrigger className="h-10 rounded-xl px-3.5">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__global__">使用全局代理配置</SelectItem>
+                  <SelectItem value="direct">直连（不使用代理）</SelectItem>
+                  {enabledProxies.length > 0 && (
+                    <SelectGroup>
+                      <SelectLabel>代理池</SelectLabel>
+                      {enabledProxies.map((p) => (
+                        <SelectItem key={p.id} value={p.url}>
+                          {p.label ? `${p.label} | ${maskProxyUrl(p.url)}` : maskProxyUrl(p.url)}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  )}
+                  <SelectItem value="__custom__">手动输入...</SelectItem>
+                </SelectContent>
+              </Select>
 
               {/* 自定义 URL 手动输入框 */}
               {showManualInput && (

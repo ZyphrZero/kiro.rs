@@ -481,6 +481,8 @@ export interface TraceRecord {
   cacheCreationTokens?: number
   /** 缓存读取 token */
   cacheReadTokens?: number
+  /** 总 token = input + output + cache_creation + cache_read */
+  totalTokens?: number
   /** 费用（credits） */
   credits?: number
   /** 首 Token 延迟（毫秒，仅流式有值） */

@@ -2,6 +2,7 @@ import { useState, useEffect, lazy, Suspense } from "react";
 import { storage } from "@/lib/storage";
 import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
+import { ConfirmProvider } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
 import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
@@ -115,7 +116,7 @@ function App() {
   }
 
   return (
-    <>
+    <ConfirmProvider>
       {/* 顶部 Tab 导航 */}
       <header className="sticky top-0 z-50 w-full glass">
         <div className="mx-auto max-w-[1400px] flex h-16 items-center justify-between px-4 md:px-8">
@@ -210,7 +211,7 @@ function App() {
       </main>
 
       <Toaster position="top-center" />
-    </>
+    </ConfirmProvider>
   );
 }
 

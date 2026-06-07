@@ -22,6 +22,19 @@ import {
   DropdownMenuContent,
   DropdownMenuLabel,
 } from '@/components/ui/dropdown-menu'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
+import {
+  Select as UiSelect,
+  SelectTrigger as UiSelectTrigger,
+  SelectValue as UiSelectValue,
+  SelectContent as UiSelectContent,
+  SelectItem as UiSelectItem,
+} from '@/components/ui/select'
 import { useTraces } from '@/hooks/use-traces'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import {
@@ -99,6 +112,11 @@ function formatTokens(n: number): string {
   return String(n)
 }
 
+/** 千位分隔的完整数值（用于明细悬浮框） */
+function formatTokenFull(n: number): string {
+  return n.toLocaleString('en-US')
+}
+
 function credLabel(id: number, email?: string | null): string {
   if (id === 0) return '—'
   return email ? email : `#${id}`
@@ -156,6 +174,60 @@ function AttemptRow({ a }: { a: TraceAttempt }) {
 }
 
 /** 可展开的链路行 */
+/** Token 用量单元格：紧凑展示总量，hover 显示分项明细 */
+function TokenCell({ rec }: { rec: TraceRecord }) {
+  const input = rec.inputTokens ?? 0
+  const output = rec.outputTokens ?? 0
+  const cacheCreation = rec.cacheCreationTokens ?? 0
+  const cacheRead = rec.cacheReadTokens ?? 0
+  const total = rec.totalTokens ?? input + output + cacheCreation + cacheRead
+  // 全 0（早期失败、未走到上游）时不显示明细，仅占位
+  if (total === 0) {
+    return <span className="text-muted-foreground">—</span>
+  }
+  const rows: Array<[string, number]> = [
+    ['输入 Token', input],
+    ['输出 Token', output],
+  ]
+  if (cacheCreation > 0) rows.push(['缓存创建 Token', cacheCreation])
+  if (cacheRead > 0) rows.push(['缓存读取 Token', cacheRead])
+  return (
+    <TooltipProvider delayDuration={150}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="inline-flex items-center gap-1 font-mono tabular-nums cursor-default border-b border-dotted border-muted-foreground/40">
+            <span className="text-emerald-600 dark:text-emerald-400">
+              ↓{formatTokens(input + cacheCreation + cacheRead)}
+            </span>
+            <span className="text-violet-600 dark:text-violet-400">
+              ↑{formatTokens(output)}
+            </span>
+          </span>
+        </TooltipTrigger>
+        <TooltipContent className="p-0">
+          <div className="min-w-[180px] px-3 py-2">
+            <div className="mb-1.5 text-[13px] font-semibold">Token 明细</div>
+            <div className="space-y-1 text-[12px]">
+              {rows.map(([label, val]) => (
+                <div key={label} className="flex items-center justify-between gap-6">
+                  <span className="text-muted-foreground">{label}</span>
+                  <span className="font-mono tabular-nums">{formatTokenFull(val)}</span>
+                </div>
+              ))}
+              <div className="mt-1 flex items-center justify-between gap-6 border-t border-border/50 pt-1">
+                <span className="font-medium">总 Token</span>
+                <span className="font-mono font-semibold tabular-nums">
+                  {formatTokenFull(total)}
+                </span>
+              </div>
+            </div>
+          </div>
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  )
+}
+
 function TraceRow({ rec }: { rec: TraceRecord }) {
   const [open, setOpen] = useState(false)
   const errStyle = rec.errorType ? outcomeStyle(rec.errorType) : null
@@ -193,17 +265,7 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
           {credLabel(rec.finalCredentialId, rec.finalEmail)}
         </td>
         <td className="py-2.5 pr-3 text-[12px] tabular-nums">
-          <span className="text-emerald-600 dark:text-emerald-400" title="输入 token">
-            ↓{formatTokens(rec.inputTokens ?? 0)}
-          </span>
-          <span className="ml-1.5 text-violet-600 dark:text-violet-400" title="输出 token">
-            ↑{formatTokens(rec.outputTokens ?? 0)}
-          </span>
-          {((rec.cacheCreationTokens ?? 0) + (rec.cacheReadTokens ?? 0)) > 0 && (
-            <span className="ml-1.5 text-amber-600 dark:text-amber-400" title="缓存 token（创建+读取）">
-              ⚡{formatTokens((rec.cacheCreationTokens ?? 0) + (rec.cacheReadTokens ?? 0))}
-            </span>
-          )}
+          <TokenCell rec={rec} />
         </td>
         <td className="py-2.5 pr-3 text-[13px] tabular-nums">
           {rec.credits != null && rec.credits > 0 ? rec.credits.toFixed(4) : '—'}
@@ -271,18 +333,24 @@ function Select({
   onChange: (v: string) => void
   options: { value: string; label: string }[]
 }) {
+  // radix Select 不允许空字符串 value，用哨兵 "__all__" 代表「空/全部」，对外透明。
+  const SENTINEL = '__all__'
   return (
-    <select
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-      className="h-8 rounded-md border border-border/70 bg-background px-2 text-[13px] focus:outline-none focus:ring-2 focus:ring-ring"
+    <UiSelect
+      value={value === '' ? SENTINEL : value}
+      onValueChange={(v) => onChange(v === SENTINEL ? '' : v)}
     >
-      {options.map((o) => (
-        <option key={o.value} value={o.value}>
-          {o.label}
-        </option>
-      ))}
-    </select>
+      <UiSelectTrigger className="h-8 w-auto min-w-[120px]">
+        <UiSelectValue />
+      </UiSelectTrigger>
+      <UiSelectContent>
+        {options.map((o) => (
+          <UiSelectItem key={o.value} value={o.value === '' ? SENTINEL : o.value}>
+            {o.label}
+          </UiSelectItem>
+        ))}
+      </UiSelectContent>
+    </UiSelect>
   )
 }
 
