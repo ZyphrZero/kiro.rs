@@ -49,7 +49,6 @@ function parseCallbackUrl(rawUrl: string): { code: string; state: string; loginO
 
 export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLoginDialogProps) {
   const [step, setStep] = useState<Step>('form')
-  const [priority, setPriority] = useState('0')
   const [email, setEmail] = useState('')
   const [incognito, setIncognito] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -99,7 +98,6 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
     const loginWindow = incognito ? null : window.open('about:blank', '_blank')
     try {
       const resp = await startSocialLogin({
-        priority: parseInt(priority) || 0,
         email: email.trim() || undefined,
       })
       setSession(resp)
@@ -188,26 +186,14 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
 
         {step === 'form' && (
           <div className="space-y-4 py-2">
-            <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-1.5">
-                <label htmlFor="social-priority" className="text-sm font-medium">优先级</label>
-                <Input
-                  id="social-priority"
-                  type="number"
-                  min="0"
-                  value={priority}
-                  onChange={(e) => setPriority(e.target.value)}
-                />
-              </div>
-              <div className="space-y-1.5">
-                <label htmlFor="social-email" className="text-sm font-medium">邮箱（可选）</label>
-                <Input
-                  id="social-email"
-                  placeholder="user@example.com"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                />
-              </div>
+            <div className="space-y-1.5">
+              <label htmlFor="social-email" className="text-sm font-medium">邮箱（可选）</label>
+              <Input
+                id="social-email"
+                placeholder="user@example.com"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+              />
             </div>
             <label className="flex items-start gap-2 rounded-lg border bg-muted/40 p-3 cursor-pointer">
               <input

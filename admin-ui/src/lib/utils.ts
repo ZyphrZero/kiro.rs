@@ -27,6 +27,19 @@ export function extractErrorMessage(error: unknown): string {
 }
 
 /**
+ * 超额操作失败提示：403 / 权限不足 统一提示联系组织管理员
+ * （Enterprise / 受组织策略限制的账号无法自行开启超额）
+ */
+export function overageFailureMessage(raw?: string): string {
+  const msg = (raw ?? '').trim()
+  if (!msg) return '操作失败'
+  if (/\b403\b|Forbidden|权限不足/i.test(msg)) {
+    return '请联系您的组织管理员以获取支持'
+  }
+  return msg
+}
+
+/**
  * 解析错误，返回结构化的错误信息
  */
 export function parseError(error: unknown): ParsedError {

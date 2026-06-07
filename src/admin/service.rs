@@ -23,7 +23,8 @@ use super::types::{
     AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse,
     BalanceResponse, BatchAddProxyRequest,
     CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse, EnableOverageAllResult,
-    GitHubRateLimitInfo, ImageUpdateResponse, KamExportAccount, KamExportResponse,
+    GitHubRateLimitInfo, ImageUpdateResponse, ExportedAccount, ExportedCredentials,
+    CredentialsExportResponse,
     LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
     QuotaExceededResult, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
@@ -275,11 +276,11 @@ fn cleanup_other_staged(exe: &std::path::Path, keep_version: &str) {
     }
 }
 
-/// 将单个凭据映射为 KAM 1.8.3+ 平铺格式的账号结构
+/// 将单个凭据映射为嵌套 `Account` 结构
 ///
-/// API Key 凭据无 refreshToken，KAM 无对应字段，跳过。
-/// 空字符串字段会被过滤为 None，保持导出 JSON 整洁。
-fn credential_to_kam_account(cred: KiroCredentials) -> Option<KamExportAccount> {
+/// API Key 凭据无 refreshToken，导出格式无对应字段，跳过。
+/// 空字符串字段会被过滤，保持导出 JSON 整洁。
+fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount> {
     let refresh_token = cred
         .refresh_token
         .as_deref()
@@ -293,35 +294,103 @@ fn credential_to_kam_account(cred: KiroCredentials) -> Option<KamExportAccount> 
             .filter(|s| !s.is_empty())
     }
 
-    let auth_method = non_empty(cred.auth_method.clone());
+    // authMethod 规范化："idc" → "IdC"，其余按 social 处理
+    let auth_method = non_empty(cred.auth_method.clone()).map(|m| {
+        if m.eq_ignore_ascii_case("idc")
+            || m.eq_ignore_ascii_case("builder-id")
+            || m.eq_ignore_ascii_case("iam")
+        {
+            "IdC".to_string()
+        } else {
+            "social".to_string()
+        }
+    });
+    let is_idc = auth_method.as_deref() == Some("IdC");
+
     let provider = non_empty(cred.provider.clone());
-    // KAM 旧版字段：idp 与 provider 同义，二者都填以最大兼容
-    let idp = provider.clone();
+    // idp 与 provider 同义；缺失时按认证方式回退到合法的身份提供商
+    let idp = provider
+        .clone()
+        .unwrap_or_else(|| if is_idc { "BuilderId" } else { "Google" }.to_string());
+
     let status = if cred.disabled {
-        Some("disabled".to_string())
+        "unknown".to_string()
     } else {
-        Some("active".to_string())
+        "active".to_string()
     };
 
-    Some(KamExportAccount {
-        email: non_empty(cred.email),
-        nickname: None,
-        idp,
-        provider,
-        status,
-        auth_method,
+    // expiresAt → 毫秒时间戳（解析失败或缺失时为 0）
+    let expires_at_ms = cred
+        .expires_at
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or(0);
+
+    // 订阅：最小可用结构（type + 原始 title）
+    let subscription = serde_json::json!({
+        "type": subscription_type_from_title(cred.subscription_title.as_deref()),
+        "title": cred.subscription_title,
+    });
+    let now_ms = Utc::now().timestamp_millis();
+    let usage = serde_json::json!({
+        "current": 0,
+        "limit": 0,
+        "percentUsed": 0,
+        "lastUpdated": now_ms,
+    });
+
+    // 仅导出真实 profileArn，跳过 BuilderID 占位符
+    let profile_arn = cred.effective_profile_arn().map(str::to_string);
+
+    let credentials = ExportedCredentials {
+        access_token: non_empty(cred.access_token).unwrap_or_default(),
+        csrf_token: String::new(),
+        refresh_token: Some(refresh_token),
+        client_id: non_empty(cred.client_id),
+        client_secret: non_empty(cred.client_secret),
         region: non_empty(cred.region.clone())
             .or_else(|| non_empty(cred.auth_region.clone()))
             .or_else(|| non_empty(cred.api_region.clone())),
-        start_url: None,
-        client_id: non_empty(cred.client_id),
-        client_secret: non_empty(cred.client_secret),
-        refresh_token: Some(refresh_token),
-        access_token: non_empty(cred.access_token),
-        profile_arn: non_empty(cred.profile_arn),
-        expires_at: non_empty(cred.expires_at),
+        start_url: non_empty(cred.start_url.clone()),
+        expires_at: expires_at_ms,
+        auth_method,
+        provider: provider.clone(),
+    };
+
+    Some(ExportedAccount {
+        id: uuid::Uuid::new_v4().to_string(),
+        email: non_empty(cred.email).unwrap_or_default(),
+        nickname: None,
+        idp,
+        user_id: None,
+        profile_arn,
         machine_id: non_empty(cred.machine_id),
+        credentials,
+        subscription,
+        usage,
+        tags: Vec::new(),
+        status,
+        created_at: now_ms,
+        last_used_at: now_ms,
     })
+}
+
+/// 由订阅标题推断 `SubscriptionType`（粗粒度，导入方刷新后会自行校正）
+fn subscription_type_from_title(title: Option<&str>) -> &'static str {
+    let Some(title) = title else { return "Free" };
+    let u = title.to_uppercase();
+    if u.contains("FREE") {
+        "Free"
+    } else if u.contains("PRO+") || u.contains("PRO PLUS") || u.contains("PRO_PLUS") {
+        "Pro_Plus"
+    } else if u.contains("POWER") || u.contains("ENTERPRISE") || u.contains("TEAM") {
+        "Enterprise"
+    } else if u.contains("PRO") {
+        "Pro"
+    } else {
+        "Free"
+    }
 }
 
 /// GitHub Release 仓库名（owner/repo）。
@@ -417,6 +486,7 @@ impl AdminService {
                     is_current: entry.id == snapshot.current_id,
                     expires_at: entry.expires_at,
                     auth_method: entry.auth_method,
+                    provider: entry.provider,
                     has_profile_arn: entry.has_profile_arn,
                     refresh_token_hash: entry.refresh_token_hash,
                     api_key_hash: entry.api_key_hash,
@@ -448,15 +518,15 @@ impl AdminService {
         }
     }
 
-    /// 导出凭据为 KAM 兼容 JSON（KAM 1.8.3+ 平铺格式）
+    /// 导出凭据为兼容 JSON（嵌套 `Account` 格式）
     ///
     /// 返回的结构体含 refreshToken、accessToken、clientSecret 等敏感字段，
     /// 调用方需自行保证传输与存储安全；按 priority 升序排序，与 UI 列表一致。
     /// `id_filter` 为 None 时导出全部凭据；为 Some 时仅导出集合内的 ID。
-    pub fn export_kam_credentials(
+    pub fn export_credentials(
         &self,
         id_filter: Option<&HashSet<u64>>,
-    ) -> KamExportResponse {
+    ) -> CredentialsExportResponse {
         let mut credentials = self.token_manager.clone_all_credentials();
         if let Some(filter) = id_filter {
             credentials.retain(|c| c.id.map(|id| filter.contains(&id)).unwrap_or(false));
@@ -465,13 +535,15 @@ impl AdminService {
 
         let accounts = credentials
             .into_iter()
-            .filter_map(credential_to_kam_account)
+            .filter_map(credential_to_export_account)
             .collect();
 
-        KamExportResponse {
+        CredentialsExportResponse {
             version: "1.8.3".to_string(),
-            exported_at: Utc::now().to_rfc3339(),
+            exported_at: Utc::now().timestamp_millis(),
             accounts,
+            groups: Vec::new(),
+            tags: Vec::new(),
         }
     }
 
@@ -866,6 +938,7 @@ impl AdminService {
             provider: req.provider,
             client_id: req.client_id,
             client_secret: req.client_secret,
+            start_url: req.start_url,
             priority: req.priority,
             region: req.region,
             auth_region: req.auth_region,
@@ -890,9 +963,10 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_add_error(e))?;
 
-        // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
-        if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
-            tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
+        // 主动获取余额（含订阅等级 / 邮箱）并写入缓存，添加后立即可见，
+        // 同时避免首次请求时 Free 账号绕过 Opus 模型过滤
+        if let Err(e) = self.get_balance(credential_id).await {
+            tracing::warn!("添加凭据后刷新余额失败（不影响凭据添加）: {}", e);
         }
 
         Ok(AddCredentialResponse {
@@ -2405,6 +2479,11 @@ impl AdminService {
             .await
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
+        // 主动刷新余额（含订阅等级 / 邮箱）并写入缓存，登录后立即可见
+        if let Err(e) = self.get_balance(credential_id).await {
+            tracing::warn!("Social 登录后刷新余额失败（不影响登录）: {}", e);
+        }
+
         tracing::info!("Social 登录成功，已添加凭据 #{}", credential_id);
         Ok(PollIdcLoginResponse::Success { credential_id })
     }
@@ -2471,7 +2550,7 @@ impl AdminService {
         let start_url = req.start_url.as_deref().unwrap_or(BUILDER_ID_START_URL);
 
         // 1. 注册 OIDC 客户端
-        let reg = idc::register_client(&req.region, config, proxy.as_ref())
+        let reg = idc::register_client(&req.region, start_url, config, proxy.as_ref())
             .await
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
@@ -2490,11 +2569,20 @@ impl AdminService {
         let expires_at = Utc::now() + Duration::seconds(device.expires_in);
         let session_id = Uuid::new_v4().to_string();
 
+        // 身份提供商：默认 Start URL 为 AWS Builder ID，自定义 Start URL 为企业 IAM Identity Center
+        let provider = if start_url == BUILDER_ID_START_URL {
+            "BuilderId"
+        } else {
+            "Enterprise"
+        };
+
         // 构建登录成功后写入的凭据模板
         let cred_template = KiroCredentials {
             auth_method: Some("idc".to_string()),
+            provider: Some(provider.to_string()),
             client_id: Some(reg.client_id.clone()),
             client_secret: Some(reg.client_secret.clone()),
+            start_url: Some(start_url.to_string()),
             region: Some(req.region.clone()),
             priority: req.priority,
             email: req.email,
@@ -2610,6 +2698,11 @@ impl AdminService {
                     .await
                     .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
+                // 主动刷新余额（含订阅等级 / 邮箱）并写入缓存，登录后立即可见
+                if let Err(e) = self.get_balance(credential_id).await {
+                    tracing::warn!("IdC 登录后刷新余额失败（不影响登录）: {}", e);
+                }
+
                 tracing::info!("IdC 设备授权登录成功，已添加凭据 #{}", credential_id);
                 Ok(PollIdcLoginResponse::Success { credential_id })
             }
@@ -2716,7 +2809,7 @@ impl AdminService {
 
         let start_url = req.start_url.as_deref().unwrap_or(BUILDER_ID_START_URL);
 
-        let reg = idc::register_client(&req.region, config, proxy.as_ref())
+        let reg = idc::register_client(&req.region, start_url, config, proxy.as_ref())
             .await
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
@@ -2771,5 +2864,56 @@ mod tests {
         assert_eq!(compare_semver("v0.3.1", "0.3.1"), Ordering::Equal);
         assert_eq!(compare_semver("1.0.0", "0.99.99"), Ordering::Greater);
         assert_eq!(compare_semver("0.3.1-rc.1", "0.3.1"), Ordering::Equal);
+    }
+
+    #[test]
+    fn export_uses_nested_account_format() {
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("rt-123".to_string());
+        cred.client_id = Some("cid".to_string());
+        cred.client_secret = Some("csec".to_string());
+        cred.auth_method = Some("idc".to_string());
+        cred.provider = Some("Enterprise".to_string());
+        cred.region = Some("us-east-1".to_string());
+        cred.email = Some("e@example.com".to_string());
+        cred.expires_at = Some("2026-06-06T00:00:00Z".to_string());
+        // 占位符 profileArn 应在导出时被剥离
+        cred.profile_arn = Some(
+            crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string(),
+        );
+
+        let acc = credential_to_export_account(cred).expect("应生成账号");
+
+        // 嵌套 credentials 结构
+        assert_eq!(acc.credentials.refresh_token.as_deref(), Some("rt-123"));
+        assert_eq!(acc.credentials.client_id.as_deref(), Some("cid"));
+        // authMethod 规范化为 "IdC"
+        assert_eq!(acc.credentials.auth_method.as_deref(), Some("IdC"));
+        // expiresAt 解析为毫秒时间戳
+        assert!(acc.credentials.expires_at > 0);
+        // idp 取 provider
+        assert_eq!(acc.idp, "Enterprise");
+        // 占位符 profileArn 被跳过
+        assert_eq!(acc.profile_arn, None);
+        // 必填的 csrfToken 输出空串
+        assert_eq!(acc.credentials.csrf_token, "");
+    }
+
+    #[test]
+    fn export_skips_api_key_credentials() {
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_abc".to_string());
+        cred.auth_method = Some("api_key".to_string());
+        // 无 refreshToken → 跳过
+        assert!(credential_to_export_account(cred).is_none());
+    }
+
+    #[test]
+    fn subscription_type_mapping() {
+        assert_eq!(subscription_type_from_title(Some("KIRO FREE")), "Free");
+        assert_eq!(subscription_type_from_title(Some("KIRO PRO+")), "Pro_Plus");
+        assert_eq!(subscription_type_from_title(Some("KIRO PRO")), "Pro");
+        assert_eq!(subscription_type_from_title(Some("KIRO POWER")), "Enterprise");
+        assert_eq!(subscription_type_from_title(None), "Free");
     }
 }

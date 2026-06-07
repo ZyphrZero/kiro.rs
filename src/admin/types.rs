@@ -39,6 +39,9 @@ pub struct CredentialStatusItem {
     pub expires_at: Option<String>,
     /// 认证方式
     pub auth_method: Option<String>,
+    /// 身份提供商（BuilderId / Enterprise / Github / Google / IAM_SSO）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
@@ -104,7 +107,7 @@ pub struct AddCredentialRequest {
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
     pub refresh_token: Option<String>,
 
-    /// 访问令牌（可选，来自 KAM 等导出时保留）
+    /// 访问令牌（可选，导入/导出时保留）
     #[serde(default)]
     pub access_token: Option<String>,
 
@@ -120,7 +123,7 @@ pub struct AddCredentialRequest {
     #[serde(default = "default_auth_method")]
     pub auth_method: String,
 
-    /// 身份提供商（兼容 Kiro Account Manager 导出）
+    /// 身份提供商
     #[serde(default)]
     pub provider: Option<String>,
 
@@ -129,6 +132,10 @@ pub struct AddCredentialRequest {
 
     /// OIDC Client Secret（IdC 认证需要）
     pub client_secret: Option<String>,
+
+    /// SSO Start URL（Enterprise / IAM Identity Center 账号专用）
+    #[serde(default)]
+    pub start_url: Option<String>,
 
     /// 优先级（可选，默认 0）
     #[serde(default)]
@@ -187,7 +194,7 @@ fn default_auth_method() -> String {
 pub struct UpdateRefreshTokenRequest {
     /// 新的刷新令牌
     pub refresh_token: String,
-    /// 可选：同时更新 accessToken（来自 KAM 导出，避免强制清空后立即需要刷新）
+    /// 可选：同时更新 accessToken（避免强制清空后立即需要刷新）
     #[serde(default)]
     pub access_token: Option<String>,
     /// 可选：同时更新 expiresAt（与 accessToken 配套）
@@ -801,57 +808,76 @@ fn default_oauth_path() -> String {
 
 // ============ 通用响应 ============
 
-// ============ KAM 导出 ============
+// ============ 账号导出 ============
 
-/// Kiro Account Manager 导出文件中的单个账号（KAM 1.8.3+ 平铺格式）
+/// 账号导出文件中单个账号的认证凭证（嵌套 `credentials` 对象）
 ///
-/// 字段命名与 KAM 导入逻辑对齐（见 `admin-ui/src/components/kam-import-dialog.tsx`），
-/// 仅在凭据 `Some(value)` 时输出，避免 `null` 字段。
+/// `expiresAt` 为毫秒时间戳，`authMethod` 取 `"IdC"` / `"social"`，
+/// `accessToken` / `csrfToken` 为必填字段（无值时输出空串）。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct KamExportAccount {
+pub struct ExportedCredentials {
+    pub access_token: String,
+    pub csrf_token: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub email: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nickname: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub idp: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth_method: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub region: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub start_url: Option<String>,
+    pub refresh_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub refresh_token: Option<String>,
+    pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub access_token: Option<String>,
+    pub start_url: Option<String>,
+    pub expires_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub profile_arn: Option<String>,
+    pub auth_method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub machine_id: Option<String>,
+    pub provider: Option<String>,
 }
 
-/// KAM 导出响应（含版本号 + 账号数组，兼容 KAM 旧版导入器）
+/// 账号导出文件中的单个账号（嵌套 `Account` 结构）
+///
+/// 账号字段位于顶层，凭据收进嵌套 `credentials` 对象，便于第三方账号管理工具直接导入。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct KamExportResponse {
+pub struct ExportedAccount {
+    pub id: String,
+    pub email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
+    pub idp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_arn: Option<String>,
+    pub credentials: ExportedCredentials,
+    /// 订阅信息（最小可用结构：type + title）
+    pub subscription: serde_json::Value,
+    /// 使用量信息（最小可用结构：归零）
+    pub usage: serde_json::Value,
+    pub tags: Vec<String>,
+    pub status: String,
+    pub created_at: i64,
+    pub last_used_at: i64,
+}
+
+/// 账号导出响应（含顶层 `groups` / `tags` 数组，便于第三方导入器直接消费）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialsExportResponse {
     /// 导出格式版本号
     pub version: String,
-    /// 导出时间（RFC3339）
-    pub exported_at: String,
-    /// 账号列表（KAM 1.8.3+ 平铺格式）
-    pub accounts: Vec<KamExportAccount>,
+    /// 导出时间（毫秒时间戳）
+    pub exported_at: i64,
+    /// 账号列表（嵌套 Account 格式）
+    pub accounts: Vec<ExportedAccount>,
+    /// 分组（导出不含分组，固定空数组）
+    pub groups: Vec<serde_json::Value>,
+    /// 标签（导出不含标签，固定空数组）
+    pub tags: Vec<serde_json::Value>,
 }
 
 /// 操作成功响应

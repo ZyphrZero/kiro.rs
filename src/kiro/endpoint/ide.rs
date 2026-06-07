@@ -10,6 +10,7 @@ use reqwest::RequestBuilder;
 use uuid::Uuid;
 
 use super::{KiroEndpoint, RequestContext};
+use crate::kiro::kiro_version;
 
 /// Kiro IDE 端点名称
 pub const IDE_ENDPOINT_NAME: &str = "ide";
@@ -33,7 +34,8 @@ impl IdeEndpoint {
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
-            ctx.config.kiro_version, ctx.machine_id
+            kiro_version::effective(&ctx.config.kiro_version),
+            ctx.machine_id
         )
     }
 
@@ -42,7 +44,7 @@ impl IdeEndpoint {
             "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
             ctx.config.system_version,
             ctx.config.node_version,
-            ctx.config.kiro_version,
+            kiro_version::effective(&ctx.config.kiro_version),
             ctx.machine_id
         )
     }
@@ -96,7 +98,7 @@ impl KiroEndpoint for IdeEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if let Some(ref arn) = ctx.credentials.profile_arn {
+        if let Some(arn) = ctx.credentials.effective_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
         if ctx.credentials.is_api_key_credential() {
@@ -106,15 +108,15 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
-        inject_profile_arn(body, &ctx.credentials.profile_arn)
+        inject_profile_arn(body, ctx.credentials.streaming_profile_arn().as_deref())
     }
 }
 
 /// 将 profile_arn 注入到请求体 JSON 根对象
-fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> String {
+fn inject_profile_arn(request_body: &str, profile_arn: Option<&str>) -> String {
     if let Some(arn) = profile_arn {
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
-            json["profileArn"] = serde_json::Value::String(arn.clone());
+            json["profileArn"] = serde_json::Value::String(arn.to_string());
             if let Ok(body) = serde_json::to_string(&json) {
                 return body;
             }
@@ -132,7 +134,7 @@ mod tests {
     fn test_inject_profile_arn_with_some() {
         let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
         let arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC".to_string());
-        let result = inject_profile_arn(body, &arn);
+        let result = inject_profile_arn(body, arn.as_deref());
         let json: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(
             json["profileArn"],
@@ -144,7 +146,7 @@ mod tests {
     #[test]
     fn test_inject_profile_arn_with_none() {
         let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
-        let result = inject_profile_arn(body, &None);
+        let result = inject_profile_arn(body, None);
         let json: Value = serde_json::from_str(&result).unwrap();
         assert!(json.get("profileArn").is_none());
         assert_eq!(json["conversationState"]["conversationId"], "c1");
@@ -154,7 +156,7 @@ mod tests {
     fn test_inject_profile_arn_overwrites_existing() {
         let body = r#"{"conversationState":{},"profileArn":"old-arn"}"#;
         let arn = Some("new-arn".to_string());
-        let result = inject_profile_arn(body, &arn);
+        let result = inject_profile_arn(body, arn.as_deref());
         let json: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["profileArn"], "new-arn");
     }
@@ -163,7 +165,7 @@ mod tests {
     fn test_inject_profile_arn_invalid_json() {
         let body = "not-valid-json";
         let arn = Some("arn:test".to_string());
-        let result = inject_profile_arn(body, &arn);
+        let result = inject_profile_arn(body, arn.as_deref());
         assert_eq!(result, "not-valid-json");
     }
 }

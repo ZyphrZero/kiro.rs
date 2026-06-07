@@ -28,7 +28,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [apiRegion, setApiRegion] = useState('')
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
-  const [priority, setPriority] = useState('0')
   const [machineId, setMachineId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
@@ -52,7 +51,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setApiRegion('')
     setClientId('')
     setClientSecret('')
-    setPriority('0')
     setMachineId('')
     setProxyUrl('')
     setProxyUsername('')
@@ -94,7 +92,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         apiRegion: apiRegion.trim() || undefined,
         clientId: isApiKey ? undefined : clientId.trim() || undefined,
         clientSecret: isApiKey ? undefined : clientSecret.trim() || undefined,
-        priority: parseInt(priority) || 0,
         machineId: machineId.trim() || undefined,
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
@@ -235,25 +232,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 </div>
               </>
             )}
-
-            {/* 优先级 */}
-            <div className="space-y-2">
-              <label htmlFor="priority" className="text-sm font-medium">
-                优先级
-              </label>
-              <Input
-                id="priority"
-                type="number"
-                min="0"
-                placeholder="数字越小优先级越高"
-                value={priority}
-                onChange={(e) => setPriority(e.target.value)}
-                disabled={isPending}
-              />
-              <p className="text-xs text-muted-foreground">
-                数字越小优先级越高，默认为 0
-              </p>
-            </div>
 
             {/* Machine ID */}
             <div className="space-y-2">

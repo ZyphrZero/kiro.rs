@@ -39,7 +39,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type { CredentialStatusItem, BalanceResponse } from "@/types/api";
-import { maskProxyUrl, extractErrorMessage } from "@/lib/utils";
+import { maskProxyUrl, extractErrorMessage, overageFailureMessage } from "@/lib/utils";
 import {
   useSetDisabled,
   useSetPriority,
@@ -263,7 +263,9 @@ export function CredentialCard({
       queryClient.invalidateQueries({ queryKey: ["credentials"] });
     } catch (err) {
       toast.error(
-        (enabled ? "开启" : "关闭") + "超额失败: " + extractErrorMessage(err),
+        (enabled ? "开启" : "关闭") +
+          "超额失败: " +
+          overageFailureMessage(extractErrorMessage(err)),
       );
     } finally {
       setOverageBusy(false);
@@ -322,11 +324,6 @@ export function CredentialCard({
     });
 
   const handleDelete = () => {
-    if (!credential.disabled) {
-      toast.error("请先禁用凭据再删除");
-      setShowDeleteDialog(false);
-      return;
-    }
     deleteCredential.mutate(credential.id, {
       onSuccess: (res) => {
         toast.success(res.message);
@@ -336,14 +333,22 @@ export function CredentialCard({
     });
   };
 
-  const authLabel =
-    credential.authMethod === "api_key"
-      ? "API Key"
-      : credential.authMethod === "idc"
-        ? "IdC"
-        : credential.authMethod === "social"
-          ? "Social"
-          : credential.authMethod;
+  const authLabel = (() => {
+    if (credential.authMethod === "api_key") return "API Key";
+    const provider = credential.provider?.toLowerCase();
+    if (credential.authMethod === "social") {
+      if (provider === "github") return "GitHub";
+      if (provider === "google") return "Google";
+      return "Social";
+    }
+    if (credential.authMethod === "idc") {
+      if (provider === "enterprise") return "Enterprise";
+      if (provider === "iam_sso") return "IAM SSO";
+      if (provider === "builderid") return "Builder ID";
+      return "IdC";
+    }
+    return credential.authMethod;
+  })();
 
   const isQuotaExceeded = balance
     ? balance.remaining <= 0 || balance.usagePercentage >= 100
@@ -823,13 +828,8 @@ export function CredentialCard({
                   <DropdownMenuSeparator />
                   <DropdownMenuItem
                     destructive
-                    disabled={!credential.disabled}
                     onSelect={(e) => {
                       e.preventDefault();
-                      if (!credential.disabled) {
-                        toast.error("请先禁用凭据再删除");
-                        return;
-                      }
                       setShowDeleteDialog(true);
                     }}
                   >
