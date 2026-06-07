@@ -11,7 +11,7 @@ use super::{
         assign_proxy_to_credential, batch_add_proxies, check_all_proxies, check_proxy,
         check_rate_limit, check_update, clear_throttle, complete_social_login,
         complete_social_relogin, create_client_key, delete_client_key, delete_credential,
-        delete_proxy, disable_quota_exceeded, enable_overage_all, export_kam_credentials,
+        delete_proxy, disable_quota_exceeded, enable_overage_all, export_credentials,
         force_refresh_token, get_account_throttle_config, get_all_credentials,
         get_credential_balance, get_credential_models, get_global_proxy, get_load_balancing_mode, get_log_governance_config,
         get_proxy_pool, get_update_config, list_client_keys, list_traces, trace_failure_stats, poll_idc_login,
@@ -54,7 +54,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials",
             get(get_all_credentials).post(add_credential),
         )
-        .route("/credentials/export", get(export_kam_credentials))
+        .route("/credentials/export", get(export_credentials))
         .route(
             "/credentials/{id}",
             delete(delete_credential).put(update_credential),

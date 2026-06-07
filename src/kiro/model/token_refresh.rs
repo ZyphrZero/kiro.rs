@@ -53,6 +53,7 @@ pub struct RegisterClientRequest {
     pub client_type: String,
     pub scopes: Vec<String>,
     pub grant_types: Vec<String>,
+    pub issuer_url: String,
 }
 
 /// 注册 OIDC 客户端响应体

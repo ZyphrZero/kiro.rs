@@ -17,6 +17,7 @@ export interface CredentialStatusItem {
   isCurrent: boolean
   expiresAt: string | null
   authMethod: string | null
+  provider?: string | null
   hasProfileArn: boolean
   email?: string
   refreshTokenHash?: string
@@ -105,6 +106,7 @@ export interface AddCredentialRequest {
   provider?: string
   clientId?: string
   clientSecret?: string
+  startUrl?: string
   priority?: number
   authRegion?: string
   apiRegion?: string

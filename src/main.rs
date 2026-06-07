@@ -109,6 +109,14 @@ async fn main() {
         tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
     }
 
+    // 启动 Kiro IDE 版本自动获取：从官方元数据端点拉取 currentRelease，
+    // 用于流式端点 User-Agent（替代写死的版本号）；失败时回退 config.kiroVersion。
+    kiro::kiro_version::spawn_refresher(
+        proxy_config.clone(),
+        config.tls_backend,
+        std::time::Duration::from_secs(12 * 3600),
+    );
+
     // 构建端点注册表
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     {

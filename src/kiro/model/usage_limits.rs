@@ -23,6 +23,19 @@ pub struct UsageLimitsResponse {
     /// 超额配置（用户当前是否开启了超额；可能不存在）
     #[serde(default)]
     pub overage_configuration: Option<OverageConfiguration>,
+
+    /// 用户信息（请求带 isEmailRequired=true 时上游返回）
+    #[serde(default)]
+    pub user_info: Option<UserInfo>,
+}
+
+/// 用户信息
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInfo {
+    /// 账号邮箱
+    #[serde(default)]
+    pub email: Option<String>,
 }
 
 /// 订阅信息
@@ -163,6 +176,14 @@ impl UsageLimitsResponse {
             .and_then(|info| info.subscription_title.as_deref())
     }
 
+    /// 获取账号邮箱（上游 userInfo.email，可能为空）
+    pub fn email(&self) -> Option<&str> {
+        self.user_info
+            .as_ref()
+            .and_then(|info| info.email.as_deref())
+            .filter(|s| !s.is_empty())
+    }
+
     /// 用户当前是否开启了超额（兼容 overageEnabled / overageStatus）
     pub fn overage_enabled(&self) -> Option<bool> {
         let cfg = self.overage_configuration.as_ref()?;
@@ -250,5 +271,36 @@ impl UsageLimitsResponse {
         }
 
         total
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_email_from_user_info() {
+        let json = r#"{
+            "subscriptionInfo": { "subscriptionTitle": "KIRO PRO+" },
+            "userInfo": { "email": "alice@example.com", "userId": "u-123" }
+        }"#;
+        let resp: UsageLimitsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.subscription_title(), Some("KIRO PRO+"));
+        assert_eq!(resp.email(), Some("alice@example.com"));
+    }
+
+    #[test]
+    fn test_email_none_when_user_info_absent() {
+        let json = r#"{ "subscriptionInfo": { "subscriptionTitle": "KIRO FREE" } }"#;
+        let resp: UsageLimitsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.email(), None);
+    }
+
+    #[test]
+    fn test_email_none_when_empty_string() {
+        // 上游可能返回空字符串邮箱，应视为无邮箱
+        let json = r#"{ "userInfo": { "email": "" } }"#;
+        let resp: UsageLimitsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.email(), None);
     }
 }

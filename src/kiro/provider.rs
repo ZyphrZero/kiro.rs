@@ -103,6 +103,12 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
+    /// 已尝试过 profileArn 解析的凭据 ID（进程内）。
+    ///
+    /// 避免对「无 Enterprise profile」的账号（如纯 BuilderID）在每次请求都重复调用
+    /// `ListAvailableProfiles`。命中真实 ARN 的账号会把 ARN 持久化进凭据，之后
+    /// 通过 `streaming_profile_arn()` 直接命中，不再进入解析路径。
+    profile_resolution_attempted: Mutex<HashSet<u64>>,
 }
 
 impl KiroProvider {
@@ -137,6 +143,7 @@ impl KiroProvider {
             tls_backend,
             endpoints,
             default_endpoint,
+            profile_resolution_attempted: Mutex::new(HashSet::new()),
         }
     }
 
@@ -165,6 +172,54 @@ impl KiroProvider {
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    }
+
+    /// 在发起请求前，确保 Enterprise / IdC 账号的真实 profileArn 已解析并写入 `ctx`。
+    ///
+    /// 流式端点强制要求 profileArn；BuilderID 占位符会被以 403 拒绝，缺失则 400。
+    /// 仅对「OAuth 凭据 + profileArn 缺失或为占位符」的账号触发一次上游
+    /// `ListAvailableProfiles` 查询（进程内去重）：
+    /// - 命中真实 ARN → 写回 `ctx.credentials.profile_arn` 并由 token_manager 持久化；
+    ///   之后该凭据的 `streaming_profile_arn()` 直接命中，不再进入此路径。
+    /// - 无 Enterprise profile（纯 BuilderID 等）→ 保持占位符回退逻辑，并标记已尝试，
+    ///   避免每次请求重复查询。
+    async fn ensure_profile_arn(&self, ctx: &mut crate::kiro::token_manager::CallContext) {
+        use crate::kiro::model::credentials::is_placeholder_profile_arn;
+
+        if ctx.credentials.is_api_key_credential() {
+            return;
+        }
+        let needs = match ctx.credentials.profile_arn.as_deref() {
+            None => true,
+            Some(arn) => is_placeholder_profile_arn(arn),
+        };
+        if !needs {
+            return;
+        }
+        // 进程内去重：仅在「拿到上游确定结果」后才标记已尝试，避免一次网络抖动
+        // 把账号永久卡在占位符上（重启前不再重试）。
+        if self.profile_resolution_attempted.lock().contains(&ctx.id) {
+            return;
+        }
+        match self
+            .token_manager
+            .resolve_profile_arn_for(ctx.id, &ctx.token)
+            .await
+        {
+            Ok(Some(arn)) => {
+                ctx.credentials.profile_arn = Some(arn);
+                self.profile_resolution_attempted.lock().insert(ctx.id);
+            }
+            Ok(None) => {
+                // 上游确认该账号无 Enterprise profile（纯 BuilderID 等）：标记已尝试，
+                // 后续请求回退到占位符逻辑，不再重复查询。
+                self.profile_resolution_attempted.lock().insert(ctx.id);
+            }
+            Err(e) => {
+                // 网络/瞬态错误：不标记，下次请求再试；本次按原 profileArn 继续
+                tracing::warn!("凭据 #{} 解析真实 profileArn 失败（按原 profileArn 继续）: {}", ctx.id, e);
+            }
+        }
     }
 
     /// 发送非流式 API 请求
@@ -366,7 +421,7 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref(), group).await {
+            let mut ctx = match self.token_manager.acquire_context(model.as_deref(), group).await {
                 Ok(c) => c,
                 Err(e) => {
                     Self::emit_attempt(
@@ -377,6 +432,9 @@ impl KiroProvider {
                     continue;
                 }
             };
+
+            // 确保 Enterprise / IdC 账号的真实 profileArn 已解析（流式端点强制要求）
+            self.ensure_profile_arn(&mut ctx).await;
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);

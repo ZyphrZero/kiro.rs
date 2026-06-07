@@ -393,6 +393,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             // 仅映射 authRegion 会导致 API 请求回退到全局默认 region，跨 region 403
             authRegion: cred.region?.trim() || undefined,
             apiRegion: cred.region?.trim() || undefined,
+            startUrl: cred.startUrl?.trim() || undefined,
             clientId,
             clientSecret,
             machineId: account.machineId?.trim() || undefined,

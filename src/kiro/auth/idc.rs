@@ -32,12 +32,11 @@ pub const BUILDER_ID_START_URL: &str = "https://view.awsapps.com/start";
 
 /// Kiro IDE 使用的 OIDC 作用域
 const KIRO_SCOPES: &[&str] = &[
-    "sso:account:access",
     "codewhisperer:completions",
     "codewhisperer:analysis",
-    "openid",
-    "profile",
-    "email",
+    "codewhisperer:conversations",
+    "codewhisperer:transformations",
+    "codewhisperer:taskassist",
 ];
 
 fn oidc_endpoint(region: &str) -> String {
@@ -48,8 +47,11 @@ fn oidc_endpoint(region: &str) -> String {
 ///
 /// 每次发起设备授权前调用，获得 clientId 和 clientSecret。
 /// 注册结果有过期时间（通常数天），但此处每次重新注册以保持简单。
+/// `start_url` 作为 issuerUrl 一并提交：Builder ID 为默认 Start URL，
+/// 企业 IAM Identity Center 为组织自己的 Start URL。
 pub async fn register_client(
     region: &str,
+    start_url: &str,
     config: &Config,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<RegisterClientResponse> {
@@ -64,6 +66,7 @@ pub async fn register_client(
             "urn:ietf:params:oauth:grant-type:device_code".to_string(),
             "refresh_token".to_string(),
         ],
+        issuer_url: start_url.to_string(),
     };
 
     let resp = client

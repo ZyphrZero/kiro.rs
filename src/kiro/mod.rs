@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod endpoint;
+pub mod kiro_version;
 pub mod machine_id;
 pub mod model;
 pub mod parser;
