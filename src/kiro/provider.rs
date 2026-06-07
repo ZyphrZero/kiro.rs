@@ -180,7 +180,8 @@ impl KiroProvider {
 
     /// 在发起请求前，确保 Enterprise / IdC 账号的真实 profileArn 已解析并写入 `ctx`。
     ///
-    /// 流式端点强制要求 profileArn；BuilderID 占位符会被以 403 拒绝，缺失则 400。
+    /// 流式端点强制要求 profileArn；Enterprise / IdC 账号必须先把 BuilderID
+    /// 占位符解析为真实 ARN，纯 BuilderID 账号则回退占位符。
     /// 仅对「OAuth 凭据 + profileArn 缺失或为占位符」的账号触发一次上游
     /// `ListAvailableProfiles` 查询（进程内去重）：
     /// - 命中真实 ARN → 写回 `ctx.credentials.profile_arn` 并由 token_manager 持久化；

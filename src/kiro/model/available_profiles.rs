@@ -5,9 +5,8 @@
 //!
 //! Enterprise / IAM Identity Center (IdC) 账号需要真实的 `profileArn` 才能调用
 //! 流式端点 `generateAssistantResponse`——不带 profileArn 会被上游以
-//! `400 {"message":"profileArn is required for this request."}` 拒绝，带 BuilderID
-//! 占位符则会以 `403 {"message":"The bearer token included in the request is invalid."}`
-//! 拒绝。真实 profileArn 只能通过本接口获取。
+//! `400 {"message":"profileArn is required for this request."}` 拒绝；带 BuilderID
+//! 占位符则会因 token 身份不匹配被拒绝。真实 profileArn 只能通过本接口获取。
 
 use serde::Deserialize;
 

@@ -2227,8 +2227,8 @@ impl MultiTokenManager {
     /// 解析并回填 Enterprise / IdC 账号的真实 profileArn。
     ///
     /// 流式端点（`generateAssistantResponse`）强制要求 profileArn：不带 → 400
-    /// `profileArn is required`；带 BuilderID 占位符 → 403 `bearer token invalid`。
-    /// 真实 profileArn 只能通过 `ListAvailableProfiles` 获取。
+    /// `profileArn is required`。Enterprise / IdC 账号若带 BuilderID 占位符会因
+    /// token 身份不匹配触发 403，真实 profileArn 只能通过 `ListAvailableProfiles` 获取。
     ///
     /// 行为：
     /// - API Key 凭据 / 已有真实（非占位符）profileArn → 直接返回，不发起网络请求；
