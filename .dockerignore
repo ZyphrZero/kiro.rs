@@ -63,6 +63,7 @@ proxy_pool.json
 usage_log.*.jsonl
 usage_stats.json
 prompt_cache.json
+cache_metering.json
 traces.db
 traces.db-shm
 traces.db-wal

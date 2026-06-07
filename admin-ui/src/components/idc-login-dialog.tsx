@@ -9,6 +9,15 @@ import {
   DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog'
+import {
+  Select,
+  SelectGroup,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from '@/components/ui/select'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { startIdcLogin, pollIdcLogin } from '@/api/credentials'
@@ -64,30 +73,42 @@ const KNOWN_SSO_REGIONS = SSO_REGION_GROUPS.flatMap((g) => g.items.map(([v]) => 
 
 /** SSO 区域选择：下拉预设区域 + 始终可输入的自定义文本框 */
 function RegionSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const inputRef = useRef<HTMLInputElement>(null)
   const selectValue = KNOWN_SSO_REGIONS.includes(value) ? value : 'custom'
+  const handleSelectChange = (v: string) => {
+    if (v !== 'custom') {
+      onChange(v)
+      return
+    }
+    if (KNOWN_SSO_REGIONS.includes(value)) onChange('')
+    requestAnimationFrame(() => inputRef.current?.focus())
+  }
+
   return (
     <div className="flex gap-2">
-      <select
-        value={selectValue}
-        onChange={(e) => {
-          if (e.target.value !== 'custom') onChange(e.target.value)
-        }}
-        className="flex-1 h-10 rounded-md border border-input bg-background px-3 text-sm"
-      >
-        {SSO_REGION_GROUPS.map((g) => (
-          <optgroup key={g.group} label={g.group}>
-            {g.items.map(([v, label]) => (
-              <option key={v} value={v}>
-                {label}
-              </option>
-            ))}
-          </optgroup>
-        ))}
-        <optgroup label="自定义">
-          <option value="custom">-- 自定义输入 --</option>
-        </optgroup>
-      </select>
+      <Select value={selectValue} onValueChange={handleSelectChange}>
+        <SelectTrigger className="flex-1 h-10">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {SSO_REGION_GROUPS.map((g) => (
+            <SelectGroup key={g.group}>
+              <SelectLabel>{g.group}</SelectLabel>
+              {g.items.map(([v, label]) => (
+                <SelectItem key={v} value={v}>
+                  {label}
+                </SelectItem>
+              ))}
+            </SelectGroup>
+          ))}
+          <SelectGroup>
+            <SelectLabel>自定义</SelectLabel>
+            <SelectItem value="custom">-- 自定义输入 --</SelectItem>
+          </SelectGroup>
+        </SelectContent>
+      </Select>
       <Input
+        ref={inputRef}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder="例如: cn-north-1"

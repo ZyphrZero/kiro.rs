@@ -656,12 +656,13 @@ pub async fn post_messages(
 
     let tool_name_map = conversion_result.tool_name_map;
 
-    // PromptCache：根据 cache_control 断点查 / 写中转层提示词缓存
-    let (cache_creation_tokens, cache_read_tokens) = state
-        .prompt_cache
+    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
+    // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
+    let cache_usage = state
+        .cache_meter
         .as_ref()
-        .map(|cache| super::prompt_cache::compute_cache_usage(cache, &payload))
-        .unwrap_or((0, 0));
+        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
+        .unwrap_or_default();
 
     if payload.stream {
         // 流式响应
@@ -679,8 +680,7 @@ pub async fn post_messages(
             thinking_enabled,
             tool_name_map,
             hook,
-            cache_creation_tokens,
-            cache_read_tokens,
+            cache_usage,
             tracer,
             key_ctx.group.clone(),
         )
@@ -702,8 +702,7 @@ pub async fn post_messages(
             extract_thinking,
             tool_name_map,
             hook,
-            cache_creation_tokens,
-            cache_read_tokens,
+            cache_usage,
             tracer,
             key_ctx.group.clone(),
         )
@@ -720,8 +719,7 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     hook: UsageRecordHook,
-    cache_creation_tokens: i32,
-    cache_read_tokens: i32,
+    cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -740,8 +738,7 @@ async fn handle_stream_request(
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
-    ctx.cache_creation_input_tokens = cache_creation_tokens;
-    ctx.cache_read_input_tokens = cache_read_tokens;
+    ctx.cache_usage = cache_usage;
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -882,13 +879,14 @@ fn record_stream_usage(
     credential_id: u64,
     status: &str,
 ) {
-    let input = ctx.context_input_tokens.unwrap_or(ctx.input_tokens);
+    // 互斥分摊后的 (input, cache_creation, cache_read)，与 trace 上报口径一致。
+    let (input, cache_creation, cache_read) = ctx.resolved_usage();
     hook.record(
         credential_id,
         input,
         ctx.output_tokens,
-        ctx.cache_creation_input_tokens,
-        ctx.cache_read_input_tokens,
+        cache_creation,
+        cache_read,
         ctx.credits,
         status,
     );
@@ -896,12 +894,12 @@ fn record_stream_usage(
 
 /// 从 StreamContext 提取用量，转成 trace 行用量（与 record_stream_usage 同源）
 fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
-    let input = ctx.context_input_tokens.unwrap_or(ctx.input_tokens);
+    let (input, cache_creation, cache_read) = ctx.resolved_usage();
     TraceUsage {
         input_tokens: input.max(0) as u64,
         output_tokens: ctx.output_tokens.max(0) as u64,
-        cache_creation_tokens: ctx.cache_creation_input_tokens.max(0) as u64,
-        cache_read_tokens: ctx.cache_read_input_tokens.max(0) as u64,
+        cache_creation_tokens: cache_creation.max(0) as u64,
+        cache_read_tokens: cache_read.max(0) as u64,
         credits: if ctx.credits.is_finite() && ctx.credits > 0.0 { ctx.credits } else { 0.0 },
     }
 }
@@ -917,8 +915,7 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     hook: UsageRecordHook,
-    initial_cache_creation: i32,
-    initial_cache_read: i32,
+    cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -970,11 +967,8 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
-    // meteringEvent 上报的 token 与缓存数据
-    // 上游 metering 只给 credit；input 来自 contextUsage，output 来自估算
-    // cache_creation / cache_read 由调用方（PromptCache）传入初值
-    let cache_creation_tokens: i32 = initial_cache_creation;
-    let cache_read_tokens: i32 = initial_cache_read;
+    // meteringEvent 上报的 credit 计费量（上游真实下发）；
+    // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
     let mut credits: f64 = 0.0;
 
     // 收集工具调用的增量 JSON
@@ -1106,7 +1100,10 @@ async fn handle_non_stream_request(
     let output_tokens = token::estimate_output_tokens(&content);
 
     // 输入 tokens：contextUsage 真实值优先，否则用客户端估算
-    let final_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
+    let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
+    // 互斥分摊：input + cache_creation + cache_read == total
+    let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
+        cache_usage.split_against_total(total_input_tokens);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1340,12 +1337,12 @@ pub async fn post_messages_cc(
 
     let tool_name_map = conversion_result.tool_name_map;
 
-    // PromptCache：根据 cache_control 断点查 / 写中转层提示词缓存
-    let (cache_creation_tokens, cache_read_tokens) = state
-        .prompt_cache
+    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（estimate 口径）。
+    let cache_usage = state
+        .cache_meter
         .as_ref()
-        .map(|cache| super::prompt_cache::compute_cache_usage(cache, &payload))
-        .unwrap_or((0, 0));
+        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
+        .unwrap_or_default();
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -1363,8 +1360,7 @@ pub async fn post_messages_cc(
             tool_name_map,
             hook,
             total_input_tokens,
-            cache_creation_tokens,
-            cache_read_tokens,
+            cache_usage,
             tracer,
             key_ctx.group.clone(),
         )
@@ -1386,8 +1382,7 @@ pub async fn post_messages_cc(
             extract_thinking,
             tool_name_map,
             hook,
-            cache_creation_tokens,
-            cache_read_tokens,
+            cache_usage,
             tracer,
             key_ctx.group.clone(),
         )
@@ -1407,8 +1402,7 @@ async fn handle_stream_request_buffered(
     tool_name_map: std::collections::HashMap<String, String>,
     hook: UsageRecordHook,
     fallback_input_tokens: i32,
-    cache_creation_tokens: i32,
-    cache_read_tokens: i32,
+    cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -1431,7 +1425,7 @@ async fn handle_stream_request_buffered(
         thinking_enabled,
         tool_name_map,
     );
-    ctx.set_initial_cache_tokens(cache_creation_tokens, cache_read_tokens);
+    ctx.set_cache_usage(cache_usage);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);

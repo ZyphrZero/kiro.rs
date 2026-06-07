@@ -229,12 +229,12 @@ async fn main() {
     // 把 api_key 包成 Arc<RwLock<...>>，以便 Admin 模块运行时改 key 后立刻生效
     let shared_api_key = std::sync::Arc::new(parking_lot::RwLock::new(api_key.clone()));
 
-    // PromptCache：基于 cache_control 断点的进程内提示词缓存
-    // 持久化到 cache_dir/prompt_cache.json，启动时自动加载有效条目
-    let prompt_cache = std::sync::Arc::new(anthropic::prompt_cache::PromptCache::new(Some(
-        cache_dir.join("prompt_cache.json"),
+    // CacheMeter：模拟 Anthropic 缓存、计量 cache_read/creation token 的进程内组件。
+    // 持久化到 cache_dir/cache_metering.json，启动时自动加载未过期条目。
+    let cache_meter = std::sync::Arc::new(anthropic::cache_metering::CacheMeter::new(Some(
+        cache_dir.join("cache_metering.json"),
     )));
-    prompt_cache.clone().spawn_background();
+    cache_meter.clone().spawn_background();
 
     let anthropic_app = anthropic::create_router_with_shared_key(
         shared_api_key.clone(),
@@ -243,7 +243,7 @@ async fn main() {
         Some(client_key_manager.clone()),
         Some(usage_recorder.clone()),
         Some(usage_aggregator.clone()),
-        Some(prompt_cache.clone()),
+        Some(cache_meter.clone()),
         trace_store.clone(),
     );
 

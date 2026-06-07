@@ -18,7 +18,7 @@ use crate::kiro::provider::KiroProvider;
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
-    prompt_cache::SharedPromptCache,
+    cache_metering::SharedCacheMeter,
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -57,7 +57,7 @@ pub fn create_router_with_shared_key(
     client_keys: Option<SharedClientKeyManager>,
     usage_recorder: Option<SharedRecorder>,
     usage_aggregator: Option<SharedAggregator>,
-    prompt_cache: Option<SharedPromptCache>,
+    cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
 ) -> Router {
     let mut state = AppState::with_shared_api_key(api_key, extract_thinking);
@@ -65,7 +65,7 @@ pub fn create_router_with_shared_key(
         state = state.with_kiro_provider(provider);
     }
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
-    state = state.with_prompt_cache(prompt_cache);
+    state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
 
     // 需要认证的 /v1 路由

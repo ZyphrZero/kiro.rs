@@ -553,15 +553,23 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
-    /// 缓存写入（创建）token：来自中转层 PromptCache 计费
-    pub cache_creation_input_tokens: i32,
-    /// 缓存命中（读取）token：来自中转层 PromptCache 计费
-    pub cache_read_input_tokens: i32,
+    /// 中转层 CacheMeter 的缓存覆盖情况（estimate 口径）。最终上报时按真实 total
+    /// 做互斥分摊：`input + cache_creation + cache_read == total`，避免把被缓存
+    /// 覆盖的前缀重复计进 input_tokens。
+    pub cache_usage: super::cache_metering::CacheUsage,
     /// meteringEvent 上报的 credit 计费量（上游真实下发）
     pub credits: f64,
 }
 
 impl StreamContext {
+    /// 解析最终上报口径的 `(input_tokens, cache_creation, cache_read)`。
+    ///
+    /// total 真值优先取 contextUsage（上游真实百分比×窗口），否则用客户端估算的
+    /// `input_tokens`；再由 [`CacheUsage::split_against_total`] 做互斥分摊。
+    pub fn resolved_usage(&self) -> (i32, i32, i32) {
+        let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
+        self.cache_usage.split_against_total(total_real)
+    }
     /// 创建 StreamContext
     pub fn new_with_thinking(
         model: impl Into<String>,
@@ -585,8 +593,7 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
+            cache_usage: super::cache_metering::CacheUsage::default(),
             credits: 0.0,
         }
     }
@@ -1176,15 +1183,15 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(" "));
         }
 
-        // input: contextUsage 真实值优先；否则用客户端估算
-        let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        // 互斥口径：total 真值（contextUsage 优先）− 缓存覆盖 = 未缓存的 input。
+        let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
 
         // 生成最终事件
         events.extend(self.state_manager.generate_final_events(
             final_input_tokens,
             self.output_tokens,
-            self.cache_creation_input_tokens,
-            self.cache_read_input_tokens,
+            cache_creation,
+            cache_read,
         ));
         events
     }
@@ -1205,8 +1212,6 @@ pub struct BufferedStreamContext {
     inner: StreamContext,
     /// 缓冲的所有事件（包括 message_start、content_block_start 等）
     event_buffer: Vec<SseEvent>,
-    /// 估算的 input_tokens（用于回退）
-    estimated_input_tokens: i32,
     /// 是否已经生成了初始事件
     initial_events_generated: bool,
 }
@@ -1228,15 +1233,13 @@ impl BufferedStreamContext {
         Self {
             inner,
             event_buffer: Vec::new(),
-            estimated_input_tokens,
             initial_events_generated: false,
         }
     }
 
-    /// 注入由 PromptCache 计算的初始 cache_creation / cache_read tokens
-    pub fn set_initial_cache_tokens(&mut self, creation: i32, read: i32) {
-        self.inner.cache_creation_input_tokens = creation;
-        self.inner.cache_read_input_tokens = read;
+    /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），最终上报时分摊。
+    pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
+        self.inner.cache_usage = cache_usage;
     }
 
     /// 处理 Kiro 事件并缓冲结果
@@ -1269,15 +1272,10 @@ impl BufferedStreamContext {
             self.initial_events_generated = true;
         }
 
-        // input: contextUsage 真实值优先；否则用客户端估算
-        let final_input_tokens = self
-            .inner
-            .context_input_tokens
-            .unwrap_or(self.estimated_input_tokens);
-        let cache_creation = self.inner.cache_creation_input_tokens;
-        let cache_read = self.inner.cache_read_input_tokens;
+        // 互斥口径分摊：total 真值 − 缓存覆盖 = 未缓存 input（与 inner 收尾一致）。
+        let (final_input_tokens, cache_creation, cache_read) = self.inner.resolved_usage();
 
-        // 生成最终事件（StreamContext 内部会用同样的优先级）
+        // 生成最终事件（StreamContext 内部会用同样的优先级与分摊）
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
@@ -1301,15 +1299,12 @@ impl BufferedStreamContext {
     ///
     /// 返回顺序：(input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits)
     pub fn final_usage(&self) -> (i32, i32, i32, i32, f64) {
-        let final_input = self
-            .inner
-            .context_input_tokens
-            .unwrap_or(self.estimated_input_tokens);
+        let (input, creation, read) = self.inner.resolved_usage();
         (
-            final_input,
+            input,
             self.inner.output_tokens,
-            self.inner.cache_creation_input_tokens,
-            self.inner.cache_read_input_tokens,
+            creation,
+            read,
             self.inner.credits,
         )
     }
@@ -1317,7 +1312,7 @@ impl BufferedStreamContext {
 
 /// 简单的 token 估算（中英文字符混合）
 ///
-/// 公开供 prompt_cache 等模块复用同一估算口径。
+/// 公开供 cache_meter 等模块复用同一估算口径。
 pub fn estimate_tokens(text: &str) -> i32 {
     let chars: Vec<char> = text.chars().collect();
     let mut chinese_count = 0;

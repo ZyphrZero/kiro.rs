@@ -11,7 +11,8 @@
 /credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json
-# 中转层 prompt cache 落盘（运行时产物，不入库）
+# 中转层缓存计量落盘（运行时产物，不入库）
+/cache_metering.json
 /prompt_cache.json
 # 客户端 Key 分发（含明文 csk_*，绝对不能提交）
 /client_api_keys.json
