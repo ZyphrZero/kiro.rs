@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.3] - 2026-06-08
+
+主题：**Claude Code Thinking 兼容 + Kiro 原生 reasoning 事件 + 后台弹窗表单体验修复**。这一版聚焦暂存区中的协议兼容与 Admin UI 表单体验：转换层按上游模型能力处理 Opus / Sonnet Thinking 请求，流式 / 非流式路径支持 Kiro 原生 `reasoningContentEvent`，后台管理页修复导入 / 登录类弹窗的焦点裁切、标签间距和 textarea 拖拽卡顿问题。
+
+### 🛠 修复 — Claude Code / Opus 与 Sonnet Thinking 兼容
+
+- **Opus / Sonnet Thinking 兼容**：Claude Code 可能在普通模型名或 `-thinking` 模型下发送 `thinking` / `output_config`；转换层现在按上游模型能力决定是否发送 `additionalModelRequestFields`，不再因为开启 thinking 或客户端携带 `output_config` 就直接透传不受支持的字段，避免 `additionalModelRequestFields is not supported for this model`。
+- **收窄 `output_config.effort` 透传范围**：`additionalModelRequestFields.output_config` 只在已知可接受的 Opus 4.6 adaptive thinking 路径上传递；Opus 4.6 非 adaptive thinking、Opus 4.7 / 4.8、Sonnet 系列与其它模型会显式跳过该字段。
+
+### ✨ 新功能 — Kiro 原生 reasoning 事件
+
+- **支持 `reasoningContentEvent`**：新增 Kiro 原生 reasoning 事件解析，流式响应会把 `text` 转为 Anthropic `thinking_delta`、把 `signature` 转为 `signature_delta`、把 `redactedContent` 转为 `redacted_thinking`。
+- **非流式响应保留原生 thinking**：非流式路径会优先使用上游原生 thinking / signature / redacted content 组装 Anthropic content block；没有原生 reasoning 时仍保留旧的 `<thinking>...</thinking>` 文本提取兼容路径。
+- **thinking disabled 明确降级**：请求未启用 thinking 时，原生 reasoning 明文会作为普通 text 输出，不输出签名或 redacted thinking，避免客户端收到未请求的 thinking block。
+- **token 估算覆盖 thinking 内容**：输出 token 估算现在计入 `thinking` block，并为 `redacted_thinking` 计入固定开销，减少用量统计漏算。
+- **补充边界测试与真实 Claude Code 验证**：新增请求转换、流式顺序、非流式内容组装、redacted thinking、signature-only、thinking disabled 降级和 token 估算测试；真实 Claude Code 请求验证普通 Sonnet 4.5 与 `-thinking` 模型均可返回 thinking/signature/text 合法事件序列。
+
+### 🎨 改进 — 后台弹窗表单体验
+
+- **修复表单控件焦点态裁切 / 贴边**：`Input` / `Select` / `Textarea` 与按钮焦点环改为内嵌显示，避免在 Dialog 滚动区域、KAM 导入、批量导入、重新登录、重新导入、远程登录回调和代理池批量导入等窗口中被容器边缘裁掉。
+- **恢复标签与控件垂直间距**：普通 `label` 改为块级显示，修复 `space-y-*` 不能作用于 inline label 导致标签和输入框 / 下拉框过近的问题，同时保留 checkbox / switch 这类 flex label 布局。
+- **改善 textarea 拖拽调整高度体验**：textarea 不再使用 `transition-all` 过渡高度，只保留边框、背景和阴影过渡；拖动改变高度会立即跟手，KAM 导入、批量导入、Token 重新导入、远程登录回调和代理池批量导入中的原生 textarea 样式同步统一。
+
 ## [0.6.2] - 2026-06-07
 
 主题：**Builder ID/free 流式对话 profileArn 400 修复 + 后台前端依赖清理**。上一版为规避占位符 ARN 的 403 风险，在流式请求中剥离了 BuilderID 占位 `profileArn`；但 `q.* /generateAssistantResponse` 对 Builder ID/free 账号仍强制要求该字段，调用 `claude-sonnet-4.5` 等模型会报 `400 "profileArn is required for this request."`。这一版恢复纯 Builder ID/free 流式请求体的占位 ARN，同时保留 Enterprise / IdC 账号解析真实 ARN 的路径。

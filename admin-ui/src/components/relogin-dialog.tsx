@@ -413,7 +413,7 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
                   value={callbackUrl}
                   onChange={(e) => setCallbackUrl(e.target.value)}
                   disabled={isCompleting}
-                  className="flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-xs font-mono placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+                  className="flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-xs font-mono placeholder:text-muted-foreground focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30 disabled:opacity-50"
                 />
               </div>
             ) : (
@@ -490,7 +490,7 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
                 value={manualInput}
                 onChange={(e) => setManualInput(e.target.value)}
                 disabled={isManualUpdating}
-                className="flex min-h-[140px] w-full rounded-xl border border-input bg-background/60 px-3.5 py-2.5 text-sm transition-all duration-150 ease-apple placeholder:text-muted-foreground/70 hover:border-border focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30 focus-visible:bg-background disabled:opacity-50 font-mono"
+                className="flex min-h-[140px] w-full rounded-xl border border-input bg-background/60 px-3.5 py-2.5 text-sm transition-[border-color,background-color,box-shadow] duration-150 ease-apple placeholder:text-muted-foreground/70 hover:border-border focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30 focus-visible:bg-background disabled:opacity-50 font-mono"
               />
               {manualInput.trim() && step === 'form' && (
                 <div className={`text-sm rounded-md p-3 ${isManualValid ? 'bg-green-50 dark:bg-green-950 text-green-700 dark:text-green-300' : 'bg-red-50 dark:bg-red-950 text-red-700 dark:text-red-300'}`}>

@@ -195,12 +195,42 @@ pub fn get_context_window_size(model: &str) -> i32 {
 /// The field is currently only known to be accepted by the Opus 4.6 adaptive-thinking path.
 /// Sending it to other models causes upstream 400 responses such as
 /// `additionalModelRequestFields is not supported for this model`.
-fn should_emit_additional_model_request_fields(req: &MessagesRequest, model_id: &str) -> bool {
+fn should_emit_output_config(req: &MessagesRequest, model_id: &str) -> bool {
     model_id == "claude-opus-4.6"
         && req
             .thinking
             .as_ref()
             .is_some_and(|t| t.thinking_type == "adaptive")
+}
+
+fn build_additional_model_request_fields(
+    req: &MessagesRequest,
+    model_id: &str,
+) -> Option<AdditionalModelRequestFields> {
+    let output_config = if should_emit_output_config(req, model_id) {
+        req.output_config.as_ref().and_then(|oc| {
+            if oc.effort.trim().is_empty() {
+                return None;
+            }
+            Some(KiroOutputConfig {
+                effort: oc.effort.clone(),
+            })
+        })
+    } else {
+        if let Some(oc) = &req.output_config
+            && !oc.effort.trim().is_empty()
+        {
+            tracing::debug!(
+                model_id = %model_id,
+                "skipping unsupported additionalModelRequestFields.output_config for model"
+            );
+        }
+        None
+    };
+
+    output_config.map(|output_config| AdditionalModelRequestFields {
+        output_config: Some(output_config),
+    })
 }
 
 /// 转换结果
@@ -422,29 +452,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // wire field is narrower: newer/non-adaptive models reject it with
     // `additionalModelRequestFields is not supported for this model`, so keep the field opt-in
     // by upstream model capability rather than by the mere presence of client output_config.
-    let additional_model_request_fields =
-        if should_emit_additional_model_request_fields(req, &model_id) {
-            req.output_config.as_ref().and_then(|oc| {
-                if oc.effort.trim().is_empty() {
-                    return None;
-                }
-                Some(AdditionalModelRequestFields {
-                    output_config: Some(KiroOutputConfig {
-                        effort: oc.effort.clone(),
-                    }),
-                })
-            })
-        } else {
-            if let Some(oc) = &req.output_config
-                && !oc.effort.trim().is_empty()
-            {
-                tracing::debug!(
-                    model_id = %model_id,
-                    "skipping unsupported additionalModelRequestFields for model"
-                );
-            }
-            None
-        };
+    let additional_model_request_fields = build_additional_model_request_fields(req, &model_id);
 
     Ok(ConversionResult {
         conversation_state,
@@ -1223,6 +1231,18 @@ mod tests {
         req
     }
 
+    fn minimal_thinking_request(model: &str, thinking_type: &str) -> MessagesRequest {
+        use super::super::types::Thinking;
+
+        let mut req = minimal_request_with_output_config(model);
+        req.output_config = None;
+        req.thinking = Some(Thinking {
+            thinking_type: thinking_type.to_string(),
+            budget_tokens: 20000,
+        });
+        req
+    }
+
     #[test]
     fn test_output_config_does_not_emit_unsupported_additional_fields() {
         let req = minimal_request_with_output_config("claude-sonnet-4-8-thinking");
@@ -1242,6 +1262,29 @@ mod tests {
         assert!(
             result.additional_model_request_fields.is_none(),
             "opus 4.6 only uses additionalModelRequestFields for adaptive thinking"
+        );
+    }
+
+    #[test]
+    fn test_thinking_does_not_emit_additional_fields_for_sonnet_4_5() {
+        let req = minimal_thinking_request("claude-sonnet-4-5-20250929-thinking", "enabled");
+        let result = convert_request(&req).unwrap();
+
+        assert!(
+            result.additional_model_request_fields.is_none(),
+            "sonnet 4.5 rejects additionalModelRequestFields even when thinking is enabled"
+        );
+    }
+
+    #[test]
+    fn test_enabled_thinking_does_not_emit_output_config_for_opus_4_6() {
+        let mut req = minimal_request_with_output_config("claude-opus-4-6-thinking");
+        req.thinking = minimal_thinking_request("claude-opus-4-6-thinking", "enabled").thinking;
+        let result = convert_request(&req).unwrap();
+
+        assert!(
+            result.additional_model_request_fields.is_none(),
+            "opus 4.6 output_config is only accepted on adaptive thinking requests"
         );
     }
 

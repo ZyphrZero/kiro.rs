@@ -232,6 +232,12 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
         if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
             total += count_tokens(text) as i32;
         }
+        if let Some(thinking) = block.get("thinking").and_then(|v| v.as_str()) {
+            total += count_tokens(thinking) as i32;
+        }
+        if block.get("type").and_then(|v| v.as_str()) == Some("redacted_thinking") {
+            total += 8;
+        }
         if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
             // 工具调用开销
             if let Some(input) = block.get("input") {
@@ -242,4 +248,34 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     }
 
     total.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn estimate_output_tokens_counts_thinking_blocks() {
+        let with_thinking = estimate_output_tokens(&[json!({
+            "type": "thinking",
+            "thinking": "需要计入输出 token"
+        })]);
+        let text_only = estimate_output_tokens(&[json!({
+            "type": "text",
+            "text": ""
+        })]);
+
+        assert!(with_thinking > text_only);
+    }
+
+    #[test]
+    fn estimate_output_tokens_counts_redacted_thinking() {
+        let tokens = estimate_output_tokens(&[json!({
+            "type": "redacted_thinking",
+            "data": "encrypted"
+        })]);
+
+        assert!(tokens >= 8);
+    }
 }
