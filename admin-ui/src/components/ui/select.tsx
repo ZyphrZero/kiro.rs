@@ -127,7 +127,8 @@ const SelectTrigger = React.forwardRef<
       disabled={disabled}
       className={cn(
         'flex h-8 w-full items-center justify-between gap-2 rounded-md border border-border/70 bg-background px-2.5 text-[13px]',
-        'focus:outline-none focus:ring-2 focus:ring-ring',
+        'focus:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/30',
+        'data-[state=open]:border-ring data-[state=open]:ring-2 data-[state=open]:ring-inset data-[state=open]:ring-ring/25',
         'disabled:cursor-not-allowed disabled:opacity-50 [&>span]:truncate',
         className
       )}

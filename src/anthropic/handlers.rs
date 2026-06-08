@@ -962,6 +962,9 @@ async fn handle_non_stream_request(
     }
 
     let mut text_content = String::new();
+    let mut native_thinking = String::new();
+    let mut native_thinking_signature: Option<String> = None;
+    let mut native_redacted_thinking: Vec<String> = Vec::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
@@ -982,6 +985,23 @@ async fn handle_non_stream_request(
                     match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
+                        }
+                        Event::ReasoningContent(reasoning) => {
+                            if let Some(text) = reasoning.text
+                                && !text.is_empty()
+                            {
+                                native_thinking.push_str(&text);
+                            }
+                            if let Some(signature) = reasoning.signature
+                                && !signature.is_empty()
+                            {
+                                native_thinking_signature = Some(signature);
+                            }
+                            if let Some(redacted) = reasoning.redacted_content
+                                && !redacted.is_empty()
+                            {
+                                native_redacted_thinking.push(redacted);
+                            }
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
@@ -1063,37 +1083,13 @@ async fn handle_non_stream_request(
     }
 
     // 构建响应内容
-    let mut content: Vec<serde_json::Value> = Vec::new();
-
-    if thinking_enabled {
-        // 从完整文本中提取 thinking 块
-        let (thinking, remaining_text) =
-            super::stream::extract_thinking_from_complete_text(&text_content);
-
-        if let Some(thinking_text) = thinking {
-            // signature 占位字符串：上游 Kiro 不下发真实 Anthropic 签名，
-            // 但 thinking 模式下客户端要求 thinking 块带 signature 字段，
-            // 否则下一轮回传时 SDK 本地校验会拒绝（"must be passed back"）
-            content.push(json!({
-                "type": "thinking",
-                "thinking": thinking_text,
-                "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
-            }));
-        }
-
-        if !remaining_text.is_empty() {
-            content.push(json!({
-                "type": "text",
-                "text": remaining_text
-            }));
-        }
-    } else if !text_content.is_empty() {
-        content.push(json!({
-            "type": "text",
-            "text": text_content
-        }));
-    }
-
+    let mut content = build_non_stream_content(
+        thinking_enabled,
+        text_content,
+        native_thinking,
+        native_thinking_signature,
+        native_redacted_thinking,
+    );
     content.extend(tool_uses);
 
     // 估算输出 tokens（上游不下发 token，全部走估算）
@@ -1145,6 +1141,72 @@ async fn handle_non_stream_request(
         },
     );
     (StatusCode::OK, Json(response_body)).into_response()
+}
+
+fn build_non_stream_content(
+    thinking_enabled: bool,
+    text_content: String,
+    native_thinking: String,
+    native_thinking_signature: Option<String>,
+    native_redacted_thinking: Vec<String>,
+) -> Vec<serde_json::Value> {
+    let mut content = Vec::new();
+    let has_native_thinking = !native_thinking.is_empty();
+
+    if thinking_enabled {
+        if has_native_thinking {
+            content.push(json!({
+                "type": "thinking",
+                "thinking": native_thinking.clone(),
+                "signature": native_thinking_signature
+                    .unwrap_or_else(|| super::stream::THINKING_SIGNATURE_PLACEHOLDER.to_string()),
+            }));
+        } else {
+            // 从完整文本中提取 thinking 块，兼容旧的 <thinking> 文本路径。
+            let (thinking, remaining_text) =
+                super::stream::extract_thinking_from_complete_text(&text_content);
+
+            if let Some(thinking_text) = thinking {
+                content.push(json!({
+                    "type": "thinking",
+                    "thinking": thinking_text,
+                    "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
+                }));
+            }
+
+            if !remaining_text.is_empty() {
+                content.push(json!({
+                    "type": "text",
+                    "text": remaining_text
+                }));
+            }
+        }
+
+        for redacted in native_redacted_thinking {
+            content.push(json!({
+                "type": "redacted_thinking",
+                "data": redacted
+            }));
+        }
+
+        if has_native_thinking && !text_content.is_empty() {
+            content.push(json!({
+                "type": "text",
+                "text": text_content
+            }));
+        }
+    } else if !text_content.is_empty() {
+        content.push(json!({
+            "type": "text",
+            "text": text_content
+        }));
+    } else if has_native_thinking {
+        content.push(json!({
+            "type": "text",
+            "text": native_thinking
+        }));
+    }
+    content
 }
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
@@ -1605,6 +1667,62 @@ mod tests {
             "ValidationException: transient backend issue".to_string()
         ));
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn non_stream_native_thinking_precedes_redacted_and_text() {
+        let content = build_non_stream_content(
+            true,
+            "final answer".to_string(),
+            "native thinking".to_string(),
+            Some("real-signature".to_string()),
+            vec!["encrypted-thinking".to_string()],
+        );
+
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "native thinking");
+        assert_eq!(content[0]["signature"], "real-signature");
+        assert_eq!(content[1]["type"], "redacted_thinking");
+        assert_eq!(content[1]["data"], "encrypted-thinking");
+        assert_eq!(content[2]["type"], "text");
+        assert_eq!(content[2]["text"], "final answer");
+    }
+
+    #[test]
+    fn non_stream_legacy_thinking_extraction_still_works_without_native_reasoning() {
+        let content = build_non_stream_content(
+            true,
+            "<thinking>legacy thinking</thinking>\n\nfinal answer".to_string(),
+            String::new(),
+            None,
+            Vec::new(),
+        );
+
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "legacy thinking");
+        assert_eq!(
+            content[0]["signature"],
+            crate::anthropic::stream::THINKING_SIGNATURE_PLACEHOLDER
+        );
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "final answer");
+    }
+
+    #[test]
+    fn non_stream_native_thinking_downgrades_to_text_when_thinking_disabled() {
+        let content = build_non_stream_content(
+            false,
+            String::new(),
+            "native thinking fallback".to_string(),
+            Some("ignored-signature".to_string()),
+            vec!["ignored-redacted".to_string()],
+        );
+
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "native thinking fallback");
     }
 
     #[test]

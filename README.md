@@ -1,736 +1,762 @@
 # kiro-rs
 
-一个用 Rust 编写的 Anthropic Claude API 兼容代理服务，将 Anthropic API 请求转换为 Kiro API 请求。
+`kiro-rs` 是一个用 Rust 编写的 Anthropic Messages API 兼容代理。它把
+`/v1/messages`、`/v1/models`、`/v1/messages/count_tokens` 等 Anthropic 风格请求转换为 Kiro / Amazon Q 后端请求，并提供一个可选的 Web Admin 面板来管理凭据、客户端 Key、用量、代理池、请求日志和在线更新。
 
----
+项目当前的核心目标是：让 Claude Code、Anthropic SDK 或其它兼容 Anthropic API 的客户端，通过统一的本地 / 自托管服务访问 Kiro 账号能力，同时在服务端集中处理多凭据、token 刷新、故障转移、用量统计和可观测性。
 
-<table>
-<tr>
-<td>
-<b>特别感谢</b>：<a href="https://co.yes.vg/register?ref=hank9999">YesCode</a> 为本项目提供了 AI API 额度赞助, YesCode 作为一家低调务实的 AI API 中转服务商 <br>
-长期以来提供稳定高可用的服务, 如您有意体验, 请点击链接注册体验 → <a href="https://co.yes.vg/register?ref=hank9999">立即访问</a>
-</td>
-</tr>
-</table>
+## 🔎 快速引导
 
----
-
-#### [LINUX DO 讨论帖](https://linux.do/t/topic/1571986)
-
-## 免责声明
-
-本项目仅供研究使用, Use at your own risk, 使用本项目所导致的任何后果由使用人承担, 与本项目无关。
-本项目与 AWS/KIRO/Anthropic/Claude 等官方无关, 本项目不代表官方立场。
-
-## 注意！
-
-因 TLS 默认从 native-tls 切换至 rustls，你可能需要专门安装证书后才能配置 HTTP 代理。可通过 `config.json` 的 `tlsBackend` 切回 `native-tls`。
-如果遇到请求报错, 尤其是无法刷新 token, 或者是直接返回 error request, 请尝试切换 tls 后端为 `native-tls`, 一般即可解决。
-
-**Write Failed/会话卡死**: 如果遇到持续的 Write File / Write Failed 并导致会话不可用，参考 Issue [#22](https://github.com/hank9999/kiro.rs/issues/22) 和 [#49](https://github.com/hank9999/kiro.rs/issues/49) 的说明与临时解决方案（通常与输出过长被截断有关，可尝试调低输出相关 token 上限）
-
-## 功能特性
-
-- **Anthropic API 兼容**: 完整支持 Anthropic Claude API 格式
-- **流式响应**: 支持 SSE (Server-Sent Events) 流式输出
-- **Token 自动刷新**: 自动管理和刷新 OAuth Token
-- **多凭据支持**: 支持配置多个凭据，按优先级自动故障转移
-- **负载均衡**: 支持 `priority`（按优先级）和 `balanced`（均衡分配）两种模式
-- **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
-- **凭据回写**: 多凭据格式下自动回写刷新后的 Token
-- **Thinking 模式**: 支持 Claude 的 extended thinking 功能
-- **工具调用**: 完整支持 function calling / tool use
-- **WebSearch**: 内置 WebSearch 工具转换逻辑
-- **多模型支持**: Sonnet / Opus / Haiku 全系列，**Opus 4.8 / 4.7 / 4.6、Sonnet 4.8 / 4.6 支持 1M 上下文**，其他默认 200K
-- **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
-- **客户端 Key 分发**（v0.4.0+）：在 Admin 面板生成多把 `csk_*` 客户端 Key 分发给下游用户/项目，每把 Key 独立启用/禁用与计数，泄露不影响其他用户
-- **用量统计与仪表盘**（v0.4.0+）：按请求记录 token 消耗（按日滚动 JSONL），仪表盘展示时间趋势、模型分布、上游凭据贡献
-- **多级 Region 配置**: 支持全局和凭据级别的 Auth Region / API Region 配置
-- **凭据级代理**: 支持为每个凭据单独配置 HTTP/SOCKS5 代理，优先级：凭据代理 > 全局代理 > 无代理
-
----
-
-- [开始](#开始)
-  - [1. 编译](#1-编译)
-  - [2. 最小配置](#2-最小配置)
-  - [3. 启动](#3-启动)
-  - [4. 验证](#4-验证)
-  - [Docker](#docker)
-    - [一、最小部署](#一最小部署)
-    - [二、首次启动获取密钥](#二首次启动获取密钥)
-    - [三、访问管理面板](#三访问管理面板)
-    - [四、定制配置](#四定制配置)
-    - [五、升级与回退](#五升级与回退)
-    - [六、备份](#六备份)
-    - [七、常见问题](#七常见问题)
-- [配置详解](#配置详解)
-  - [config.json](#configjson)
-  - [credentials.json](#credentialsjson)
-  - [Region 配置](#region-配置)
-  - [代理配置](#代理配置)
-  - [认证方式](#认证方式)
-  - [环境变量](#环境变量)
-- [API 端点](#api-端点)
-  - [标准端点 (/v1)](#标准端点-v1)
-  - [Claude Code 兼容端点 (/cc/v1)](#claude-code-兼容端点-ccv1)
-  - [Thinking 模式](#thinking-模式)
-  - [工具调用](#工具调用)
-- [模型映射](#模型映射)
-- [Admin（可选）](#admin可选)
-- [发布流程](#发布流程)
-- [注意事项](#注意事项)
-- [项目结构](#项目结构)
-- [技术栈](#技术栈)
+- [声明](#notice)
+- [功能](#features)
+- [快速开始](#quick-start)
+- [调用 API](#api-usage)
+- [API 路由](#api-routes)
+- [配置](#configuration)
+- [凭据](#credentials)
+- [模型](#models)
+- [Thinking、工具与 WebSearch](#thinking-tools-websearch)
+- [图片处理](#images)
+- [用量、缓存与日志](#usage-cache-logs)
+- [Admin UI](#admin-ui)
+- [代理和 Region](#proxy-region)
+- [负载均衡与故障转移](#load-balancing-failover)
+- [在线更新和发布](#updates-release)
+- [开发](#development)
+- [目录结构](#project-structure)
 - [License](#license)
-- [致谢](#致谢)
+- [社区支持](#community)
+- [致谢](#acknowledgements)
 
-## 开始
+<a id="notice"></a>
+## 📚 声明
 
-### 1. 编译
+本项目仅供研究和自用。使用本项目产生的任何后果由使用者自行承担。本项目与 AWS、Kiro、Amazon Q、Anthropic、Claude 等官方实体无关，不代表任何官方立场。
 
-> PS: 如果不想编辑可以直接前往 Release 下载二进制文件
+<a id="features"></a>
+## ✨ 功能
 
-> **前置步骤**：编译前需要先构建前端 Admin UI（用于嵌入到二进制中）：
-> ```bash
-> cd admin-ui && bun install && bun run build
-> ```
+- **Anthropic Messages API 兼容**：`/v1/messages`、`/v1/models`、`/v1/messages/count_tokens`。
+- **Claude Code 兼容端点**：`/cc/v1/messages`、`/cc/v1/messages/count_tokens`。
+- 流式和非流式响应：支持 Anthropic SSE 事件格式。
+- **多凭据管理**：OAuth、Builder ID、Social、Enterprise / IdC、Kiro API Key。
+- 自动 token 刷新：支持刷新后回写 `credentials.json`。
+- **多凭据调度**：`priority` 固定优先级和 `balanced` 均衡分配。
+- **故障转移**：凭据失败、额度用尽、账号级 429 风控冷却、token 失效强制刷新。
+- **profileArn 策略**：流式端点按账号类型注入真实 ARN 或 Builder ID 占位 ARN；用量类 / 头部类调用跳过占位 ARN。
+- **端点抽象**：按凭据选择 `ide` 或 `cli` endpoint。
+- **工具调用**：支持 `tool_use` / `tool_result` 配对、工具名缩短与反向映射。
+- **Thinking / Reasoning 兼容**：支持 `thinking.type=enabled` / `adaptive`、Claude Code 默认 thinking 请求、Kiro 原生 `reasoningContentEvent` 到 Anthropic thinking / signature / redacted thinking 事件的转换。
+- **WebSearch**：支持纯 `web_search` 请求和混合工具场景下的本地 agentic web_search loop。
+- **图像处理**：入站图片按环境变量自动缩放 / 重编码，降低 AWS Q 单字段大小限制导致的 400 风险。
+- **Prompt cache 计量**：模拟 Anthropic cache_control 的 `cache_creation` / `cache_read` token 统计。
+- **用量统计**：按客户端 Key、模型、凭据、日期聚合 input/output/cache token 和 credits。
+- **请求链路追踪**：SQLite `traces.db`，记录成功 / 失败请求、尝试链路和错误类型。
+- 客户端 Key 分发：Admin 面板生成 `csk_*` Key，支持独立启停和统计。
+- **Admin UI**：概览、凭据管理、客户端 Key、请求日志四个主视图。
+- 代理能力：全局代理、凭据级代理、代理池、健康检查、轮询分配。
+- **在线更新**：从 GitHub Release / Docker Hub 拉取新版本，支持镜像定时自动更新与手动回退。
+- **多平台发布**：GitHub Release 构建 Windows、Linux、macOS 和 Docker Hub 多架构镜像。
 
-```bash
-cargo build --release
-```
-
-### 2. 最小配置
-
-创建 `config.json`：
-
-```json
-{
-   "host": "127.0.0.1",
-   "port": 8990,
-   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
-   "region": "us-east-1"
-}
-```
-> PS: 如果你需要 Web 管理面板, 请注意配置 `adminApiKey`
-
-创建 `credentials.json`（从 Kiro IDE 等中获取凭证信息）：
-> PS: 可以前往 Web 管理面板配置跳过本步骤
-> 如果你对凭据地域有疑惑, 请查看 [Region 配置](#region-配置)
-
-Social 认证：
-```json
-{
-   "refreshToken": "你的刷新token",
-   "expiresAt": "2025-12-31T02:32:45.144Z",
-   "authMethod": "social"
-}
-```
-
-IdC 认证：
-```json
-{
-   "refreshToken": "你的刷新token",
-   "expiresAt": "2025-12-31T02:32:45.144Z",
-   "authMethod": "idc",
-   "clientId": "你的clientId",
-   "clientSecret": "你的clientSecret"
-}
-```
-
-### 3. 启动
-
-```bash
-./target/release/kiro-rs
-```
-
-或指定配置文件路径：
-
-```bash
-./target/release/kiro-rs -c /path/to/config.json --credentials /path/to/credentials.json
-```
-
-### 4. 验证
-
-```bash
-curl http://127.0.0.1:8990/v1/messages \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: sk-kiro-rs-qazWSXedcRFV123456" \
-  -d '{
-    "model": "claude-sonnet-4-20250514",
-    "max_tokens": 1024,
-    "stream": true,
-    "messages": [
-      {"role": "user", "content": "Hello, Claude!"}
-    ]
-  }'
-```
+<a id="quick-start"></a>
+## 🚀 快速开始
 
 ### Docker
 
-> 推荐生产部署方式。镜像已预编译多架构二进制（linux/amd64、linux/arm64），开箱即用，无需安装 Rust 工具链。
-
-#### 一、最小部署
-
-只需要 `docker-compose.yml` + 一个空的数据目录：
-
-```bash
-mkdir -p /opt/kiro-rs/data && cd /opt/kiro-rs
-curl -O https://raw.githubusercontent.com/ZyphrZero/kiro.rs/master/docker-compose.yml
-docker compose up -d
-```
-
-目录结构（首次启动后由容器自动生成 `config.json` / `credentials.json`）：
-
-```
-/opt/kiro-rs/
-├── docker-compose.yml
-└── data/                          # 持久化目录，挂载为容器内 /app/config
-    ├── config.json                # 自动生成，含随机 apiKey / adminApiKey
-    ├── credentials.json           # 自动生成的空数组 []，通过 Admin UI 添加
-    ├── client_api_keys.json       # 客户端 Key 分发（v0.4.0+，含明文 csk）
-    ├── usage_log.YYYY-MM-DD.jsonl # 按日滚动的请求用量日志（最多保留 31 天）
-    ├── kiro_balance_cache.json    # 上游凭据余额缓存
-    └── proxy_pool.json            # 代理池（如启用）
-```
-
-`docker-compose.yml` 默认包含 `kiro-rs` 服务：
-
-- **kiro-rs**：监听 `8990`，挂载 `./data/:/app/config/`，`restart: unless-stopped`
-
-#### 二、首次启动获取密钥
-
-容器首次启动会在日志里打印一次随机生成的密钥：
-
-```bash
-docker compose logs kiro-rs | grep -E "apiKey|adminApiKey"
-```
-
-输出形如：
-
-```
-apiKey      = sk-kiro-rs-3f8a9b2cQz...
-adminApiKey = sk-admin-x9KpRtVw...
-```
-
-- `apiKey` — 客户端调用 `/v1/messages` 时携带（`x-api-key` 或 `Authorization: Bearer`）
-- `adminApiKey` — 登录 `http://<host>:8990/admin` 管理界面用
-
-记下来后即可关闭日志窗口。也可以直接打开 `data/config.json` 查看或修改。
-
-#### 三、访问管理面板
-
-浏览器打开 `http://<服务器 IP>:8990/admin`，用 `adminApiKey` 登录。三个 Tab：
-
-- **概览** — Token 消耗趋势、按模型/凭据分布
-- **凭据管理** — 添加上游 Kiro 凭据（Social / IdC / API Key）
-- **客户端 Key** — 分发面向下游的 `csk_*` Key
-
-#### 四、定制配置
-
-**修改端口**：编辑 `docker-compose.yml` 把 `"8990:8990"` 改成 `"<host port>:8990"`，容器内端口保持 8990 不变。
-
-**自定义镜像 tag**：通过环境变量覆盖（默认 `zyphrzero/kiro-rs:latest`）：
-
-```bash
-KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.4.0 docker compose up -d
-```
-
-或写到 `.env` 文件：
-
-```
-KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.4.0
-```
-
-**关闭 Redis**：v0.4.0+ 已移除 prompt cache 与 Redis 依赖，无需额外配置。如果你之前在 `data/config.json` 里留有 `redisUrl` / `cacheDebugLogging` / `cacheMaxReadRatio` 字段，可以一并删除。
-
-**配置 HTTP 代理**：在 `data/config.json` 加 `proxyUrl`，或在 Admin UI 的代理池里管理。
-
-#### 五、升级与回退
-
-**通过 Admin UI 在线更新**（推荐）：右上角点云朵图标 → 「更新并重启」。下载 GitHub Releases 二进制，校验 SHA256，原子替换 `<exe>`，旧版本备份到 `<exe>.backup`，进程退出后由 `restart: unless-stopped` 接管重启。失败完全无副作用，断网也能用 `<exe>.backup` 一键回退。
-
-也可以在 Admin UI 的「设置」里启用 **无人值守自动更新**（每天指定时间检查并应用新版本）。
-
-**手动升级**（拉新镜像）：
-
-```bash
-docker compose pull && docker compose up -d
-```
-
-> 注意：手动 pull 升级与 Admin UI 在线更新使用的是不同的二进制路径——前者拉镜像里的二进制，后者下载 GitHub Releases 并写到容器卷。两种方式都安全，不会互相干扰，但建议固定使用其中一种以便追踪版本。
-
-#### 六、备份
-
-`data/` 目录是唯一的状态来源，定期备份即可：
-
-```bash
-tar -czf kiro-rs-backup-$(date +%F).tar.gz /opt/kiro-rs/data/
-```
-
-> ⚠️ 备份包含明文凭据（`credentials.json`）和明文客户端 Key（`client_api_keys.json`），请加密保存或限制访问权限。
-
-恢复时把备份解压回 `/opt/kiro-rs/data/` 后 `docker compose restart` 即可。
-
-#### 七、常见问题
-
-- **首次启动看不到日志中的密钥** — 改用 `docker compose logs --tail=200 kiro-rs`，或直接看 `data/config.json` 里的 `apiKey` / `adminApiKey` 字段
-- **想从 Docker Hub 之外的镜像源拉取** — 把 `docker-compose.yml` 里的 `image:` 改成你自己镜像源的地址（如 `ghcr.io/...`、阿里云镜像加速等）
-- **Admin UI 显示 "暂无数据"** — 仪表盘需要至少一次请求才会有数据，先用 curl 调一次 `/v1/messages` 即可看到趋势开始填充
-
-## 配置详解
-
-### config.json
-
-| 字段 | 类型 | 默认值 | 描述 |
-|------|------|--------|------|
-| `host` | string | `127.0.0.1` | 服务监听地址 |
-| `port` | number | `8080` | 服务监听端口 |
-| `apiKey` | string | - | 自定义 API Key（用于客户端认证，必配） |
-| `region` | string | `us-east-1` | AWS 区域 |
-| `authRegion` | string | - | Auth Region（用于 Token 刷新），未配置时回退到 region |
-| `apiRegion` | string | - | API Region（用于 API 请求），未配置时回退到 region |
-| `kiroVersion` | string | `0.9.2` | Kiro 版本号 |
-| `machineId` | string | - | 自定义机器码（64位十六进制），不定义则自动生成 |
-| `systemVersion` | string | 随机 | 系统版本标识 |
-| `nodeVersion` | string | `22.21.1` | Node.js 版本标识 |
-| `tlsBackend` | string | `rustls` | TLS 后端：`rustls` 或 `native-tls` |
-| `countTokensApiUrl` | string | - | 外部 count_tokens API 地址 |
-| `countTokensApiKey` | string | - | 外部 count_tokens API 密钥 |
-| `countTokensAuthType` | string | `x-api-key` | 外部 API 认证类型：`x-api-key` 或 `bearer` |
-| `proxyUrl` | string | - | HTTP/SOCKS5 代理地址 |
-| `proxyUsername` | string | - | 代理用户名 |
-| `proxyPassword` | string | - | 代理密码 |
-| `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
-| `updateAutoApply` | boolean | `false` | 是否启用无人值守自动更新；开启后每天到 `updateAutoApplyTime` 自动从 GitHub Releases 下载新版本二进制并重启 |
-| `updateAutoApplyTime` | string | `03:00` | 自动更新触发时间（本地时区，HH:MM 24 小时制） |
-| `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
-| `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
-| `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。可选值：`ide`（Kiro IDE）、`cli`（Amazon Q for CLI，适用于 `ksk_` 前缀的 API Key） |
-
-完整配置示例：
-
-```json
-{
-   "host": "127.0.0.1",
-   "port": 8990,
-   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
-   "region": "us-east-1",
-   "tlsBackend": "rustls",
-   "kiroVersion": "0.9.2",
-   "machineId": "64位十六进制机器码",
-   "systemVersion": "darwin#24.6.0",
-   "nodeVersion": "22.21.1",
-   "authRegion": "us-east-1",
-   "apiRegion": "us-east-1",
-   "countTokensApiUrl": "https://api.example.com/v1/messages/count_tokens",
-   "countTokensApiKey": "sk-your-count-tokens-api-key",
-   "countTokensAuthType": "x-api-key",
-   "proxyUrl": "http://127.0.0.1:7890",
-   "proxyUsername": "user",
-   "proxyPassword": "pass",
-   "adminApiKey": "sk-admin-your-secret-key",
-   "updateAutoApply": false,
-   "updateAutoApplyTime": "03:00",
-   "loadBalancingMode": "priority",
-   "extractThinking": true
-}
-```
-
-### credentials.json
-
-支持单对象格式（向后兼容）或数组格式（多凭据）。
-
-#### 字段说明
-
-| 字段             | 类型     | 描述                                          |
-|----------------|--------|---------------------------------------------|
-| `id`           | number | 凭据唯一 ID（可选，仅用于 Admin API 管理；手写文件可不填）        |
-| `accessToken`  | string | OAuth 访问令牌（可选，可自动刷新）                        |
-| `refreshToken` | string | OAuth 刷新令牌                                  |
-| `profileArn`   | string | AWS Profile ARN（可选，登录时返回）                   |
-| `expiresAt`    | string | Token 过期时间 (RFC3339)                        |
-| `authMethod`   | string | 认证方式：`social` 或 `idc`                       |
-| `clientId`     | string | IdC 登录的客户端 ID（IdC 认证必填）                     |
-| `clientSecret` | string | IdC 登录的客户端密钥（IdC 认证必填）                      |
-| `priority`     | number | 凭据优先级，数字越小越优先，默认为 0                         |
-| `region`       | string | 凭据级 Auth Region, 兼容字段                       |
-| `authRegion`   | string | 凭据级 Auth Region，用于 Token 刷新, 未配置时回退到 region |
-| `apiRegion`    | string | 凭据级 API Region，用于 API 请求                    |
-| `machineId`    | string | 凭据级机器码（64位十六进制）                             |
-| `email`        | string | 用户邮箱（可选，从 API 获取）                           |
-| `proxyUrl`     | string | 凭据级代理 URL（可选，特殊值 `direct` 表示不使用代理）       |
-| `proxyUsername`| string | 凭据级代理用户名（可选）                                |
-| `proxyPassword`| string | 凭据级代理密码（可选）                                 |
-| `endpoint`     | string | 凭据级端点名称（可选，未配置时使用 `config.defaultEndpoint`）。可选值：`ide`、`cli` |
-| `kiroApiKey`   | string | Kiro API Key（`ksk_` 前缀，仅 `authMethod: "api_key"` 时使用） |
-
-说明：
-- IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
-- 为兼容旧配置，`builder-id` / `iam` 仍可被识别，但会按 `idc` 处理
-- **`ksk_` 前缀的 API Key 凭据必须将 `endpoint` 设为 `cli`**（或将 `config.defaultEndpoint` 设为 `cli`），否则请求会因协议不匹配而失败
-
-#### 单凭据格式（旧格式，向后兼容）
-
-```json
-{
-   "accessToken": "请求token，一般有效期一小时，可选",
-   "refreshToken": "刷新token，一般有效期7-30天不等",
-   "profileArn": "arn:aws:codewhisperer:us-east-1:111112222233:profile/QWER1QAZSDFGH",
-   "expiresAt": "2025-12-31T02:32:45.144Z",
-   "authMethod": "social",
-   "clientId": "IdC 登录需要",
-   "clientSecret": "IdC 登录需要"
-}
-```
-
-#### 多凭据格式（支持故障转移和自动回写）
-
-```json
-[
-   {
-      "refreshToken": "第一个凭据的刷新token",
-      "expiresAt": "2025-12-31T02:32:45.144Z",
-      "authMethod": "social",
-      "priority": 0
-   },
-   {
-      "refreshToken": "第二个凭据的刷新token",
-      "expiresAt": "2025-12-31T02:32:45.144Z",
-      "authMethod": "idc",
-      "clientId": "xxxxxxxxx",
-      "clientSecret": "xxxxxxxxx",
-      "region": "us-east-2",
-      "priority": 1,
-      "proxyUrl": "socks5://proxy.example.com:1080",
-      "proxyUsername": "user",
-      "proxyPassword": "pass"
-   },
-   {
-      "refreshToken": "第三个凭据（显式不走代理）",
-      "expiresAt": "2025-12-31T02:32:45.144Z",
-      "authMethod": "social",
-      "priority": 2,
-      "proxyUrl": "direct"
-   }
-]
-```
-
-多凭据特性：
-- 按 `priority` 字段排序，数字越小优先级越高（默认为 0）
-- 单凭据最多重试 3 次，单请求最多重试 9 次
-- 自动故障转移到下一个可用凭据
-- 多凭据格式下 Token 刷新后自动回写到源文件
-
-### Region 配置
-
-支持多级 Region 配置，分别控制 Token 刷新和 API 请求使用的区域。
-
-**Auth Region**（Token 刷新）优先级：
-`凭据.authRegion` > `凭据.region` > `config.authRegion` > `config.region`
-
-**API Region**（API 请求）优先级：
-`凭据.apiRegion` > `config.apiRegion` > `config.region`
-
-### 代理配置
-
-支持全局代理和凭据级代理，凭据级代理会覆盖该凭据产生的所有出站连接（API 请求、Token 刷新、额度查询）。
-
-**代理优先级**：`凭据.proxyUrl` > `config.proxyUrl` > 无代理
-
-| 凭据 `proxyUrl` 值 | 行为 |
-|---|---|
-| 具体 URL（如 `http://proxy:8080`、`socks5://proxy:1080`） | 使用凭据指定的代理 |
-| `direct` | 显式不使用代理（即使全局配置了代理） |
-| 未配置（留空） | 回退到全局代理配置 |
-
-凭据级代理示例：
-
-```json
-[
-   {
-      "refreshToken": "凭据A：使用自己的代理",
-      "authMethod": "social",
-      "proxyUrl": "socks5://proxy-a.example.com:1080",
-      "proxyUsername": "user_a",
-      "proxyPassword": "pass_a"
-   },
-   {
-      "refreshToken": "凭据B：显式不走代理（直连）",
-      "authMethod": "social",
-      "proxyUrl": "direct"
-   },
-   {
-      "refreshToken": "凭据C：使用全局代理（或直连，取决于 config.json）",
-      "authMethod": "social"
-   }
-]
-```
-
-### 认证方式
-
-客户端请求本服务时，支持两种认证方式：
-
-1. **x-api-key Header**
-   ```
-   x-api-key: sk-your-api-key
-   ```
-
-2. **Authorization Bearer**
-   ```
-   Authorization: Bearer sk-your-api-key
-   ```
-
-### 环境变量
-
-可通过环境变量配置日志级别：
-
-```bash
-RUST_LOG=debug ./target/release/kiro-rs
-```
-
-## API 端点
-
-### 标准端点 (/v1)
-
-| 端点 | 方法 | 描述 |
-|------|------|------|
-| `/v1/models` | GET | 获取可用模型列表 |
-| `/v1/messages` | POST | 创建消息（对话） |
-| `/v1/messages/count_tokens` | POST | 估算 Token 数量 |
-
-### Claude Code 兼容端点 (/cc/v1)
-
-| 端点 | 方法 | 描述 |
-|------|------|------|
-| `/cc/v1/messages` | POST | 创建消息（缓冲模式，确保 `input_tokens` 准确） |
-| `/cc/v1/messages/count_tokens` | POST | 估算 Token 数量（与 `/v1` 相同） |
-
-> **`/cc/v1/messages` 与 `/v1/messages` 的区别**：
-> - `/v1/messages`：实时流式返回，`message_start` 中的 `input_tokens` 是估算值
-> - `/cc/v1/messages`：缓冲模式，等待上游流完成后，用从 `contextUsageEvent` 计算的准确 `input_tokens` 更正 `message_start`，然后一次性返回所有事件
-> - 等待期间会每 25 秒发送 `ping` 事件保活
-
-### Thinking 模式
-
-支持 Claude 的 extended thinking 功能：
-
-```json
-{
-  "model": "claude-sonnet-4-20250514",
-  "max_tokens": 16000,
-  "thinking": {
-    "type": "enabled",
-    "budget_tokens": 10000
-  },
-  "messages": [...]
-}
-```
-
-### 工具调用
-
-完整支持 Anthropic 的 tool use 功能：
-
-```json
-{
-  "model": "claude-sonnet-4-20250514",
-  "max_tokens": 1024,
-  "tools": [
-    {
-      "name": "get_weather",
-      "description": "获取指定城市的天气",
-      "input_schema": {
-        "type": "object",
-        "properties": {
-          "city": {"type": "string"}
-        },
-        "required": ["city"]
-      }
-    }
-  ],
-  "messages": [...]
-}
-```
-
-## 模型映射
-
-`map_model` 通过模型名中的关键词匹配（不区分大小写，支持 `4-7` 或 `4.7` 写法），转换为 Kiro 内部模型名：
-
-| Anthropic 模型（关键词） | Kiro 模型 | 上下文窗口 |
-|---|---|---|
-| `*sonnet*` 含 `4-8` / `4.8` | `claude-sonnet-4.8` | **1M** |
-| `*sonnet*` 含 `4-6` / `4.6` | `claude-sonnet-4.6` | **1M** |
-| `*sonnet*`（其他，默认） | `claude-sonnet-4.5` | 200K |
-| `*opus*` 含 `4-8` / `4.8` | `claude-opus-4.8` | **1M** |
-| `*opus*` 含 `4-7` / `4.7` | `claude-opus-4.7` | **1M** |
-| `*opus*` 含 `4-6` / `4.6` | `claude-opus-4.6` | **1M** |
-| `*opus*` 含 `4-5` / `4.5` | `claude-opus-4.5` | 200K |
-| `*haiku*` | `claude-haiku-4.5` | 200K |
-
-> **1M 上下文支持**：Kiro 于 2026-03-24 将 Sonnet 4.6 / Opus 4.6 升级到 1M 上下文窗口，Opus 4.7 / 4.8 与 Sonnet 4.8 同样为 1M。其余模型仍为 200K。本服务在收到上述模型请求时会按 1M 计算 `contextUsageEvent` 的实际 `input_tokens`，前端发起 `max_tokens` 大请求时不需要额外配置。
->
-> 模型名带 `-thinking` 后缀（如 `claude-opus-4-8-thinking`）会自动覆写 `thinking` 配置：Opus 4.6 走 `adaptive` 模式，其他走 `enabled` 模式，`budget_tokens` 固定 20000。Opus 4.6 同时强制 `output_config.effort = "high"`。
-
-可用模型完整列表通过 `GET /v1/models` 查询。
-
-## Admin（可选）
-
-当 `config.json` 配置了非空 `adminApiKey` 时，会启用：
-
-- **凭据管理 API**
-  - `GET /api/admin/credentials` - 获取所有凭据状态
-  - `POST /api/admin/credentials` - 添加新凭据
-  - `DELETE /api/admin/credentials/:id` - 删除凭据
-  - `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
-  - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
-  - `POST /api/admin/credentials/:id/reset` - 重置失败计数
-  - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
-
-- **客户端 Key 分发 API**（v0.4.0+）
-  - `GET /api/admin/client-keys` - 列出所有客户端 Key（脱敏展示）
-  - `POST /api/admin/client-keys` - 创建新 Key（响应里返回明文，仅此一次）
-  - `PUT /api/admin/client-keys/:id` - 修改名称 / 描述
-  - `DELETE /api/admin/client-keys/:id` - 删除 Key
-  - `POST /api/admin/client-keys/:id/disabled` - 启用/禁用
-  - `POST /api/admin/client-keys/:id/reset-stats` - 重置累计计数
-
-- **用量统计 API**（v0.4.0+）
-  - `GET /api/admin/stats/overview` - 今日 / 最近 7 天概览
-  - `GET /api/admin/stats/timeseries?range=24h|7d|30d` - 时序点
-  - `GET /api/admin/stats/by-model?range=...` - 按模型分布
-  - `GET /api/admin/stats/by-credential?range=...` - 按上游凭据分布
-
-- **Admin UI**（v0.4.0+ 升级为三 Tab SPA）
-  - `GET /admin` - 概览 / 凭据管理 / 客户端 Key
-  - 顶栏统一工具：负载均衡切换、刷新、在线更新、Key 管理（修改 Admin Key 与业务 API Key）
-
-### 在线更新
-
-Admin UI 顶部的「镜像在线更新」入口支持：
-
-- 一键从 GitHub Releases 下载新版本二进制（带 SHA256 校验），原子替换当前 `kiro-rs`，旧版本备份到 `<exe>.backup`
-- 替换完成后进程主动退出，由 `docker-compose.yml` 里的 `restart: unless-stopped` 接管重启，新二进制随之生效
-- 失败完全无副作用：网络断、校验不通过都不会动到正在运行的旧 `kiro-rs`
-- 「回退到上一版本」从 `<exe>.backup` 恢复并重启进程，断网也能用
-- 可开启「无人值守自动更新」：每天到指定时间检查并应用新版本
-- 自动检查 Docker Hub tag 与 GitHub Releases，发现新版本时在工具栏图标上显示红点提醒
-
-容器部署只需要把 `data/` 目录挂进容器，不再需要 docker socket 或 compose 文件透传：
+推荐生产部署使用 Docker。仓库提供的 `docker-compose.yml` 默认使用 Docker Hub 镜像：
 
 ```yaml
+image: ${KIRO_RS_IMAGE:-zyphrzero/kiro-rs:latest}
+ports:
+  - "8990:8990"
 volumes:
   - ./data/:/app/config/
 ```
 
-镜像和版本号都从 Docker Hub 取（`hub.docker.com/r/<owner>/kiro-rs`），项目 GitHub Actions 在每次发布时会自动推送到 Docker Hub 并发布对应平台二进制到 GitHub Releases。
+部署：
 
-## 发布流程
-
-正式发布使用 `v*` git tag 触发 GitHub Actions 的 **Release** workflow：
-
-1. 修改 `Cargo.toml` 中的 `package.version`，例如 `0.1.0`。
-2. 合并到 `master` 后，创建并推送同版本 tag，例如 `v0.1.0`。
-
-也可以在 GitHub Actions 页面手动运行 `Release`，输入同一个版本号（可写 `0.1.0` 或 `v0.1.0`）。
-
-该 workflow 会自动完成：
-
-- 校验 tag/input 版本和 `Cargo.toml` 一致，避免 tag、二进制和镜像版本错位
-- 构建 Windows、Linux、macOS 多平台二进制并打包
-- 发布 Docker Hub 多架构镜像：
-  - `zyphrzero/kiro-rs:<version>`
-  - `zyphrzero/kiro-rs:latest`
-- 创建 GitHub Release，并上传二进制包和 `SHA256SUMS.txt`
-
-`Build Artifacts` 和 `Build and Push Docker Hub Images` workflow 仍会在 `master` push 上生成 beta 构建，也可以手动输入版本号运行；正式发布入口以 `Release` workflow 为准，避免重复构建和重复推送镜像。`master` 的 beta 镜像只更新 `beta` 标签，不会覆盖 `latest`。
-
-> 第一次切到 Docker Hub 发布前，先在仓库 Settings → Secrets and variables → Actions 添加 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN`（Docker Hub Access Token）。
-
-## 注意事项
-
-1. **凭证安全**: 请妥善保管 `credentials.json` 文件，不要提交到版本控制
-2. **Token 刷新**: 服务会自动刷新过期的 Token，无需手动干预
-3. **WebSearch 工具**: 当 `tools` 列表仅包含一个 `web_search` 工具时，会走内置 WebSearch 转换逻辑
-
-## 项目结构
-
+```bash
+mkdir -p /opt/kiro-rs/data
+cd /opt/kiro-rs
+curl -O https://raw.githubusercontent.com/ZyphrZero/kiro.rs/master/docker-compose.yml
+docker compose up -d
 ```
-kiro-rs/
+
+首次启动时，程序会在挂载目录中自动生成：
+
+```text
+data/
+├── config.json
+└── credentials.json
+```
+
+`config.json` 会包含随机生成的 `apiKey` 和 `adminApiKey`。查看日志：
+
+```bash
+docker compose logs --tail=200 kiro-rs
+```
+
+也可以直接打开 `data/config.json` 查看：
+
+```json
+{
+  "host": "0.0.0.0",
+  "port": 8990,
+  "apiKey": "sk-kiro-rs-...",
+  "adminApiKey": "sk-admin-...",
+  "region": "us-east-1",
+  "tlsBackend": "rustls",
+  "defaultEndpoint": "ide"
+}
+```
+
+访问：
+
+- API: `http://<host>:8990/v1/messages`
+- Admin UI: `http://<host>:8990/admin`
+
+指定镜像版本：
+
+```bash
+KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.6.3 docker compose up -d
+```
+
+### 下载二进制
+
+正式版本会在 GitHub Release 中发布以下平台产物：
+
+- Windows x64
+- Linux x64 / arm64
+- Linux musl x64 / arm64
+- macOS x64 / arm64
+
+下载后把二进制放到工作目录，首次启动会自动生成 `config.json` 和 `credentials.json`。
+
+```bash
+./kiro-rs
+```
+
+Windows:
+
+```powershell
+.\kiro-rs.exe
+```
+
+指定配置文件：
+
+```bash
+./kiro-rs --config /path/to/config.json --credentials /path/to/credentials.json
+```
+
+### 从源码构建
+
+前端 Admin UI 会通过 `rust-embed` 嵌入到最终二进制。构建后端前先构建前端：
+
+```bash
+cd admin-ui
+bun install
+bun run build
+cd ..
+cargo build --release
+```
+
+测试：
+
+```bash
+cargo test
+```
+
+<a id="api-usage"></a>
+## 调用 API
+
+`/v1` 路由支持 `x-api-key` 和 `Authorization: Bearer` 两种鉴权方式。Key 可以是主 `apiKey`，也可以是 Admin 面板生成的 `csk_*` 客户端 Key。
+
+```bash
+curl http://127.0.0.1:8990/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: sk-kiro-rs-..." \
+  -d '{
+    "model": "claude-sonnet-4-5-20250929",
+    "max_tokens": 1024,
+    "stream": true,
+    "messages": [
+      { "role": "user", "content": "Hello" }
+    ]
+  }'
+```
+
+Claude Code 兼容端点：
+
+```bash
+curl http://127.0.0.1:8990/cc/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-kiro-rs-..." \
+  -d '{
+    "model": "claude-sonnet-4-8",
+    "max_tokens": 1024,
+    "stream": true,
+    "messages": [
+      { "role": "user", "content": "Hello from Claude Code style endpoint" }
+    ]
+  }'
+```
+
+列出模型：
+
+```bash
+curl http://127.0.0.1:8990/v1/models \
+  -H "Authorization: Bearer sk-kiro-rs-..."
+```
+
+估算 token：
+
+```bash
+curl http://127.0.0.1:8990/v1/messages/count_tokens \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: sk-kiro-rs-..." \
+  -d '{
+    "model": "claude-sonnet-4-5-20250929",
+    "messages": [
+      { "role": "user", "content": "Count this." }
+    ]
+  }'
+```
+
+<a id="api-routes"></a>
+## API 路由
+
+### Anthropic 兼容
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/v1/models` | 返回本服务声明支持的 Anthropic 模型列表 |
+| `POST` | `/v1/messages` | Anthropic Messages API 兼容入口 |
+| `POST` | `/v1/messages/count_tokens` | Anthropic count_tokens 兼容入口 |
+| `POST` | `/cc/v1/messages` | Claude Code 兼容入口，流式事件顺序针对 Claude Code 调整 |
+| `POST` | `/cc/v1/messages/count_tokens` | Claude Code 兼容 count_tokens |
+
+### Admin
+
+启用 `adminApiKey` 后会挂载：
+
+| 路径 | 说明 |
+|---|---|
+| `/admin` | 嵌入式 Web 管理界面 |
+| `/api/admin/credentials` | 凭据列表、新增、编辑、删除 |
+| `/api/admin/credentials/{id}/balance` | 查询单个凭据订阅 / 用量 |
+| `/api/admin/credentials/{id}/models` | 查询该凭据上游实际可用模型 |
+| `/api/admin/client-keys` | 客户端 Key 管理 |
+| `/api/admin/stats/*` | 用量统计 |
+| `/api/admin/traces` | 请求链路追踪查询 |
+| `/api/admin/proxy-pool` | 代理池 |
+| `/api/admin/config/*` | 运行时配置 |
+| `/api/admin/auth/*` | Social / IdC 登录流程 |
+| `/api/admin/system/update/*` | 在线更新、回退、版本检查 |
+
+Admin API 鉴权同样支持：
+
+- `x-api-key: <adminApiKey>`
+- `Authorization: Bearer <adminApiKey>`
+
+<a id="configuration"></a>
+## ⚙️ 配置
+
+默认配置文件名是 `config.json`。首次启动如果文件不存在，会自动生成最小配置。
+
+### 最小配置
+
+```json
+{
+  "host": "0.0.0.0",
+  "port": 8990,
+  "apiKey": "sk-kiro-rs-change-me",
+  "adminApiKey": "sk-admin-change-me",
+  "region": "us-east-1",
+  "tlsBackend": "rustls",
+  "defaultEndpoint": "ide"
+}
+```
+
+### 常用字段
+
+| 字段 | 默认值 | 说明 |
+|---|---:|---|
+| `host` | `127.0.0.1` | 监听地址。自动生成配置时为 `0.0.0.0` |
+| `port` | `8080` | 监听端口。自动生成配置时为 `8990` |
+| `apiKey` | 无 | 主 API Key，调用 `/v1` 和 `/cc/v1` 必填 |
+| `adminApiKey` | 无 | 设置后启用 `/admin` 和 `/api/admin` |
+| `region` | `us-east-1` | 全局默认 Region |
+| `authRegion` | 无 | token 刷新用 Region，未配置时回退 `region` |
+| `apiRegion` | 无 | Kiro API 请求用 Region，未配置时回退 `region` |
+| `defaultEndpoint` | `ide` | 凭据未指定 endpoint 时使用的端点 |
+| `tlsBackend` | `rustls` | `rustls` 或 `native-tls` |
+| `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
+| `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
+| `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
+| `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
+| `accountThrottleCooldownSecs` | `1800` | 账号级风控冷却秒数 |
+| `extractThinking` | `true` | 非流式响应是否把旧 `<thinking>` 文本提取成 thinking block |
+| `traceEnabled` | `true` | 是否写入 `traces.db` |
+| `traceRetentionDays` | `7` | trace 保留天数 |
+| `usageLogRetentionDays` | `31` | `usage_log.*.jsonl` 保留天数 |
+| `countTokensApiUrl` | 无 | 外部 count_tokens API 地址 |
+| `countTokensApiKey` | 无 | 外部 count_tokens API Key |
+| `countTokensAuthType` | `x-api-key` | `x-api-key` 或 `bearer` |
+| `githubToken` | 无 | 在线更新访问 GitHub API 时使用，降低 rate limit 风险 |
+| `updateAutoApply` | `false` | 是否每天自动检查并应用新版本 |
+| `updateAutoApplyTime` | `03:00` | 自动更新时间，本地时区 `HH:MM` |
+
+<a id="credentials"></a>
+## 🔐 凭据
+
+默认凭据文件名是 `credentials.json`。推荐通过 Admin UI 添加、登录和重登凭据；直接编辑文件时建议使用数组格式。
+
+```json
+[
+  {
+    "id": 1,
+    "refreshToken": "xxx",
+    "expiresAt": "2026-12-31T00:00:00Z",
+    "authMethod": "idc",
+    "provider": "BuilderId",
+    "clientId": "xxx",
+    "clientSecret": "xxx",
+    "priority": 0
+  }
+]
+```
+
+### 支持的凭据类型
+
+#### Builder ID / IdC
+
+```json
+{
+  "refreshToken": "xxx",
+  "expiresAt": "2026-12-31T00:00:00Z",
+  "authMethod": "idc",
+  "provider": "BuilderId",
+  "clientId": "xxx",
+  "clientSecret": "xxx"
+}
+```
+
+#### Enterprise IAM Identity Center
+
+```json
+{
+  "refreshToken": "xxx",
+  "expiresAt": "2026-12-31T00:00:00Z",
+  "authMethod": "idc",
+  "provider": "Enterprise",
+  "startUrl": "https://example.awsapps.com/start",
+  "region": "us-east-1",
+  "clientId": "xxx",
+  "clientSecret": "xxx"
+}
+```
+
+Enterprise / IdC 账号在流式调用前会按需调用 `ListAvailableProfiles` 解析真实 `profileArn`，成功后写回凭据。纯 Builder ID/free 账号没有 Enterprise profile 时，会回退到官方 IDE 使用的 Builder ID 占位 ARN，以避免流式端点缺少 `profileArn` 返回 400。
+
+#### Social 登录
+
+```json
+{
+  "refreshToken": "xxx",
+  "expiresAt": "2026-12-31T00:00:00Z",
+  "authMethod": "social",
+  "provider": "Github"
+}
+```
+
+`provider` 可为 `Github` 或 `Google`。Social 登录会使用固定 Social profile ARN。
+
+#### Kiro API Key
+
+```json
+{
+  "kiroApiKey": "ksk_xxx",
+  "authMethod": "api_key",
+  "endpoint": "cli"
+}
+```
+
+也可以通过环境变量临时注入最高优先级 API Key 凭据：
+
+```bash
+KIRO_API_KEY=ksk_xxx ./kiro-rs
+```
+
+### 凭据字段
+
+| 字段 | 说明 |
+|---|---|
+| `id` | 凭据 ID，Admin 管理时自动分配 |
+| `refreshToken` / `accessToken` | OAuth token |
+| `expiresAt` | RFC3339 过期时间 |
+| `authMethod` | `idc`、`social`、`api_key`。旧值 `builder-id`、`iam` 会规范化为 `idc` |
+| `provider` | `BuilderId`、`Enterprise`、`Github`、`Google`、`IAM_SSO` 等 |
+| `clientId` / `clientSecret` | IdC 刷新 token 所需 OIDC client |
+| `startUrl` | Enterprise IAM Identity Center Start URL |
+| `profileArn` | 真实 profile ARN 或已知固定 ARN；通常由程序维护 |
+| `priority` | 数字越小优先级越高 |
+| `region` | 凭据级 Region，兼容旧配置 |
+| `authRegion` | 凭据级 token 刷新 Region |
+| `apiRegion` | 凭据级 API 请求 Region |
+| `machineId` | 凭据级 machine id，未填时自动派生 |
+| `email` / `subscriptionTitle` | Admin 查询后回填的展示信息 |
+| `proxyUrl` | 凭据级代理；填 `direct` 表示绕过全局代理 |
+| `proxyUsername` / `proxyPassword` | 凭据级代理认证 |
+| `disabled` | 是否禁用 |
+| `kiroApiKey` | `ksk_*` Kiro API Key |
+| `endpoint` | `ide` 或 `cli`，未填使用 `config.defaultEndpoint` |
+
+<a id="models"></a>
+## 模型
+
+`GET /v1/models` 返回本服务声明支持的模型 ID。真实可用性仍取决于上游账号订阅；Admin 的“凭据模型”会查询该凭据的上游真实可用模型列表。
+
+当前静态列表包含：
+
+- `claude-opus-4-8` / `claude-opus-4-8-thinking`
+- `claude-sonnet-4-8` / `claude-sonnet-4-8-thinking`
+- `claude-opus-4-7` / `claude-opus-4-7-thinking`
+- `claude-opus-4-6` / `claude-opus-4-6-thinking`
+- `claude-sonnet-4-6` / `claude-sonnet-4-6-thinking`
+- `claude-opus-4-5-20251101` / `claude-opus-4-5-20251101-thinking`
+- `claude-sonnet-4-5-20250929` / `claude-sonnet-4-5-20250929-thinking`
+- `claude-haiku-4-5-20251001` / `claude-haiku-4-5-20251001-thinking`
+
+模型映射按关键词归一化到 Kiro 内部模型 ID：
+
+| 请求模型关键词 | 上游模型 |
+|---|---|
+| `sonnet` + `4-8` / `4.8` | `claude-sonnet-4.8` |
+| `sonnet` + `4-6` / `4.6` | `claude-sonnet-4.6` |
+| `sonnet` + `4-5` / `4.5` | `claude-sonnet-4.5` |
+| `opus` + `4-8` / `4.8` | `claude-opus-4.8` |
+| `opus` + `4-7` / `4.7` | `claude-opus-4.7` |
+| `opus` + `4-6` / `4.6` | `claude-opus-4.6` |
+| `opus` + `4-5` / `4.5` | `claude-opus-4.5` |
+| 任意 `haiku` | `claude-haiku-4.5` |
+
+没有命中上述规则的模型会作为不支持模型处理。
+
+上下文窗口估算：
+
+- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`：`1_000_000`
+- 其它模型：`200_000`
+
+<a id="thinking-tools-websearch"></a>
+## Thinking、工具与 WebSearch
+
+### Thinking
+
+客户端可以显式发送 Anthropic `thinking` 字段，也可以直接使用带 `-thinking` 后缀的模型名。Claude Code 当前也可能在普通模型名下默认发送 `thinking.type=enabled`；服务端会按请求体实际 thinking 配置处理，不依赖模型名是否带后缀。
+
+普通 thinking：
+
+```json
+{
+  "model": "claude-sonnet-4-8-thinking",
+  "max_tokens": 4096,
+  "thinking": {
+    "type": "enabled",
+    "budget_tokens": 20000
+  },
+  "messages": [
+    { "role": "user", "content": "推理一下这个问题" }
+  ]
+}
+```
+
+`budget_tokens` 会限制在 `24576` 以内。
+
+模型名带 `-thinking` 后缀时会自动覆写 thinking 配置：
+
+- Opus 4.6：`thinking.type=adaptive`，并默认设置 `output_config.effort=high`。
+- 其它 thinking 模型：`thinking.type=enabled`，`budget_tokens=20000`。
+
+Adaptive thinking：
+
+```json
+{
+  "model": "claude-opus-4-6-thinking",
+  "max_tokens": 4096,
+  "thinking": {
+    "type": "adaptive"
+  },
+  "output_config": {
+    "effort": "high"
+  },
+  "messages": [
+    { "role": "user", "content": "给出完整分析" }
+  ]
+}
+```
+
+`additionalModelRequestFields.output_config` 是 Kiro 上游的窄兼容字段。当前只会在已知可接受该字段的 Opus 4.6 adaptive thinking 路径上传递；Sonnet 4.5 / 4.8、Opus 4.6 非 adaptive thinking 等路径会跳过该字段，避免上游返回 `additionalModelRequestFields is not supported for this model`。
+
+Kiro 上游可能返回原生 `reasoningContentEvent`。`kiro-rs` 会把它转换为 Anthropic 兼容内容：
+
+- `text` → 流式 `thinking_delta`，非流式 `thinking` block。
+- `signature` → 流式 `signature_delta`，非流式 `thinking.signature`。
+- `redactedContent` → `redacted_thinking` block。
+- 如果当前请求没有启用 thinking，明文 reasoning 会降级为普通 text；签名和 redacted 内容不会输出。
+
+非流式响应优先使用原生 reasoning 事件；只有没有原生 reasoning 时，才回退到旧的 `<thinking>...</thinking>` 文本提取路径。
+
+### Tool Use
+
+服务端会把 Anthropic tools 转成 Kiro 工具定义，并处理以下兼容逻辑：
+
+- 长工具名会被缩短，并在响应流中恢复原始名称。
+- 孤立的 `tool_use` / `tool_result` 会被过滤或修复，避免上游因消息配对错误返回不可恢复错误。
+- tool_result 中的图片会提升到 Kiro 顶层图片字段，并走同一套图片缩放逻辑。
+
+### WebSearch
+
+支持 Anthropic web_search tool：
+
+```json
+{
+  "model": "claude-sonnet-4-8",
+  "max_tokens": 2048,
+  "stream": true,
+  "tools": [
+    {
+      "type": "web_search_20250305",
+      "name": "web_search",
+      "max_uses": 5
+    }
+  ],
+  "messages": [
+    { "role": "user", "content": "搜索今天的相关信息" }
+  ]
+}
+```
+
+纯 web_search 请求会直接走上游 MCP 搜索接口。混合工具场景下，如果上游返回只包含 `web_search` 的工具调用，`kiro-rs` 会内部调用同一套 MCP 搜索接口，把结果作为 tool_result 喂回上游，直到上游停止搜索或达到轮数限制；其它工具调用会原样返回给客户端。
+
+<a id="images"></a>
+## 图片处理
+
+入站图片会在本地 CPU 上按需压缩，默认策略：
+
+- 长边上限：`1568px`
+- base64 字段大小上限：`400000`
+- JPEG 质量：`85`
+- PNG / JPEG / WebP 大图会重编码为 JPEG
+- GIF 保留原格式，避免破坏动画
+- 解码失败时保留原图并记录 warning，不会让整个请求失败
+
+环境变量：
+
+| 变量 | 默认值 | 说明 |
+|---|---:|---|
+| `KIRO_RS_IMAGE_RESIZE` | `1` | `0`、`false`、`no`、`off` 可关闭 |
+| `KIRO_RS_IMAGE_MAX_LONG_SIDE` | `1568` | 长边像素上限 |
+| `KIRO_RS_IMAGE_MAX_BYTES` | `400000` | base64 字段大小阈值 |
+| `KIRO_RS_IMAGE_JPEG_QUALITY` | `85` | JPEG 输出质量 |
+
+<a id="usage-cache-logs"></a>
+## 用量、缓存与日志
+
+运行数据默认落在 `credentials.json` 所在目录。Docker 部署时就是 `./data/`。
+
+```text
+data/
+├── config.json
+├── credentials.json
+├── client_api_keys.json
+├── kiro_stats.json
+├── kiro_balance_cache.json
+├── proxy_pool.json
+├── cache_metering.json
+├── traces.db
+└── usage_log.YYYY-MM-DD.jsonl
+```
+
+说明：
+
+- `client_api_keys.json`：Admin 生成的 `csk_*` 客户端 Key，明文存储，用于鉴权。
+- `kiro_stats.json`：凭据成功 / 失败 / 额度 / 冷却等统计。
+- `kiro_balance_cache.json`：凭据订阅、额度、邮箱等缓存。
+- `proxy_pool.json`：代理池与健康状态。
+- `cache_metering.json`：prompt cache 计量缓存，定期落盘。
+- `traces.db`：SQLite 请求链路追踪数据库，WAL 模式。
+- `usage_log.*.jsonl`：按日滚动请求用量日志。
+
+`CacheMeter` 会基于 `cache_control` 和会话信息模拟 Anthropic prompt cache 口径，输出互斥的：
+
+- `input_tokens`
+- `cache_creation_input_tokens`
+- `cache_read_input_tokens`
+- `output_tokens`
+
+<a id="admin-ui"></a>
+## 🖥️ Admin UI
+
+启用 `adminApiKey` 后访问 `/admin`。当前页面：
+
+- 概览：整体请求量、token、模型分布、凭据贡献。
+- 凭据管理：添加、登录、重登、删除、禁用、优先级、余额、模型列表、超额开关、代理绑定。
+- 客户端 Key：创建、编辑、禁用、删除、重置统计。
+- 请求日志：查询 `traces.db`，查看失败原因、状态码、凭据尝试链路和 token 用量。
+
+Admin 还提供：
+
+- Social 登录和 IdC / Enterprise 登录流程。
+- 全局代理设置和代理池健康检查。
+- 负载均衡模式配置。
+- 账号级风控故障转移配置。
+- trace / usage log 保留策略。
+- 在线更新、自动更新和回退。
+
+<a id="proxy-region"></a>
+## 代理和 Region
+
+### Region 优先级
+
+Token 刷新：
+
+```text
+credential.authRegion -> credential.region -> config.authRegion -> config.region
+```
+
+API 请求：
+
+```text
+credential.apiRegion -> config.apiRegion -> config.region
+```
+
+部分 REST / 管理类上游接口只在 `us-east-1` 和 `eu-central-1` 提供服务，代码会按账号区域选择候选端点并在必要时回退。
+
+### 代理优先级
+
+```text
+credential.proxyUrl -> config.proxyUrl -> direct
+```
+
+凭据级 `proxyUrl` 填 `direct` 表示即使配置了全局代理也直连。
+
+支持：
+
+- `http://host:port`
+- `https://host:port`
+- `socks5://host:port`
+
+如果 `rustls` 环境下代理或证书行为异常，可以在 `config.json` 中切到：
+
+```json
+{
+  "tlsBackend": "native-tls"
+}
+```
+
+<a id="load-balancing-failover"></a>
+## 负载均衡与故障转移
+
+`loadBalancingMode` 支持：
+
+- `priority`：优先使用 priority 数字最小的可用凭据。
+- `balanced`：在可用凭据之间均衡分配。
+
+故障处理：
+
+- 单凭据连续 API 失败会增加失败计数，达到阈值后跳过。
+- 402 / quota exhausted 会禁用该凭据并切换。
+- 401 / 403 中识别到 bearer token 失效时，会对该凭据强制刷新一次 token 后重试。
+- 429 + suspicious activity 可触发账号级冷却并切换凭据。
+- 400 客户端请求错误不会切换凭据。
+- 网关超时和部分不可恢复错误会快速失败，避免一次请求内无限放大重试。
+
+<a id="updates-release"></a>
+## 在线更新和发布
+
+发布 tag `vX.Y.Z` 会触发 Release workflow：
+
+- 校验 `Cargo.toml` 版本和 tag 一致。
+- 构建 Admin UI。
+- 构建多平台二进制。
+- 构建并推送 Docker Hub 多架构镜像。
+- 创建 GitHub Release。
+
+Docker 镜像：
+
+- `zyphrzero/kiro-rs:<version>`
+- `zyphrzero/kiro-rs:latest`
+- `zyphrzero/kiro-rs:beta`（master beta 构建）
+
+容器内在线更新会下载对应平台二进制并替换当前可执行文件；替换后进程退出，由 Docker `restart: unless-stopped` 拉起新进程。回退依赖本地 `<exe>.backup`。
+
+<a id="development"></a>
+## 开发
+
+常用命令：
+
+```bash
+# 后端测试
+cargo test
+
+# 前端构建
+cd admin-ui && bun run build
+
+# 后端 release 构建
+cargo build --release
+
+# 开启 debug 日志
+RUST_LOG=debug ./target/release/kiro-rs
+```
+
+发布前建议：
+
+```bash
+cargo test
+cd admin-ui && bun run build
+git diff --check
+```
+
+<a id="project-structure"></a>
+## 目录结构
+
+```text
+.
 ├── src/
-│   ├── main.rs                 # 程序入口
-│   ├── http_client.rs          # HTTP 客户端构建
-│   ├── token.rs                # Token 计算模块
-│   ├── debug.rs                # 调试工具
-│   ├── test.rs                 # 测试
-│   ├── model/                  # 配置和参数模型
-│   │   ├── config.rs           # 应用配置
-│   │   └── arg.rs              # 命令行参数
-│   ├── anthropic/              # Anthropic API 兼容层
-│   │   ├── router.rs           # 路由配置
-│   │   ├── handlers.rs         # 请求处理器
-│   │   ├── middleware.rs       # 认证中间件
-│   │   ├── types.rs            # 类型定义
-│   │   ├── converter.rs        # 协议转换器
-│   │   ├── stream.rs           # 流式响应处理
-│   │   └── websearch.rs        # WebSearch 工具处理
-│   ├── kiro/                   # Kiro API 客户端
-│   │   ├── provider.rs         # API 提供者
-│   │   ├── token_manager.rs    # Token 管理
-│   │   ├── machine_id.rs       # 设备指纹生成
-│   │   ├── model/              # 数据模型
-│   │   │   ├── credentials.rs  # OAuth 凭证
-│   │   │   ├── events/         # 响应事件类型
-│   │   │   ├── requests/       # 请求类型
-│   │   │   ├── common/         # 共享类型
-│   │   │   ├── token_refresh.rs # Token 刷新模型
-│   │   │   └── usage_limits.rs # 使用额度模型
-│   │   └── parser/             # AWS Event Stream 解析器
-│   │       ├── decoder.rs      # 流式解码器
-│   │       ├── frame.rs        # 帧解析
-│   │       ├── header.rs       # 头部解析
-│   │       ├── error.rs        # 错误类型
-│   │       └── crc.rs          # CRC 校验
-│   ├── admin/                  # Admin API 模块
-│   │   ├── router.rs           # 路由配置
-│   │   ├── handlers.rs         # 请求处理器
-│   │   ├── service.rs          # 业务逻辑服务
-│   │   ├── types.rs            # 类型定义
-│   │   ├── middleware.rs       # 认证中间件
-│   │   └── error.rs            # 错误处理
-│   ├── admin_ui/               # Admin UI 静态文件嵌入
-│   │   └── router.rs           # 静态文件路由
-│   └── common/                 # 公共模块
-│       └── auth.rs             # 认证工具函数
-├── admin-ui/                   # Admin UI 前端工程（构建产物会嵌入二进制）
-├── tools/                      # 辅助工具
-├── Cargo.toml                  # 项目配置
-├── config.example.json         # 配置示例
-├── docker-compose.yml          # Docker Compose 配置
-└── Dockerfile                  # Docker 构建文件
+│   ├── anthropic/      # Anthropic API 兼容层
+│   ├── kiro/           # Kiro / Amazon Q 上游、token、endpoint、event-stream
+│   ├── admin/          # Admin API、用量、trace、代理池、在线更新
+│   ├── admin_ui/       # 嵌入式 Admin UI 静态资源路由
+│   ├── model/          # CLI 参数和 config.json 模型
+│   ├── common/         # 通用鉴权工具
+│   ├── image_resize.rs # 图片缩放与 token 估算
+│   ├── token.rs        # count_tokens 估算和远程 count_tokens 调用
+│   └── main.rs         # 入口
+├── admin-ui/           # React Admin UI
+├── .github/workflows/  # build、docker、release workflows
+├── docker-compose.yml
+├── Cargo.toml
+└── CHANGELOG.md
 ```
 
-## 技术栈
-
-- **Web 框架**: [Axum](https://github.com/tokio-rs/axum) 0.8
-- **异步运行时**: [Tokio](https://tokio.rs/)
-- **HTTP 客户端**: [Reqwest](https://github.com/seanmonstar/reqwest)
-- **序列化**: [Serde](https://serde.rs/)
-- **日志**: [tracing](https://github.com/tokio-rs/tracing)
-- **命令行**: [Clap](https://github.com/clap-rs/clap)
-
+<a id="license"></a>
 ## License
 
-MIT
+见 [LICENSE](LICENSE)。
 
-## 致谢
-
-本项目的实现离不开前辈的努力:  
- - [kiro2api](https://github.com/caidaoli/kiro2api)
- - [proxycast](https://github.com/aiclientproxy/proxycast)
-
-本项目部分逻辑参考了以上的项目, 再次由衷的感谢!
-
-## 社区支持
+<a id="community"></a>
+## 💬 社区支持
 
 欢迎到 [linux.do](https://linux.do/) 交流、分享和反馈。
 
+<a id="acknowledgements"></a>
+## 🙏 致谢
 
+本项目的实现离不开社区项目和反馈的帮助：
+
+- [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs)
+- [kiro2api](https://github.com/caidaoli/kiro2api)
+- [proxycast](https://github.com/aiclientproxy/proxycast)
+- [Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager)
+
+感谢所有 issue、PR、测试和部署反馈的贡献者。
