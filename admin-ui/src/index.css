@@ -67,7 +67,10 @@
       "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui,
       sans-serif;
     font-feature-settings: "rlig" 1, "calt" 1, "ss01" 1;
-    letter-spacing: -0.01em;
+    letter-spacing: 0;
+  }
+  label:not(.flex):not(.inline-flex) {
+    display: block;
   }
   /* Subtle ambient gradient background, macOS-style */
   body::before {
