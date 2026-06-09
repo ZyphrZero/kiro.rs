@@ -454,6 +454,52 @@ fn find_next_param_open(body: &str, from: usize) -> Option<usize> {
 /// `call` / `count` / `card`。集合形式便于以后扩充。
 const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card"];
 
+/// 复读熔断阈值：同一个 stray token（call/count/card）连续作为独占一行重复出现
+/// 超过这么多次，判定为「Opus 长上下文退化复读死循环」，立即熔断本轮文本输出。
+///
+/// 取值权衡：正常工具调用前最多出现 1 个引导词行（偶有 2~3），绝不会连续几十次。
+/// 设为 32 远高于正常上限、又远低于退化时的数万次，既不误伤正常引导词，又能尽早止血。
+const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 32;
+
+/// 块级复读折叠：对「已完整的整段文本」做一次性复读熔断。
+///
+/// 用于非流式 / web_search loop 路径（`extract_invoke_content_blocks` 入口）——
+/// 那条路不经过流式 `emit_text_delta_raw` 的逐 chunk 熔断，所以在这里独立兜一次。
+///
+/// 规则与流式版一致：同一个 `STRAY_INVOKE_TOKENS`（call/count/card）连续作为独占一行
+/// 重复超过 `REPEAT_GUARD_TRIP_THRESHOLD` 次，判定为 Opus 退化复读，**从超阈值处截断**，
+/// 丢弃其后的全部复读垃圾（断雪球、不灌历史）。阈值内的少量引导词重复原样保留。
+fn collapse_stray_token_floods(text: &str) -> std::borrow::Cow<'_, str> {
+    let mut last_line = "";
+    let mut run: u32 = 0;
+    let mut cut_at: Option<usize> = None;
+    let mut offset = 0usize;
+    for segment in text.split_inclusive('\n') {
+        let line = segment.trim();
+        if STRAY_INVOKE_TOKENS.contains(&line) {
+            if line == last_line {
+                run += 1;
+            } else {
+                last_line = line;
+                run = 1;
+            }
+            if run >= REPEAT_GUARD_TRIP_THRESHOLD {
+                // 从「本段（这一行）开头」截断：保留阈值内已累计的内容。
+                cut_at = Some(offset);
+                break;
+            }
+        } else if !line.is_empty() {
+            last_line = line;
+            run = 0;
+        }
+        offset += segment.len();
+    }
+    match cut_at {
+        Some(pos) => std::borrow::Cow::Owned(text[..pos].to_string()),
+        None => std::borrow::Cow::Borrowed(text),
+    }
+}
+
 fn strip_trailing_stray_tokens(before: &str) -> &str {
     let mut end = before.len();
     loop {
@@ -616,6 +662,10 @@ pub(crate) fn extract_invoke_content_blocks(
     known_tool_names: &std::collections::HashSet<String>,
     tool_name_map: &std::collections::HashMap<String, String>,
 ) -> Vec<serde_json::Value> {
+    // 🛑 块级复读熔断：先把 Opus 退化的「同一 stray token 连续复读」截断，
+    // 再做 invoke 嗅探。覆盖 web_search loop（99.9% 真实流量）这条非流式路径。
+    let collapsed = collapse_stray_token_floods(text);
+    let text: &str = &collapsed;
     let mut blocks: Vec<serde_json::Value> = Vec::new();
     let mut pending_text = String::new();
     // 围栏奇偶状态：跨「已吐出的文本」累进，确保 ``` 跨片段也能正确判定。
@@ -1033,6 +1083,14 @@ pub struct StreamContext {
     pub cache_usage: super::cache_metering::CacheUsage,
     /// meteringEvent 上报的 credit 计费量（上游真实下发）
     pub credits: f64,
+    /// 复读熔断：最近一次作为文本吐出的「尾行」内容（去空白）。
+    /// Opus 长上下文退化时会把同一个 stray token（call/count/card）一行一行无限复读，
+    /// 我们在文本出口处统计「同一短行连续重复了多少次」。
+    repeat_guard_last_line: String,
+    /// 复读熔断：当前尾行已连续重复的次数。
+    repeat_guard_run: u32,
+    /// 复读熔断：是否已经触发过熔断（触发后本轮后续文本一律丢弃，不再吐、不写历史）。
+    repeat_guard_tripped: bool,
 }
 
 impl StreamContext {
@@ -1075,6 +1133,9 @@ impl StreamContext {
             strip_thinking_leading_newline: false,
             cache_usage: super::cache_metering::CacheUsage::default(),
             credits: 0.0,
+            repeat_guard_last_line: String::new(),
+            repeat_guard_run: 0,
+            repeat_guard_tripped: false,
         }
     }
 
@@ -1550,8 +1611,63 @@ impl StreamContext {
     /// 当发生 tool_use 时，状态机会自动关闭当前文本块；后续文本会自动创建新的文本块继续输出。
     ///
     /// 返回值包含可能的 content_block_start 事件和 content_block_delta 事件。
+    /// 复读熔断过滤器：在文本真正吐给客户端之前，逐行检测「同一 stray token 连续复读」。
+    ///
+    /// 工作方式（流式安全，跨 chunk 累计）：
+    /// - 把进来的 `text` 按行切，逐行和上一行（去空白）比较；
+    /// - 只对 `STRAY_INVOKE_TOKENS`（call/count/card）这类退化引导词计数，普通文本一律放行；
+    /// - 同一 stray token 连续重复达到 `REPEAT_GUARD_TRIP_THRESHOLD` 即「跳闸」；
+    /// - 跳闸后：本轮内后续任何文本（含继续复读的 count）一律丢弃，返回空串。
+    ///
+    /// 返回应当继续吐出的文本（跳闸时返回空串）。
+    fn repeat_guard_filter(&mut self, text: &str) -> String {
+        // 已跳闸：本轮剩余文本全部丢弃，断雪球。
+        if self.repeat_guard_tripped {
+            return String::new();
+        }
+
+        let mut kept = String::new();
+        // 用 split_inclusive 保留换行符，确保放行的正常文本不丢字节。
+        for segment in text.split_inclusive('\n') {
+            let line = segment.trim();
+            if STRAY_INVOKE_TOKENS.contains(&line) {
+                if line == self.repeat_guard_last_line {
+                    self.repeat_guard_run += 1;
+                } else {
+                    self.repeat_guard_last_line = line.to_string();
+                    self.repeat_guard_run = 1;
+                }
+                if self.repeat_guard_run >= REPEAT_GUARD_TRIP_THRESHOLD {
+                    // 跳闸：丢弃这一行及本轮后续所有文本。已经放行的 kept 保留
+                    // （阈值内的少量重复无害），但不再追加，并标记 tripped。
+                    self.repeat_guard_tripped = true;
+                    return kept;
+                }
+                // 阈值内：照常放行（少量引导词重复是正常的）。
+                kept.push_str(segment);
+            } else {
+                // 普通文本行（含空行）：重置复读计数，正常放行。
+                if !line.is_empty() {
+                    self.repeat_guard_last_line = line.to_string();
+                    self.repeat_guard_run = 0;
+                }
+                kept.push_str(segment);
+            }
+        }
+        kept
+    }
+
     fn emit_text_delta_raw(&mut self, text: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        // 🛑 复读熔断（root cause: Opus 长上下文退化，把同一 stray token 一行行无限复读）。
+        // 在文本出口处过滤：一旦同一短行连续重复超过阈值，丢弃后续复读文本，
+        // 既不让它喷给客户端、不烧满 max_tokens，也不写进对话历史（断雪球）。
+        let kept = self.repeat_guard_filter(text);
+        if kept.is_empty() {
+            return events;
+        }
+        let text: &str = &kept;
 
         // 🅱 维护跨流的代码围栏奇偶状态：所有真正作为「文本」吐出的内容都过这里，
         // 在此累进围栏状态，使后续 <invoke> 能判断自己是否落在代码块内。
@@ -3714,6 +3830,132 @@ mod tests {
         // count stray token 也不应泄漏
         assert!(!text.contains("\ncount\n") && !text.ends_with("count"),
             "count stray token 不应泄漏: {:?}", text);
+    }
+
+    // ---- 复读熔断 (repeat guard)：root cause = Opus 长上下文退化复读 ----
+
+    /// 🔴→🟢 复现真实泄漏：模型一句正常话后无限复读 `count`（thread 019ea4e9 的真账）。
+    /// 熔断后吐出的 count 数必须远小于喂入的数量，且不撑满输出。
+    #[test]
+    fn repeat_guard_trips_on_count_flood() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+
+        // 真实形态：正常话 + call + 海量 count（这里用 5000 次模拟 3.2 万次）
+        let mut payload = String::from("先看 crawlee 状态。\n\ncall\n\n");
+        for _ in 0..5000 {
+            payload.push_str("count\n\n");
+        }
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(&payload));
+        all.extend(ctx.generate_final_events());
+
+        let text = collect_text_content(&all);
+        let emitted_counts = text.matches("count").count();
+        assert!(
+            emitted_counts < 64,
+            "复读应被熔断：吐出的 count 数应远小于喂入的 5000，实际={}",
+            emitted_counts
+        );
+        // 正常开头那句话必须保留（熔断不能误伤正文）
+        assert!(
+            text.contains("先看 crawlee 状态"),
+            "熔断不应误伤正常正文: {:?}",
+            &text[..text.len().min(80)]
+        );
+    }
+
+    /// 🟢 不误伤：正常工具调用前的 1 个引导词 `count` + 真 <invoke> 仍被正常捞回。
+    #[test]
+    fn repeat_guard_does_not_trip_on_single_stray_token() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        let payload =
+            "count\n<invoke name=\"exec_command\"><parameter name=\"cmd\">ls</parameter></invoke>";
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(payload));
+        all.extend(ctx.generate_final_events());
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 1, "单个引导词不应触发熔断，invoke 应正常捞回: {:?}", tools);
+        assert_eq!(tools[0].0, "exec_command");
+    }
+
+    /// 🟢 不误伤：正常多行文本里偶尔出现 count 单词（非独占行复读）不熔断。
+    #[test]
+    fn repeat_guard_does_not_trip_on_normal_prose() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        let payload = "我数了一下 count = 3，然后继续做别的事。\n这是第二行正常文字。\n第三行也正常。";
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(payload));
+        all.extend(ctx.generate_final_events());
+        let text = collect_text_content(&all);
+        assert!(text.contains("我数了一下"), "正常正文不应被熔断: {:?}", text);
+        assert!(text.contains("第三行也正常"), "正常正文应完整保留: {:?}", text);
+    }
+
+    /// 🟢 跨 chunk 复读也能熔断（流式分片到达，每片一个 count）。
+    #[test]
+    fn repeat_guard_trips_across_chunks() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("call\n\n"));
+        for _ in 0..2000 {
+            all.extend(ctx.process_assistant_response("count\n\n"));
+        }
+        all.extend(ctx.generate_final_events());
+        let text = collect_text_content(&all);
+        let emitted_counts = text.matches("count").count();
+        assert!(
+            emitted_counts < 64,
+            "跨 chunk 复读也应熔断：实际吐出 count={}",
+            emitted_counts
+        );
+    }
+
+    // ---- 块级复读熔断 (collapse_stray_token_floods)：覆盖 web_search loop 路径 ----
+
+    /// 🔴→🟢 块级路径（extract_invoke_content_blocks / web_search loop）也必须熔断 count 洪水。
+    #[test]
+    fn extract_blocks_collapses_count_flood() {
+        let mut text = String::from("先看 crawlee 状态。\n\ncall\n\n");
+        for _ in 0..5000 {
+            text.push_str("count\n\n");
+        }
+        let blocks = extract_invoke_content_blocks(
+            &text,
+            &test_known_tools(),
+            &std::collections::HashMap::new(),
+        );
+        let joined: String = blocks
+            .iter()
+            .filter(|b| b["type"] == "text")
+            .filter_map(|b| b["text"].as_str())
+            .collect();
+        let emitted = joined.matches("count").count();
+        assert!(emitted < 64, "块级路径应折叠 count 洪水：实际={}", emitted);
+        assert!(joined.contains("先看 crawlee 状态"), "正常正文应保留: {:?}", &joined[..joined.len().min(60)]);
+    }
+
+    /// 🟢 块级不误伤：单个引导词 count + 真 invoke 仍被捞回。
+    #[test]
+    fn extract_blocks_keeps_single_stray_and_reclaims() {
+        let text = "count\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n</invoke>";
+        let blocks = extract_invoke_content_blocks(
+            text,
+            &test_known_tools(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(
+            blocks.iter().any(|b| b["type"] == "tool_use" && b["name"] == "exec_command"),
+            "单个引导词不应触发折叠，invoke 应捞回: {:?}",
+            blocks
+        );
     }
 
     #[test]
