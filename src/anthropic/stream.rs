@@ -514,8 +514,13 @@ fn strip_trailing_stray_tokens(before: &str) -> &str {
         // Opus 长上下文退化时，泄漏的 <invoke> 前常有一个孤立的 stray token 行。
         // 实测样本里出现过 call / count / card 三种；用集合便于以后扩充。
         if STRAY_INVOKE_TOKENS.contains(&last_line) {
-            // 连同其前面的换行一起剥掉
-            end = if line_start == 0 { 0 } else { line_start - 1 };
+            // 只剥 stray token 行本身，【保留】前一行末尾的换行符。
+            // 旧实现用 line_start - 1 把前一行的换行也吞掉，会把前面的叙述正文和
+            // 后续 <invoke> 挤到同一行，导致 invoke_looks_like_real_leak 的“行首”判定
+            // 失败、漏捞真泄漏（narrative\ncall\n<invoke>）。改成 end = line_start：
+            //   "some text\ncall" -> "some text\n"（行首信号保留）
+            //   "call"（无前导正文）-> ""（line_start==0）
+            end = line_start;
             if end == 0 {
                 return "";
             }
@@ -1453,8 +1458,15 @@ impl StreamContext {
     /// - `flush=true`（流末尾）：不再保留尾巴，剩余全部走 `emit_text_delta_raw` 吐出（防尾字节丢）。
     fn drain_invoke_sniff_buffer(&mut self, flush: bool) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        // Drive the loop on an owned local buffer taken out of `self` ONCE, instead of
+        // cloning `self.invoke_sniff_buffer` on every iteration. Under degraded-model
+        // floods this buffer can grow up to MAX_INVOKE_HOLD_BYTES, so a per-iteration
+        // full clone was O(n) per loop (quadratic overall). The only in-loop allocation
+        // now is the (smaller) remainder after a reclaimed block. Every exit path writes
+        // the intended remainder back into `self.invoke_sniff_buffer` (empty if fully
+        // consumed); the Some->Some path keeps looping on the local `buf`.
+        let mut buf = std::mem::take(&mut self.invoke_sniff_buffer);
         loop {
-            let buf = self.invoke_sniff_buffer.clone();
             match find_invoke_start(&buf) {
                 Some(start) => {
                     match find_invoke_block_end(&buf, start) {
@@ -1487,8 +1499,9 @@ impl StreamContext {
                                 // 不捞回（嵌句中 / 围栏内 / 工具名未知 / 解析失败）→ 整段当普通文本吐出
                                 events.extend(self.emit_text_delta_raw(&buf[..end]));
                             }
-                            // 推进缓冲区到块之后，继续循环
-                            self.invoke_sniff_buffer = buf[end..].to_string();
+                            // 推进本地缓冲区到块之后，继续循环（不再回写 self、不再整体 clone）
+                            buf = buf[end..].to_string();
+                            continue;
                         }
                         None => {
                             // 块还没到齐。先用 P1 行首判定：不在行首的 <invoke 当讨论文本，
@@ -1501,9 +1514,8 @@ impl StreamContext {
                                 before,
                             );
                             if !invoke_looks_like_real_leak(before) || fence_after_before {
-                                let rest = std::mem::take(&mut self.invoke_sniff_buffer);
-                                if !rest.is_empty() {
-                                    events.extend(self.emit_text_delta_raw(&rest));
+                                if !buf.is_empty() {
+                                    events.extend(self.emit_text_delta_raw(&buf));
                                 }
                                 break;
                             }
@@ -1511,12 +1523,11 @@ impl StreamContext {
                             if start > 0 {
                                 events.extend(self.emit_text_delta_raw(&buf[..start]));
                             }
-                            self.invoke_sniff_buffer = buf[start..].to_string();
+                            let remainder = buf[start..].to_string();
                             if flush {
                                 // flush 模式：残留半块当普通文本吐出
-                                let rest = std::mem::take(&mut self.invoke_sniff_buffer);
-                                if !rest.is_empty() {
-                                    events.extend(self.emit_text_delta_raw(&rest));
+                                if !remainder.is_empty() {
+                                    events.extend(self.emit_text_delta_raw(&remainder));
                                 }
                             } else {
                                 // P2 上限：hold 的 <invoke 块累计超过阈值仍没等到 </invoke>，
@@ -1524,11 +1535,12 @@ impl StreamContext {
                                 // 仅用纯字节上限兜底"永不闭合的 `<invoke` 把流卡死"；
                                 // 不再按换行数放弃——多行参数（apply_patch 等）是常态，
                                 // 换行数不是放弃 hold 的好信号，否则会误杀分片到达的合法 invoke。
-                                let held = &self.invoke_sniff_buffer;
-                                let too_long = held.len() > Self::MAX_INVOKE_HOLD_BYTES;
+                                let too_long = remainder.len() > Self::MAX_INVOKE_HOLD_BYTES;
                                 if too_long {
-                                    let rest = std::mem::take(&mut self.invoke_sniff_buffer);
-                                    events.extend(self.emit_text_delta_raw(&rest));
+                                    events.extend(self.emit_text_delta_raw(&remainder));
+                                } else {
+                                    // 保留半块到 self，等下一片到达再续
+                                    self.invoke_sniff_buffer = remainder;
                                 }
                             }
                             break;
@@ -1538,9 +1550,8 @@ impl StreamContext {
                 None => {
                     // 没有任何 invoke 开标签
                     if flush {
-                        let rest = std::mem::take(&mut self.invoke_sniff_buffer);
-                        if !rest.is_empty() {
-                            events.extend(self.emit_text_delta_raw(&rest));
+                        if !buf.is_empty() {
+                            events.extend(self.emit_text_delta_raw(&buf));
                         }
                     } else {
                         // 保留一段可能是部分 `<invoke` 开标签前缀的尾巴，其余吐出
@@ -3109,6 +3120,45 @@ mod tests {
             "前置的 stray `call` 应被剥掉，text 不应残留: {:?}",
             text
         );
+    }
+
+    #[test]
+    fn strip_trailing_stray_preserves_preceding_newline() {
+        // 回归：narrative 文本后跟一行 stray token（`some text\ncall`）。
+        // 旧实现把 stray 行连同其【前面的换行】一起剥掉 -> 得到 "some text"（无换行结尾），
+        // 这会让随后的 invoke_looks_like_real_leak 行首启发式失败、漏捞真泄漏。
+        // 正确：只剥 stray 行本身，保留前一行的换行 -> "some text\n"。
+        let got = strip_trailing_stray_tokens("some text\ncall");
+        assert_eq!(
+            got, "some text\n",
+            "must keep the newline terminating the narrative line so the invoke stays line-start"
+        );
+        // 且剥完的结果应让行首判定通过
+        assert!(
+            invoke_looks_like_real_leak(got),
+            "stripped narrative must still look like a line-start leak (ends with newline)"
+        );
+    }
+
+    #[test]
+    fn test_invoke_sniff_reclaims_after_narrative_then_stray_token() {
+        // 端到端：`正文\ncall\n<invoke...>` —— 正文 + stray token + 真泄漏 invoke。
+        // 旧实现漏捞（stray 剥过头把正文和 invoke 挤一行），修后应成功捞回 tool_use。
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "先看看结果。\ncall\n<invoke name=\"exec_command\"><parameter name=\"cmd\">ls</parameter></invoke>",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 1, "narrative+stray+invoke 应捞回 1 个 tool_use: {:?}", tools);
+        let text = collect_text_content(&all);
+        assert!(text.contains("先看看结果"), "叙述正文应保留: {:?}", text);
+        assert!(!text.contains("call\n<invoke") && !text.contains("<invoke"), "invoke 不应泄漏为文本: {:?}", text);
     }
 
     #[test]
