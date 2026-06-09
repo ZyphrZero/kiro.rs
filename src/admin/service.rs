@@ -1064,13 +1064,13 @@ impl AdminService {
         Ok(())
     }
 
-    /// 持久化新的 Admin API Key 到配置文件（内存中的 key 由 handler 层负责更新）
+    /// 持久化新的登录API密钥到配置文件（内存中的 key 由 handler 层负责更新）
     pub fn persist_admin_key(&self, new_key: &str) {
         let key = new_key.to_string();
         self.update_config_file(move |c| c.admin_api_key = Some(key));
     }
 
-    /// 持久化新的业务 API Key 到配置文件
+    /// 持久化新的管理员API密钥到配置文件
     pub fn persist_api_key(&self, new_key: &str) {
         let key = new_key.to_string();
         self.update_config_file(move |c| c.api_key = Some(key));

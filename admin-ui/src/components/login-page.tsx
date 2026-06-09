@@ -53,7 +53,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
               Kiro Admin
             </h1>
             <p className="mt-1 text-sm text-muted-foreground">
-              使用 Admin API Key 登录管理面板
+              使用登录API密钥登录管理面板
             </p>
           </div>
           <form onSubmit={handleSubmit} className="space-y-3">
@@ -61,7 +61,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
               <Lock className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
               <Input
                 type="password"
-                placeholder="Admin API Key"
+                placeholder="登录API密钥"
                 value={apiKey}
                 onChange={(e) => {
                   setApiKey(e.target.value);

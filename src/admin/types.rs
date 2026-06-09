@@ -638,13 +638,13 @@ pub struct UpdateCheckInfo {
     pub warning: Option<String>,
 }
 
-// ============ Admin API Key 修改 ============
+// ============ 登录API密钥修改 ============
 
-/// 修改 Admin API Key 请求
+/// 修改登录API密钥请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateAdminKeyRequest {
-    /// 新的 Admin API Key
+    /// 新的登录API密钥
     pub new_key: String,
 }
 

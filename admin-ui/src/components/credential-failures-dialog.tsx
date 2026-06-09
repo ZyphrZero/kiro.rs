@@ -47,6 +47,11 @@ function formatTime(ts: string): string {
   return d.toLocaleString("zh-CN", { hour12: false });
 }
 
+function keySourceLabel(rec: TraceRecord): string {
+  if (rec.keySource === "clientKey") return rec.keyName ?? `#${rec.keyId}`;
+  return "管理员API密钥";
+}
+
 export function CredentialFailuresDialog({
   open,
   onOpenChange,
@@ -115,6 +120,7 @@ function FailureRow({
         <span className="tabular-nums text-muted-foreground">
           {formatTime(rec.ts)}
         </span>
+        <Badge variant="secondary">{keySourceLabel(rec)}</Badge>
         <Badge variant={style.variant}>{style.label}</Badge>
         {attempt.httpStatus != null && (
           <span className="font-mono text-muted-foreground">

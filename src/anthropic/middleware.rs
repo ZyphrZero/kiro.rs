@@ -12,8 +12,8 @@ use axum::{
 use parking_lot::RwLock;
 
 use crate::admin::client_keys::SharedClientKeyManager;
+use crate::admin::trace_db::{SharedTraceStore, TraceKeySource};
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
-use crate::admin::trace_db::SharedTraceStore;
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
@@ -27,6 +27,8 @@ pub struct KeyContext {
     pub key_id: u64,
     /// 该 Key 绑定的账号分组；None 表示未绑定（含 master apiKey），可使用全部账号
     pub group: Option<String>,
+    /// 命中的入口 Key 类型。
+    pub key_source: TraceKeySource,
 }
 
 /// 应用共享状态
@@ -136,7 +138,11 @@ pub async fn auth_middleware(
     // 1) master apiKey
     let master = state.api_key.read().clone();
     if auth::constant_time_eq(&presented, &master) {
-        request.extensions_mut().insert(KeyContext { key_id: 0, group: None });
+        request.extensions_mut().insert(KeyContext {
+            key_id: 0,
+            group: None,
+            key_source: TraceKeySource::MasterApiKey,
+        });
         return next.run(request).await;
     }
 
@@ -144,7 +150,11 @@ pub async fn auth_middleware(
     if let Some(mgr) = &state.client_keys {
         if let Some(id) = mgr.verify_and_touch(&presented) {
             let group = mgr.group_of(id);
-            request.extensions_mut().insert(KeyContext { key_id: id, group });
+            request.extensions_mut().insert(KeyContext {
+                key_id: id,
+                group,
+                key_source: TraceKeySource::ClientKey,
+            });
             return next.run(request).await;
         }
     }

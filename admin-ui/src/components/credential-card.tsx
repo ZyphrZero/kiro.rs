@@ -365,7 +365,7 @@ export function CredentialCard({
         ref={setNodeRef}
         style={dragStyle}
         data-credential-id={credential.id}
-        className={`group flex h-full flex-col ${
+        className={`group flex h-full min-w-0 flex-col ${
           isDragging
             ? "shadow-apple-lg opacity-80"
             : "hover:-translate-y-0.5 hover:shadow-apple-lg"
@@ -391,11 +391,11 @@ export function CredentialCard({
           credential.disabled && !disabledByQuota ? "opacity-70" : ""
         }`}
       >
-        <CardHeader className="pb-3">
-          <div className="flex items-start gap-3">
+        <CardHeader className="p-4 pb-3 sm:p-5 sm:pb-3">
+          <div className="flex min-w-0 items-start gap-2.5 sm:gap-3">
             <label
               data-no-rect-select
-              className="mt-0.5 flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-accent"
+              className="mt-0.5 flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-accent sm:h-7 sm:w-7"
               onClick={(e) => {
                 // label + Checkbox 双击事件去重，避免触发两次 onCheckedChange
                 e.stopPropagation();
@@ -407,13 +407,16 @@ export function CredentialCard({
                 onCheckedChange={onToggleSelect}
               />
             </label>
-            <div className="flex-1 min-w-0">
-              <CardTitle className="truncate text-[15px]">
+            <div className="min-w-0 flex-1">
+              <CardTitle className="truncate text-[15px] leading-5">
                 {credential.email || `凭据 #${credential.id}`}
               </CardTitle>
-              <div className="mt-1.5 flex flex-wrap items-center gap-1">
+              <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1 overflow-hidden">
                 {balance?.subscriptionTitle && (
-                  <SubscriptionBadge title={balance.subscriptionTitle} />
+                  <SubscriptionBadge
+                    title={balance.subscriptionTitle}
+                    className="max-w-full"
+                  />
                 )}
                 {credential.isCurrent && <Badge variant="success">活跃</Badge>}
                 {/* 禁用状态：合并 "已禁用" + 中文化的原因，单个 Badge 更醒目 */}
@@ -446,6 +449,7 @@ export function CredentialCard({
                 {(credential.endpoint || credential.hasProfileArn) && (
                   <Badge
                     variant="outline"
+                    className="max-w-full truncate"
                     title={
                       credential.hasProfileArn
                         ? "endpoint / 已配置 Profile ARN"
@@ -475,6 +479,7 @@ export function CredentialCard({
               </div>
             </div>
             <Switch
+              className="mt-0.5"
               checked={!credential.disabled}
               onCheckedChange={handleToggleDisabled}
               disabled={setDisabled.isPending}
@@ -483,14 +488,14 @@ export function CredentialCard({
           </div>
         </CardHeader>
 
-        <CardContent className="flex flex-1 flex-col space-y-4">
+        <CardContent className="flex flex-1 flex-col space-y-3 px-4 pb-4 sm:space-y-4 sm:px-5 sm:pb-5">
           {/* 信息行 */}
-          <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-[13px]">
-            <div className="flex items-center justify-between gap-2">
-              <dt className="text-muted-foreground">优先级</dt>
-              <dd>
+          <dl className="grid grid-cols-1 gap-2 text-[13px] min-[420px]:grid-cols-2 min-[420px]:gap-x-4">
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <dt className="shrink-0 text-muted-foreground">优先级</dt>
+              <dd className="min-w-0">
                 {editingPriority ? (
-                  <div className="inline-flex items-center gap-1">
+                  <div className="inline-flex max-w-full items-center gap-1">
                     <Input
                       type="number"
                       value={priorityValue}
@@ -532,9 +537,9 @@ export function CredentialCard({
                 )}
               </dd>
             </div>
-            <div className="flex items-center justify-between gap-2">
-              <dt className="text-muted-foreground">失败次数</dt>
-              <dd>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <dt className="shrink-0 text-muted-foreground">失败次数</dt>
+              <dd className="min-w-0">
                 <button
                   type="button"
                   onClick={() => setShowFailuresDialog(true)}
@@ -566,17 +571,17 @@ export function CredentialCard({
                 </button>
               </dd>
             </div>
-            <div className="flex items-center justify-between gap-2">
-              <dt className="text-muted-foreground">刷新失败</dt>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <dt className="shrink-0 text-muted-foreground">刷新失败</dt>
               <dd
                 className={`tabular-nums font-medium ${credential.refreshFailureCount > 0 ? "text-destructive" : ""}`}
               >
                 {credential.refreshFailureCount}
               </dd>
             </div>
-            <div className="flex items-center justify-between gap-2">
-              <dt className="text-muted-foreground">成功次数</dt>
-              <dd>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <dt className="shrink-0 text-muted-foreground">成功次数</dt>
+              <dd className="min-w-0">
                 <button
                   type="button"
                   onClick={handleResetSuccess}
@@ -588,24 +593,24 @@ export function CredentialCard({
                 </button>
               </dd>
             </div>
-            <div className="col-span-2 flex items-center justify-between gap-2 border-t border-border/50 pt-2">
-              <dt className="text-muted-foreground">最后调用</dt>
-              <dd className="font-medium">
+            <div className="flex min-w-0 items-center justify-between gap-2 border-t border-border/50 pt-2 min-[420px]:col-span-2">
+              <dt className="shrink-0 text-muted-foreground">最后调用</dt>
+              <dd className="min-w-0 truncate text-right font-medium">
                 {formatLastUsed(credential.lastUsedAt)}
               </dd>
             </div>
             {credential.maskedApiKey && (
-              <div className="col-span-2 flex items-center justify-between gap-2">
-                <dt className="text-muted-foreground">API Key</dt>
-                <dd className="font-mono text-xs truncate">
+              <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
+                <dt className="shrink-0 text-muted-foreground">API Key</dt>
+                <dd className="min-w-0 truncate text-right font-mono text-xs">
                   {credential.maskedApiKey}
                 </dd>
               </div>
             )}
             {credential.hasProxy && (
-              <div className="col-span-2 flex items-center justify-between gap-2">
-                <dt className="text-muted-foreground">代理</dt>
-                <dd className="font-mono text-xs truncate">
+              <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
+                <dt className="shrink-0 text-muted-foreground">代理</dt>
+                <dd className="min-w-0 truncate text-right font-mono text-xs">
                   {maskProxyUrl(credential.proxyUrl ?? "")}
                 </dd>
               </div>
@@ -614,7 +619,7 @@ export function CredentialCard({
 
           {/* 余额面板 */}
           <div
-            className={`flex min-h-[150px] flex-col rounded-xl border p-4 transition-colors ${
+            className={`flex min-h-[138px] flex-col rounded-xl border p-3 transition-colors sm:min-h-[150px] sm:p-4 ${
               isQuotaExceeded || disabledByQuota
                 ? "border-amber-500/40 bg-amber-50/60 dark:bg-amber-500/[0.06]"
                 : "border-border/60 bg-secondary/40"
@@ -627,7 +632,7 @@ export function CredentialCard({
               </div>
             ) : balance ? (
               <div className="space-y-3">
-                <div className="flex items-end justify-between gap-3">
+                <div className="flex min-w-0 items-end justify-between gap-3">
                   <div className="min-w-0">
                     <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
                       {balance.remaining < 0 ? "超额" : "余额"}
@@ -646,7 +651,7 @@ export function CredentialCard({
                         : `$${formatNumber(balance.remaining)}`}
                     </div>
                   </div>
-                  <div className="text-right min-w-0">
+                  <div className="min-w-0 shrink-0 text-right">
                     <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
                       超额
                     </div>
@@ -657,13 +662,19 @@ export function CredentialCard({
                 </div>
                 <div className="space-y-1.5">
                   <Progress value={balance.usagePercentage} />
-                  <div className="flex justify-between text-[11px] tabular-nums text-muted-foreground">
-                    <span>已用 ${formatNumber(balance.currentUsage)}</span>
-                    <span>{balance.usagePercentage.toFixed(1)}%</span>
-                    <span>额度 ${formatNumber(balance.usageLimit)}</span>
+                  <div className="grid grid-cols-3 gap-1 text-[11px] tabular-nums text-muted-foreground">
+                    <span className="min-w-0 truncate">
+                      已用 ${formatNumber(balance.currentUsage)}
+                    </span>
+                    <span className="text-center">
+                      {balance.usagePercentage.toFixed(1)}%
+                    </span>
+                    <span className="min-w-0 truncate text-right">
+                      额度 ${formatNumber(balance.usageLimit)}
+                    </span>
                   </div>
                 </div>
-                <div className="border-t border-border/50 pt-2 text-[11px] text-muted-foreground">
+                <div className="break-words border-t border-border/50 pt-2 text-[11px] text-muted-foreground">
                   下次重置：
                   <span className="font-medium text-foreground">
                     {formatResetDate(balance.nextResetAt)}
@@ -678,24 +689,25 @@ export function CredentialCard({
           </div>
 
           {/* 操作区 */}
-          <div className="mt-auto flex items-center justify-between gap-2 border-t border-border/50 pt-3">
-            <div className="flex items-center gap-1">
+          <div className="mt-auto flex flex-col gap-2 border-t border-border/50 pt-3 min-[420px]:flex-row min-[420px]:items-center min-[420px]:justify-between">
+            <div className="grid grid-cols-3 gap-1 min-[420px]:flex min-[420px]:items-center">
               <Button
                 ref={setActivatorNodeRef}
                 size="icon"
                 variant="ghost"
                 data-no-rect-select
-                className="cursor-grab touch-none active:cursor-grabbing"
+                className="w-full cursor-grab touch-none active:cursor-grabbing min-[420px]:w-9"
                 title="拖拽调整优先级"
                 {...attributes}
                 {...listeners}
               >
                 <GripVertical className="h-4 w-4 text-muted-foreground" />
               </Button>
-              <span className="mx-1 h-5 w-px bg-border/70" />
+              <span className="mx-1 hidden h-5 w-px bg-border/70 min-[420px]:inline-block" />
               <Button
                 size="sm"
                 variant="ghost"
+                className="w-full px-2 min-[420px]:w-auto min-[420px]:px-3"
                 onClick={handleForceRefresh}
                 disabled={
                   forceRefresh.isPending ||
@@ -718,6 +730,7 @@ export function CredentialCard({
               <Button
                 size="sm"
                 variant="ghost"
+                className="w-full px-2 min-[420px]:w-auto min-[420px]:px-3"
                 onClick={onRefreshBalance}
                 disabled={loadingBalance || credential.disabled}
                 title={credential.disabled ? "已禁用" : "刷新余额"}
@@ -729,10 +742,11 @@ export function CredentialCard({
               </Button>
             </div>
 
-            <div className="flex items-center gap-1">
+            <div className="grid grid-cols-[1fr_auto] gap-1 min-[420px]:flex min-[420px]:items-center">
               <Button
                 size="sm"
                 variant="outline"
+                className="w-full min-[420px]:w-auto"
                 onClick={() => setShowEditDialog(true)}
               >
                 <Pencil className="h-3.5 w-3.5" />

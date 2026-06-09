@@ -5,7 +5,9 @@ use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
-use crate::admin::trace_db::{SharedTraceStore, TraceAttempt, TraceRecord, TraceSink, outcome};
+use crate::admin::trace_db::{
+    SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
+};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -124,6 +126,7 @@ pub(crate) struct RequestTracer {
     trace_id: String,
     ts: String,
     key_id: u64,
+    key_source: TraceKeySource,
     model: String,
     is_stream: bool,
     started_at: Instant,
@@ -149,15 +152,22 @@ impl TraceUsage {
     }
 }
 
+struct RequestTraceOptions {
+    key_ctx: KeyContext,
+    model: String,
+    is_stream: bool,
+}
+
 impl RequestTracer {
-    pub fn new(state: &AppState, key_id: u64, model: String, is_stream: bool) -> Self {
+    fn new(state: &AppState, options: RequestTraceOptions) -> Self {
         Self {
             store: state.trace_store.clone(),
             trace_id: Uuid::new_v4().to_string(),
             ts: Utc::now().to_rfc3339(),
-            key_id,
-            model,
-            is_stream,
+            key_id: options.key_ctx.key_id,
+            key_source: options.key_ctx.key_source,
+            model: options.model,
+            is_stream: options.is_stream,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
@@ -193,6 +203,7 @@ impl RequestTracer {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
             key_id: self.key_id,
+            key_source: self.key_source,
             model: self.model.clone(),
             is_stream: self.is_stream,
             final_status: final_status.to_string(),
@@ -668,9 +679,11 @@ pub async fn post_messages(
         // 流式响应
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
-            key_ctx.key_id,
-            payload.model.clone(),
-            true,
+            RequestTraceOptions {
+                key_ctx,
+                model: payload.model.clone(),
+                is_stream: true,
+            },
         ));
         handle_stream_request(
             provider,
@@ -690,9 +703,11 @@ pub async fn post_messages(
         let extract_thinking = state.extract_thinking && thinking_enabled;
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
-            key_ctx.key_id,
-            payload.model.clone(),
-            false,
+            RequestTraceOptions {
+                key_ctx,
+                model: payload.model.clone(),
+                is_stream: false,
+            },
         ));
         handle_non_stream_request(
             provider,
@@ -1410,9 +1425,11 @@ pub async fn post_messages_cc(
         // 流式响应（缓冲模式）
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
-            key_ctx.key_id,
-            payload.model.clone(),
-            true,
+            RequestTraceOptions {
+                key_ctx,
+                model: payload.model.clone(),
+                is_stream: true,
+            },
         ));
         handle_stream_request_buffered(
             provider,
@@ -1432,9 +1449,11 @@ pub async fn post_messages_cc(
         let extract_thinking = state.extract_thinking && thinking_enabled;
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
-            key_ctx.key_id,
-            payload.model.clone(),
-            false,
+            RequestTraceOptions {
+                key_ctx,
+                model: payload.model.clone(),
+                is_stream: false,
+            },
         ));
         handle_non_stream_request(
             provider,

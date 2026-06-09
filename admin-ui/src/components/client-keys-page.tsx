@@ -195,10 +195,10 @@ export function ClientKeysPage() {
         </Card>
       ) : (
         <Card>
-          <CardContent className="p-0 overflow-x-auto">
-            <table className="w-full text-sm">
+          <CardContent className="overflow-x-auto p-0">
+            <table className="w-full min-w-[920px] text-sm">
               <thead className="text-[12px] text-muted-foreground border-b border-border/60">
-                <tr>
+                <tr className="whitespace-nowrap">
                   <th className="text-left font-medium px-4 py-3">名称</th>
                   <th className="text-left font-medium px-4 py-3">Key</th>
                   <th className="text-left font-medium px-4 py-3">分组</th>
@@ -212,11 +212,11 @@ export function ClientKeysPage() {
               </thead>
               <tbody>
                 {data.keys.map((k) => (
-                  <tr key={k.id} className="border-t border-border/40">
+                  <tr key={k.id} className="border-t border-border/40 whitespace-nowrap">
                     <td className="px-4 py-3">
-                      <div className="font-medium">{k.name}</div>
+                      <div className="max-w-[220px] truncate font-medium">{k.name}</div>
                       {k.description && (
-                        <div className="text-[11px] text-muted-foreground truncate max-w-[180px]">
+                        <div className="max-w-[220px] truncate text-[11px] text-muted-foreground">
                           {k.description}
                         </div>
                       )}
