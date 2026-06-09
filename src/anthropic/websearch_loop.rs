@@ -418,6 +418,21 @@ fn resolve_flush_stop_reason(
 /// we reclaim it into a structured `tool_use` instead of passing the raw XML through.
 /// The web_search loop builds its own SSE/content and historically bypassed that
 /// fault tolerance entirely — this is the fix.
+/// Canonical, order-independent key for a tool_use `input` JSON value, used to
+/// detect that a reclaimed-from-text tool_use is identical to a structured one.
+/// `serde_json::Value`'s `Map` is a BTreeMap (or preserves order when the
+/// `preserve_order` feature is on); to be robust we serialize via a BTreeMap so
+/// key order never affects equality.
+fn canonical_input_key(input: &Value) -> String {
+    match input {
+        Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<&String, &Value> = map.iter().collect();
+            serde_json::to_string(&sorted).unwrap_or_else(|_| input.to_string())
+        }
+        _ => input.to_string(),
+    }
+}
+
 fn build_flush_content(
     presentation: Vec<Value>,
     text: &str,
@@ -446,11 +461,35 @@ fn build_flush_content(
             .filter(|n| n.as_str() != "web_search")
             .cloned()
             .collect();
-        content.extend(super::stream::extract_invoke_content_blocks(
-            text,
-            &reclaim_tools,
-            tool_name_map,
-        ));
+        // DEDUP GUARD: a degraded model can emit BOTH a leaked literal `<invoke>` in the
+        // text AND the matching structured tool_use in `tool_uses`. Emitting both would
+        // make the host execute the same command twice. Suppress any reclaimed-from-text
+        // tool_use whose (name + canonical input) already appears in the structured
+        // `tool_uses` for this round. Text blocks (and distinct tool_uses) are kept as-is.
+        let structured_keys: std::collections::HashSet<(String, String)> = tool_uses
+            .iter()
+            .filter(|t| t.name != "web_search")
+            .map(|t| (t.name.clone(), canonical_input_key(&t.input)))
+            .collect();
+        for block in super::stream::extract_invoke_content_blocks(text, &reclaim_tools, tool_name_map)
+        {
+            if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let key = (
+                    name.to_string(),
+                    block
+                        .get("input")
+                        .map(canonical_input_key)
+                        .unwrap_or_default(),
+                );
+                if structured_keys.contains(&key) {
+                    // identical to a structured tool_use already emitted below -> drop the
+                    // reclaimed duplicate (avoid double execution).
+                    continue;
+                }
+            }
+            content.push(block);
+        }
     }
     for (idx, tu) in tool_uses.iter().enumerate() {
         if tu.name == "web_search" {
@@ -1323,5 +1362,66 @@ mod tests {
         // client-tool partition is empty -> caller will choose end_turn
         let (_web, client) = partition_tool_uses(&tool_uses);
         assert!(client.is_empty());
+    }
+
+    #[test]
+    fn flush_content_dedups_reclaimed_against_structured_tool_use() {
+        // Degraded models can emit BOTH a leaked literal `<invoke>` in the assistant
+        // text AND a structured tool_use for the SAME action. Without dedup the host
+        // would receive two identical tool_use blocks and execute the command twice.
+        // The reclaimed-from-text tool_use must be suppressed when an identical
+        // (name + canonical input) structured tool_use already exists in this round.
+        let leaked = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">rm -rf build</parameter>\n</invoke>";
+        let structured = vec![DecodedToolUse {
+            id: "toolu_dup".to_string(),
+            name: "exec_command".to_string(),
+            input: json!({"cmd": "rm -rf build"}),
+        }];
+        let content = build_flush_content(
+            Vec::new(),
+            leaked,
+            &structured,
+            &[],
+            &names(&["exec_command"]),
+            &nomap(),
+        );
+        let exec_calls = content
+            .iter()
+            .filter(|c| c["type"] == "tool_use" && c["name"] == "exec_command")
+            .count();
+        assert_eq!(
+            exec_calls, 1,
+            "duplicate tool_use (reclaimed + structured) must be de-duped to one. content={:?}",
+            content
+        );
+    }
+
+    #[test]
+    fn flush_content_keeps_distinct_reclaimed_and_structured() {
+        // Dedup must only collapse TRUE duplicates: a reclaimed tool_use with a
+        // different input than the structured one is a distinct action and must be kept.
+        let leaked = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n</invoke>";
+        let structured = vec![DecodedToolUse {
+            id: "toolu_other".to_string(),
+            name: "exec_command".to_string(),
+            input: json!({"cmd": "pwd"}),
+        }];
+        let content = build_flush_content(
+            Vec::new(),
+            leaked,
+            &structured,
+            &[],
+            &names(&["exec_command"]),
+            &nomap(),
+        );
+        let exec_calls = content
+            .iter()
+            .filter(|c| c["type"] == "tool_use" && c["name"] == "exec_command")
+            .count();
+        assert_eq!(
+            exec_calls, 2,
+            "distinct inputs must both be kept. content={:?}",
+            content
+        );
     }
 }

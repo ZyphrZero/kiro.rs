@@ -351,14 +351,11 @@ fn parse_invoke_block(block: &str) -> Option<(String, String)> {
         let name_kw = cursor + rel;
         // 确认是真正的 '<parameter' 或 '<prefix:parameter' 开标签
         // name_kw 指向 'parameter'，往前应是 '<' 或 '<prefix:'
-        let lt = match open_tag_lt_pos(body, name_kw) {
-            Some(p) => p,
-            None => {
-                cursor = name_kw + "parameter".len();
-                continue;
-            }
-        };
-        let _ = lt;
+        // 确认是真正的开标签（'<parameter' / '<prefix:parameter'）；仅用于校验，不需要位置值
+        if open_tag_lt_pos(body, name_kw).is_none() {
+            cursor = name_kw + "parameter".len();
+            continue;
+        }
         // 找该参数开标签的 '>'
         let tag_gt = match body[name_kw..].find('>') {
             Some(r) => name_kw + r,
@@ -373,19 +370,17 @@ fn parse_invoke_block(block: &str) -> Option<(String, String)> {
                 continue;
             }
         };
-        // 参数值取到第一个 </parameter>（兼容前缀）为界
+        // 参数值取到 </parameter>（兼容前缀）为界。find_param_close 较贵，只调一次，
+        // 同时复用 (闭标签起始, 闭标签结束) 两个值：起始用于切值，结束用于推进游标。
         let val_start = tag_gt + 1;
-        let close_rel = match find_param_close(body, val_start) {
-            Some((s, _)) => s,
+        let (close_start, close_end) = match find_param_close(body, val_start) {
+            Some(pair) => pair,
             None => break, // 值未闭合，停止
         };
-        let value = &body[val_start..close_rel];
+        let value = &body[val_start..close_start];
         map.insert(key, serde_json::Value::String(value.to_string()));
         // 推进到闭标签之后
-        cursor = match find_param_close(body, val_start) {
-            Some((_, e)) => e,
-            None => break,
-        };
+        cursor = close_end;
     }
 
     let obj = serde_json::Value::Object(map);
