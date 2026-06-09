@@ -57,3 +57,8 @@ export async function resetClientKeyStats(id: number): Promise<SuccessResponse> 
   const { data } = await api.post<SuccessResponse>(`/client-keys/${id}/reset-stats`)
   return data
 }
+
+export async function rotateClientKey(id: number): Promise<CreateClientKeyResponse> {
+  const { data } = await api.post<CreateClientKeyResponse>(`/client-keys/${id}/rotate`)
+  return data
+}

@@ -1,18 +1,22 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
 import {
-  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil,
+  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import {
+  DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
+} from '@/components/ui/dropdown-menu'
+import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription,
 } from '@/components/ui/dialog'
 import {
   useClientKeys, useCreateClientKey, useDeleteClientKey,
   useSetClientKeyDisabled, useResetClientKeyStats, useUpdateClientKey,
+  useRotateClientKey,
 } from '@/hooks/use-client-keys'
 import { useCredentials } from '@/hooks/use-credentials'
 import { GroupSingleSelect } from '@/components/group-select'
@@ -44,6 +48,7 @@ export function ClientKeysPage() {
   const setDisabled = useSetClientKeyDisabled()
   const resetStats = useResetClientKeyStats()
   const updateKey = useUpdateClientKey()
+  const rotateKey = useRotateClientKey()
   const confirm = useConfirm()
 
   // 现有分组名集合（从所有账号的 groups 聚合去重），供下拉建议
@@ -129,6 +134,25 @@ export function ClientKeysPage() {
       toast.success('统计已重置')
     } catch (err) {
       toast.error('重置失败：' + extractErrorMessage(err))
+    }
+  }
+
+  const handleRotate = async (item: ClientKeyItem) => {
+    if (
+      !(await confirm({
+        title: '重新生成 Key',
+        description: `重新生成 Key "${item.name}"？旧明文将立即失效，使用旧明文的下游需要换上新明文才能继续调用。Key 的名称、描述、绑定分组与累计统计保留不变。`,
+        confirmText: '重新生成',
+        destructive: true,
+      }))
+    )
+      return
+    try {
+      const res = await rotateKey.mutateAsync(item.id)
+      setCreatedKey(res)
+      setShowCreatedPlain(true)
+    } catch (err) {
+      toast.error('重新生成失败：' + extractErrorMessage(err))
     }
   }
 
@@ -222,7 +246,23 @@ export function ClientKeysPage() {
                       )}
                     </td>
                     <td className="px-4 py-3">
-                      <code className="text-[12px] font-mono text-muted-foreground">{k.maskedKey}</code>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <button
+                            type="button"
+                            className="rounded px-1 py-0.5 font-mono text-[12px] text-muted-foreground hover:bg-accent/60 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                            title="点击展开 Key 操作"
+                          >
+                            {k.maskedKey}
+                          </button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="start">
+                          <DropdownMenuItem onSelect={() => handleRotate(k)}>
+                            <RefreshCw className="h-3.5 w-3.5" />
+                            重新生成 Key（旧 Key 立即失效）
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
                     </td>
                     <td className="px-4 py-3">
                       {k.group ? (
