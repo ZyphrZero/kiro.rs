@@ -892,6 +892,34 @@ pub async fn reset_client_key_stats(
     }
 }
 
+/// POST /api/admin/client-keys/:id/rotate
+///
+/// 轮换 Key 值：旧明文立即失效，生成新明文返回（仅此一次可见）。
+/// 保留 id/name/description/group/统计/disabled 不变，无需重新分组绑定。
+pub async fn rotate_client_key(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+    match state.client_keys.rotate(id) {
+        Some(entry) => Json(CreateClientKeyResponse {
+            id: entry.id,
+            key: entry.key,
+            name: entry.name,
+            created_at: entry.created_at,
+        })
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "Key #{} 不存在",
+                id
+            ))),
+        )
+            .into_response(),
+    }
+}
+
 // ============ 用量统计 ============
 
 fn parse_range(params: &std::collections::HashMap<String, String>) -> Result<Range, String> {

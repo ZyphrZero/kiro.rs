@@ -237,6 +237,24 @@ impl ClientKeyManager {
         self.inner.read().entries.get(&id).and_then(|e| e.group.clone())
     }
 
+    /// 轮换 Key 值：旧 Key 立即失效，生成新明文，保留 id/name/description/group/统计/disabled。
+    /// 用于「明文遗失」「下游怀疑泄漏」场景，比删后重建更安全（不会丢统计与分组绑定）。
+    /// 命中且替换成功时返回新条目（含新明文）；id 不存在时返回 None。
+    pub fn rotate(&self, id: u64) -> Option<ClientKey> {
+        let new_key = generate_client_key();
+        let mut inner = self.inner.write();
+        // 取出旧条目并从 by_key 索引摘除
+        let old_key = inner.entries.get(&id).map(|e| e.key.clone())?;
+        inner.by_key.remove(&old_key);
+        // 写入新明文 + 索引
+        let entry = inner.entries.get_mut(&id)?;
+        entry.key = new_key.clone();
+        let snapshot = entry.clone();
+        inner.by_key.insert(new_key, id);
+        self.save_locked(&inner);
+        Some(snapshot)
+    }
+
     /// 重置计数（保留 Key 与名称）
     pub fn reset_stats(&self, id: u64) -> bool {
         let mut inner = self.inner.write();
@@ -394,5 +412,36 @@ mod tests {
     fn mask_format() {
         assert_eq!(mask_client_key("csk_abcdefghijklmnop"), "csk_abcd...mnop");
         assert_eq!(mask_client_key("short"), "short");
+    }
+
+    #[test]
+    fn rotate_replaces_key_but_keeps_metadata_and_stats() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("kb".to_string(), Some("desc".into()), Some("groupA".into()));
+        // 累计一些统计
+        mgr.record_usage(entry.id, 100, 50, 5, 10, 1.5);
+        let old_key = entry.key.clone();
+        let rotated = mgr.rotate(entry.id).expect("rotate should succeed");
+        // 新 Key 与旧 Key 不同、且仍带前缀
+        assert_ne!(rotated.key, old_key);
+        assert!(rotated.key.starts_with(CLIENT_KEY_PREFIX));
+        // 元数据保留
+        assert_eq!(rotated.id, entry.id);
+        assert_eq!(rotated.name, "kb");
+        assert_eq!(rotated.description.as_deref(), Some("desc"));
+        assert_eq!(rotated.group.as_deref(), Some("groupA"));
+        // 统计保留
+        assert_eq!(rotated.total_input_tokens, 100);
+        assert_eq!(rotated.total_output_tokens, 50);
+        // 旧 Key 立即失效
+        assert_eq!(mgr.verify_and_touch(&old_key), None);
+        // 新 Key 命中
+        assert_eq!(mgr.verify_and_touch(&rotated.key), Some(entry.id));
+    }
+
+    #[test]
+    fn rotate_unknown_id_returns_none() {
+        let mgr = ClientKeyManager::new();
+        assert!(mgr.rotate(999).is_none());
     }
 }

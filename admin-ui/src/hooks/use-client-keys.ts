@@ -6,6 +6,7 @@ import {
   updateClientKey,
   setClientKeyDisabled,
   resetClientKeyStats,
+  rotateClientKey,
 } from '@/api/client-keys'
 import type { CreateClientKeyRequest, UpdateClientKeyRequest } from '@/types/api'
 
@@ -55,6 +56,14 @@ export function useResetClientKeyStats() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => resetClientKeyStats(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['client-keys'] }),
+  })
+}
+
+export function useRotateClientKey() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => rotateClientKey(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['client-keys'] }),
   })
 }
