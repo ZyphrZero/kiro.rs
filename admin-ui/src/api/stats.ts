@@ -4,7 +4,8 @@ import type {
   CredentialDistribution,
   ModelDistribution,
   OverviewStats,
-  StatsRange,
+  StatsFilter,
+  StatsTimeFilter,
   TimeSeriesPoint,
 } from '@/types/api'
 
@@ -25,17 +26,30 @@ export async function getOverview(): Promise<OverviewStats> {
   return data
 }
 
-export async function getTimeSeries(range: StatsRange): Promise<TimeSeriesPoint[]> {
-  const { data } = await api.get<TimeSeriesPoint[]>('/stats/timeseries', { params: { range } })
+function statsParams(time: StatsTimeFilter, filter?: StatsFilter) {
+  return {
+    ...time,
+    ...(filter?.keyId !== undefined ? { keyId: filter.keyId } : {}),
+  }
+}
+
+export async function getTimeSeries(time: StatsTimeFilter, filter?: StatsFilter): Promise<TimeSeriesPoint[]> {
+  const { data } = await api.get<TimeSeriesPoint[]>('/stats/timeseries', {
+    params: statsParams(time, filter),
+  })
   return data
 }
 
-export async function getByModel(range: StatsRange): Promise<ModelDistribution[]> {
-  const { data } = await api.get<ModelDistribution[]>('/stats/by-model', { params: { range } })
+export async function getByModel(time: StatsTimeFilter, filter?: StatsFilter): Promise<ModelDistribution[]> {
+  const { data } = await api.get<ModelDistribution[]>('/stats/by-model', {
+    params: statsParams(time, filter),
+  })
   return data
 }
 
-export async function getByCredential(range: StatsRange): Promise<CredentialDistribution[]> {
-  const { data } = await api.get<CredentialDistribution[]>('/stats/by-credential', { params: { range } })
+export async function getByCredential(time: StatsTimeFilter, filter?: StatsFilter): Promise<CredentialDistribution[]> {
+  const { data } = await api.get<CredentialDistribution[]>('/stats/by-credential', {
+    params: statsParams(time, filter),
+  })
   return data
 }

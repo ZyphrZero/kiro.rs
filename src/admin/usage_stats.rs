@@ -2,7 +2,7 @@
 //!
 //! 记录每次 `/v1/messages` 请求的 token 消耗与命中信息：
 //! - 落盘：`usage_log.YYYY-MM-DD.jsonl`，每行一条 [`UsageRecord`]，按本地日期滚动
-//! - 内存：[`UsageAggregator`] 维护近 7 天的小时桶 + 近 31 天的天桶，按需查询
+//! - 内存：[`UsageAggregator`] 维护近 31 天的小时桶 + 近 31 天的天桶，按需查询
 //!
 //! 启动时扫描历史 JSONL 文件重建聚合，保证重启后趋势图不丢数据。
 
@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 
 /// JSONL 文件保留天数
 const RETENTION_DAYS: i64 = 31;
-/// 小时桶数量（7 天）
-const HOUR_BUCKETS: usize = 24 * 7;
+/// 小时桶数量（31 天）
+const HOUR_BUCKETS: usize = 24 * 31;
 /// 天桶数量（31 天）
 const DAY_BUCKETS: usize = 31;
 
@@ -90,7 +90,8 @@ impl UsageRecorder {
     }
 
     fn log_path(&self, date: NaiveDate) -> PathBuf {
-        self.dir.join(format!("usage_log.{}.jsonl", date.format("%Y-%m-%d")))
+        self.dir
+            .join(format!("usage_log.{}.jsonl", date.format("%Y-%m-%d")))
     }
 
     /// 同步写入一条记录。失败仅 warn，不阻塞请求。
@@ -130,7 +131,8 @@ impl UsageRecorder {
 
     /// 获取保留天数
     pub fn retention_days(&self) -> i64 {
-        self.retention_days.load(std::sync::atomic::Ordering::Relaxed)
+        self.retention_days
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 设置保留天数（>=1）
@@ -200,8 +202,11 @@ struct BucketEntry {
     /// 桶起始时间戳（小时桶为整点 Unix 秒；天桶为本地 0 点 Unix 秒）
     ts: i64,
     overall: BucketStats,
+    by_key: HashMap<u64, BucketStats>,
     by_model: HashMap<String, BucketStats>,
     by_credential: HashMap<u64, BucketStats>,
+    by_key_model: HashMap<u64, HashMap<String, BucketStats>>,
+    by_key_credential: HashMap<u64, HashMap<u64, BucketStats>>,
 }
 
 /// 时间维度聚合器
@@ -210,13 +215,13 @@ pub struct UsageAggregator {
 }
 
 struct AggregatorInner {
-    /// 小时桶（环形数组按桶起始时间索引），最近 168 个小时
+    /// 小时桶（环形数组按桶起始时间索引），最近 31 天
     hour_buckets: Vec<BucketEntry>,
     /// 天桶（按本地日期），最近 31 天
     day_buckets: Vec<BucketEntry>,
 }
 
-/// 聚合查询时间范围
+/// 预设聚合查询时间范围
 #[derive(Debug, Clone, Copy)]
 pub enum Range {
     Last24h,
@@ -225,11 +230,51 @@ pub enum Range {
 }
 
 impl Range {
-    pub fn parse(s: &str) -> Self {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "7d" => Range::Last7d,
-            "30d" => Range::Last30d,
-            _ => Range::Last24h,
+            "24h" => Some(Range::Last24h),
+            "7d" => Some(Range::Last7d),
+            "30d" => Some(Range::Last30d),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatsGranularity {
+    Hour,
+    Day,
+}
+
+impl StatsGranularity {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "hour" => Some(StatsGranularity::Hour),
+            "day" => Some(StatsGranularity::Day),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StatsQueryWindow {
+    pub start_ts: i64,
+    pub end_ts: i64,
+    pub granularity: StatsGranularity,
+}
+
+impl StatsQueryWindow {
+    pub fn preset(range: Range, granularity: StatsGranularity) -> Self {
+        let now = Utc::now().timestamp();
+        let start_ts = match range {
+            Range::Last24h => now - 24 * 3600,
+            Range::Last7d => now - 7 * 24 * 3600,
+            Range::Last30d => now - 30 * 24 * 3600,
+        };
+        Self {
+            start_ts,
+            end_ts: now,
+            granularity,
         }
     }
 }
@@ -375,31 +420,27 @@ impl UsageAggregator {
     }
 
     /// 时序数据查询
-    pub fn query_timeseries(&self, range: Range) -> Vec<TimeSeriesPoint> {
+    pub fn query_timeseries(
+        &self,
+        window: StatsQueryWindow,
+        key_id: Option<u64>,
+    ) -> Vec<TimeSeriesPoint> {
         let inner = self.inner.read();
-        let buckets = match range {
-            Range::Last24h | Range::Last7d => &inner.hour_buckets,
-            Range::Last30d => &inner.day_buckets,
-        };
-        let now = Utc::now().timestamp();
-        let cutoff = match range {
-            Range::Last24h => now - 24 * 3600,
-            Range::Last7d => now - 7 * 24 * 3600,
-            Range::Last30d => now - 30 * 24 * 3600,
-        };
+        let buckets = select_buckets(&inner, window.granularity);
 
         let mut points: Vec<TimeSeriesPoint> = buckets
             .iter()
-            .filter(|b| b.ts >= cutoff)
+            .filter(|b| bucket_in_window(b, window))
+            .filter(|b| bucket_matches_key(b, key_id))
             .map(|b| TimeSeriesPoint {
                 ts: ts_to_rfc3339(b.ts),
-                input_tokens: b.overall.input_tokens,
-                output_tokens: b.overall.output_tokens,
-                cache_creation_tokens: b.overall.cache_creation_tokens,
-                cache_read_tokens: b.overall.cache_read_tokens,
-                calls: b.overall.calls,
-                errors: b.overall.errors,
-                credits: b.overall.credits,
+                input_tokens: stats_for_key(b, key_id).input_tokens,
+                output_tokens: stats_for_key(b, key_id).output_tokens,
+                cache_creation_tokens: stats_for_key(b, key_id).cache_creation_tokens,
+                cache_read_tokens: stats_for_key(b, key_id).cache_read_tokens,
+                calls: stats_for_key(b, key_id).calls,
+                errors: stats_for_key(b, key_id).errors,
+                credits: stats_for_key(b, key_id).credits,
             })
             .collect();
         points.sort_by_key(|p| p.ts.clone());
@@ -407,21 +448,19 @@ impl UsageAggregator {
     }
 
     /// 模型分布
-    pub fn query_by_model(&self, range: Range) -> Vec<ModelDistribution> {
+    pub fn query_by_model(
+        &self,
+        window: StatsQueryWindow,
+        key_id: Option<u64>,
+    ) -> Vec<ModelDistribution> {
         let inner = self.inner.read();
-        let buckets = match range {
-            Range::Last24h | Range::Last7d => &inner.hour_buckets,
-            Range::Last30d => &inner.day_buckets,
-        };
-        let now = Utc::now().timestamp();
-        let cutoff = match range {
-            Range::Last24h => now - 24 * 3600,
-            Range::Last7d => now - 7 * 24 * 3600,
-            Range::Last30d => now - 30 * 24 * 3600,
-        };
+        let buckets = select_buckets(&inner, window.granularity);
         let mut acc: HashMap<String, BucketStats> = HashMap::new();
-        for b in buckets.iter().filter(|b| b.ts >= cutoff) {
-            for (model, stats) in &b.by_model {
+        for b in buckets.iter().filter(|b| bucket_in_window(b, window)) {
+            let Some(group) = model_group_for_key(b, key_id) else {
+                continue;
+            };
+            for (model, stats) in group {
                 let entry = acc.entry(model.clone()).or_default();
                 entry.input_tokens += stats.input_tokens;
                 entry.output_tokens += stats.output_tokens;
@@ -442,21 +481,19 @@ impl UsageAggregator {
     }
 
     /// 上游凭据分布
-    pub fn query_by_credential(&self, range: Range) -> Vec<CredentialDistribution> {
+    pub fn query_by_credential(
+        &self,
+        window: StatsQueryWindow,
+        key_id: Option<u64>,
+    ) -> Vec<CredentialDistribution> {
         let inner = self.inner.read();
-        let buckets = match range {
-            Range::Last24h | Range::Last7d => &inner.hour_buckets,
-            Range::Last30d => &inner.day_buckets,
-        };
-        let now = Utc::now().timestamp();
-        let cutoff = match range {
-            Range::Last24h => now - 24 * 3600,
-            Range::Last7d => now - 7 * 24 * 3600,
-            Range::Last30d => now - 30 * 24 * 3600,
-        };
+        let buckets = select_buckets(&inner, window.granularity);
         let mut acc: HashMap<u64, BucketStats> = HashMap::new();
-        for b in buckets.iter().filter(|b| b.ts >= cutoff) {
-            for (id, stats) in &b.by_credential {
+        for b in buckets.iter().filter(|b| bucket_in_window(b, window)) {
+            let Some(group) = credential_group_for_key(b, key_id) else {
+                continue;
+            };
+            for (id, stats) in group {
                 let entry = acc.entry(*id).or_default();
                 entry.input_tokens += stats.input_tokens;
                 entry.output_tokens += stats.output_tokens;
@@ -535,34 +572,94 @@ impl Default for UsageAggregator {
 /// 把记录写入对应桶；不存在则插入并按时间排序，超过容量时移除最旧的
 fn upsert_bucket(buckets: &mut Vec<BucketEntry>, ts: i64, rec: &UsageRecord, max: usize) {
     if let Some(b) = buckets.iter_mut().find(|b| b.ts == ts) {
-        b.overall.add(rec);
-        b.by_model.entry(rec.model.clone()).or_default().add(rec);
-        if rec.credential_id != 0 {
-            b.by_credential.entry(rec.credential_id).or_default().add(rec);
-        }
+        add_record_to_bucket(b, rec);
         return;
     }
     let mut entry = BucketEntry {
         ts,
         ..Default::default()
     };
-    entry.overall.add(rec);
-    entry
-        .by_model
-        .entry(rec.model.clone())
-        .or_default()
-        .add(rec);
-    if rec.credential_id != 0 {
-        entry
-            .by_credential
-            .entry(rec.credential_id)
-            .or_default()
-            .add(rec);
-    }
+    add_record_to_bucket(&mut entry, rec);
     buckets.push(entry);
     buckets.sort_by_key(|b| b.ts);
     while buckets.len() > max {
         buckets.remove(0);
+    }
+}
+
+fn add_record_to_bucket(bucket: &mut BucketEntry, rec: &UsageRecord) {
+    bucket.overall.add(rec);
+    bucket.by_key.entry(rec.key_id).or_default().add(rec);
+    bucket
+        .by_model
+        .entry(rec.model.clone())
+        .or_default()
+        .add(rec);
+    bucket
+        .by_key_model
+        .entry(rec.key_id)
+        .or_default()
+        .entry(rec.model.clone())
+        .or_default()
+        .add(rec);
+    if rec.credential_id == 0 {
+        return;
+    }
+    bucket
+        .by_credential
+        .entry(rec.credential_id)
+        .or_default()
+        .add(rec);
+    bucket
+        .by_key_credential
+        .entry(rec.key_id)
+        .or_default()
+        .entry(rec.credential_id)
+        .or_default()
+        .add(rec);
+}
+
+fn bucket_matches_key(bucket: &BucketEntry, key_id: Option<u64>) -> bool {
+    key_id
+        .map(|id| bucket.by_key.contains_key(&id))
+        .unwrap_or(true)
+}
+
+fn credential_group_for_key(
+    bucket: &BucketEntry,
+    key_id: Option<u64>,
+) -> Option<&HashMap<u64, BucketStats>> {
+    match key_id {
+        Some(id) => bucket.by_key_credential.get(&id),
+        None => Some(&bucket.by_credential),
+    }
+}
+
+fn model_group_for_key(
+    bucket: &BucketEntry,
+    key_id: Option<u64>,
+) -> Option<&HashMap<String, BucketStats>> {
+    match key_id {
+        Some(id) => bucket.by_key_model.get(&id),
+        None => Some(&bucket.by_model),
+    }
+}
+
+fn bucket_in_window(bucket: &BucketEntry, window: StatsQueryWindow) -> bool {
+    bucket.ts >= window.start_ts && bucket.ts < window.end_ts
+}
+
+fn select_buckets(inner: &AggregatorInner, granularity: StatsGranularity) -> &[BucketEntry] {
+    match granularity {
+        StatsGranularity::Hour => &inner.hour_buckets,
+        StatsGranularity::Day => &inner.day_buckets,
+    }
+}
+
+fn stats_for_key(bucket: &BucketEntry, key_id: Option<u64>) -> BucketStats {
+    match key_id {
+        Some(id) => bucket.by_key.get(&id).copied().unwrap_or_default(),
+        None => bucket.overall,
     }
 }
 
@@ -609,17 +706,148 @@ mod tests {
         assert_eq!(ov.today_calls, 2);
         assert_eq!(ov.today_input_tokens, 2000);
 
-        let series = agg.query_timeseries(Range::Last24h);
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let series = agg.query_timeseries(window, None);
         assert!(!series.is_empty());
 
-        let by_model = agg.query_by_model(Range::Last24h);
+        let by_model = agg.query_by_model(window, None);
         assert_eq!(by_model.len(), 1);
         assert_eq!(by_model[0].model, "claude-opus-4-7");
         assert_eq!(by_model[0].calls, 2);
 
-        let by_cred = agg.query_by_credential(Range::Last24h);
+        let by_cred = agg.query_by_credential(window, None);
         assert_eq!(by_cred.len(), 1);
         assert_eq!(by_cred[0].credential_id, 5);
+    }
+
+    #[test]
+    fn aggregator_filters_by_client_key() {
+        let agg = UsageAggregator::new();
+        let now = Utc::now().to_rfc3339();
+        let rec_a = UsageRecord {
+            ts: now.clone(),
+            key_id: 1,
+            credential_id: 5,
+            model: "m-a".to_string(),
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 0.01,
+            duration_ms: 100,
+            status: "success".to_string(),
+        };
+        let rec_b = UsageRecord {
+            ts: now,
+            key_id: 2,
+            credential_id: 6,
+            model: "m-b".to_string(),
+            input_tokens: 300,
+            output_tokens: 40,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 0.02,
+            duration_ms: 200,
+            status: "error".to_string(),
+        };
+        agg.ingest(&rec_a);
+        agg.ingest(&rec_b);
+
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let series = agg.query_timeseries(window, Some(1));
+        assert_eq!(series.iter().map(|p| p.calls).sum::<u64>(), 1);
+        assert_eq!(series.iter().map(|p| p.input_tokens).sum::<u64>(), 100);
+
+        let by_model = agg.query_by_model(window, Some(1));
+        assert_eq!(by_model.len(), 1);
+        assert_eq!(by_model[0].model, "m-a");
+
+        let by_cred = agg.query_by_credential(window, Some(1));
+        assert_eq!(by_cred.len(), 1);
+        assert_eq!(by_cred[0].credential_id, 5);
+    }
+
+    #[test]
+    fn aggregator_filters_by_custom_window_and_granularity() {
+        let agg = UsageAggregator::new();
+        let today = Local::now().date_naive();
+        let yesterday = today - Duration::days(1);
+        let yesterday_noon = Local
+            .with_ymd_and_hms(
+                yesterday.year(),
+                yesterday.month(),
+                yesterday.day(),
+                12,
+                0,
+                0,
+            )
+            .single()
+            .unwrap()
+            .with_timezone(&Utc)
+            .to_rfc3339();
+        let today_noon = Local
+            .with_ymd_and_hms(today.year(), today.month(), today.day(), 12, 0, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc)
+            .to_rfc3339();
+        let rec_yesterday = UsageRecord {
+            ts: yesterday_noon,
+            key_id: 0,
+            credential_id: 5,
+            model: "m-yesterday".to_string(),
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 0.01,
+            duration_ms: 100,
+            status: "success".to_string(),
+        };
+        let rec_today = UsageRecord {
+            ts: today_noon,
+            key_id: 0,
+            credential_id: 5,
+            model: "m-today".to_string(),
+            input_tokens: 300,
+            output_tokens: 40,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 0.02,
+            duration_ms: 100,
+            status: "success".to_string(),
+        };
+        agg.ingest(&rec_yesterday);
+        agg.ingest(&rec_today);
+
+        let start_ts = Local
+            .with_ymd_and_hms(today.year(), today.month(), today.day(), 0, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        let end_ts = Local
+            .with_ymd_and_hms(today.year(), today.month(), today.day(), 23, 59, 59)
+            .single()
+            .unwrap()
+            .timestamp();
+        let hour_window = StatsQueryWindow {
+            start_ts,
+            end_ts,
+            granularity: StatsGranularity::Hour,
+        };
+        let day_window = StatsQueryWindow {
+            start_ts,
+            end_ts,
+            granularity: StatsGranularity::Day,
+        };
+
+        let hourly = agg.query_timeseries(hour_window, None);
+        assert_eq!(hourly.iter().map(|p| p.calls).sum::<u64>(), 1);
+        assert_eq!(hourly.iter().map(|p| p.input_tokens).sum::<u64>(), 300);
+
+        let daily = agg.query_timeseries(day_window, None);
+        assert_eq!(daily.iter().map(|p| p.calls).sum::<u64>(), 1);
+        assert_eq!(daily.iter().map(|p| p.output_tokens).sum::<u64>(), 40);
     }
 
     #[test]

@@ -44,11 +44,11 @@ use super::{
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
 ///
 /// # 认证
-/// 需要 Admin API Key 认证，支持：
+/// 需要登录API密钥认证，支持：
 /// - `x-api-key` header
 /// - `Authorization: Bearer <token>` header
 pub fn create_admin_router(state: AdminState) -> Router {
-    // 需要 Admin API Key 认证的路由
+    // 需要登录API密钥认证的路由
     let authenticated = Router::new()
         .route(
             "/credentials",

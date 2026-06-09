@@ -41,25 +41,34 @@ const TraceLogPage = lazy(() =>
 
 type Tab = "overview" | "credentials" | "keys" | "traces";
 
-const TABS: { key: Tab; label: string; icon: React.ReactNode }[] = [
+const TABS: {
+  key: Tab;
+  label: string;
+  mobileLabel: string;
+  icon: React.ReactNode;
+}[] = [
   {
     key: "overview",
     label: "概览",
+    mobileLabel: "概览",
     icon: <Activity className="h-3.5 w-3.5" />,
   },
   {
     key: "credentials",
     label: "凭据管理",
+    mobileLabel: "凭据",
     icon: <Server className="h-3.5 w-3.5" />,
   },
   {
     key: "keys",
     label: "客户端 Key",
+    mobileLabel: "Key",
     icon: <KeyRound className="h-3.5 w-3.5" />,
   },
   {
     key: "traces",
     label: "请求日志",
+    mobileLabel: "日志",
     icon: <ScrollText className="h-3.5 w-3.5" />,
   },
 ];
@@ -71,7 +80,33 @@ function readTabFromHash(): Tab {
   return "overview";
 }
 
+interface AppHeaderProps {
+  darkMode: boolean;
+  tab: Tab;
+  onLogout: () => void;
+  onSwitchTab: (next: Tab) => void;
+  onToggleDarkMode: () => void;
+}
+
 function App() {
+  const app = useAppShell();
+
+  if (!app.isLoggedIn) {
+    return <LoggedOutApp onLogin={app.handleLogin} />;
+  }
+
+  return (
+    <LoggedInApp
+      darkMode={app.darkMode}
+      tab={app.tab}
+      onLogout={app.handleLogout}
+      onSwitchTab={app.switchTab}
+      onToggleDarkMode={app.toggleDarkMode}
+    />
+  );
+}
+
+function useAppShell() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [tab, setTab] = useState<Tab>(readTabFromHash);
   const [darkMode, setDarkMode] = useState(() => {
@@ -106,112 +141,227 @@ function App() {
     document.documentElement.classList.toggle("dark");
   };
 
-  if (!isLoggedIn) {
-    return (
-      <>
-        <LoginPage onLogin={handleLogin} />
-        <Toaster position="top-center" />
-      </>
-    );
-  }
+  return {
+    darkMode,
+    handleLogin,
+    handleLogout,
+    isLoggedIn,
+    switchTab,
+    tab,
+    toggleDarkMode,
+  };
+}
 
+function LoggedOutApp({ onLogin }: { onLogin: () => void }) {
+  return (
+    <>
+      <LoginPage onLogin={onLogin} />
+      <Toaster position="top-center" />
+    </>
+  );
+}
+
+function LoggedInApp({
+  darkMode,
+  onLogout,
+  onSwitchTab,
+  onToggleDarkMode,
+  tab,
+}: AppHeaderProps) {
   return (
     <ConfirmProvider>
-      {/* 顶部 Tab 导航 */}
-      <header className="sticky top-0 z-50 w-full glass">
-        <div className="mx-auto max-w-[1400px] flex h-16 items-center justify-between px-4 md:px-8">
-          <div className="flex items-center gap-3">
-            <img
-              src="/admin/kirors.png"
-              alt="Kiro"
-              className="h-9 w-9 object-contain"
-              draggable={false}
-            />
-            <span className="font-semibold tracking-tight">Kiro Admin</span>
-            <div className="ml-4 hidden sm:flex items-center gap-1 rounded-full border border-border/60 p-0.5">
-              {TABS.map((t) => (
-                <Button
-                  key={t.key}
-                  size="sm"
-                  variant={tab === t.key ? "default" : "ghost"}
-                  className="h-7 rounded-full px-3 text-xs"
-                  onClick={() => switchTab(t.key)}
-                >
-                  {t.icon}
-                  {t.label}
-                </Button>
-              ))}
-            </div>
-          </div>
-          <div className="flex items-center gap-1">
-            <TopbarTools />
-            <span className="mx-1 h-5 w-px bg-border/70" />
-            <Button variant="ghost" size="icon" asChild title="GitHub 仓库">
-              <a
-                href="https://github.com/ZyphrZero/kiro.rs"
-                target="_blank"
-                rel="noopener noreferrer"
-                aria-label="GitHub 仓库"
-              >
-                <GithubIcon className="h-4 w-4" />
-              </a>
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={toggleDarkMode}
-              title="切换主题"
-            >
-              {darkMode ? (
-                <Sun className="h-4 w-4" />
-              ) : (
-                <Moon className="h-4 w-4" />
-              )}
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={handleLogout}
-              title="退出登录"
-            >
-              <LogOut className="h-4 w-4" />
-            </Button>
-          </div>
-        </div>
-        {/* 移动端 Tab 行 */}
-        <div className="sm:hidden mx-auto max-w-[1400px] flex items-center gap-1 px-4 pb-2">
-          {TABS.map((t) => (
-            <Button
-              key={t.key}
-              size="sm"
-              variant={tab === t.key ? "default" : "ghost"}
-              className="h-7 rounded-full px-3 text-xs flex-1"
-              onClick={() => switchTab(t.key)}
-            >
-              {t.icon}
-              {t.label}
-            </Button>
-          ))}
-        </div>
-      </header>
-
-      <main className="mx-auto max-w-[1400px] px-4 md:px-8 py-8">
-        <Suspense
-          fallback={
-            <div className="text-sm text-muted-foreground">加载中…</div>
-          }
-        >
-          {tab === "overview" && <OverviewPage />}
-          {tab === "credentials" && (
-            <Dashboard onLogout={handleLogout} embedded />
-          )}
-          {tab === "keys" && <ClientKeysPage />}
-          {tab === "traces" && <TraceLogPage />}
-        </Suspense>
-      </main>
-
+      <AppHeader
+        darkMode={darkMode}
+        tab={tab}
+        onLogout={onLogout}
+        onSwitchTab={onSwitchTab}
+        onToggleDarkMode={onToggleDarkMode}
+      />
+      <AppMain tab={tab} onLogout={onLogout} />
       <Toaster position="top-center" />
     </ConfirmProvider>
+  );
+}
+
+function AppHeader({
+  darkMode,
+  onLogout,
+  onSwitchTab,
+  onToggleDarkMode,
+  tab,
+}: AppHeaderProps) {
+  return (
+    <header className="sticky top-0 z-50 w-full glass">
+      <div className="mx-auto flex h-14 max-w-[1400px] min-w-0 items-center gap-2 px-3 sm:h-16 sm:px-4 xl:px-8">
+        <HeaderBrand tab={tab} onSwitchTab={onSwitchTab} />
+        <HeaderActions
+          darkMode={darkMode}
+          onLogout={onLogout}
+          onToggleDarkMode={onToggleDarkMode}
+        />
+      </div>
+      <MobileTabs tab={tab} onSwitchTab={onSwitchTab} />
+    </header>
+  );
+}
+
+function HeaderBrand({
+  onSwitchTab,
+  tab,
+}: {
+  onSwitchTab: (next: Tab) => void;
+  tab: Tab;
+}) {
+  return (
+    <div className="flex min-w-0 flex-1 items-center gap-2 xl:gap-3">
+      <img
+        src="/admin/kirors.png"
+        alt="Kiro"
+        className="size-8 shrink-0 object-contain xl:size-9"
+        draggable={false}
+      />
+      <span className="min-w-0 truncate text-sm font-semibold tracking-tight min-[380px]:text-base">
+        Kiro Admin
+      </span>
+      <DesktopTabs tab={tab} onSwitchTab={onSwitchTab} />
+    </div>
+  );
+}
+
+function DesktopTabs({
+  onSwitchTab,
+  tab,
+}: {
+  onSwitchTab: (next: Tab) => void;
+  tab: Tab;
+}) {
+  return (
+    <div className="ml-4 hidden items-center gap-1 rounded-full border border-border/60 p-0.5 xl:flex">
+      {TABS.map((t) => (
+        <TabButton
+          key={t.key}
+          active={tab === t.key}
+          tab={t}
+          onSwitchTab={onSwitchTab}
+        />
+      ))}
+    </div>
+  );
+}
+
+function HeaderActions({
+  darkMode,
+  onLogout,
+  onToggleDarkMode,
+}: {
+  darkMode: boolean;
+  onLogout: () => void;
+  onToggleDarkMode: () => void;
+}) {
+  return (
+    <div className="flex shrink-0 items-center gap-1">
+      <div className="xl:hidden">
+        <TopbarTools compact />
+      </div>
+      <div className="hidden items-center gap-1 xl:flex">
+        <TopbarTools />
+      </div>
+      <span className="mx-1 hidden h-5 w-px bg-border/70 xl:inline-block" />
+      <GithubButton />
+      <Button variant="ghost" size="icon" onClick={onToggleDarkMode} title="切换主题">
+        {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+      </Button>
+      <Button variant="ghost" size="icon" onClick={onLogout} title="退出登录">
+        <LogOut className="h-4 w-4" />
+      </Button>
+    </div>
+  );
+}
+
+function GithubButton() {
+  return (
+    <Button
+      variant="ghost"
+      size="icon"
+      asChild
+      title="GitHub 仓库"
+      className="hidden xl:inline-flex"
+    >
+      <a
+        href="https://github.com/ZyphrZero/kiro.rs"
+        target="_blank"
+        rel="noopener noreferrer"
+        aria-label="GitHub 仓库"
+      >
+        <GithubIcon className="h-4 w-4" />
+      </a>
+    </Button>
+  );
+}
+
+function MobileTabs({
+  onSwitchTab,
+  tab,
+}: {
+  onSwitchTab: (next: Tab) => void;
+  tab: Tab;
+}) {
+  return (
+    <div className="mx-auto flex max-w-[1400px] items-center gap-1 overflow-x-auto px-3 pb-2 xl:hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+      {TABS.map((t) => (
+        <TabButton
+          key={t.key}
+          active={tab === t.key}
+          mobile
+          tab={t}
+          onSwitchTab={onSwitchTab}
+        />
+      ))}
+    </div>
+  );
+}
+
+function TabButton({
+  active,
+  mobile = false,
+  onSwitchTab,
+  tab,
+}: {
+  active: boolean;
+  mobile?: boolean;
+  onSwitchTab: (next: Tab) => void;
+  tab: (typeof TABS)[number];
+}) {
+  const className = mobile
+    ? "h-8 min-w-[4.25rem] flex-1 overflow-hidden rounded-full px-2 text-[11px] min-[360px]:min-w-[4.75rem] min-[390px]:px-3 min-[390px]:text-xs md:min-w-0 md:flex-none md:px-3"
+    : "h-7 rounded-full px-3 text-xs";
+  const label = mobile ? tab.mobileLabel : tab.label;
+
+  return (
+    <Button
+      size="sm"
+      variant={active ? "default" : "ghost"}
+      className={className}
+      onClick={() => onSwitchTab(tab.key)}
+    >
+      {tab.icon}
+      <span className={mobile ? "min-w-0 truncate" : undefined}>
+        {label}
+      </span>
+    </Button>
+  );
+}
+
+function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
+  return (
+    <main className="mx-auto max-w-[1400px] px-4 md:px-8 py-8">
+      <Suspense fallback={<div className="text-sm text-muted-foreground">加载中…</div>}>
+        {tab === "overview" && <OverviewPage />}
+        {tab === "credentials" && <Dashboard onLogout={onLogout} embedded />}
+        {tab === "keys" && <ClientKeysPage />}
+        {tab === "traces" && <TraceLogPage />}
+      </Suspense>
+    </main>
   );
 }
 

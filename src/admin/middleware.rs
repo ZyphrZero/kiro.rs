@@ -24,7 +24,7 @@ use crate::common::auth;
 pub struct AdminState {
     /// Admin API 密钥（运行时可修改）
     pub admin_api_key: Arc<RwLock<String>>,
-    /// 业务 API 密钥（运行时可修改，与 anthropic 路由共享）
+    /// 管理员API密钥（运行时可修改，与 anthropic 路由共享）
     pub api_key: Arc<RwLock<String>>,
     /// Admin 服务
     pub service: Arc<AdminService>,

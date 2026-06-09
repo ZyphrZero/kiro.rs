@@ -122,9 +122,9 @@ function credLabel(id: number, email?: string | null): string {
   return email ? email : `#${id}`
 }
 
-function keyLabel(keyId: number, keyName?: string): string {
+function keyLabel(keyId: number, keyName?: string | null): string {
   if (keyName) return keyName
-  if (keyId === 0) return 'master'
+  if (keyId === 0) return '管理员API密钥'
   return `#${keyId}`
 }
 
@@ -234,7 +234,7 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
   return (
     <>
       <tr
-        className="cursor-pointer border-b border-border/40 hover:bg-accent/40"
+        className="cursor-pointer whitespace-nowrap border-b border-border/40 hover:bg-accent/40"
         onClick={() => setOpen((v) => !v)}
       >
         <td className="py-2.5 pl-3 pr-2">
@@ -248,7 +248,7 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
           {formatTime(rec.ts)}
         </td>
         <td className="py-2.5 pr-3 text-[13px]">
-          <span className="truncate">{rec.model}</span>
+          <span className="inline-block max-w-[220px] truncate align-middle">{rec.model}</span>
           {rec.isStream && <Badge variant="outline" className="ml-1.5">流式</Badge>}
         </td>
         <td className="py-2.5 pr-3 text-[13px]">
@@ -261,9 +261,7 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
         <td className="py-2.5 pr-3">
           <StatusBadge status={rec.finalStatus} />
         </td>
-        <td className="py-2.5 pr-3 text-[13px]">
-          {credLabel(rec.finalCredentialId, rec.finalEmail)}
-        </td>
+        <TraceCredentialCell rec={rec} />
         <td className="py-2.5 pr-3 text-[12px] tabular-nums">
           <TokenCell rec={rec} />
         </td>
@@ -283,14 +281,28 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
           {formatDuration(rec.durationMs)}
         </td>
       </tr>
-      {open && (
-        <tr className="border-b border-border/40 bg-secondary/20">
-          <td colSpan={12} className="px-3 py-3">
-            <ExpandedDetail rec={rec} />
-          </td>
-        </tr>
-      )}
+      {open && <ExpandedTraceRow rec={rec} />}
     </>
+  )
+}
+
+function TraceCredentialCell({ rec }: { rec: TraceRecord }) {
+  return (
+    <td className="py-2.5 pr-3 text-[13px]">
+      <span className="inline-block max-w-[220px] truncate align-middle">
+        {credLabel(rec.finalCredentialId, rec.finalEmail)}
+      </span>
+    </td>
+  )
+}
+
+function ExpandedTraceRow({ rec }: { rec: TraceRecord }) {
+  return (
+    <tr className="border-b border-border/40 bg-secondary/20">
+      <td colSpan={12} className="px-3 py-3">
+        <ExpandedDetail rec={rec} />
+      </td>
+    </tr>
   )
 }
 
@@ -546,9 +558,9 @@ export function TraceLogPage() {
             </div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full text-left">
+              <table className="w-full min-w-[1080px] text-left">
                 <thead>
-                  <tr className="border-b border-border/60 text-[12px] uppercase tracking-wider text-muted-foreground">
+                  <tr className="whitespace-nowrap border-b border-border/60 text-[12px] uppercase tracking-wider text-muted-foreground">
                     <th className="py-2 pl-3 pr-2 font-medium"></th>
                     <th className="py-2 pr-3 font-medium">时间</th>
                     <th className="py-2 pr-3 font-medium">模型</th>

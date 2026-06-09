@@ -1,6 +1,6 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { getByCredential, getByModel, getOverview, getTimeSeries } from '@/api/stats'
-import type { StatsRange } from '@/types/api'
+import type { StatsFilter, StatsTimeFilter } from '@/types/api'
 
 /**
  * 统计接口共用配置
@@ -25,26 +25,35 @@ export function useOverview() {
   })
 }
 
-export function useTimeSeries(range: StatsRange) {
+function timeKey(time: StatsTimeFilter) {
+  return [
+    time.range ?? 'custom',
+    time.startDate ?? '',
+    time.endDate ?? '',
+    time.granularity,
+  ] as const
+}
+
+export function useTimeSeries(time: StatsTimeFilter, filter?: StatsFilter) {
   return useQuery({
-    queryKey: ['stats', 'timeseries', range],
-    queryFn: () => getTimeSeries(range),
+    queryKey: ['stats', 'timeseries', ...timeKey(time), filter?.keyId ?? 'all'],
+    queryFn: () => getTimeSeries(time, filter),
     ...COMMON,
   })
 }
 
-export function useByModel(range: StatsRange) {
+export function useByModel(time: StatsTimeFilter, filter?: StatsFilter) {
   return useQuery({
-    queryKey: ['stats', 'by-model', range],
-    queryFn: () => getByModel(range),
+    queryKey: ['stats', 'by-model', ...timeKey(time), filter?.keyId ?? 'all'],
+    queryFn: () => getByModel(time, filter),
     ...COMMON,
   })
 }
 
-export function useByCredential(range: StatsRange) {
+export function useByCredential(time: StatsTimeFilter, filter?: StatsFilter) {
   return useQuery({
-    queryKey: ['stats', 'by-credential', range],
-    queryFn: () => getByCredential(range),
+    queryKey: ['stats', 'by-credential', ...timeKey(time), filter?.keyId ?? 'all'],
+    queryFn: () => getByCredential(time, filter),
     ...COMMON,
   })
 }
