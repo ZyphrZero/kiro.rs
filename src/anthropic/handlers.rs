@@ -680,7 +680,7 @@ pub async fn post_messages(
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
-                key_ctx,
+                key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: true,
             },
@@ -704,7 +704,7 @@ pub async fn post_messages(
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
-                key_ctx,
+                key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: false,
             },
@@ -1426,7 +1426,7 @@ pub async fn post_messages_cc(
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
-                key_ctx,
+                key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: true,
             },
@@ -1450,7 +1450,7 @@ pub async fn post_messages_cc(
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
-                key_ctx,
+                key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: false,
             },
