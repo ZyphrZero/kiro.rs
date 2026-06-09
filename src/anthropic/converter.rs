@@ -240,6 +240,10 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// 本次请求声明的所有工具名（原始 client 名）。用于 `<invoke>` 文本容错的灾难兜底：
+    /// 只有合成出的工具名在此集合里，才允许把字面 `<invoke>` 捞回成结构化 tool_use；
+    /// 否则当普通文本吐出，避免把「正文展示的工具调用」误执行成真命令。
+    pub known_tool_names: std::collections::HashSet<String>,
     /// Additional model request fields (including `output_config.effort`), translated from the
     /// `output_config` field of the client's Anthropic request. Not sent when empty.
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
@@ -381,6 +385,18 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let mut tool_name_map = HashMap::new();
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
 
+    // 收集本次请求声明的所有工具名（原始 client 名），供 `<invoke>` 容错的工具表校验。
+    let mut known_tool_names: std::collections::HashSet<String> = req
+        .tools
+        .as_ref()
+        .map(|ts| ts.iter().map(|t| t.name.clone()).collect())
+        .unwrap_or_default();
+    // 建议3 修复：超长工具名（>63）会被 shorten 成短名发给上游，模型回吐的也是短名。
+    // tool_name_map 的 key 正是这些短名，一并加入，避免「超长名工具的合法 invoke 被漏捞」。
+    for short in tool_name_map.keys() {
+        known_tool_names.insert(short.clone());
+    }
+
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
 
@@ -457,6 +473,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
+        known_tool_names,
         additional_model_request_fields,
     })
 }
