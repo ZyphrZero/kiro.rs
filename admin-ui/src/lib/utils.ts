@@ -278,35 +278,3 @@ export function generateApiKey(prefix: string = 'sk-kiro-', randomLen: number = 
   return prefix + out
 }
 
-/** 分组配色：按分组名稳定映射到一组预设 tailwind 颜色 */
-export interface GroupColor {
-  /** 高亮描边类，如 ring-emerald-500/70 */
-  ring: string
-  /** 色点背景类，如 bg-emerald-500 */
-  dot: string
-  /** 文字色类，如 text-emerald-600 dark:text-emerald-400 */
-  text: string
-}
-
-const GROUP_COLORS: GroupColor[] = [
-  { ring: 'ring-emerald-500/70', dot: 'bg-emerald-500', text: 'text-emerald-600 dark:text-emerald-400' },
-  { ring: 'ring-violet-500/70', dot: 'bg-violet-500', text: 'text-violet-600 dark:text-violet-400' },
-  { ring: 'ring-amber-500/70', dot: 'bg-amber-500', text: 'text-amber-600 dark:text-amber-400' },
-  { ring: 'ring-cyan-500/70', dot: 'bg-cyan-500', text: 'text-cyan-600 dark:text-cyan-400' },
-  { ring: 'ring-pink-500/70', dot: 'bg-pink-500', text: 'text-pink-600 dark:text-pink-400' },
-  { ring: 'ring-indigo-500/70', dot: 'bg-indigo-500', text: 'text-indigo-600 dark:text-indigo-400' },
-  { ring: 'ring-teal-500/70', dot: 'bg-teal-500', text: 'text-teal-600 dark:text-teal-400' },
-  { ring: 'ring-rose-500/70', dot: 'bg-rose-500', text: 'text-rose-600 dark:text-rose-400' },
-  { ring: 'ring-lime-500/70', dot: 'bg-lime-500', text: 'text-lime-600 dark:text-lime-400' },
-  { ring: 'ring-sky-500/70', dot: 'bg-sky-500', text: 'text-sky-600 dark:text-sky-400' },
-]
-
-/** 同名分组始终返回同一种颜色（简单字符串哈希取模） */
-export function groupColor(name: string): GroupColor {
-  let hash = 0
-  for (let i = 0; i < name.length; i++) {
-    hash = (hash << 5) - hash + name.charCodeAt(i)
-    hash |= 0
-  }
-  return GROUP_COLORS[Math.abs(hash) % GROUP_COLORS.length]
-}

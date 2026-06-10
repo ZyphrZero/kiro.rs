@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   RefreshCw,
   LogOut,
@@ -29,8 +29,6 @@ import {
   Wand2,
   Zap,
   Tags,
-  LayoutGrid,
-  Rows3,
 } from "lucide-react";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -69,7 +67,6 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { CredentialCard } from "@/components/credential-card";
-import { CredentialRow } from "@/components/credential-row";
 import { AddCredentialDialog } from "@/components/add-credential-dialog";
 import { BatchImportDialog } from "@/components/batch-import-dialog";
 import { BatchEditCredentialDialog } from "@/components/batch-edit-credential-dialog";
@@ -94,9 +91,6 @@ import {
 } from "@/hooks/use-credentials";
 import { useUpdateCheck } from "@/hooks/use-update-check";
 import { useFailureStats } from "@/hooks/use-traces";
-import { useTraces } from "@/hooks/use-traces";
-import { useClientKeys } from "@/hooks/use-client-keys";
-import { groupColor } from "@/lib/utils";
 import { useRectSelect } from "@/hooks/use-rect-select";
 import {
   DndContext,
@@ -200,46 +194,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const setPriority = useSetPriority();
   const { data: updateCheck } = useUpdateCheck();
   const { data: failureStatsMap } = useFailureStats();
-
-  // 视图模式：卡片网格 / 分组横向视图
-  const [viewMode, setViewMode] = useState<"card" | "group">("card");
-  // 分组视图所需数据：最近请求日志 + 客户端 Key（含 group）
-  const { data: tracesData } = useTraces({ limit: 200 }, viewMode === "group");
-  const { data: clientKeysData } = useClientKeys();
-
-  // 每个分组「当前在用」的账号 id：keyId→组映射后，倒序遍历 traces，每组首遇即最新
-  const groupCurrentMap = useMemo(() => {
-    const keyToGroup = new Map<number, string>();
-    for (const k of clientKeysData?.keys ?? []) {
-      if (k.group) keyToGroup.set(k.id, k.group);
-    }
-    const map = new Map<string, number>();
-    for (const r of tracesData?.records ?? []) {
-      const g = keyToGroup.get(r.keyId);
-      if (g && !map.has(g)) map.set(g, r.finalCredentialId);
-    }
-    return map;
-  }, [tracesData, clientKeysData]);
-
-  // 按分组归拢账号：每个所属分组各出现一次，无分组归入「未分组」
-  const groupedCredentials = useMemo(() => {
-    const UNGROUPED = "未分组";
-    const creds = data?.credentials ?? [];
-    const groups = new Map<string, typeof creds>();
-    for (const c of creds) {
-      const names = c.groups && c.groups.length > 0 ? c.groups : [UNGROUPED];
-      for (const name of names) {
-        if (!groups.has(name)) groups.set(name, []);
-        groups.get(name)!.push(c);
-      }
-    }
-    // 组名排序：未分组放最后，其余按名称
-    return Array.from(groups.entries()).sort(([a], [b]) => {
-      if (a === UNGROUPED) return 1;
-      if (b === UNGROUPED) return -1;
-      return a.localeCompare(b);
-    });
-  }, [data?.credentials]);
 
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage);
   const startIndex = (currentPage - 1) * itemsPerPage;
@@ -1145,27 +1099,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             {data?.credentials && data.credentials.length > 0 && (
               <Badge variant="secondary">{data.credentials.length}</Badge>
             )}
-            {/* 视图切换：卡片 / 分组 */}
-            <div className="flex items-center rounded-lg border border-border/60 p-0.5">
-              <Button
-                size="sm"
-                variant={viewMode === "card" ? "secondary" : "ghost"}
-                className="h-7 px-2"
-                onClick={() => setViewMode("card")}
-                title="卡片视图"
-              >
-                <LayoutGrid className="h-3.5 w-3.5" />
-              </Button>
-              <Button
-                size="sm"
-                variant={viewMode === "group" ? "secondary" : "ghost"}
-                className="h-7 px-2"
-                onClick={() => setViewMode("group")}
-                title="分组视图"
-              >
-                <Rows3 className="h-3.5 w-3.5" />
-              </Button>
-            </div>
             {currentCredentials.length > 0 && (
               <Button
                 size="sm"
@@ -1449,50 +1382,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </p>
             </CardContent>
           </Card>
-        ) : viewMode === "group" ? (
-          <div className="space-y-6">
-            {groupedCredentials.map(([groupName, creds]) => {
-              const color = groupColor(groupName);
-              const availableCount = creds.filter(
-                (c) => !c.disabled && (c.throttledRemainingSecs ?? 0) === 0,
-              ).length;
-              const currentId = groupCurrentMap.get(groupName);
-              return (
-                <div key={groupName}>
-                  <div className="mb-2 flex items-center gap-2">
-                    <span className={`h-2.5 w-2.5 rounded-full ${color.dot}`} />
-                    <h3 className={`text-sm font-semibold ${color.text}`}>
-                      {groupName}
-                    </h3>
-                    <Badge variant="secondary">
-                      {availableCount}/{creds.length} 可用
-                    </Badge>
-                  </div>
-                  <div className="space-y-1.5">
-                    {creds.map((credential) => (
-                      <CredentialRow
-                        key={`${groupName}-${credential.id}`}
-                        credential={credential}
-                        selected={selectedIds.has(credential.id)}
-                        onToggleSelect={() => toggleSelect(credential.id)}
-                        balance={
-                          balanceMap.get(credential.id) ||
-                          credential.balance ||
-                          null
-                        }
-                        loadingBalance={loadingBalanceIds.has(credential.id)}
-                        onRefreshBalance={() =>
-                          handleRefreshBalance(credential.id)
-                        }
-                        groupCurrent={currentId === credential.id}
-                        highlightColor={color}
-                      />
-                    ))}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
         ) : (
           <>
             <DndContext
