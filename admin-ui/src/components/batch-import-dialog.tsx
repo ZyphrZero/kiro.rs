@@ -48,6 +48,46 @@ interface VerificationResult {
   rollbackError?: string
 }
 
+/**
+ * 字段归一化：兼容 Kiro durable token 导出的下划线命名（refresh_token/client_id/...）
+ * 与本工具原生的驼峰命名（refreshToken/clientId/...）。驼峰优先，下划线兜底。
+ * access_token / profile_arn / expires_at 等多余字段忽略：后端用 refreshToken 重新刷新、
+ * profileArn 在调用时自动解析。
+ */
+function normalizeCredential(raw: Record<string, unknown>): CredentialInput {
+  const pick = (...keys: string[]): string | undefined => {
+    for (const k of keys) {
+      const v = raw[k]
+      if (typeof v === 'string' && v.trim()) return v.trim()
+    }
+    return undefined
+  }
+  const pickNum = (...keys: string[]): number | undefined => {
+    for (const k of keys) {
+      const v = raw[k]
+      if (typeof v === 'number') return v
+    }
+    return undefined
+  }
+  return {
+    refreshToken: pick('refreshToken', 'refresh_token'),
+    clientId: pick('clientId', 'client_id'),
+    clientSecret: pick('clientSecret', 'client_secret'),
+    kiroApiKey: pick('kiroApiKey', 'kiro_api_key'),
+    authMethod: pick('authMethod', 'auth_method'),
+    region: pick('region'),
+    authRegion: pick('authRegion', 'auth_region'),
+    apiRegion: pick('apiRegion', 'api_region'),
+    machineId: pick('machineId', 'machine_id'),
+    endpoint: pick('endpoint'),
+    email: pick('email'),
+    proxyUrl: pick('proxyUrl', 'proxy_url'),
+    proxyUsername: pick('proxyUsername', 'proxy_username'),
+    proxyPassword: pick('proxyPassword', 'proxy_password'),
+    priority: pickNum('priority'),
+  }
+}
+
 
 
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
@@ -99,7 +139,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     let credentials: CredentialInput[]
     try {
       const parsed = JSON.parse(jsonInput)
-      credentials = Array.isArray(parsed) ? parsed : [parsed]
+      const arr = Array.isArray(parsed) ? parsed : [parsed]
+      // 字段归一化：兼容下划线（Kiro 导出格式）与驼峰两种命名
+      credentials = arr.map((c) => normalizeCredential(c as Record<string, unknown>))
     } catch (error) {
       toast.error('JSON 格式错误: ' + extractErrorMessage(error))
       return
@@ -451,7 +493,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\nregion 字段会同时映射为 authRegion 与 apiRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\n支持驼峰与下划线两种命名：\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nKiro 导出: [{"refresh_token":"...","client_id":"...","client_secret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n多余字段(access_token/profile_arn/expires_at 等)会被忽略\nregion 字段会同时映射为 authRegion 与 apiRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
