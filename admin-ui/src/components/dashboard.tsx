@@ -91,7 +91,15 @@ import {
 } from "@/hooks/use-credentials";
 import { useUpdateCheck } from "@/hooks/use-update-check";
 import { useFailureStats } from "@/hooks/use-traces";
+import { useGroupOptions } from "@/hooks/use-groups";
 import { useRectSelect } from "@/hooks/use-rect-select";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   DndContext,
   PointerSensor,
@@ -194,11 +202,30 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const setPriority = useSetPriority();
   const { data: updateCheck } = useUpdateCheck();
   const { data: failureStatsMap } = useFailureStats();
+  const groupOptions = useGroupOptions();
 
-  const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage);
+  // 分组筛选：'' = 全部；'__none__' = 仅显示未分组；其他 = 按分组名筛选
+  const [groupFilter, setGroupFilter] = useState<string>('');
+
+  // 应用分组筛选后的凭据全集（分页前先过滤，确保翻页粒度正确）
+  const filteredCredentials = (() => {
+    const all = data?.credentials ?? [];
+    if (!groupFilter) return all;
+    if (groupFilter === '__none__') {
+      return all.filter((c) => !c.groups || c.groups.length === 0);
+    }
+    return all.filter((c) => c.groups?.includes(groupFilter));
+  })();
+
+  // 切换分组筛选时复位到第 1 页，避免空页
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [groupFilter]);
+
+  const totalPages = Math.ceil(filteredCredentials.length / itemsPerPage);
   const startIndex = (currentPage - 1) * itemsPerPage;
   const endIndex = startIndex + itemsPerPage;
-  const serverPageCreds = data?.credentials.slice(startIndex, endIndex) || [];
+  const serverPageCreds = filteredCredentials.slice(startIndex, endIndex);
   // 拖拽排序的本地乐观顺序：仅当 id 集合与当前页一致时生效，否则回落到服务端顺序，
   // 避免翻页 / 数据变更后顺序错乱。
   const [pageOrder, setPageOrder] = useState<number[] | null>(null);
@@ -1097,7 +1124,24 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             <h2 className="text-lg font-semibold tracking-tight">凭据列表</h2>
             {data?.credentials && data.credentials.length > 0 && (
-              <Badge variant="secondary">{data.credentials.length}</Badge>
+              <Badge variant="secondary">
+                {groupFilter
+                  ? `${filteredCredentials.length} / ${data.credentials.length}`
+                  : data.credentials.length}
+              </Badge>
+            )}
+            {groupFilter && (
+              <Badge variant="outline" className="gap-1">
+                筛选：{groupFilter === '__none__' ? '未分组' : groupFilter}
+                <button
+                  type="button"
+                  className="ml-1 text-muted-foreground hover:text-foreground"
+                  onClick={() => setGroupFilter('')}
+                  title="清除筛选"
+                >
+                  ×
+                </button>
+              </Badge>
             )}
             {currentCredentials.length > 0 && (
               <Button
@@ -1204,6 +1248,25 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 <span className="mx-1 hidden h-5 w-px bg-border/70 sm:inline-block" />
               </>
             )}
+
+            {/* 分组筛选 */}
+            <Select value={groupFilter || 'all'} onValueChange={(v) => setGroupFilter(v === 'all' ? '' : v)}>
+              <SelectTrigger
+                className="h-8 w-full rounded-full border-border bg-card/60 px-3 backdrop-blur sm:w-[160px]"
+                title="按分组筛选凭据"
+              >
+                <SelectValue placeholder="全部分组" />
+              </SelectTrigger>
+              <SelectContent align="end">
+                <SelectItem value="all">全部分组</SelectItem>
+                <SelectItem value="__none__">未分组</SelectItem>
+                {groupOptions.map((g) => (
+                  <SelectItem key={g} value={g}>
+                    {g}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
 
             {/* 刷新当前页余额 */}
             <Button
@@ -1466,9 +1529,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         open={batchEditDialogOpen}
         onOpenChange={setBatchEditDialogOpen}
         credentials={(data?.credentials ?? []).filter((c) => selectedIds.has(c.id))}
-        groupOptions={Array.from(
-          new Set((data?.credentials ?? []).flatMap((c) => c.groups ?? [])),
-        ).sort()}
+        groupOptions={groupOptions}
         onDone={deselectAll}
       />
       <SocialLoginDialog

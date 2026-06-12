@@ -13,6 +13,7 @@ use axum::{
 };
 
 use super::client_keys::SharedClientKeyManager;
+use super::groups::SharedGroupManager;
 use super::service::AdminService;
 use super::types::AdminErrorResponse;
 use super::usage_stats::SharedAggregator;
@@ -34,6 +35,8 @@ pub struct AdminState {
     pub usage_aggregator: SharedAggregator,
     /// 请求链路追踪存储（与 anthropic 路由共享）
     pub trace_store: SharedTraceStore,
+    /// 账号分组注册表（持久化到 groups.json）
+    pub groups: SharedGroupManager,
 }
 
 impl AdminState {
@@ -44,6 +47,7 @@ impl AdminState {
         client_keys: SharedClientKeyManager,
         usage_aggregator: SharedAggregator,
         trace_store: SharedTraceStore,
+        groups: SharedGroupManager,
     ) -> Self {
         Self {
             admin_api_key: Arc::new(RwLock::new(admin_api_key.into())),
@@ -52,6 +56,7 @@ impl AdminState {
             client_keys,
             usage_aggregator,
             trace_store,
+            groups,
         }
     }
 }

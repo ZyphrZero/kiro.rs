@@ -18,7 +18,7 @@ import {
   useSetClientKeyDisabled, useResetClientKeyStats, useUpdateClientKey,
   useRotateClientKey,
 } from '@/hooks/use-client-keys'
-import { useCredentials } from '@/hooks/use-credentials'
+import { useGroupOptions } from '@/hooks/use-groups'
 import { GroupSingleSelect } from '@/components/group-select'
 import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
@@ -42,7 +42,8 @@ function formatRelative(ts?: string): string {
 
 export function ClientKeysPage() {
   const { data, isLoading } = useClientKeys()
-  const { data: credData } = useCredentials()
+  // 已注册分组列表（来自 groups.json 注册表，与凭据的 groups 字段解耦）
+  const groupOptions = useGroupOptions()
   const createKey = useCreateClientKey()
   const deleteKey = useDeleteClientKey()
   const setDisabled = useSetClientKeyDisabled()
@@ -50,11 +51,6 @@ export function ClientKeysPage() {
   const updateKey = useUpdateClientKey()
   const rotateKey = useRotateClientKey()
   const confirm = useConfirm()
-
-  // 现有分组名集合（从所有账号的 groups 聚合去重），供下拉建议
-  const groupOptions = Array.from(
-    new Set((credData?.credentials ?? []).flatMap((c) => c.groups ?? [])),
-  ).sort()
 
   const [createOpen, setCreateOpen] = useState(false)
   const [createName, setCreateName] = useState('')

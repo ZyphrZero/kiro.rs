@@ -407,6 +407,8 @@ export interface StatsTimeFilter {
 export interface StatsFilter {
   /** 不传 = 全部；0 = 管理员API密钥；其它值 = 创建的客户端 Key id */
   keyId?: number
+  /** 按账号分组筛选（仅影响 timeseries / by-credential，by-model 不支持） */
+  group?: string
 }
 
 export interface OverviewStats {
@@ -535,3 +537,32 @@ export interface FailureStats {
 
 /** credentialId(字符串) → 失败分类计数 */
 export type FailureStatsMap = Record<string, FailureStats>
+
+// ============ 账号分组（独立实体）============
+
+export interface GroupItem {
+  name: string
+  description?: string
+  createdAt: string
+  /** 引用计数：有多少个凭据带这个分组 */
+  credentialCount: number
+  /** 引用计数：有多少把客户端 Key 绑定这个分组 */
+  clientKeyCount: number
+}
+
+export interface GroupsResponse {
+  total: number
+  groups: GroupItem[]
+}
+
+export interface CreateGroupRequest {
+  name: string
+  description?: string
+}
+
+export interface UpdateGroupRequest {
+  /** 新名字；不传或与原名一致则不改名 */
+  newName?: string
+  /** 新备注；空字符串清除；undefined 保留原值 */
+  description?: string
+}

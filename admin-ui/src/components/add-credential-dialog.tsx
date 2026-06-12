@@ -16,7 +16,8 @@ import {
   SelectContent,
   SelectItem,
 } from '@/components/ui/select'
-import { useAddCredential, useCredentials } from '@/hooks/use-credentials'
+import { useAddCredential } from '@/hooks/use-credentials'
+import { useGroupOptions } from '@/hooks/use-groups'
 import { extractErrorMessage } from '@/lib/utils'
 import { GroupMultiSelect } from '@/components/group-select'
 
@@ -43,10 +44,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [groups, setGroups] = useState<string[]>([])
   const [sourceChannel, setSourceChannel] = useState('')
 
-  const { data: credData } = useCredentials()
-  const groupOptions = Array.from(
-    new Set((credData?.credentials ?? []).flatMap((c) => c.groups ?? [])),
-  ).sort()
+  const groupOptions = useGroupOptions()
 
   const { mutate, isPending } = useAddCredential()
 

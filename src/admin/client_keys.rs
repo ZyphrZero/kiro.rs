@@ -237,6 +237,64 @@ impl ClientKeyManager {
         self.inner.read().entries.get(&id).and_then(|e| e.group.clone())
     }
 
+    /// 列出所有当前被引用的分组名（仅去重，不带计数）。
+    pub fn used_group_names(&self) -> Vec<String> {
+        let inner = self.inner.read();
+        let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for e in inner.entries.values() {
+            if let Some(g) = &e.group {
+                set.insert(g.clone());
+            }
+        }
+        let mut list: Vec<String> = set.into_iter().collect();
+        list.sort();
+        list
+    }
+
+    /// 统计指定分组被多少把 Key 绑定（用于分组管理页 / 删除前提示）。
+    pub fn count_with_group(&self, group: &str) -> usize {
+        self.inner
+            .read()
+            .entries
+            .values()
+            .filter(|e| e.group.as_deref() == Some(group))
+            .count()
+    }
+
+    /// 把所有引用 `old` 的 Key 的 group 字段改为 `new`（分组改名级联用）。
+    /// 返回受影响的 Key 数。
+    pub fn rename_group(&self, old: &str, new: &str) -> usize {
+        let mut inner = self.inner.write();
+        let mut affected = 0usize;
+        for entry in inner.entries.values_mut() {
+            if entry.group.as_deref() == Some(old) {
+                entry.group = Some(new.to_string());
+                affected += 1;
+            }
+        }
+        if affected > 0 {
+            self.save_locked(&inner);
+        }
+        affected
+    }
+
+    /// 把所有引用 `name` 的 Key 的 group 字段清空（强删分组级联用）。
+    /// 返回受影响的 Key 数。
+    pub fn clear_group(&self, name: &str) -> usize {
+        let mut inner = self.inner.write();
+        let mut affected = 0usize;
+        for entry in inner.entries.values_mut() {
+            if entry.group.as_deref() == Some(name) {
+                entry.group = None;
+                affected += 1;
+            }
+        }
+        if affected > 0 {
+            self.save_locked(&inner);
+        }
+        affected
+    }
+
     /// 轮换 Key 值：旧 Key 立即失效，生成新明文，保留 id/name/description/group/统计/disabled。
     /// 用于「明文遗失」「下游怀疑泄漏」场景，比删后重建更安全（不会丢统计与分组绑定）。
     /// 命中且替换成功时返回新条目（含新明文）；id 不存在时返回 None。

@@ -36,7 +36,7 @@ function timeKey(time: StatsTimeFilter) {
 
 export function useTimeSeries(time: StatsTimeFilter, filter?: StatsFilter) {
   return useQuery({
-    queryKey: ['stats', 'timeseries', ...timeKey(time), filter?.keyId ?? 'all'],
+    queryKey: ['stats', 'timeseries', ...timeKey(time), filter?.keyId ?? 'all', filter?.group ?? 'all'],
     queryFn: () => getTimeSeries(time, filter),
     ...COMMON,
   })
@@ -44,7 +44,7 @@ export function useTimeSeries(time: StatsTimeFilter, filter?: StatsFilter) {
 
 export function useByModel(time: StatsTimeFilter, filter?: StatsFilter) {
   return useQuery({
-    queryKey: ['stats', 'by-model', ...timeKey(time), filter?.keyId ?? 'all'],
+    queryKey: ['stats', 'by-model', ...timeKey(time), filter?.keyId ?? 'all', filter?.group ?? 'all'],
     queryFn: () => getByModel(time, filter),
     ...COMMON,
   })
@@ -52,7 +52,7 @@ export function useByModel(time: StatsTimeFilter, filter?: StatsFilter) {
 
 export function useByCredential(time: StatsTimeFilter, filter?: StatsFilter) {
   return useQuery({
-    queryKey: ['stats', 'by-credential', ...timeKey(time), filter?.keyId ?? 'all'],
+    queryKey: ['stats', 'by-credential', ...timeKey(time), filter?.keyId ?? 'all', filter?.group ?? 'all'],
     queryFn: () => getByCredential(time, filter),
     ...COMMON,
   })

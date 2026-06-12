@@ -19,7 +19,8 @@ import {
   SelectItem,
 } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
-import { useUpdateCredential, useCredentials } from '@/hooks/use-credentials'
+import { useUpdateCredential } from '@/hooks/use-credentials'
+import { useGroupOptions } from '@/hooks/use-groups'
 import { getProxyPool } from '@/api/credentials'
 import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
 import { GroupMultiSelect } from '@/components/group-select'
@@ -44,10 +45,7 @@ export function EditCredentialDialog({
   const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
   const [manualMode, setManualMode] = useState(false)
 
-  const { data: credData } = useCredentials()
-  const groupOptions = Array.from(
-    new Set((credData?.credentials ?? []).flatMap((c) => c.groups ?? [])),
-  ).sort()
+  const groupOptions = useGroupOptions()
 
   const { data: proxyPool } = useQuery({
     queryKey: ['proxy-pool'],

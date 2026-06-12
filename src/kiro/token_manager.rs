@@ -2803,6 +2803,91 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 列出所有凭据当前引用的分组名（去重排序）。
+    /// 用于启动迁移到 GroupManager 注册表，以及前端的引用计数显示。
+    pub fn list_credential_groups(&self) -> Vec<String> {
+        let entries = self.entries.lock();
+        let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for e in entries.iter() {
+            for g in &e.credentials.groups {
+                if !g.is_empty() {
+                    set.insert(g.clone());
+                }
+            }
+        }
+        let mut list: Vec<String> = set.into_iter().collect();
+        list.sort();
+        list
+    }
+
+    /// 统计指定分组被多少个凭据引用（用于分组管理页 / 删除前提示）。
+    pub fn count_credentials_with_group(&self, group: &str) -> usize {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .filter(|e| e.credentials.groups.iter().any(|g| g == group))
+            .count()
+    }
+
+    /// 把所有凭据 `groups` 字段中等于 `old` 的元素改为 `new`（分组改名级联用）。
+    /// 已经显式带 `new` 的凭据不会重复添加。返回受影响的凭据数。
+    pub fn rename_credential_group(&self, old: &str, new: &str) -> anyhow::Result<usize> {
+        let mut affected = 0usize;
+        {
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                let groups = &mut entry.credentials.groups;
+                let mut hit = false;
+                let mut already_has_new = false;
+                for g in groups.iter() {
+                    if g == old {
+                        hit = true;
+                    }
+                    if g == new {
+                        already_has_new = true;
+                    }
+                }
+                if hit {
+                    if already_has_new {
+                        // old 和 new 共存：只去掉 old，避免重复
+                        groups.retain(|g| g != old);
+                    } else {
+                        for g in groups.iter_mut() {
+                            if g == old {
+                                *g = new.to_string();
+                            }
+                        }
+                    }
+                    affected += 1;
+                }
+            }
+        }
+        if affected > 0 {
+            self.persist_credentials()?;
+        }
+        Ok(affected)
+    }
+
+    /// 把 `name` 这个分组从所有凭据的 `groups` 字段中移除（强删分组级联用）。
+    /// 返回受影响的凭据数。
+    pub fn remove_credential_group(&self, name: &str) -> anyhow::Result<usize> {
+        let mut affected = 0usize;
+        {
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                let before = entry.credentials.groups.len();
+                entry.credentials.groups.retain(|g| g != name);
+                if entry.credentials.groups.len() != before {
+                    affected += 1;
+                }
+            }
+        }
+        if affected > 0 {
+            self.persist_credentials()?;
+        }
+        Ok(affected)
+    }
+
     /// 删除凭据（Admin API）
     ///
     /// # 前置条件

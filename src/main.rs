@@ -195,6 +195,25 @@ async fn main() {
     let usage_aggregator = std::sync::Arc::new(admin::UsageAggregator::new());
     usage_aggregator.rebuild_from_logs(&cache_dir);
 
+    // 账号分组注册表（持久化到 groups.json）。
+    // 启动时若文件不存在则首次创建，并把现有凭据 / 客户端 Key 的 groups 字段反向迁移进去，
+    // 保证老用户升级后所有已用分组都自动注册，不会因为本次改造而消失。
+    let groups_path = admin::groups::default_path_in(&cache_dir);
+    let group_manager = std::sync::Arc::new(
+        admin::GroupManager::load(&groups_path).unwrap_or_else(|e| {
+            tracing::warn!("加载分组注册表失败 ({}): {}", groups_path.display(), e);
+            admin::GroupManager::new()
+        }),
+    );
+    {
+        let mut all_used: Vec<String> = token_manager.list_credential_groups();
+        all_used.extend(client_key_manager.used_group_names());
+        let added = group_manager.bootstrap_from_existing(all_used);
+        if added > 0 {
+            tracing::info!("分组注册表：自动迁移 {} 个已用分组", added);
+        }
+    }
+
     // 请求链路追踪存储（SQLite，traces.db）。失败不致命：trace 不可用但服务正常。
     let trace_store: Option<admin::SharedTraceStore> = match admin::TraceStore::open(
         cache_dir.join("traces.db"),
@@ -280,6 +299,7 @@ async fn main() {
                 client_key_manager.clone(),
                 usage_aggregator.clone(),
                 admin_trace_store,
+                group_manager.clone(),
             );
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）

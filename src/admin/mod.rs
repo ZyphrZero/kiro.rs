@@ -25,10 +25,12 @@ mod service;
 pub mod types;
 mod binary_update;
 pub mod client_keys;
+pub mod groups;
 pub mod usage_stats;
 pub mod trace_db;
 
 pub use client_keys::ClientKeyManager;
+pub use groups::GroupManager;
 pub use middleware::AdminState;
 pub use router::create_admin_router;
 pub use service::AdminService;

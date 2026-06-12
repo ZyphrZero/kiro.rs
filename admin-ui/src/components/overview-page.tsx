@@ -5,6 +5,7 @@ import { Badge } from '@/components/ui/badge'
 import { Activity, Calendar, Coins, Cpu, KeyRound, Server } from 'lucide-react'
 import { useByCredential, useByModel, useOverview, useTimeSeries } from '@/hooks/use-stats'
 import { useClientKeys } from '@/hooks/use-client-keys'
+import { useGroupOptions } from '@/hooks/use-groups'
 import type {
   ClientKeyItem,
   CredentialDistribution,
@@ -78,6 +79,7 @@ export function OverviewPage() {
   const filters = useOverviewFilters()
   const { data: overview } = useOverview()
   const { data: keysData } = useClientKeys()
+  const groupOptions = useGroupOptions()
   const { data: series } = useTimeSeries(filters.timeFilter, filters.statsFilter)
   const { data: byModel } = useByModel(filters.timeFilter, filters.statsFilter)
   const { data: byCred } = useByCredential(filters.timeFilter, filters.statsFilter)
@@ -86,6 +88,7 @@ export function OverviewPage() {
   const credData = useMemo(() => byCred ?? [], [byCred])
   const rangeStats = useMemo(() => aggregateSeries(seriesData), [seriesData])
   const selectedKeyLabel = selectedStatsKeyLabel(filters.keyFilter, keysData?.keys ?? [])
+  const groupFilterActive = filters.groupFilter !== 'all'
 
   return (
     <div>
@@ -101,6 +104,9 @@ export function OverviewPage() {
         keys={keysData?.keys ?? []}
         selectedLabel={selectedKeyLabel}
         onChange={filters.setKeyFilter}
+        groupFilter={filters.groupFilter}
+        groupOptions={groupOptions}
+        onGroupChange={filters.setGroupFilter}
       />
       <TrendCard
         customEndDate={filters.customEndDate}
@@ -120,6 +126,7 @@ export function OverviewPage() {
         byCred={credData}
         byModel={modelData}
         timeText={timeLabel(filters.timeFilter)}
+        groupFilterActive={groupFilterActive}
       />
     </div>
   )
@@ -135,10 +142,13 @@ function useOverviewFilters() {
   const [draftGranularity, setDraftGranularity] = useState<StatsGranularity>('hour')
   const [draftRange, setDraftRange] = useState<StatsRange | undefined>('24h')
   const [keyFilter, setKeyFilter] = useState('all')
+  const [groupFilter, setGroupFilter] = useState('all')
   const statsFilter = useMemo<StatsFilter>(() => {
-    if (keyFilter === 'all') return {}
-    return { keyId: Number(keyFilter) }
-  }, [keyFilter])
+    const f: StatsFilter = {}
+    if (keyFilter !== 'all') f.keyId = Number(keyFilter)
+    if (groupFilter !== 'all') f.group = groupFilter
+    return f
+  }, [keyFilter, groupFilter])
   const applyCustomRange = () => {
     setTimeFilter(customTimeFilter(customStartDate, customEndDate, draftGranularity))
   }
@@ -163,11 +173,13 @@ function useOverviewFilters() {
     draftGranularity,
     draftRange,
     keyFilter,
+    groupFilter,
     selectPresetRange,
     setCustomEndDate: updateCustomEndDate,
     setCustomStartDate: updateCustomStartDate,
     setDraftGranularity,
     setKeyFilter,
+    setGroupFilter,
     statsFilter,
     timeFilter,
   }
@@ -267,34 +279,60 @@ function KeyFilterCard({
   keys,
   onChange,
   selectedLabel,
+  groupFilter,
+  groupOptions,
+  onGroupChange,
 }: {
   keyFilter: string
   keys: ClientKeyItem[]
   onChange: (value: string) => void
   selectedLabel: string
+  groupFilter: string
+  groupOptions: string[]
+  onGroupChange: (value: string) => void
 }) {
   return (
     <Card className="mb-6">
       <CardContent className="p-4 sm:p-5">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <div className="text-sm font-medium">统计入口</div>
-            <div className="truncate text-[12px] text-muted-foreground">{selectedLabel}</div>
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-medium">统计筛选</div>
+            <div className="truncate text-[12px] text-muted-foreground">
+              {selectedLabel}
+              {groupFilter !== 'all' && ` · 分组：${groupFilter}`}
+            </div>
           </div>
-          <Select value={keyFilter} onValueChange={onChange}>
-            <SelectTrigger className="h-8 w-full sm:w-[220px]">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent align="end">
-              <SelectItem value="all">全部入口 Key</SelectItem>
-              <SelectItem value="0">管理员API密钥</SelectItem>
-              {keys.map((key) => (
-                <SelectItem key={key.id} value={String(key.id)}>
-                  {key.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <div className="flex flex-col gap-2 sm:flex-row">
+            {/* 入口 Key 筛选 */}
+            <Select value={keyFilter} onValueChange={onChange}>
+              <SelectTrigger className="h-8 w-full sm:w-[180px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent align="end">
+                <SelectItem value="all">全部入口 Key</SelectItem>
+                <SelectItem value="0">管理员API密钥</SelectItem>
+                {keys.map((key) => (
+                  <SelectItem key={key.id} value={String(key.id)}>
+                    {key.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {/* 账号分组筛选 */}
+            <Select value={groupFilter} onValueChange={onGroupChange}>
+              <SelectTrigger className="h-8 w-full sm:w-[180px]">
+                <SelectValue placeholder="全部分组" />
+              </SelectTrigger>
+              <SelectContent align="end">
+                <SelectItem value="all">全部分组</SelectItem>
+                {groupOptions.map((g) => (
+                  <SelectItem key={g} value={g}>
+                    {g}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
         </div>
       </CardContent>
     </Card>
@@ -498,20 +536,30 @@ function DistributionPanels({
   byCred,
   byModel,
   timeText,
+  groupFilterActive,
 }: {
   byCred: CredentialDistribution[]
   byModel: ModelDistribution[]
   timeText: string
+  groupFilterActive: boolean
 }) {
   return (
     <div className="mb-6 grid gap-4 lg:grid-cols-2">
-      <ModelPanel data={byModel} timeText={timeText} />
+      <ModelPanel data={byModel} timeText={timeText} groupFilterActive={groupFilterActive} />
       <CredentialPanel data={byCred} />
     </div>
   )
 }
 
-function ModelPanel({ data, timeText }: { data: ModelDistribution[]; timeText: string }) {
+function ModelPanel({
+  data,
+  timeText,
+  groupFilterActive,
+}: {
+  data: ModelDistribution[]
+  timeText: string
+  groupFilterActive: boolean
+}) {
   return (
     <Card>
       <CardContent className="p-4 sm:p-5">
@@ -519,6 +567,12 @@ function ModelPanel({ data, timeText }: { data: ModelDistribution[]; timeText: s
           <h2 className="text-base font-semibold tracking-tight">按模型分布</h2>
           <span className="text-[11px] text-muted-foreground">{timeText}</span>
         </div>
+        {groupFilterActive && (
+          <p className="mb-3 rounded-md bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-600">
+            当前已启用「分组筛选」。模型分布暂未细分到分组维度，本卡片显示的是
+            <strong className="mx-0.5">不区分分组</strong>的模型聚合结果。
+          </p>
+        )}
         <ModelPieChart data={data} />
         {data.length > 0 && <ModelTable data={data} />}
       </CardContent>

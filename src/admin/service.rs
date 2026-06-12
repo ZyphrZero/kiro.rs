@@ -444,6 +444,11 @@ impl AdminService {
         svc
     }
 
+    /// 暴露 TokenManager 给 handlers（分组管理需要 count / rename / remove 凭据 groups 字段）
+    pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
+        &self.token_manager
+    }
+
     /// 注入日志治理句柄（trace 存储 + 用量记录器），用于运行时改保留期/开关。
     pub fn with_log_governance(
         mut self,

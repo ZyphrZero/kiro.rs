@@ -16,6 +16,8 @@
 /prompt_cache.json
 # 客户端 Key 分发（含明文 csk_*，绝对不能提交）
 /client_api_keys.json
+# 账号分组注册表（运行时产物，不入库）
+/groups.json
 # 按天滚动的请求用量日志
 /usage_log.*.jsonl
 /usage_stats.json

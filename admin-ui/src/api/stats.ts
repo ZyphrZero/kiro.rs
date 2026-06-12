@@ -30,6 +30,7 @@ function statsParams(time: StatsTimeFilter, filter?: StatsFilter) {
   return {
     ...time,
     ...(filter?.keyId !== undefined ? { keyId: filter.keyId } : {}),
+    ...(filter?.group ? { group: filter.group } : {}),
   }
 }
 

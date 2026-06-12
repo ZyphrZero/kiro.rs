@@ -194,6 +194,17 @@ impl BucketStats {
             self.errors += 1;
         }
     }
+
+    /// 把另一个 stats 累加到自己上（用于 group 过滤后重新汇总）
+    fn add_stats(&mut self, other: &BucketStats) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_creation_tokens += other.cache_creation_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.credits += other.credits;
+        self.calls += other.calls;
+        self.errors += other.errors;
+    }
 }
 
 /// 单个时间桶含分组数据
@@ -424,6 +435,7 @@ impl UsageAggregator {
         &self,
         window: StatsQueryWindow,
         key_id: Option<u64>,
+        cred_filter: Option<&std::collections::HashSet<u64>>,
     ) -> Vec<TimeSeriesPoint> {
         let inner = self.inner.read();
         let buckets = select_buckets(&inner, window.granularity);
@@ -432,15 +444,32 @@ impl UsageAggregator {
             .iter()
             .filter(|b| bucket_in_window(b, window))
             .filter(|b| bucket_matches_key(b, key_id))
-            .map(|b| TimeSeriesPoint {
-                ts: ts_to_rfc3339(b.ts),
-                input_tokens: stats_for_key(b, key_id).input_tokens,
-                output_tokens: stats_for_key(b, key_id).output_tokens,
-                cache_creation_tokens: stats_for_key(b, key_id).cache_creation_tokens,
-                cache_read_tokens: stats_for_key(b, key_id).cache_read_tokens,
-                calls: stats_for_key(b, key_id).calls,
-                errors: stats_for_key(b, key_id).errors,
-                credits: stats_for_key(b, key_id).credits,
+            .map(|b| {
+                // 不带 group 过滤 → 走老逻辑（更快，命中预聚合 by_key/overall 桶）
+                let stats = match cred_filter {
+                    None => stats_for_key(b, key_id),
+                    Some(allow) => credential_group_for_key(b, key_id)
+                        .map(|group| {
+                            let mut s = BucketStats::default();
+                            for (cid, cs) in group {
+                                if allow.contains(cid) {
+                                    s.add_stats(cs);
+                                }
+                            }
+                            s
+                        })
+                        .unwrap_or_default(),
+                };
+                TimeSeriesPoint {
+                    ts: ts_to_rfc3339(b.ts),
+                    input_tokens: stats.input_tokens,
+                    output_tokens: stats.output_tokens,
+                    cache_creation_tokens: stats.cache_creation_tokens,
+                    cache_read_tokens: stats.cache_read_tokens,
+                    calls: stats.calls,
+                    errors: stats.errors,
+                    credits: stats.credits,
+                }
             })
             .collect();
         points.sort_by_key(|p| p.ts.clone());
@@ -485,6 +514,7 @@ impl UsageAggregator {
         &self,
         window: StatsQueryWindow,
         key_id: Option<u64>,
+        cred_filter: Option<&std::collections::HashSet<u64>>,
     ) -> Vec<CredentialDistribution> {
         let inner = self.inner.read();
         let buckets = select_buckets(&inner, window.granularity);
@@ -494,6 +524,11 @@ impl UsageAggregator {
                 continue;
             };
             for (id, stats) in group {
+                if let Some(allow) = cred_filter {
+                    if !allow.contains(id) {
+                        continue;
+                    }
+                }
                 let entry = acc.entry(*id).or_default();
                 entry.input_tokens += stats.input_tokens;
                 entry.output_tokens += stats.output_tokens;
