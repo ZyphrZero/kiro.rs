@@ -31,3 +31,5 @@
 .ace-tool/
 .codegraph/
 .claude/
+# Runtime data directory (credentials, logs, SQLite DBs — never commit)
+/data/
