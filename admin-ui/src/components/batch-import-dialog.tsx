@@ -36,6 +36,10 @@ interface CredentialInput {
   machineId?: string
   kiroApiKey?: string
   authMethod?: string
+  provider?: string
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
   endpoint?: string
   email?: string
   proxyUrl?: string
@@ -52,6 +56,31 @@ interface VerificationResult {
   credentialId?: number
   rollbackStatus?: 'success' | 'failed' | 'skipped'
   rollbackError?: string
+}
+
+/**
+ * 归一化单条导入条目，兼容两种格式：
+ * 1. 扁平 `credentials.json` 格式（字段直接位于顶层）；
+ * 2. 嵌套「Account / Kiro Account Manager」导出格式（账号字段在顶层，
+ *    认证字段收进嵌套 `credentials` 对象，`idp` 即 provider）。
+ * 嵌套对象里的字段优先级高于顶层同名字段。
+ */
+function normalizeImportEntry(raw: unknown): CredentialInput {
+  if (!raw || typeof raw !== 'object') return {}
+  const obj = raw as Record<string, unknown>
+  const nested =
+    obj.credentials && typeof obj.credentials === 'object'
+      ? (obj.credentials as Record<string, unknown>)
+      : {}
+  // 合并：顶层在前，嵌套 credentials 覆盖顶层
+  const merged = { ...obj, ...nested } as Record<string, unknown>
+  // provider 兼容 idp 别名
+  if (merged.provider == null && obj.idp != null) {
+    merged.provider = obj.idp
+  }
+  // 仅保留 CredentialInput 关心的字段（其余忽略），避免把 credentials 子对象本身传下去
+  delete merged.credentials
+  return merged as CredentialInput
 }
 
 
@@ -95,7 +124,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     let credentials: CredentialInput[]
     try {
       const parsed = JSON.parse(jsonInput)
-      credentials = Array.isArray(parsed) ? parsed : [parsed]
+      const arr = Array.isArray(parsed) ? parsed : [parsed]
+      credentials = arr.map(normalizeImportEntry)
     } catch (error) {
       toast.error('JSON 格式错误: ' + extractErrorMessage(error))
       return
@@ -202,24 +232,75 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
-          const authMethod = clientId && clientSecret ? 'idc' : 'social'
-          if (authMethod === 'social' && (clientId || clientSecret)) {
+          const tokenEndpoint = cred.tokenEndpoint?.trim() || undefined
+          const issuerUrl = cred.issuerUrl?.trim() || undefined
+          const scopes = cred.scopes?.trim() || undefined
+
+          // 认证方式优先取 JSON 中显式声明的 authMethod；未声明时按字段推断：
+          // 有 tokenEndpoint → external_idp；有 clientId+clientSecret → idc；否则 social。
+          const declared = cred.authMethod?.trim().toLowerCase()
+          let authMethod: 'social' | 'idc' | 'external_idp'
+          if (declared === 'external_idp') {
+            authMethod = 'external_idp'
+          } else if (
+            declared === 'idc' ||
+            declared === 'builder-id' ||
+            declared === 'iam'
+          ) {
+            authMethod = 'idc'
+          } else if (declared === 'social') {
+            authMethod = 'social'
+          } else if (tokenEndpoint) {
+            authMethod = 'external_idp'
+          } else if (clientId && clientSecret) {
+            authMethod = 'idc'
+          } else {
+            authMethod = 'social'
+          }
+
+          // 各方式的必填字段校验
+          if (authMethod === 'idc' && !(clientId && clientSecret)) {
             updateResult(i, {
               status: 'failed',
               error: 'idc 模式需要同时提供 clientId 和 clientSecret',
             })
             continue
           }
+          if (authMethod === 'external_idp' && !(clientId && tokenEndpoint)) {
+            updateResult(i, {
+              status: 'failed',
+              error: 'external_idp（Entra ID / Azure AD）需要同时提供 clientId 和 tokenEndpoint',
+            })
+            continue
+          }
+          if (
+            authMethod === 'social' &&
+            (clientSecret || (clientId && !tokenEndpoint))
+          ) {
+            updateResult(i, {
+              status: 'failed',
+              error: 'social 模式不应携带 clientId/clientSecret；如为企业 SSO 请设置 authMethod=external_idp 并提供 tokenEndpoint',
+            })
+            continue
+          }
 
+          const isExternalIdp = authMethod === 'external_idp'
           toImport.push({
             index: i,
             req: {
               refreshToken: token,
               authMethod,
+              provider:
+                cred.provider?.trim() ||
+                (isExternalIdp ? 'AzureAD' : undefined),
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
               clientId,
-              clientSecret,
+              // external_idp 为公共客户端，不携带 clientSecret
+              clientSecret: isExternalIdp ? undefined : clientSecret,
+              tokenEndpoint: isExternalIdp ? tokenEndpoint : undefined,
+              issuerUrl: isExternalIdp ? issuerUrl : undefined,
+              scopes: isExternalIdp ? scopes : undefined,
               priority: cred.priority || 0,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
