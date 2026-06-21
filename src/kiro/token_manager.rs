@@ -2906,6 +2906,33 @@ impl MultiTokenManager {
                     anyhow::bail!(msg);
                 }
             }
+
+            // balanced（Least-Used）模式下，新凭据若从 success_count=0 起步，会被
+            // 持续独占直到追平其它账号——尤其当它频繁吃普通 429 时 success_count 停在
+            // 0，导致"反复选中→反复 429"的死循环，老凭据反而闲置。
+            // 因此把新凭据的成功数对齐到"与它同组的现有可用凭据"的最小值，使其一加入
+            // 就以公平基线参与轮转，而非被无限优先。多组凭据取所有重叠组中的最小值，
+            // 保证它在任一分组内都不会抢跑。无分组（全局可用）时取全局可用凭据的最小值。
+            // priority 模式不读 success_count，不受此影响。
+            let new_groups = &validated_cred.groups;
+            let baseline_success = entries
+                .iter()
+                .filter(|e| {
+                    if e.disabled {
+                        return false;
+                    }
+                    // 同组判定：新凭据无分组 → 与所有凭据同处全局；否则需至少共享一个分组
+                    new_groups.is_empty()
+                        || e.credentials.groups.is_empty()
+                        || e.credentials
+                            .groups
+                            .iter()
+                            .any(|g| new_groups.contains(g))
+                })
+                .map(|e| e.success_count)
+                .min()
+                .unwrap_or(0);
+
             entries.push(CredentialEntry {
                 id: new_id,
                 credentials: validated_cred,
@@ -2914,7 +2941,7 @@ impl MultiTokenManager {
                 refresh_failure_count: 0,
                 disabled: false,
                 disabled_reason: None,
-                success_count: 0,
+                success_count: baseline_success,
                 last_used_at: None,
                 throttled_until: None,
             });
