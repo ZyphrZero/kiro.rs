@@ -604,6 +604,42 @@ impl TraceStore {
         }
     }
 
+    /// 清空全部 trace 记录（traces + 关联 attempts）。返回删除的 traces 行数。
+    /// 用于管理面板「清空请求日志」按钮。仅 warn 失败，失败时返回 0。
+    pub fn clear_all(&self) -> usize {
+        let mut conn = self.conn.lock();
+        let tx = match conn.transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("trace 清空事务失败: {}", e);
+                return 0;
+            }
+        };
+        let res = (|| -> rusqlite::Result<usize> {
+            tx.execute("DELETE FROM trace_attempts", [])?;
+            let n = tx.execute("DELETE FROM traces", [])?;
+            Ok(n)
+        })();
+        match res {
+            Ok(n) => match tx.commit() {
+                Ok(()) => {
+                    if n > 0 {
+                        tracing::info!("已清空全部 trace 记录（{} 条）", n);
+                    }
+                    n
+                }
+                Err(e) => {
+                    tracing::warn!("trace 清空提交失败: {}", e);
+                    0
+                }
+            },
+            Err(e) => {
+                tracing::warn!("trace 清空失败: {}", e);
+                0
+            }
+        }
+    }
+
     /// 按凭据聚合失败跳数，归并为三类：鉴权 / 账号风控 / 其他。
     /// 统计 trace_attempts 里 outcome != 'success' 的跳，按 credential_id + outcome 分组。
     /// 返回 credential_id → (auth, throttle, other)。仅 warn 失败，返回空。
@@ -947,6 +983,34 @@ mod tests {
         });
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].trace_id, "recent");
+    }
+
+    #[test]
+    fn clear_all_removes_everything() {
+        let store = mem_store();
+        store.insert(&sample(TraceSample {
+            trace_id: "a",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        }));
+        store.insert(&sample(TraceSample {
+            trace_id: "b",
+            status: "error",
+            credential_id: 6,
+            model: "m1",
+        }));
+        let cleared = store.clear_all();
+        assert_eq!(cleared, 2);
+        let out = store.query(&TraceQuery {
+            limit: 50,
+            ..Default::default()
+        });
+        assert!(out.is_empty(), "clear_all 后应无任何 trace");
+        // attempts 也应清空：failure_stats 不再有任何条目
+        assert!(store.failure_stats().is_empty(), "clear_all 后 attempts 应清空");
+        // 空库再清一次返回 0，不报错
+        assert_eq!(store.clear_all(), 0);
     }
 
     #[test]

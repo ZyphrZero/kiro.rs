@@ -1437,6 +1437,13 @@ pub async fn list_traces(
     Json(serde_json::json!({ "records": enriched, "total": total }))
 }
 
+/// DELETE /api/admin/traces
+/// 清空全部请求链路记录（traces + attempts）。返回删除条数。
+pub async fn clear_traces(State(state): State<AdminState>) -> impl IntoResponse {
+    let cleared = state.trace_store.clear_all();
+    Json(serde_json::json!({ "cleared": cleared }))
+}
+
 /// GET /api/admin/traces/failure-stats
 /// 按凭据聚合失败次数（鉴权 / 账号风控 / 其他三类），用于卡片分色展示。
 /// 返回 { "<credentialId>": { auth, throttle, other }, ... }

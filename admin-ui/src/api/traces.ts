@@ -35,3 +35,9 @@ export async function getFailureStats(): Promise<FailureStatsMap> {
   const { data } = await api.get<FailureStatsMap>('/traces/failure-stats')
   return data
 }
+
+/** 清空全部请求链路记录，返回删除条数 */
+export async function clearTraces(): Promise<number> {
+  const { data } = await api.delete<{ cleared: number }>('/traces')
+  return data.cleared
+}

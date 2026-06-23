@@ -1,5 +1,5 @@
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { getTraces, getFailureStats } from '@/api/traces'
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { getTraces, getFailureStats, clearTraces } from '@/api/traces'
 import type { TraceQuery } from '@/types/api'
 
 /**
@@ -28,5 +28,16 @@ export function useFailureStats() {
     refetchInterval: 30_000,
     staleTime: 10_000,
     refetchOnWindowFocus: false,
+  })
+}
+
+/** 清空全部请求链路记录；成功后刷新列表与失败统计 */
+export function useClearTraces() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: clearTraces,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['traces'] })
+    },
   })
 }

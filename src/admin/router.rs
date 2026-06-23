@@ -10,7 +10,7 @@ use super::{
         add_credential, add_proxy, apply_image_update, assign_proxies_round_robin,
         assign_proxy_to_credential, batch_add_proxies, batch_import_credentials,
         check_all_proxies, check_proxy,
-        check_rate_limit, check_update, clear_throttle, complete_social_login,
+        check_rate_limit, check_update, clear_throttle, clear_traces, complete_social_login,
         complete_social_relogin, create_client_key, create_group, delete_client_key,
         delete_credential, delete_group, delete_proxy, disable_quota_exceeded, enable_overage_all,
         export_credentials, force_refresh_token, get_account_throttle_config,
@@ -162,7 +162,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/stats/by-model", get(stats_by_model))
         .route("/stats/by-credential", get(stats_by_credential))
         .route("/traces/failure-stats", get(trace_failure_stats))
-        .route("/traces", get(list_traces))
+        .route("/traces", get(list_traces).delete(clear_traces))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

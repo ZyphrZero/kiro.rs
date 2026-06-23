@@ -10,6 +10,7 @@ import {
   CheckCircle2,
   Unplug,
   Settings2,
+  Trash2,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -35,9 +36,10 @@ import {
   SelectContent as UiSelectContent,
   SelectItem as UiSelectItem,
 } from '@/components/ui/select'
-import { useTraces } from '@/hooks/use-traces'
+import { useTraces, useClearTraces } from '@/hooks/use-traces'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
+import { useConfirm } from '@/components/ui/confirm-dialog'
 import {
   useLogGovernanceConfig,
   useSetLogGovernanceConfig,
@@ -516,6 +518,25 @@ export function TraceLogPage() {
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
 
+  const confirm = useConfirm()
+  const clearTraces = useClearTraces()
+  const handleClear = async () => {
+    const ok = await confirm({
+      title: '清空请求日志',
+      description: '将删除全部链路记录，不可恢复。',
+      confirmText: '清空',
+      destructive: true,
+    })
+    if (!ok) return
+    clearTraces.mutate(undefined, {
+      onSuccess: (n) => {
+        toast.success(`已清空请求日志（${n} 条）`)
+        setPage(0)
+      },
+      onError: (err) => toast.error('清空失败：' + extractErrorMessage(err)),
+    })
+  }
+
   return (
     <div className="space-y-5">
       {/* 筛选栏 */}
@@ -548,6 +569,16 @@ export function TraceLogPage() {
           <Button size="sm" variant="outline" onClick={() => refetch()} disabled={isFetching}>
             <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
             刷新
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleClear}
+            disabled={clearTraces.isPending || total === 0}
+            className="text-destructive hover:text-destructive"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            清空
           </Button>
         </div>
       </div>
