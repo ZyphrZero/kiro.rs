@@ -920,12 +920,23 @@ struct CredentialCandidate {
     success_count: u64,
     capacity: usize,
     in_flight: usize,
+    /// 近期错误率 EWMA(0.0~1.0),用于把高错误率账号软降权。
+    ewma_error: f64,
     runtime: Arc<CredentialRuntime>,
 }
 
 impl CredentialCandidate {
     fn load_per_mille(&self) -> usize {
         self.in_flight.saturating_mul(1000) / self.capacity.max(1)
+    }
+
+    /// 排序用的有效负载 = 真实负载率 + 错误率惩罚(整数千分比)。
+    /// 错误率惩罚最大 +1000(等价于"满载一倍"),让高错误率账号在健康账号有空槽时排后,
+    /// 但不硬性排除——健康账号全忙时它仍会被选中(优于直接禁用)。error≈0 时惩罚≈0,
+    /// 完全不影响健康账号间的纯负载均衡。
+    fn effective_load(&self) -> usize {
+        let penalty = (self.ewma_error * ERROR_PENALTY_SCALE as f64) as usize;
+        self.load_per_mille().saturating_add(penalty)
     }
 }
 
@@ -1237,6 +1248,10 @@ const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
 /// EWMA 平滑系数（新样本权重）。0.3 ≈ 取最近若干次的指数加权平均，既反映近期变化又不过分抖动。
 const EWMA_ALPHA: f64 = 0.3;
+
+/// 排序时错误率惩罚的满额值(整数千分比)。ewma_error=1.0(全失败)时 +1000,
+/// 等价于该账号"额外满载一倍",在健康账号有空槽时排到其后。
+const ERROR_PENALTY_SCALE: usize = 1000;
 
 /// 单凭据运行时调度指标（进程内，不持久化）。
 ///
@@ -1680,21 +1695,29 @@ impl MultiTokenManager {
             .map(|(id, priority, success_count, cap)| {
                 let runtime = self.runtime_for_credential(id, cap);
                 runtime.set_capacity(cap);
+                // 错误率从 metrics 读取(此处 entries 锁已释放,只锁 metrics,不构成锁序环)。
+                let ewma_error = self
+                    .metrics
+                    .lock()
+                    .get(&id)
+                    .map(|m| m.ewma_error)
+                    .unwrap_or(0.0);
                 CredentialCandidate {
                     id,
                     priority,
                     success_count,
                     capacity: runtime.capacity(),
                     in_flight: runtime.in_flight(),
+                    ewma_error,
                     runtime,
                 }
             })
             .collect();
 
         if mode == "balanced" {
-            available.sort_by_key(|e| (e.load_per_mille(), e.success_count, e.priority, e.id));
+            available.sort_by_key(|e| (e.effective_load(), e.success_count, e.priority, e.id));
         } else {
-            available.sort_by_key(|e| (e.load_per_mille(), e.priority, e.id));
+            available.sort_by_key(|e| (e.effective_load(), e.priority, e.id));
         }
 
         available
@@ -5131,6 +5154,35 @@ mod tests {
         drop(large_contexts);
         drop(a2);
         drop(a1);
+    }
+
+    /// 两个账号容量相同、均空闲(load=0)时,近期错误率高的账号应被软降权排到后面。
+    /// flaky 是 id=1(若无错误率惩罚,纯负载相同则按 id 升序它会胜出),只有惩罚生效才会翻转到 id=2。
+    #[tokio::test]
+    async fn test_acquire_context_demotes_high_error_account() {
+        let flaky = grouped_cred("flaky", &[]); // id=1
+        let healthy = grouped_cred("healthy", &[]); // id=2
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![flaky, healthy], None, None, false)
+                .unwrap();
+
+        // 直接喂 error EWMA 抬高 id=1 的错误率(绕开 report_failure 的禁用副作用,
+        // 本测试只验证排序惩罚,不验证故障转移)。喂满几次使 ewma_error 接近 1.0。
+        {
+            let mut m = manager.metrics.lock();
+            let cm = m.entry(1).or_default();
+            for _ in 0..10 {
+                cm.feed_error(true);
+            }
+        }
+
+        // 两者都空闲(load=0)。无惩罚时按 id 升序选 1;惩罚生效则应选健康的 2。
+        let ctx = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(
+            ctx.id, 2,
+            "高错误率的 id=1 应被降权,即便 id 更小、负载相同也应选健康的 id=2"
+        );
+        drop(ctx);
     }
 
     #[tokio::test]

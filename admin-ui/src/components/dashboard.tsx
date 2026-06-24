@@ -395,6 +395,22 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const disabledCredentialCount =
     data?.credentials.filter((c) => c.disabled).length || 0;
 
+  // 实时并发调度态：多账号并发模型下没有单一"当前账号"，
+  // 用真实在途计数衡量——activeAccounts=此刻有请求在途的账号数，
+  // inFlightTotal=全部账号在途请求之和。与「并发监控」页同语义。
+  const { activeAccounts, inFlightTotal } = (() => {
+    let activeAccounts = 0;
+    let inFlightTotal = 0;
+    for (const c of data?.credentials || []) {
+      const n = c.inFlight ?? 0;
+      if (n > 0) {
+        activeAccounts += 1;
+        inFlightTotal += n;
+      }
+    }
+    return { activeAccounts, inFlightTotal };
+  })();
+
   // 已超额且尚未禁用的数量（用于一键超额按钮）
   const quotaExceededCount = (data?.credentials || []).filter((c) => {
     if (c.disabled) return false;
@@ -1264,13 +1280,24 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
             <CardContent className="p-3 sm:p-5">
               <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
-                当前活跃
+                活跃账号
               </div>
-              <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1.5 sm:mt-2 sm:gap-2">
-                <span className="truncate text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl">
-                  #{data?.currentId || "-"}
+              <div className="mt-1.5 flex min-w-0 flex-wrap items-baseline gap-1.5 sm:mt-2 sm:gap-2">
+                <span
+                  className={`truncate text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl ${
+                    activeAccounts > 0
+                      ? "text-emerald-600 dark:text-emerald-400"
+                      : ""
+                  }`}
+                >
+                  {formatNumber(activeAccounts)}
                 </span>
-                {data?.currentId && <Badge variant="success">活跃</Badge>}
+                <span
+                  className="text-xs text-muted-foreground"
+                  title="此刻有请求在途的账号数 · 全部账号在途请求总数（实时并发调度态见「并发监控」页）"
+                >
+                  {inFlightTotal > 0 ? `${inFlightTotal} 在途` : "空闲"}
+                </span>
               </div>
             </CardContent>
           </Card>

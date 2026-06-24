@@ -364,9 +364,10 @@ export function CredentialCard({
   const reasonStyle = getDisabledReasonStyle(credential.disabledReason);
   const isThrottled = !credential.disabled && throttleRemaining > 0;
 
-  // 卡片与列表行共用的状态描边 / 灰化（活跃 · 超额 · 冷却 · 禁用）
+  // 卡片与列表行共用的状态描边 / 灰化（超额 · 冷却 · 禁用）
+  // 注：不再按"当前账号"描边——多账号并发调度下没有单一当前账号，
+  // 实时在途情况见「并发监控」页。
   const stateClasses = [
-    credential.isCurrent ? "ring-2 ring-primary/60 shadow-apple-lg" : "",
     !credential.disabled && isQuotaExceeded ? "ring-1 ring-amber-500/60" : "",
     disabledByQuota
       ? "ring-1 ring-amber-500/70 bg-amber-50/40 dark:bg-amber-500/[0.04]"
@@ -388,7 +389,6 @@ export function CredentialCard({
           className="max-w-full"
         />
       )}
-      {credential.isCurrent && <Badge variant="success">活跃</Badge>}
       {/* 禁用状态：合并 "已禁用" + 中文化的原因，单个 Badge 更醒目 */}
       {credential.disabled && reasonStyle && (
         <Badge variant={reasonStyle.variant}>已禁用 · {reasonStyle.label}</Badge>

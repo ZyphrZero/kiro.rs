@@ -20,6 +20,26 @@ use crate::kiro::token_manager::{CallContext, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
+/// debug 日志下请求体最大打印字节数。超过则只打印头部 + 省略提示,
+/// 避免 RUST_LOG=debug 时 200K 级请求体被完整格式化拖垮代理。
+const LOG_BODY_MAX_BYTES: usize = 2048;
+
+/// 为 debug 日志截断请求体（UTF-8 安全,只在字符边界切）。
+pub(crate) fn truncate_for_log(body: &str) -> std::borrow::Cow<'_, str> {
+    if body.len() <= LOG_BODY_MAX_BYTES {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut end = LOG_BODY_MAX_BYTES;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!(
+        "{}…[截断,完整 {} bytes]",
+        &body[..end],
+        body.len()
+    ))
+}
+
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
@@ -499,7 +519,9 @@ impl KiroProvider {
             let body = endpoint.transform_api_body(request_body, &rctx);
 
             tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
-            tracing::debug!("实际发送请求体: {}", body);
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                tracing::debug!("实际发送请求体: {}", truncate_for_log(&body));
+            }
 
             let base = self
                 .client_for(&ctx.credentials)?

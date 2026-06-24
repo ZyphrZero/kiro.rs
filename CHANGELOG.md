@@ -4,6 +4,36 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.13] - 2026-06-25
+
+主题：**原生模式非语义优化(连接/调度/观测)**。在不改 prompt、不删历史、不做代理侧摘要的前提下,做一批保持 Claude 原生一致的优化:质量感知路由、减少代理自身开销、long-context 分级观测,并修正多账号并发下的"活跃"语义。
+
+### ⚡ 优化 — 质量感知路由(EWMA 软降权)
+
+- 把已采集但闲置的近期错误率 EWMA 纳入账号排序:`effective_load = load_per_mille + ewma_error × 1000`(整数千分比)。高错误率账号被软降权排到健康账号之后,但**不硬性排除**——健康账号全忙时它仍会被选中。`ewma_error≈0` 时惩罚≈0,完全不影响健康账号间的纯负载均衡。
+- endpoint fallback:账号级故障转移已存在于重试循环(每次重试重新选账号、用其 endpoint);跨 endpoint 同账号回退因 IDE/CLI 是不同 API 面、无证据可互替,按证据驱动原则**不实现**。
+
+### ⚡ 优化 — 减少代理自身开销
+
+- debug 请求体日志截断:`provider.rs` / `handlers.rs` 的 `debug!("...body")` 加 `enabled!` 守卫 + 2KB 截断,避免 `RUST_LOG=debug` 下 200K 级请求体被完整格式化拖垮代理。
+- `count_all_tokens` 改按引用接收(`&str` / `&[Message]` / `&Option<...>`),消除每请求一次完整 `messages`/`system`/`tools` 克隆(仅为数 token)。大请求收益明显。
+
+### ✨ 新功能 — long-context 分级观测
+
+- 请求按输入 token 分级 small(<32K)/ medium(<100K)/ long(≥100K);long 请求单独打 info 日志,便于在高并发时段判断大上下文请求的占比与分布。仅观测,**不限流**(待真实分布数据后再决定是否做 lane/权重)。
+
+### 🐛 修复 — 多账号并发下的"活跃"语义
+
+- Dashboard "当前活跃 #id" 改为「活跃账号」实时统计:`activeAccounts`(此刻有请求在途的账号数)/ `inFlightTotal`(全部账号在途之和),与「并发监控」页同语义。并发模型下 `currentId`/`isCurrent` 是 last-writer-wins、只指向并发中的随机一个,对"活跃"无意义——已在类型上标注 `@deprecated`,引导改用 `inFlight`。
+
+### 📝 文档
+
+- 新增 `docs/load-balancer-redesign.md`(基于生产 traces.db 实证的 adaptive 模式负载均衡重设计稿,待评审)、`docs/native-mode-optimization-implementation.md`(原生模式优化实施说明)。
+
+### ✅ 测试
+
+- 新增 `test_acquire_context_demotes_high_error_account`(高错误率账号被软降权)、`classify_input_tier_buckets`(分级边界)。全套 447 测试通过。
+
 ## [0.6.12] - 2026-06-24
 
 主题：**连接复用修复 + 长上下文耗时可观测性 + 并发监控视图**。修复了一个废掉连接池的遗留头、新增定位"慢在传输/排队/prefill/输出"的 trace 诊断字段,并把账号卡片的实时调度信息独立成专门的「监控」视图。

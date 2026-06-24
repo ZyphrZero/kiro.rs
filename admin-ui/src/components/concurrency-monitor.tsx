@@ -102,7 +102,9 @@ function MonitorRow({ c }: { c: CredentialStatusItem }) {
   return (
     <div
       className={`flex items-center gap-3 rounded-xl border px-3 py-2.5 transition-colors ${
-        c.isCurrent ? "border-primary/50 bg-primary/[0.03]" : "border-border/60 bg-card"
+        st === "active"
+          ? "border-primary/50 bg-primary/[0.03]"
+          : "border-border/60 bg-card"
       } ${dim ? "opacity-55" : ""}`}
       title={name}
     >

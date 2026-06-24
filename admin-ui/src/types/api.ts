@@ -2,6 +2,11 @@
 export interface CredentialsStatusResponse {
   total: number
   available: number
+  /**
+   * @deprecated 多账号并发调度下无单一"当前账号"。该值是最后一个抢到并发租约的账号 id
+   * （last-writer-wins），只指向并发中的随机一个，不要用它表达"活跃"。
+   * 衡量实时调度态请用各凭据的 inFlight（见「并发监控」页 / dashboard 活跃账号统计）。
+   */
   currentId: number
   credentials: CredentialStatusItem[]
 }
@@ -14,6 +19,10 @@ export interface CredentialStatusItem {
   failureCount: number
   /** 累计失败次数（所有失败类型，只增不减，仅手动重置归零） */
   totalFailureCount: number
+  /**
+   * @deprecated 见 CredentialsStatusResponse.currentId。并发模型下此字段对"活跃"无意义，
+   * 请用 inFlight 判断该账号此刻是否在处理请求。
+   */
   isCurrent: boolean
   expiresAt: string | null
   authMethod: string | null

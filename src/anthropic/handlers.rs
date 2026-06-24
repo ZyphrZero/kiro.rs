@@ -374,8 +374,28 @@ pub(super) fn map_provider_error(err: Error) -> Response {
         .into_response()
 }
 
-/// 计算 Anthropic usage 口径的 input_tokens
-///
+/// 输入 token 规模分级(仅观测用)。阈值:medium ≥ 32K,long ≥ 100K。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputTier {
+    Small,
+    Medium,
+    Long,
+}
+
+const TIER_MEDIUM_TOKENS: i32 = 32_000;
+const TIER_LONG_TOKENS: i32 = 100_000;
+
+fn classify_input_tier(input_tokens: i32) -> InputTier {
+    if input_tokens >= TIER_LONG_TOKENS {
+        InputTier::Long
+    } else if input_tokens >= TIER_MEDIUM_TOKENS {
+        InputTier::Medium
+    } else {
+        InputTier::Small
+    }
+}
+
+
 /// 取 `max(contextUsage 折算值, 本地 fallback)`：contextUsage 是上游按百分比×窗口
 /// 折算的估算值，低估时会盖过本地真实转发量，导致上报 input_tokens 偏低、客户端
 /// 永不触发 auto-compact。max 保证上报量不低于本地真值，正确驱动客户端压缩。
@@ -628,10 +648,10 @@ pub async fn post_messages(
 
         // 估算输入 tokens
         let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
+            &payload.model,
+            &payload.system,
+            &payload.messages,
+            &payload.tools,
         ) as i32;
 
         let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
@@ -708,15 +728,32 @@ pub async fn post_messages(
         }
     };
 
-    tracing::debug!("Kiro request body: {}", request_body);
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        tracing::debug!(
+            "Kiro request body: {}",
+            crate::kiro::provider::truncate_for_log(&request_body)
+        );
+    }
 
     // 估算输入 tokens
     let total_input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
+        &payload.model,
+        &payload.system,
+        &payload.messages,
+        &payload.tools,
     ) as i32;
+
+    // 输入 token 分级(仅观测,不限流):small / medium / long。
+    // long 请求单独打 info 日志,便于在高并发时段判断大上下文请求占比与分布。
+    let input_tier = classify_input_tier(total_input_tokens);
+    if input_tier == InputTier::Long {
+        tracing::info!(
+            "long-context 请求: ~{} input tokens (model={}, stream={})",
+            total_input_tokens,
+            payload.model,
+            payload.stream
+        );
+    }
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -1375,10 +1412,10 @@ pub async fn count_tokens(
     );
 
     let total_tokens = token::count_all_tokens(
-        payload.model,
-        payload.system,
-        payload.messages,
-        payload.tools,
+        &payload.model,
+        &payload.system,
+        &payload.messages,
+        &payload.tools,
     ) as i32;
 
     Json(CountTokensResponse {
@@ -1431,10 +1468,10 @@ pub async fn post_messages_cc(
 
         // 估算输入 tokens
         let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
+            &payload.model,
+            &payload.system,
+            &payload.messages,
+            &payload.tools,
         ) as i32;
 
         let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
@@ -1510,15 +1547,32 @@ pub async fn post_messages_cc(
         }
     };
 
-    tracing::debug!("Kiro request body: {}", request_body);
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        tracing::debug!(
+            "Kiro request body: {}",
+            crate::kiro::provider::truncate_for_log(&request_body)
+        );
+    }
 
     // 计算总 input tokens
     let total_input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
+        &payload.model,
+        &payload.system,
+        &payload.messages,
+        &payload.tools,
     ) as i32;
+
+    // 输入 token 分级(仅观测,不限流):small / medium / long。
+    // long 请求单独打 info 日志,便于在高并发时段判断大上下文请求占比与分布。
+    let input_tier = classify_input_tier(total_input_tokens);
+    if input_tier == InputTier::Long {
+        tracing::info!(
+            "long-context 请求: ~{} input tokens (model={}, stream={})",
+            total_input_tokens,
+            payload.model,
+            payload.stream
+        );
+    }
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -1961,5 +2015,15 @@ mod tests {
         assert_eq!(resolve_usage_input_tokens(120_000, Some(150_000)), 150_000);
         // 无上游信号：回退本地 fallback。
         assert_eq!(resolve_usage_input_tokens(120_000, None), 120_000);
+    }
+
+    #[test]
+    fn classify_input_tier_buckets() {
+        assert_eq!(classify_input_tier(0), InputTier::Small);
+        assert_eq!(classify_input_tier(31_999), InputTier::Small);
+        assert_eq!(classify_input_tier(32_000), InputTier::Medium);
+        assert_eq!(classify_input_tier(99_999), InputTier::Medium);
+        assert_eq!(classify_input_tier(100_000), InputTier::Long);
+        assert_eq!(classify_input_tier(215_000), InputTier::Long);
     }
 }

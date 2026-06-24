@@ -537,10 +537,10 @@ pub(super) async fn run_web_search_loop(
     group: Option<String>,
 ) -> Response {
     let fallback_input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
+        &payload.model,
+        &payload.system,
+        &payload.messages,
+        &payload.tools,
     ) as i32;
 
     let mut presentation: Vec<Value> = Vec::new();
