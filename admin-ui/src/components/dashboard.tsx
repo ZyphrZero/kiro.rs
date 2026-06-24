@@ -32,7 +32,6 @@ import {
   ChevronDown,
   LayoutGrid,
   List,
-  Gauge,
   Search,
   X,
 } from "lucide-react";
@@ -73,7 +72,7 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { CredentialCard } from "@/components/credential-card";
-import { ConcurrencyMonitor } from "@/components/concurrency-monitor";
+import { ConcurrencyMonitorSummary } from "@/components/concurrency-monitor";
 import { AddCredentialDialog } from "@/components/add-credential-dialog";
 import { BatchImportDialog } from "@/components/batch-import-dialog";
 import { BatchEditCredentialDialog } from "@/components/batch-edit-credential-dialog";
@@ -234,10 +233,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   });
 
   const queryClient = useQueryClient();
-  // 监控视图需要近实时数据，缩短轮询到 3s；其余视图维持 30s。
-  const { data, isLoading, error, refetch } = useCredentials(
-    viewMode === "monitor" ? 3000 : 30000,
-  );
+  // 调度指标（在途/错误率/耗时）现常显在凭据卡片与顶部汇总条，统一用 5s 近实时轮询。
+  const { data, isLoading, error, refetch } = useCredentials(5000);
   const { mutate: deleteCredential } = useDeleteCredential();
   const { mutate: resetFailure } = useResetFailure();
   const { data: loadBalancingData, isLoading: isLoadingMode } =
@@ -397,7 +394,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
 
   // 实时并发调度态：多账号并发模型下没有单一"当前账号"，
   // 用真实在途计数衡量——activeAccounts=此刻有请求在途的账号数，
-  // inFlightTotal=全部账号在途请求之和。与「并发监控」页同语义。
+  // inFlightTotal=全部账号在途请求之和。与凭据卡片调度块同语义。
   const { activeAccounts, inFlightTotal } = (() => {
     let activeAccounts = 0;
     let inFlightTotal = 0;
@@ -1294,7 +1291,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 </span>
                 <span
                   className="text-xs text-muted-foreground"
-                  title="此刻有请求在途的账号数 · 全部账号在途请求总数（实时并发调度态见「并发监控」页）"
+                  title="此刻有请求在途的账号数 · 全部账号在途请求总数（每账号实时调度态见下方凭据卡片）"
                 >
                   {inFlightTotal > 0 ? `${inFlightTotal} 在途` : "空闲"}
                 </span>
@@ -1302,6 +1299,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             </CardContent>
           </Card>
         </div>
+
+        {/* 实时调度汇总条（原「监控」视图汇总并入凭据页常显） */}
+        {data?.credentials && data.credentials.length > 0 && (
+          <div className="mb-5">
+            <ConcurrencyMonitorSummary credentials={data.credentials} />
+          </div>
+        )}
 
         {/* 工具栏 */}
         <div className="mb-5 flex flex-col gap-3">
@@ -1520,20 +1524,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 >
                   <List className="h-3.5 w-3.5" />
                   <span className="hidden sm:inline">列表</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => changeViewMode("monitor")}
-                  aria-pressed={viewMode === "monitor"}
-                  title="并发监控视图"
-                  className={`inline-flex h-7 items-center gap-1 rounded-full px-2.5 text-[13px] transition-colors ${
-                    viewMode === "monitor"
-                      ? "bg-background text-foreground shadow-apple-sm"
-                      : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  <Gauge className="h-3.5 w-3.5" />
-                  <span className="hidden sm:inline">监控</span>
                 </button>
               </div>
             </div>
@@ -1790,8 +1780,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </p>
             </CardContent>
           </Card>
-        ) : viewMode === "monitor" ? (
-          <ConcurrencyMonitor credentials={filteredCredentials} />
         ) : (
           <>
             <DndContext

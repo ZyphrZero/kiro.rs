@@ -917,7 +917,6 @@ struct CredentialRuntime {
 struct CredentialCandidate {
     id: u64,
     priority: u32,
-    success_count: u64,
     capacity: usize,
     in_flight: usize,
     /// 近期错误率 EWMA(0.0~1.0),用于把高错误率账号软降权。
@@ -1673,7 +1672,6 @@ impl MultiTokenManager {
         group: Option<&str>,
     ) -> Vec<CredentialCandidate> {
         let now = Instant::now();
-        let mode = self.load_balancing_mode.lock().clone();
         let available_entries: Vec<_> = {
             let entries = self.entries.lock();
             entries
@@ -1685,14 +1683,14 @@ impl MultiTokenManager {
                 })
                 .map(|e| {
                     let cap = self.cap_of(&e.credentials);
-                    (e.id, e.credentials.priority, e.success_count, cap)
+                    (e.id, e.credentials.priority, cap)
                 })
                 .collect()
         };
 
         let mut available: Vec<_> = available_entries
             .into_iter()
-            .map(|(id, priority, success_count, cap)| {
+            .map(|(id, priority, cap)| {
                 let runtime = self.runtime_for_credential(id, cap);
                 runtime.set_capacity(cap);
                 // 错误率从 metrics 读取(此处 entries 锁已释放,只锁 metrics,不构成锁序环)。
@@ -1705,7 +1703,6 @@ impl MultiTokenManager {
                 CredentialCandidate {
                     id,
                     priority,
-                    success_count,
                     capacity: runtime.capacity(),
                     in_flight: runtime.in_flight(),
                     ewma_error,
@@ -1714,13 +1711,35 @@ impl MultiTokenManager {
             })
             .collect();
 
-        if mode == "balanced" {
-            available.sort_by_key(|e| (e.effective_load(), e.success_count, e.priority, e.id));
-        } else {
-            available.sort_by_key(|e| (e.effective_load(), e.priority, e.id));
-        }
+        // 排序：两种模式都按 effective_load(已含 ewma_error 惩罚) → priority → id。
+        // balanced 不再以 success_count(单调累计+持久化)作次键——那会让老账号/曾被禁账号
+        // 长期垫底,且对生病账号失察。balanced 与 priority 的差异改由 acquire_idle_permit
+        // 的 P2C 抽选体现(balanced 随机分散抗羊群,priority 严格按序)。
+        available.sort_by_key(|e| (e.effective_load(), e.priority, e.id));
 
         available
+    }
+
+    /// Power-of-Two-Choices 抢槽重排(balanced 模式去羊群)。
+    ///
+    /// 从候选池随机抽 2 个,把 `effective_load` 更优者移到队首先试;其余候选保持原有
+    /// (已按 effective_load 排好的)顺序跟在后面作回退。这样并发请求随机分散到不同账号,
+    /// 而不是全部从全局最优账号开始挤——数学上把最大负载从 O(log n) 降到 O(log log n)。
+    /// 调用方须保证 `candidates.len() > 1`。
+    fn p2c_reorder(candidates: &mut [CredentialCandidate]) {
+        let n = candidates.len();
+        let a = fastrand::usize(..n);
+        let mut b = fastrand::usize(..n - 1);
+        if b >= a {
+            b += 1;
+        }
+        // 选 effective_load 更低者作为本次首选,换到队首。
+        let winner = if candidates[a].effective_load() <= candidates[b].effective_load() {
+            a
+        } else {
+            b
+        };
+        candidates.swap(0, winner);
     }
 
     async fn acquire_idle_permit(
@@ -1761,6 +1780,13 @@ impl MultiTokenManager {
                 let available = entries.iter().filter(|e| !e.disabled).count();
                 anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
             };
+
+            // balanced 模式:用 Power-of-Two-Choices 打散抢槽顺序,抗高并发羊群
+            // (否则所有并发请求都从 index 0 开始试,挤向同一"当前最优"账号)。
+            // priority 模式:保持 effective_load→priority→id 的严格确定序(用户显式要优先级)。
+            if candidates.len() > 1 && *self.load_balancing_mode.lock() == "balanced" {
+                Self::p2c_reorder(&mut candidates);
+            }
 
             for candidate in &candidates {
                 match candidate
@@ -5376,6 +5402,33 @@ mod tests {
         // g2 不受 g1 计数影响，仍只会选到 C(id3)
         let pick_g2 = manager.select_next_credential(None, Some("g2"));
         assert_eq!(pick_g2.map(|(id, _)| id), Some(3));
+    }
+
+    #[test]
+    fn test_p2c_reorder_picks_lower_load_to_front_and_preserves_pool() {
+        // 构造 3 个候选,负载各不同(用 in_flight 区分 effective_load)。
+        let mk = |id: u64, in_flight: usize| CredentialCandidate {
+            id,
+            priority: 0,
+            capacity: 100,
+            in_flight,
+            ewma_error: 0.0,
+            runtime: Arc::new(CredentialRuntime::new(100)),
+        };
+        // 多次重排:无论随机抽到哪两个,队首的 effective_load 必 <= 被换下来的那个;
+        // 且集合不变(不丢候选)。
+        for _ in 0..200 {
+            let mut pool = vec![mk(1, 10), mk(2, 30), mk(3, 50)];
+            let before: std::collections::BTreeSet<u64> = pool.iter().map(|c| c.id).collect();
+            MultiTokenManager::p2c_reorder(&mut pool);
+            let after: std::collections::BTreeSet<u64> = pool.iter().map(|c| c.id).collect();
+            assert_eq!(before, after, "P2C 重排不应增删候选");
+            // 队首应是被抽中的两个里负载更低者;至少不应是全局负载最高者被无脑放队首
+            // (弱断言:队首 effective_load <= 队尾,排除把最差的放最前的退化)。
+            let head = pool[0].effective_load();
+            let tail = pool[pool.len() - 1].effective_load();
+            assert!(head <= tail || pool.len() == 1, "队首不应是负载最高者");
+        }
     }
 
     #[tokio::test]

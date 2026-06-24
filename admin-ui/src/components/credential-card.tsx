@@ -59,6 +59,11 @@ import { UpdateTokenDialog } from "@/components/update-token-dialog";
 import { ReloginDialog } from "@/components/relogin-dialog";
 import { CredentialFailuresDialog } from "@/components/credential-failures-dialog";
 import { AvailableModelsDialog } from "@/components/available-models-dialog";
+import {
+  CredentialScheduleMetrics,
+  ConcurrencyCapCell,
+  formatEwmaMs,
+} from "@/components/concurrency-monitor";
 
 interface CredentialCardProps {
   credential: CredentialStatusItem;
@@ -366,7 +371,7 @@ export function CredentialCard({
 
   // 卡片与列表行共用的状态描边 / 灰化（超额 · 冷却 · 禁用）
   // 注：不再按"当前账号"描边——多账号并发调度下没有单一当前账号，
-  // 实时在途情况见「并发监控」页。
+  // 实时在途情况见卡片调度块。
   const stateClasses = [
     !credential.disabled && isQuotaExceeded ? "ring-1 ring-amber-500/60" : "",
     disabledByQuota
@@ -702,6 +707,31 @@ export function CredentialCard({
             <RotateCcw className="h-3 w-3 opacity-70" />
           </button>
         </div>
+
+        {/* 调度（在途/上限 + 错误率/耗时，原「监控」视图并入） */}
+        <div className="w-24 text-center">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            在途/上限
+          </div>
+          <div className="mt-0.5 flex h-[26px] items-center justify-center">
+            <ConcurrencyCapCell c={credential} />
+          </div>
+          <div className="text-[10px] tabular-nums text-muted-foreground">
+            <span
+              className={
+                (credential.recentErrorRate ?? 0) >= 20
+                  ? "text-destructive"
+                  : (credential.recentErrorRate ?? 0) > 0
+                    ? "text-amber-600 dark:text-amber-400"
+                    : ""
+              }
+            >
+              {credential.recentErrorRate ?? 0}%
+            </span>
+            <span className="px-1 text-muted-foreground/40">·</span>
+            {formatEwmaMs(credential.ewmaDurationMs ?? 0)}
+          </div>
+        </div>
       </div>
 
       {/* 余额（大屏） */}
@@ -980,6 +1010,11 @@ export function CredentialCard({
               </div>
             )}
           </dl>
+
+          {/* 调度指标（在途/上限·错误率·耗时，原「监控」视图并入此处） */}
+          <div className="rounded-xl border border-border/60 bg-secondary/40 p-3 sm:p-4">
+            <CredentialScheduleMetrics c={credential} />
+          </div>
 
           {/* 余额面板 */}
           <div

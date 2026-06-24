@@ -4,6 +4,43 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.15] - 2026-06-25
+
+主题：**断流根因修复（流式禁用连接池）+ 调度去 `success_count` 化与 P2C 去羊群 + 监控并入凭据页**。
+
+### 🐛 修复 — 流式响应断流（0.6.12 连接复用的真正根因）
+
+- 0.6.12 移除 `Connection: close` 启用连接池后，长流式响应（SSE）会**概率性中途断流**。
+  0.6.14 把 `pool_idle_timeout` 降到 15s 只挡住了「建连阶段取到陈旧连接」（可重试），
+  但**流已开始（已回 200 + 部分 SSE）后连接被上游 ALB 在长 prefill 静默期掐断**的场景
+  无法重试，对客户端表现为断流——调 pool 参数无法根治。
+- 修复：流式上游请求改用**禁用空闲连接复用**的专用 Client（`pool_max_idle_per_host=0`，
+  见 `build_streaming_client`）。每条流用全新连接，从根上杜绝「取到半死连接」和
+  「复用连接被中途掐断」两类断流。**非流式请求**（MCP / token 刷新 / balance / profile）
+  仍走原连接复用 Client，首 token 优化与握手复用收益不丢。
+
+### ⚡ 优化 — 调度去 `success_count` 化（彻底消除「必须重置成功次数才回池」痛点）
+
+- balanced 模式排序键去掉 `success_count`（单调累计 + 跨重启持久化）作次键——它会让
+  老账号 / 曾被禁账号长期排序垫底，且对生病账号失察（失败不计成功 → 计数最低 → 被判最该用）。
+  两种模式现统一按 `(effective_load, priority, id)` 排序；`effective_load` 已含 0.6.13 的
+  `ewma_error` 软降权，事故恢复后账号随 EWMA 衰减**自动回池，无需手动重置**。
+- `success_count` 降级为纯展示统计（前端卡片仍显示、`reset` 接口仍在），不再参与调度决策。
+
+### ⚡ 优化 — P2C 抢槽去羊群（高并发负载倾斜）
+
+- balanced 模式下，`acquire_idle_permit` 用 **Power-of-Two-Choices** 打散抢槽顺序：
+  从候选池随机抽 2 个、`effective_load` 更优者先试，避免所有并发请求都从全局最优账号
+  开始挤导致的倾斜（数学上把最大负载从 O(log n) 降到 O(log log n)）。priority 模式
+  保持 `effective_load→priority→id` 严格确定序（用户显式要优先级）。
+
+### ✨ 优化 — 监控视图并入凭据管理页
+
+- 移除独立的「监控」视图切换，把每账号实时调度态（在途/上限 + 负载条 + 错误率 + 平均耗时，
+  并发上限仍可内联编辑）直接并入**凭据卡片与列表行**；凭据页顶部常显「实时调度」汇总条。
+- 调度指标轮询统一为 5s 近实时（原监控 3s / 其余 30s）。`CredentialView` 去掉 `monitor`，
+  旧值自动迁移为 `card`。数据全部复用 `/credentials` DTO，零新增后端请求。
+
 ## [0.6.14] - 2026-06-25
 
 主题：**修复连接池陈旧连接导致的 `socket closed unexpectedly`(0.6.12 回归)**。

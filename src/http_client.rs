@@ -58,6 +58,38 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
+    build_client_inner(proxy, timeout_secs, tls_backend, 8)
+}
+
+/// 构建**禁用空闲连接复用**的 HTTP Client（专用于流式上游请求）。
+///
+/// 流式响应体的生命周期很长（整条 SSE 流），期间上游 AWS ALB 可能在长 prefill
+/// 静默期把空闲/复用连接掐断；而流一旦开始（已回 200 + 部分 SSE），中途断连
+/// **无法重试**，对客户端表现为"断流"。把 `pool_max_idle_per_host` 设为 0 后，
+/// reqwest 不再复用空闲连接、也不把流式连接还池——每条流都用全新连接，从根上
+/// 杜绝"取到半死连接"和"复用连接被中途掐断"两类断流。代价是每次多一次 TCP+TLS
+/// 握手，对长流可忽略；非流式请求（MCP/刷新/balance/profile）仍走 [`build_client`]
+/// 保留连接复用与首 token 优化。
+pub fn build_streaming_client(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    build_client_inner(proxy, timeout_secs, tls_backend, 0)
+}
+
+/// 构建 HTTP Client（内部实现）
+///
+/// # Arguments
+/// * `proxy` - 可选的代理配置
+/// * `timeout_secs` - 总超时时间（秒）
+/// * `pool_max_idle_per_host` - 每 host 最大空闲连接数；0 = 禁用空闲连接复用
+fn build_client_inner(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+    pool_max_idle_per_host: usize,
+) -> anyhow::Result<Client> {
     // 分层超时（可经 KIRO_RS_HTTP_* 覆盖）：
     // - connect_timeout：仅 TCP+TLS 建连阶段。坏/挂死连接秒级失败重试，不再拖到总超时。
     // - read_timeout：每次读操作超时，**成功读一次即重置**。用于探测"建连后迟迟不吐字节"
@@ -79,8 +111,9 @@ pub fn build_client(
         .read_timeout(Duration::from_secs(read_timeout))
         .tcp_keepalive(Duration::from_secs(keepalive))
         // 复用空闲连接省掉重复 TCP+TLS 握手；但空闲超时短于上游关闭时间,避免取到死连接。
+        // pool_max_idle_per_host=0 时 reqwest 禁用空闲连接复用(流式专用,见 build_streaming_client)。
         .pool_idle_timeout(Duration::from_secs(pool_idle))
-        .pool_max_idle_per_host(8);
+        .pool_max_idle_per_host(pool_max_idle_per_host);
 
     match tls_backend {
         TlsBackend::Rustls => {
@@ -144,5 +177,13 @@ mod tests {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_streaming_client_builds() {
+        // 流式专用 Client(禁用空闲连接复用)应能正常构建,带/不带代理都行。
+        assert!(build_streaming_client(None, 720, TlsBackend::Rustls).is_ok());
+        let config = ProxyConfig::new("http://127.0.0.1:7890");
+        assert!(build_streaming_client(Some(&config), 720, TlsBackend::Rustls).is_ok());
     }
 }

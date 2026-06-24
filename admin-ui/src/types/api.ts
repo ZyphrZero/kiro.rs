@@ -5,7 +5,7 @@ export interface CredentialsStatusResponse {
   /**
    * @deprecated 多账号并发调度下无单一"当前账号"。该值是最后一个抢到并发租约的账号 id
    * （last-writer-wins），只指向并发中的随机一个，不要用它表达"活跃"。
-   * 衡量实时调度态请用各凭据的 inFlight（见「并发监控」页 / dashboard 活跃账号统计）。
+   * 衡量实时调度态请用各凭据的 inFlight（见凭据卡片调度块 / dashboard 活跃账号统计）。
    */
   currentId: number
   credentials: CredentialStatusItem[]

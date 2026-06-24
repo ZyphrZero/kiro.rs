@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_client, build_streaming_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -122,6 +122,10 @@ pub struct KiroProvider {
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client。
     /// 带容量上限淘汰（全局代理 client 常驻），避免代理数量增长导致内存无界增长。
     client_cache: Mutex<ClientCache>,
+    /// 流式专用 Client 缓存（禁用空闲连接复用，见 [`build_streaming_client`]）。
+    /// 与 `client_cache` 同构、同样按 effective proxy 缓存，但每条流用全新连接，
+    /// 避免长流被上游中途掐断导致的"断流"。
+    streaming_client_cache: Mutex<ClientCache>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
@@ -160,11 +164,17 @@ impl KiroProvider {
         let initial_client =
             build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
         let client_cache = ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
+        // 流式专用 Client（禁用空闲连接复用）同样预热全局代理条目。
+        let initial_streaming_client = build_streaming_client(proxy.as_ref(), 720, tls_backend)
+            .expect("创建流式 HTTP 客户端失败");
+        let streaming_client_cache =
+            ClientCache::new(proxy.clone(), initial_streaming_client, CLIENT_CACHE_CAP);
 
         Self {
             token_manager,
             global_proxy: proxy,
             client_cache: Mutex::new(client_cache),
+            streaming_client_cache: Mutex::new(streaming_client_cache),
             tls_backend,
             endpoints,
             default_endpoint,
@@ -180,6 +190,19 @@ impl KiroProvider {
             return Ok(client);
         }
         let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
+        cache.insert(effective, client.clone());
+        Ok(client)
+    }
+
+    /// 获取流式专用 Client（禁用空闲连接复用，见 [`build_streaming_client`]）。
+    /// 与 [`Self::client_for`] 同构，但走独立的 `streaming_client_cache`。
+    fn streaming_client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
+        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let mut cache = self.streaming_client_cache.lock();
+        if let Some(client) = cache.get(&effective) {
+            return Ok(client);
+        }
+        let client = build_streaming_client(effective.as_ref(), 720, self.tls_backend)?;
         cache.insert(effective, client.clone());
         Ok(client)
     }
@@ -523,8 +546,15 @@ impl KiroProvider {
                 tracing::debug!("实际发送请求体: {}", truncate_for_log(&body));
             }
 
-            let base = self
-                .client_for(&ctx.credentials)?
+            // 流式请求用禁用连接复用的专用 Client(每条流新连接,杜绝长流被上游中途
+            // 掐断的"断流");非流式仍走复用连接的 Client,保留首 token 优化。
+            let http_client = if is_stream {
+                self.streaming_client_for(&ctx.credentials)?
+            } else {
+                self.client_for(&ctx.credentials)?
+            };
+
+            let base = http_client
                 .post(&url)
                 .body(body)
                 .header("content-type", endpoint.content_type());
@@ -539,7 +569,7 @@ impl KiroProvider {
                     tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
                 }
             }
-            let response = match self.client_for(&ctx.credentials)?.execute(request).await {
+            let response = match http_client.execute(request).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
