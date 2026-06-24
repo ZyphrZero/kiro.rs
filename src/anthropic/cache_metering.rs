@@ -93,8 +93,8 @@ impl CacheUsage {
         let cache_total = cache_total.min(total);
         // 在缓存覆盖部分内部，按 estimate 口径的 read/creation 占比二次拆分。
         let read = if self.cache_covered_est > 0 {
-            ((cache_total as f64) * (self.cache_read as f64 / self.cache_covered_est as f64)).round()
-                as i32
+            ((cache_total as f64) * (self.cache_read as f64 / self.cache_covered_est as f64))
+                .round() as i32
         } else {
             0
         };
@@ -340,7 +340,10 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
             .zip(results.iter())
             .enumerate()
             .map(|(i, (s, r))| {
-                format!("[{i}] hash={} cum={} hit={}", s.hash, s.cumulative_tokens, r.hit)
+                format!(
+                    "[{i}] hash={} cum={} hit={}",
+                    s.hash, s.cumulative_tokens, r.hit
+                )
             })
             .collect();
         tracing::debug!(
@@ -363,6 +366,76 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
     // 把所有段一次性写回（命中段刷新 last_hit_at；未命中段插入）。所有段共用同一
     // ttl（detect_max_ttl 的单值），单次加锁 + 单次容量检查，避免逐段重复开销。
     cache.record(&hashes, &cum_tokens, segments[0].ttl_secs);
+
+    CacheUsage {
+        cache_read: cache_read as i32,
+        cache_covered_est: covered as i32,
+        prompt_total_est: prompt_total_est as i32,
+    }
+}
+
+/// 按 AWS / Anthropic 标准 prompt cache 口径计算缓存用量：只识别请求中显式的
+/// `cache_control` 断点，不使用中转层的自动前缀增强策略。
+///
+/// `cache` 为 `Some` 时，会用本地 [`CacheMeter`] 估算标准 cache_control 的跨请求
+/// read / creation；为 `None` 时仍会按显式断点上报 creation，但无法推断 read 命中。
+pub fn compute_standard_cache_usage(
+    cache: Option<&CacheMeter>,
+    req: &MessagesRequest,
+    key_id: u64,
+) -> CacheUsage {
+    let (segments, prompt_total_est) = extract_standard_segments(req, key_id);
+    if segments.is_empty() {
+        return CacheUsage {
+            prompt_total_est: prompt_total_est as i32,
+            ..Default::default()
+        };
+    }
+
+    let hashes: Vec<u64> = segments.iter().map(|s| s.hash).collect();
+    let cum_tokens: Vec<u32> = segments.iter().map(|s| s.cumulative_tokens).collect();
+    let results = cache
+        .map(|cache| cache.lookup(&hashes, &cum_tokens))
+        .unwrap_or_else(|| {
+            cum_tokens
+                .iter()
+                .map(|tokens| SegmentResult {
+                    hit: false,
+                    tokens: *tokens,
+                })
+                .collect()
+        });
+
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let dump: Vec<String> = segments
+            .iter()
+            .zip(results.iter())
+            .enumerate()
+            .map(|(i, (s, r))| {
+                format!(
+                    "[{i}] hash={} cum={} hit={}",
+                    s.hash, s.cumulative_tokens, r.hit
+                )
+            })
+            .collect();
+        tracing::debug!(
+            "CacheMeter standard: {} 段, msgs={} | {}",
+            segments.len(),
+            req.messages.len(),
+            dump.join(", ")
+        );
+    }
+
+    let deepest_hit = results.iter().rposition(|r| r.hit);
+    let covered = *cum_tokens.last().unwrap();
+    let cache_read = match deepest_hit {
+        Some(i) => cum_tokens[i],
+        None => 0u32,
+    };
+
+    if let Some(cache) = cache {
+        cache.record(&hashes, &cum_tokens, segments[0].ttl_secs);
+    }
 
     CacheUsage {
         cache_read: cache_read as i32,
@@ -437,7 +510,12 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
     // 1. tools（全部喂入，作为前缀基础的一部分；工具定义跨轮稳定）。
     if let Some(tools) = req.tools.as_ref() {
         for t in tools {
-            feed(&mut hasher, &tool_signature(t), &tool_token_text(t), &mut cum_tokens);
+            feed(
+                &mut hasher,
+                &tool_signature(t),
+                &tool_token_text(t),
+                &mut cum_tokens,
+            );
         }
     }
 
@@ -457,7 +535,12 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
             .position(|s| s.cache_control.is_some())
             .unwrap_or(0);
         for sys in systems.iter().skip(skip_until) {
-            feed(&mut hasher, &system_signature(sys), &sys.text, &mut cum_tokens);
+            feed(
+                &mut hasher,
+                &system_signature(sys),
+                &sys.text,
+                &mut cum_tokens,
+            );
         }
     }
 
@@ -489,7 +572,8 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
                         hasher.update(media_type.as_bytes());
                         hasher.update(b"|");
                         hasher.update(data.as_bytes());
-                        let img_tokens = crate::image_resize::estimate_image_tokens(media_type, data);
+                        let img_tokens =
+                            crate::image_resize::estimate_image_tokens(media_type, data);
                         cum_tokens = cum_tokens.saturating_add(img_tokens);
                     } else {
                         feed(
@@ -506,6 +590,101 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
         // 最后一条不切段（当前轮新输入，属 cache_creation 尾部）。
         if idx != last_idx {
             commit(&hasher, cum_tokens, &mut segments, ttl);
+        }
+    }
+
+    (segments, cum_tokens)
+}
+
+/// 标准模式：只在显式 `cache_control` 位置切断点。
+fn extract_standard_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut cum_tokens: u32 = 0;
+    let mut segments: Vec<Segment> = Vec::new();
+
+    hasher.update(b"aws-standard-cache|");
+    hasher.update(isolation_seed(req, key_id).as_bytes());
+
+    let feed = |hasher: &mut Sha256, hash_text: &str, token_text: &str, cum: &mut u32| {
+        hasher.update(hash_text.as_bytes());
+        if !token_text.is_empty() {
+            *cum = cum.saturating_add(estimate_tokens(token_text).max(0) as u32);
+        }
+    };
+
+    let commit = |hasher: &Sha256, cum: u32, segments: &mut Vec<Segment>, ttl_secs: i64| {
+        let digest = hasher.clone().finalize();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&digest[..8]);
+        segments.push(Segment {
+            hash: u64::from_be_bytes(buf),
+            cumulative_tokens: cum,
+            ttl_secs,
+        });
+    };
+
+    let ttl = detect_max_ttl(req);
+
+    if let Some(tools) = req.tools.as_ref() {
+        for t in tools {
+            feed(
+                &mut hasher,
+                &tool_signature(t),
+                &tool_token_text(t),
+                &mut cum_tokens,
+            );
+            if t.cache_control.is_some() && cum_tokens > 0 {
+                commit(&hasher, cum_tokens, &mut segments, ttl);
+            }
+        }
+    }
+
+    if let Some(systems) = req.system.as_ref() {
+        for sys in systems {
+            feed(
+                &mut hasher,
+                &system_signature(sys),
+                &sys.text,
+                &mut cum_tokens,
+            );
+            if sys.cache_control.is_some() && cum_tokens > 0 {
+                commit(&hasher, cum_tokens, &mut segments, ttl);
+            }
+        }
+    }
+
+    for msg in &req.messages {
+        feed(&mut hasher, &msg.role, "", &mut cum_tokens);
+        match &msg.content {
+            serde_json::Value::String(s) => {
+                feed(&mut hasher, s, s, &mut cum_tokens);
+            }
+            serde_json::Value::Array(arr) => {
+                for v in arr {
+                    if v.get("type").and_then(|t| t.as_str()) == Some("image") {
+                        let (media_type, data) = image_source_parts(v);
+                        hasher.update(b"block:image|");
+                        hasher.update(media_type.as_bytes());
+                        hasher.update(b"|");
+                        hasher.update(data.as_bytes());
+                        let img_tokens =
+                            crate::image_resize::estimate_image_tokens(media_type, data);
+                        cum_tokens = cum_tokens.saturating_add(img_tokens);
+                    } else {
+                        feed(
+                            &mut hasher,
+                            &block_signature_value(v),
+                            &block_token_text(v),
+                            &mut cum_tokens,
+                        );
+                    }
+                    if v.get("cache_control").is_some() && cum_tokens > 0 {
+                        commit(&hasher, cum_tokens, &mut segments, ttl);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -756,6 +935,43 @@ mod tests {
     }
 
     #[test]
+    fn standard_cache_usage_keeps_cache_control_creation() {
+        let cache = CacheMeter::new(None);
+        let req = build_request_with_system_breakpoint();
+
+        let u = compute_standard_cache_usage(Some(&cache), &req, 1);
+        assert!(
+            u.cache_covered_est > 0,
+            "explicit cache_control should cover a prefix"
+        );
+        assert_eq!(u.cache_read, 0);
+
+        let total = u.prompt_total_est;
+        let (input, creation, read) = u.split_against_total(total);
+        assert!(creation > 0, "standard mode should not zero cache_creation");
+        assert_eq!(read, 0);
+        assert_eq!(input + creation + read, total);
+    }
+
+    #[test]
+    fn standard_cache_usage_ignores_automatic_prefix_cache() {
+        let cache = CacheMeter::new(None);
+        let body = "lorem ipsum dolor sit amet ".repeat(20);
+        let req = req_with_messages(vec![
+            msg_with_cc("user", &body, false),
+            msg_with_cc("assistant", &body, false),
+            msg_with_cc("user", &body, false),
+        ]);
+
+        let u1 = compute_standard_cache_usage(Some(&cache), &req, 1);
+        let u2 = compute_standard_cache_usage(Some(&cache), &req, 1);
+
+        assert_eq!(u1.cache_covered_est, 0);
+        assert_eq!(u2.cache_covered_est, 0);
+        assert_eq!(u2.cache_read, 0);
+    }
+
+    #[test]
     fn split_against_total_is_mutually_exclusive() {
         // input + creation + read 必须恒等于 total，且缓存覆盖比例正确分摊。
         let u = CacheUsage {
@@ -843,7 +1059,8 @@ mod tests {
     }
 
     #[test]
-    fn compute_cache_usage_tools_hit_regardless_of_schema_order() {        use super::super::types::{CacheControl, Message, MessagesRequest};
+    fn compute_cache_usage_tools_hit_regardless_of_schema_order() {
+        use super::super::types::{CacheControl, Message, MessagesRequest};
 
         let make_req = |insert_required_first: bool| {
             let mut tool = build_tool_with_schema_order(insert_required_first);
@@ -900,7 +1117,9 @@ mod tests {
         }
     }
 
-    fn req_with_messages(messages: Vec<super::super::types::Message>) -> super::super::types::MessagesRequest {
+    fn req_with_messages(
+        messages: Vec<super::super::types::Message>,
+    ) -> super::super::types::MessagesRequest {
         use super::super::types::MessagesRequest;
         MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
@@ -1157,9 +1376,18 @@ mod tests {
             model: "claude-opus-4-8".to_string(),
             max_tokens: 64,
             messages: vec![
-                Message { role: "user".into(), content: serde_json::json!([{"type":"text","text":body}]) },
-                Message { role: "assistant".into(), content: serde_json::json!([{"type":"text","text":body}]) },
-                Message { role: "user".into(), content: serde_json::json!([{"type":"text","text":body}]) },
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
             ],
             stream: false,
             system: None,
@@ -1236,7 +1464,10 @@ mod tests {
         // 用 image_resize 的同款 PNG 生成器造一张 750×750（≈750 token）的真图。
         let png = make_test_png(750, 750);
         let img_tokens = crate::image_resize::estimate_image_tokens("image/png", &png) as i32;
-        assert!(img_tokens > 100, "前提：测试图应有可观 token，实测 {img_tokens}");
+        assert!(
+            img_tokens > 100,
+            "前提：测试图应有可观 token，实测 {img_tokens}"
+        );
 
         let make = |trailing: &str| MessagesRequest {
             model: "m".to_string(),
@@ -1249,8 +1480,14 @@ mod tests {
                         {"type":"text","text":"describe"}
                     ]),
                 },
-                Message { role: "assistant".to_string(), content: serde_json::json!("a pixel") },
-                Message { role: "user".to_string(), content: serde_json::json!(trailing) },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("a pixel"),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!(trailing),
+                },
             ],
             stream: false,
             system: None,
@@ -1268,7 +1505,9 @@ mod tests {
         // 最深历史段至少覆盖到 [含图user] 段，covered 应 ≥ 图片 token（远大于纯文本）。
         assert!(
             u1.cache_covered_est >= img_tokens + text_only - 5,
-            "covered({}) 应含图片 token({})", u1.cache_covered_est, img_tokens
+            "covered({}) 应含图片 token({})",
+            u1.cache_covered_est,
+            img_tokens
         );
         assert_eq!(u1.cache_read, 0);
 
@@ -1276,7 +1515,9 @@ mod tests {
         let u2 = compute_cache_usage(&cache, &make("q2"), 1);
         assert!(
             u2.cache_read >= img_tokens,
-            "含图历史应跨轮命中且 read({}) 含图片 token({})", u2.cache_read, img_tokens
+            "含图历史应跨轮命中且 read({}) 含图片 token({})",
+            u2.cache_read,
+            img_tokens
         );
     }
 
@@ -1292,7 +1533,8 @@ mod tests {
             }
         }
         let mut buf = Vec::new();
-        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png).unwrap();
+        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+            .unwrap();
         B64.encode(&buf)
     }
 }

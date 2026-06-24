@@ -7,6 +7,15 @@ use std::time::Duration;
 
 use crate::model::config::TlsBackend;
 
+/// 读取一个以秒为单位的环境变量，缺失或非法时回退到 `default`。值为 0 也视为非法（回退默认）。
+fn env_secs(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
 /// 代理配置
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ProxyConfig {
@@ -49,7 +58,24 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    // 分层超时（可经 KIRO_RS_HTTP_* 覆盖）：
+    // - connect_timeout：仅 TCP+TLS 建连阶段。坏/挂死连接秒级失败重试，不再拖到总超时。
+    // - read_timeout：每次读操作超时，**成功读一次即重置**。用于探测"建连后迟迟不吐字节"
+    //   的挂死连接；首字节一到即重置，因此大上下文的长 prefill 与长生成都不会被误杀。
+    // 这是高并发下的关键：避免少数挂死请求长时间霸占稀缺的账号并发槽，拖垮整个池子的首 token。
+    let connect_timeout = env_secs("KIRO_RS_HTTP_CONNECT_TIMEOUT_SECS", 15);
+    let read_timeout = env_secs("KIRO_RS_HTTP_READ_TIMEOUT_SECS", 300);
+    let keepalive = env_secs("KIRO_RS_HTTP_TCP_KEEPALIVE_SECS", 60);
+
+    let mut builder = Client::builder()
+        // 总超时仍保留为大兜底（含完整流式响应）；read_timeout 才是挂死探测主力。
+        .timeout(Duration::from_secs(timeout_secs))
+        .connect_timeout(Duration::from_secs(connect_timeout))
+        .read_timeout(Duration::from_secs(read_timeout))
+        .tcp_keepalive(Duration::from_secs(keepalive))
+        // 复用空闲连接，省掉重复 TCP+TLS 握手，直接降低首 token。
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(8);
 
     match tls_backend {
         TlsBackend::Rustls => {

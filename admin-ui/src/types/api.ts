@@ -102,11 +102,14 @@ export interface AddCredentialRequest {
   accessToken?: string
   profileArn?: string
   expiresAt?: string
-  authMethod?: 'social' | 'idc' | 'api_key'
+  authMethod?: string
   provider?: string
   clientId?: string
   clientSecret?: string
   startUrl?: string
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
   priority?: number
   authRegion?: string
   apiRegion?: string
@@ -368,6 +371,8 @@ export interface ClientKeyItem {
   totalOutputTokens: number
   totalCacheCreationTokens: number
   totalCacheReadTokens: number
+  /** 是否启用中转层 prompt cache */
+  cacheEnabled: boolean
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
   /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
@@ -383,6 +388,7 @@ export interface CreateClientKeyRequest {
   name: string
   description?: string
   group?: string
+  cacheEnabled?: boolean
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -397,6 +403,7 @@ export interface UpdateClientKeyRequest {
   name?: string
   description?: string
   group?: string
+  cacheEnabled?: boolean
 }
 
 // ============ 用量统计 ============

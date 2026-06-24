@@ -46,6 +46,11 @@ pub struct ClientKey {
     pub total_cache_creation_tokens: u64,
     #[serde(default)]
     pub total_cache_read_tokens: u64,
+    /// 是否启用中转层 prompt cache 计量与命中。
+    ///
+    /// 老数据无此字段时默认 true，避免升级后已有 Key 行为变化。
+    #[serde(default = "default_cache_enabled")]
+    pub cache_enabled: bool,
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
@@ -155,8 +160,13 @@ impl ClientKeyManager {
         name: String,
         description: Option<String>,
         group: Option<String>,
+        cache_enabled: bool,
     ) -> ClientKey {
-        self.create_with_key(name, description, group, generate_client_key())
+        if cache_enabled {
+            self.create_with_key(name, description, group, generate_client_key())
+        } else {
+            self.create_with_key_and_cache(name, description, group, generate_client_key(), false)
+        }
     }
 
     /// 用指定明文创建 Key（仅供首次启动 bootstrap 用，把 config.json apiKey 直接导入为第一条分发密钥）。
@@ -168,10 +178,25 @@ impl ClientKeyManager {
         group: Option<String>,
         plaintext: String,
     ) -> ClientKey {
+        self.create_with_key_and_cache(name, description, group, plaintext, true)
+    }
+
+    fn create_with_key_and_cache(
+        &self,
+        name: String,
+        description: Option<String>,
+        group: Option<String>,
+        plaintext: String,
+        cache_enabled: bool,
+    ) -> ClientKey {
         let mut inner = self.inner.write();
         // 防止 bootstrap 重复导入同一明文
         if let Some(&id) = inner.by_key.get(&plaintext) {
-            return inner.entries.get(&id).cloned().expect("by_key 与 entries 应一致");
+            return inner
+                .entries
+                .get(&id)
+                .cloned()
+                .expect("by_key 与 entries 应一致");
         }
         let id = inner.next_id;
         inner.next_id += 1;
@@ -188,6 +213,7 @@ impl ClientKeyManager {
             total_output_tokens: 0,
             total_cache_creation_tokens: 0,
             total_cache_read_tokens: 0,
+            cache_enabled,
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
@@ -261,6 +287,7 @@ impl ClientKeyManager {
                     total_output_tokens: 0,
                     total_cache_creation_tokens: 0,
                     total_cache_read_tokens: 0,
+                    cache_enabled: true,
                     total_credits: 0.0,
                     group: None,
                     is_system: true,
@@ -312,6 +339,7 @@ impl ClientKeyManager {
         name: Option<String>,
         description: Option<Option<String>>,
         group: Option<Option<String>>,
+        cache_enabled: Option<bool>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -325,6 +353,9 @@ impl ClientKeyManager {
                 if let Some(g) = group {
                     e.group = g.filter(|s| !s.trim().is_empty());
                 }
+                if let Some(enabled) = cache_enabled {
+                    e.cache_enabled = enabled;
+                }
                 true
             }
             None => false,
@@ -337,7 +368,21 @@ impl ClientKeyManager {
 
     /// 返回指定 Key 绑定的分组名（None 表示未绑定或 Key 不存在）
     pub fn group_of(&self, id: u64) -> Option<String> {
-        self.inner.read().entries.get(&id).and_then(|e| e.group.clone())
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .and_then(|e| e.group.clone())
+    }
+
+    /// 返回指定 Key 是否启用 prompt cache。不存在时保守关闭。
+    pub fn cache_enabled_of(&self, id: u64) -> bool {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .map(|e| e.cache_enabled)
+            .unwrap_or(false)
     }
 
     /// 列出所有当前被引用的分组名（仅去重，不带计数）。
@@ -503,7 +548,12 @@ impl ClientKeyManager {
 
     /// 获取统计后的 active Key 数（未禁用）
     pub fn active_count(&self) -> usize {
-        self.inner.read().entries.values().filter(|e| !e.disabled).count()
+        self.inner
+            .read()
+            .entries
+            .values()
+            .filter(|e| !e.disabled)
+            .count()
     }
 }
 
@@ -518,10 +568,13 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
+fn default_cache_enabled() -> bool {
+    true
+}
+
 /// 生成 `csk_` 前缀 + 32 位 base62 随机字符串
 pub fn generate_client_key() -> String {
-    const CHARSET: &[u8] =
-        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let body: String = (0..32)
         .map(|_| {
             let idx = fastrand::usize(..CHARSET.len());
@@ -554,7 +607,7 @@ mod tests {
     #[test]
     fn create_and_verify() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None);
+        let entry = mgr.create("test".to_string(), None, None, true);
         assert!(entry.key.starts_with(CLIENT_KEY_PREFIX));
         assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
         // 不带前缀的拒绝
@@ -564,7 +617,7 @@ mod tests {
     #[test]
     fn disabled_key_rejected() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None);
+        let entry = mgr.create("test".to_string(), None, None, true);
         mgr.set_disabled(entry.id, true);
         assert_eq!(mgr.verify_and_touch(&entry.key), None);
         mgr.set_disabled(entry.id, false);
@@ -574,7 +627,7 @@ mod tests {
     #[test]
     fn record_usage_accumulates() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None);
+        let entry = mgr.create("test".to_string(), None, None, true);
         mgr.record_usage(entry.id, 100, 50, 0, 0, 0.0);
         mgr.record_usage(entry.id, 200, 30, 5, 10, 1.5);
         let list = mgr.list();
@@ -586,6 +639,15 @@ mod tests {
     }
 
     #[test]
+    fn cache_enabled_can_be_updated() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("test".to_string(), None, None, false);
+        assert!(!mgr.cache_enabled_of(entry.id));
+        assert!(mgr.update_meta(entry.id, None, None, None, Some(true)));
+        assert!(mgr.cache_enabled_of(entry.id));
+    }
+
+    #[test]
     fn mask_format() {
         assert_eq!(mask_client_key("csk_abcdefghijklmnop"), "csk_abcd...mnop");
         assert_eq!(mask_client_key("short"), "short");
@@ -594,7 +656,12 @@ mod tests {
     #[test]
     fn rotate_replaces_key_but_keeps_metadata_and_stats() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("kb".to_string(), Some("desc".into()), Some("groupA".into()));
+        let entry = mgr.create(
+            "kb".to_string(),
+            Some("desc".into()),
+            Some("groupA".into()),
+            true,
+        );
         // 累计一些统计
         mgr.record_usage(entry.id, 100, 50, 5, 10, 1.5);
         let old_key = entry.key.clone();
@@ -643,7 +710,11 @@ mod tests {
         // 修复后启动：应迁移到 id=0
         mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
         assert!(mgr.is_system(0));
-        assert!(!mgr.list().iter().any(|k| k.id == 1 && k.key == "sk-kiro-abc"));
+        assert!(
+            !mgr.list()
+                .iter()
+                .any(|k| k.id == 1 && k.key == "sk-kiro-abc")
+        );
     }
 
     #[test]

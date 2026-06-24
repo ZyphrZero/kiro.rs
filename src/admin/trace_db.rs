@@ -266,10 +266,7 @@ impl TraceStore {
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
             if !existing.contains(name) {
-                conn.execute_batch(&format!(
-                    "ALTER TABLE traces ADD COLUMN {} {};",
-                    name, def
-                ))?;
+                conn.execute_batch(&format!("ALTER TABLE traces ADD COLUMN {} {};", name, def))?;
             }
         }
         // 老库 key_source 列首次添加后，按 key_id 语义回填：master apiKey (key_id=0) 之外都视为客户端 Key。

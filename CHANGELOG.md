@@ -4,6 +4,23 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.8] - 2026-06-24
+
+主题：**高并发首 token 延迟优化（token 刷新按凭据分锁 + HTTP 分层超时与连接复用）+ 入站文本字段裁剪兜底 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`**。这一版聚焦高并发下首 token 暴涨问题：将原先一把全局 token 刷新锁改为按凭据分锁，消除 token 临近同时过期时所有请求（含不同账号）堵在同一把锁后串行刷新的排队；HTTP 客户端引入分层超时（connect / read）、TCP keepalive 与连接池复用，避免少数挂死连接长时间霸占稀缺的账号并发槽。同时新增入站文本字段的本地裁剪，在请求发往上游之前把超大字段（最常见为 `tool_result.text`）裁到安全范围，从源头规避 AWS Q 的 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`（400）。所有改动均不触碰工具定义 / 工具名 / 工具调用入参与对话语义。
+
+### ⚡ 优化 — 高并发首 token 延迟
+
+- **Token 刷新按凭据分锁**：原先 `MultiTokenManager` 使用单一全局 `refresh_lock`，token 临近同时过期时，高并发下所有需刷新的请求（哪怕使用不同账号）全部堵在同一把锁后排队、串行执行网络刷新，导致首 token 集体暴涨。改为 `HashMap<credential_id, Arc<TokioMutex>>` 按凭据分锁：同一凭据的并发刷新仍串行去重（保留双检），不同凭据的刷新并行进行，互不阻塞。
+- **HTTP 分层超时 + 连接复用**：上游 HTTP 客户端从「仅一个 720s 总超时」改为分层超时——`connect_timeout`（默认 15s，建连阶段卡死秒级失败重试）、`read_timeout`（默认 300s，每次成功读后重置，用于探测建连后迟迟不吐字节的挂死连接，首字节一到即重置，长 prefill / 长生成不被误杀）、TCP keepalive（默认 60s）、连接池复用（`pool_max_idle_per_host=8`）。避免少数挂死请求长时间霸占稀缺的账号并发槽拖垮整个池子。均可经 `KIRO_RS_HTTP_*` 环境变量覆盖。
+
+### ✨ 新功能 — 入站文本字段裁剪
+
+- **单字段文本裁剪**：消息正文、`tool_result` 文本、历史 assistant 的 text / thinking 在本地、请求发往上游之前按单字段字节上限裁剪，规避 AWS Q 的 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`（400）。裁剪在转换阶段完成（获取账号并发槽之前），对并发零影响；超限时保留首尾、中间插入 `…[kiro-rs truncated ~N bytes]…` 标记并打 warn 日志；UTF-8 安全。默认阈值 `680000`（贴近上游约 700KB 红线，正常使用几乎永不触发），可经 `KIRO_RS_TEXT_TRUNCATE` / `KIRO_RS_TEXT_MAX_FIELD_BYTES` 配置。
+
+### 📝 文档
+
+- README 新增「文本字段裁剪」「HTTP 传输层调优」「高并发首 token 调优」三节，并补全 `accountMaxConcurrency` / `accountAcquireTimeoutSecs` 配置说明与 `KIRO_RS_TEXT_*` / `KIRO_RS_HTTP_*` 环境变量表。
+
 ## [0.6.7] - 2026-06-17
 
 主题：**远程部署 Social 登录零配置化（OAuth 回调地址自动派生）+ 凭据列表卡片 / 列表双视图与分页增强 + 来源渠道模糊搜索与移动端体验优化 + output_config.effort 分级归一化**。这一版解决了远程部署（Render / Docker / VPS）下 Social 登录回调指向 `127.0.0.1` 无法使用的痛点——前端按当前访问地址自动派生公网回调地址，远程部署零配置即可完成 Google / GitHub 登录；凭据列表新增 iOS 风格的卡片 / 列表双视图切换、可配置每页数量与跨页全选；同时归一化 `output_config.effort` 分级，避免较老模型收到不支持的 `xhigh` 报错，并在删除凭据时清理其历史失败记录。凭据管理页面还新增按来源渠道（备注）/ 邮箱的模糊搜索、批量导入 / 验活 / 刷新余额的 8 路并发化，以及一轮移动端工具栏布局与下拉菜单渲染异常的修复。

@@ -19,6 +19,7 @@ use crate::kiro::model::requests::tool::{
 use super::types::{ContentBlock, ImageSource, MessagesRequest};
 
 use crate::image_resize::{ResizeConfig, maybe_shrink_image};
+use crate::text_truncate::{TextLimitConfig, truncate_field};
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 /// 规范化 JSON Schema，修复工具定义中常见的类型问题
@@ -40,8 +41,15 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     obj.remove("$schema");
 
     // type（必须是字符串）
-    if !obj.get("type").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
-        obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
+    if !obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+    {
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
     }
 
     // properties（必须是 object）；递归规范化每个 property 的子 schema
@@ -51,9 +59,17 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
                 .into_iter()
                 .map(|(k, v)| (k, normalize_property_schema(v)))
                 .collect();
-            obj.insert("properties".to_string(), serde_json::Value::Object(normalized));
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(normalized),
+            );
         }
-        _ => { obj.insert("properties".to_string(), serde_json::Value::Object(serde_json::Map::new())); }
+        _ => {
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(serde_json::Map::new()),
+            );
+        }
     }
 
     // required（必须是 string 数组）
@@ -70,7 +86,12 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     // additionalProperties（允许 bool 或 object，其他按 true 处理）
     match obj.get("additionalProperties") {
         Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(true)); }
+        _ => {
+            obj.insert(
+                "additionalProperties".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
     }
 
     serde_json::Value::Object(obj)
@@ -90,10 +111,18 @@ fn normalize_property_schema(schema: serde_json::Value) -> serde_json::Value {
     obj.remove("$schema");
 
     // exclusiveMinimum/exclusiveMaximum：Draft 2019-09+ 为数字，Draft 07 为 bool；移除数字形式
-    if obj.get("exclusiveMinimum").and_then(|v| v.as_f64()).is_some() {
+    if obj
+        .get("exclusiveMinimum")
+        .and_then(|v| v.as_f64())
+        .is_some()
+    {
         obj.remove("exclusiveMinimum");
     }
-    if obj.get("exclusiveMaximum").and_then(|v| v.as_f64()).is_some() {
+    if obj
+        .get("exclusiveMaximum")
+        .and_then(|v| v.as_f64())
+        .is_some()
+    {
         obj.remove("exclusiveMaximum");
     }
 
@@ -112,7 +141,10 @@ fn normalize_property_schema(schema: serde_json::Value) -> serde_json::Value {
             .into_iter()
             .map(|(k, v)| (k, normalize_property_schema(v)))
             .collect();
-        obj.insert("properties".to_string(), serde_json::Value::Object(normalized));
+        obj.insert(
+            "properties".to_string(),
+            serde_json::Value::Object(normalized),
+        );
     }
 
     // 递归处理 items（数组元素 schema）
@@ -549,10 +581,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_history(history);
 
     if !tool_name_map.is_empty() {
-        tracing::info!(
-            "工具名称映射: {} 个超长名称已缩短",
-            tool_name_map.len()
-        );
+        tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
 
     // 14. Extract effort into AdditionalModelRequestFields only for models that accept it.
@@ -618,8 +647,11 @@ fn process_message_content_dedup(
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content =
-                                    extract_tool_result_content(&block.content, &mut dedup, &mut images);
+                                let result_content = extract_tool_result_content(
+                                    &block.content,
+                                    &mut dedup,
+                                    &mut images,
+                                );
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -644,7 +676,12 @@ fn process_message_content_dedup(
         _ => {}
     }
 
-    Ok((text_parts.join("\n"), images, tool_results))
+    let text = text_parts.join("\n");
+    // 单字段文本裁剪：避免单条消息文本过大触发上游 CONTENT_LENGTH_EXCEEDS_THRESHOLD。
+    // 在转换期完成（获取账号并发 permit 之前），对并发零影响。
+    let text = truncate_field(&TextLimitConfig::from_env(), "message.text", text);
+
+    Ok((text, images, tool_results))
 }
 
 /// 从 media_type 获取图片格式
@@ -680,7 +717,10 @@ fn extract_kiro_image(
     }
     let cfg = ResizeConfig::from_env();
     let processed = maybe_shrink_image(cfg, &format, &source.data);
-    images.push(KiroImage::from_base64(processed.format, processed.data_base64));
+    images.push(KiroImage::from_base64(
+        processed.format,
+        processed.data_base64,
+    ));
     None
 }
 
@@ -694,7 +734,7 @@ fn extract_tool_result_content(
     dedup: &mut Option<&mut std::collections::HashSet<String>>,
     images: &mut Vec<KiroImage>,
 ) -> String {
-    match content {
+    let result = match content {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
@@ -720,7 +760,12 @@ fn extract_tool_result_content(
         }
         Some(v) => v.to_string(),
         None => String::new(),
-    }
+    };
+
+    // 单字段文本裁剪：toolResult.content[0].text 是触发上游 CONTENT_LENGTH_EXCEEDS_THRESHOLD
+    // 最常见的字段（读大文件 / 大命令输出 / 粘贴大段文本）。在此把过大的工具结果中段裁掉，
+    // 保留首尾，避免单次请求被上游 400 拒绝。
+    truncate_field(&TextLimitConfig::from_env(), "tool_result.text", result)
 }
 
 /// 验证并过滤 tool_use/tool_result 配对
@@ -872,49 +917,67 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
 }
 
 /// 转换工具定义
-fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut HashMap<String, String>) -> Vec<Tool> {
+fn convert_tools(
+    tools: &Option<Vec<super::types::Tool>>,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Vec<Tool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
 
-    tools
-        .iter()
-        .map(|t| {
-            let mut description = t.description.clone();
+    let mut seen_names = std::collections::HashSet::new();
+    let mut converted = Vec::with_capacity(tools.len());
 
-            // 对 Write/Edit 工具追加自定义描述后缀
-            let suffix = match t.name.as_str() {
-                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
-                _ => "",
-            };
-            if !suffix.is_empty() {
-                description.push('\n');
-                description.push_str(suffix);
-            }
+    for t in tools {
+        let mapped_name = map_tool_name(&t.name, tool_name_map);
+        if !seen_names.insert(mapped_name.clone()) {
+            tracing::warn!(
+                "跳过重复工具定义: original={}, mapped={}",
+                t.name,
+                mapped_name
+            );
+            continue;
+        }
 
-            // kiro API 不接受空描述，填充占位符
-            let description = if description.trim().is_empty() {
-                t.name.clone()
-            } else {
-                description
-            };
+        let mut description = t.description.clone();
 
-            // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
-            let description = match description.char_indices().nth(10000) {
-                Some((idx, _)) => description[..idx].to_string(),
-                None => description,
-            };
+        // 对 Write/Edit 工具追加自定义描述后缀
+        let suffix = match t.name.as_str() {
+            "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
+            "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
+            _ => "",
+        };
+        if !suffix.is_empty() {
+            description.push('\n');
+            description.push_str(suffix);
+        }
 
-            Tool {
-                tool_specification: ToolSpecification {
-                    name: map_tool_name(&t.name, tool_name_map),
-                    description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
-                },
-            }
-        })
-        .collect()
+        // kiro API 不接受空描述，填充占位符
+        let description = if description.trim().is_empty() {
+            t.name.clone()
+        } else {
+            description
+        };
+
+        // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
+        let description = match description.char_indices().nth(10000) {
+            Some((idx, _)) => description[..idx].to_string(),
+            None => description,
+        };
+
+        let tool = Tool {
+            tool_specification: ToolSpecification {
+                name: mapped_name,
+                description,
+                input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
+                    t.input_schema
+                ))),
+            },
+        };
+        converted.push(tool);
+    }
+
+    converted
 }
 
 /// 生成thinking标签前缀
@@ -953,7 +1016,12 @@ fn has_thinking_tags(content: &str) -> bool {
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
+fn build_history(
+    req: &MessagesRequest,
+    messages: &[super::types::Message],
+    model_id: &str,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -1121,7 +1189,8 @@ fn convert_assistant_message(
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 let mapped_name = map_tool_name(&name, tool_name_map);
-                                tool_uses.push(ToolUseEntry::new(id, mapped_name).with_input(input));
+                                tool_uses
+                                    .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
                         }
                         _ => {}
@@ -1131,6 +1200,12 @@ fn convert_assistant_message(
         }
         _ => {}
     }
+
+    // 单字段文本裁剪：历史 assistant 轮次的 text / thinking 也可能很大（如上一轮贴了大段输出）。
+    // 分别裁剪两段，避免破坏 <thinking>...</thinking> 包裹结构。
+    let text_cfg = TextLimitConfig::from_env();
+    let text_content = truncate_field(&text_cfg, "assistant.text", text_content);
+    let thinking_content = truncate_field(&text_cfg, "assistant.thinking", thinking_content);
 
     // 组合 thinking 和 text 内容
     // 格式: <thinking>思考内容</thinking>\n\ntext内容
@@ -1211,11 +1286,7 @@ mod tests {
                 .unwrap()
                 .contains("sonnet")
         );
-        assert!(
-            map_model("claude-sonnet-4-6")
-                .unwrap()
-                .contains("sonnet")
-        );
+        assert!(map_model("claude-sonnet-4-6").unwrap().contains("sonnet"));
     }
 
     #[test]
@@ -1583,13 +1654,18 @@ mod tests {
 
     #[test]
     fn test_shorten_tool_name_deterministic() {
-        let long_name = "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
+        let long_name =
+            "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
         assert!(long_name.len() > TOOL_NAME_MAX_LEN);
 
         let short1 = shorten_tool_name(long_name);
         let short2 = shorten_tool_name(long_name);
         assert_eq!(short1, short2, "相同输入应产生相同的短名称");
-        assert!(short1.len() <= TOOL_NAME_MAX_LEN, "短名称长度应 <= 63，实际 {}", short1.len());
+        assert!(
+            short1.len() <= TOOL_NAME_MAX_LEN,
+            "短名称长度应 <= 63，实际 {}",
+            short1.len()
+        );
     }
 
     #[test]
@@ -1622,7 +1698,8 @@ mod tests {
     fn test_tool_name_mapping_in_convert_request() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
         assert!(long_tool_name.len() > TOOL_NAME_MAX_LEN);
 
         let mut schema = std::collections::BTreeMap::new();
@@ -1632,12 +1709,10 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4.5".to_string(),
             max_tokens: 1024,
-            messages: vec![
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!("test"),
-                },
-            ],
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
             system: None,
             stream: false,
             tools: Some(vec![AnthropicTool {
@@ -1665,16 +1740,65 @@ mod tests {
         assert!(short.len() <= TOOL_NAME_MAX_LEN);
 
         // Kiro 请求中的工具名应该是短名称
-        let tools = &result.conversation_state.current_message.user_input_message
-            .user_input_message_context.tools;
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
         assert_eq!(tools[0].tool_specification.name, *short);
+    }
+
+    #[test]
+    fn test_duplicate_tools_are_deduped_by_final_name() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let mut schema = std::collections::BTreeMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert("properties".to_string(), serde_json::json!({}));
+
+        let dup = AnthropicTool {
+            name: "mcp__read_bucket".to_string(),
+            description: "read bucket".to_string(),
+            input_schema: schema.clone(),
+            tool_type: None,
+            max_uses: None,
+            cache_control: None,
+        };
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            system: None,
+            stream: false,
+            tools: Some(vec![dup.clone(), dup]),
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool_specification.name, "mcp__read_bucket");
     }
 
     #[test]
     fn test_tool_name_mapping_in_history() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
 
         let mut schema = std::collections::BTreeMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
@@ -2270,9 +2394,15 @@ mod tests {
 
         let content = &result.assistant_response_message.content;
         assert!(content.contains("<thinking>"), "应包含 thinking 标签");
-        assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
+        assert!(
+            content.contains("Let me read that file"),
+            "应包含第二条消息的 text 内容"
+        );
 
-        let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
+        let tool_uses = result
+            .assistant_response_message
+            .tool_uses
+            .expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
     }
@@ -2322,7 +2452,11 @@ mod tests {
         };
 
         let result = convert_request(&req);
-        assert!(result.is_ok(), "连续 assistant 消息场景不应报错: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "连续 assistant 消息场景不应报错: {:?}",
+            result.err()
+        );
 
         let state = result.unwrap().conversation_state;
         let mut found_tool_use = false;
@@ -2384,7 +2518,11 @@ mod tests {
         let msg = &result.conversation_state.current_message.user_input_message;
 
         // image is lifted to the top-level images
-        assert_eq!(msg.images.len(), 1, "image in tool_result should be lifted to top-level images");
+        assert_eq!(
+            msg.images.len(),
+            1,
+            "image in tool_result should be lifted to top-level images"
+        );
         assert_eq!(msg.images[0].format, "png");
         assert_eq!(msg.images[0].source.bytes, TINY_PNG_B64);
 
@@ -2436,7 +2574,10 @@ mod tests {
         let result = convert_request(&req).unwrap();
         let msg = &result.conversation_state.current_message.user_input_message;
 
-        assert!(msg.images.is_empty(), "text-only tool_result should produce no top-level image");
+        assert!(
+            msg.images.is_empty(),
+            "text-only tool_result should produce no top-level image"
+        );
         let tr = &msg.user_input_message_context.tool_results;
         assert_eq!(tr.len(), 1);
         assert_eq!(

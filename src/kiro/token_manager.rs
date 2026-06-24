@@ -8,11 +8,13 @@ use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::time::sleep;
 
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -23,7 +25,8 @@ use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
-    IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
+    ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
+    RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
@@ -64,6 +67,21 @@ fn mask_api_key(key: &str) -> String {
     } else {
         "***".to_string()
     }
+}
+
+/// 从 JWT access_token 中解出 `exp`（Unix 秒）。解析失败返回 `None`。
+///
+/// 仅用于外部 IdP 导入时判断携带的 accessToken 是否仍可先用；不做签名校验。
+fn jwt_exp_unix(access_token: Option<&str>) -> Option<i64> {
+    use base64::Engine;
+
+    let token = access_token?.trim();
+    let payload_b64 = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("exp").and_then(|v| v.as_i64())
 }
 
 /// 验证 refreshToken 的基本有效性
@@ -131,7 +149,9 @@ pub(crate) async fn refresh_token(
         }
     });
 
-    if auth_method.eq_ignore_ascii_case("idc")
+    if credentials.is_external_idp() {
+        refresh_external_idp_token(credentials, config, proxy).await
+    } else if auth_method.eq_ignore_ascii_case("idc")
         || auth_method.eq_ignore_ascii_case("builder-id")
         || auth_method.eq_ignore_ascii_case("iam")
     {
@@ -322,6 +342,101 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
+/// 刷新 External IdP Token（企业 SSO 完整导入）。
+///
+/// Kiro IDE / KAM 导出的 external_idp 账号通常自带 tokenEndpoint / issuerUrl /
+/// scopes。刷新必须走导出的 tokenEndpoint，并使用标准 OAuth 表单体；不能把它压成
+/// 仅 clientId/clientSecret 的 AWS SSO OIDC 格式。
+async fn refresh_external_idp_token(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<KiroCredentials> {
+    tracing::info!("正在刷新 External IdP Token...");
+
+    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let client_id = credentials
+        .client_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 clientId"))?;
+    let token_endpoint = credentials
+        .token_endpoint
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 tokenEndpoint"))?;
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let mut form: Vec<(&str, &str)> = vec![
+        ("grant_type", "refresh_token"),
+        ("client_id", client_id),
+        ("refresh_token", refresh_token),
+    ];
+    if let Some(client_secret) = credentials.client_secret.as_deref() {
+        if !client_secret.is_empty() {
+            form.push(("client_secret", client_secret));
+        }
+    }
+    if let Some(scopes) = credentials.scopes.as_deref() {
+        if !scopes.trim().is_empty() {
+            form.push(("scope", scopes.trim()));
+        }
+    }
+
+    let response = client
+        .post(token_endpoint)
+        .header("accept", "application/json")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("Connection", "close")
+        .form(&form)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        if status.as_u16() == 400
+            && (body_text.contains("\"invalid_grant\"")
+                || body_text.contains("Invalid refresh token provided"))
+        {
+            return Err(RefreshTokenInvalidError {
+                message: format!(
+                    "External IdP refreshToken 已失效 (invalid_grant): {}",
+                    body_text
+                ),
+            }
+            .into());
+        }
+
+        let error_msg = match status.as_u16() {
+            401 => "External IdP 凭证已过期或无效，需要重新认证",
+            403 => "External IdP 权限不足，无法刷新 Token",
+            429 => "External IdP 请求过于频繁，已被限流",
+            500..=599 => "External IdP 服务器错误，暂时不可用",
+            _ => "External IdP Token 刷新失败",
+        };
+        bail!("{}: {} {}", error_msg, status, body_text);
+    }
+
+    let data: ExternalIdpRefreshResponse = response.json().await?;
+
+    let mut new_credentials = credentials.clone();
+    new_credentials.access_token = Some(data.access_token);
+
+    if let Some(new_refresh_token) = data.refresh_token {
+        new_credentials.refresh_token = Some(new_refresh_token);
+    }
+
+    if let Some(expires_in) = data.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    }
+
+    if let Some(profile_arn) = data.profile_arn {
+        new_credentials.profile_arn = Some(profile_arn);
+    }
+
+    Ok(new_credentials)
+}
+
 /// 官方 Kiro 用量 / 模型 REST 接口（getUsageLimits / ListAvailableModels /
 /// setUserPreference）仅在 `us-east-1` 与 `eu-central-1` 两个端点提供服务。
 ///
@@ -376,8 +491,13 @@ pub(crate) async fn get_usage_limits(
     let client = build_client(proxy, 60, config.tls_backend)?;
 
     let mut last_error: Option<String> = None;
+    let is_external_idp = credentials.is_external_idp();
     for (idx, region) in candidates.iter().enumerate() {
-        let host = format!("q.{}.amazonaws.com", region);
+        let host = if is_external_idp {
+            format!("codewhisperer.{}.amazonaws.com", region)
+        } else {
+            format!("q.{}.amazonaws.com", region)
+        };
         let url = format!(
             "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true{}",
             host, profile_arn_query
@@ -393,7 +513,9 @@ pub(crate) async fn get_usage_limits(
             .header("Authorization", format!("Bearer {}", token))
             .header("Connection", "close");
 
-        if credentials.is_api_key_credential() {
+        if is_external_idp {
+            request = request.header("TokenType", "EXTERNAL_IDP");
+        } else if credentials.is_api_key_credential() {
             request = request.header("tokentype", "API_KEY");
         }
 
@@ -473,8 +595,13 @@ pub(crate) async fn get_available_models(
     let client = build_client(proxy, 60, config.tls_backend)?;
 
     let mut last_error: Option<String> = None;
+    let is_external_idp = credentials.is_external_idp();
     for (idx, region) in candidates.iter().enumerate() {
-        let host = format!("q.{}.amazonaws.com", region);
+        let host = if is_external_idp {
+            format!("codewhisperer.{}.amazonaws.com", region)
+        } else {
+            format!("q.{}.amazonaws.com", region)
+        };
         let url = format!(
             "https://{}/ListAvailableModels?origin=AI_EDITOR{}",
             host, profile_arn_query
@@ -490,7 +617,9 @@ pub(crate) async fn get_available_models(
             .header("Authorization", format!("Bearer {}", token))
             .header("Connection", "close");
 
-        if credentials.is_api_key_credential() {
+        if is_external_idp {
+            request = request.header("TokenType", "EXTERNAL_IDP");
+        } else if credentials.is_api_key_credential() {
             request = request.header("tokentype", "API_KEY");
         }
 
@@ -567,31 +696,48 @@ pub(crate) async fn list_available_profiles(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
+    let is_external_idp = credentials.is_external_idp();
     let mut last_error: Option<String> = None;
     let mut empty_seen = false;
     for region in candidates.iter() {
-        let host = format!("q.{}.amazonaws.com", region);
-        let url = format!("https://{}/", host);
-
-        let mut request = client
-            .post(&url)
-            .header("content-type", "application/x-amz-json-1.0")
-            .header(
-                "x-amz-target",
-                "AmazonCodeWhispererService.ListAvailableProfiles",
-            )
-            .header("x-amz-user-agent", &amz_user_agent)
-            .header("user-agent", &user_agent)
-            .header("host", &host)
-            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=1")
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Connection", "close")
-            .body(r#"{"maxResults":10}"#);
-
-        if credentials.is_api_key_credential() {
-            request = request.header("tokentype", "API_KEY");
-        }
+        let request = if is_external_idp {
+            let host = format!("codewhisperer.{}.amazonaws.com", region);
+            let url = format!("https://{}/ListAvailableProfiles", host);
+            client
+                .post(&url)
+                .header("content-type", "application/json")
+                .header("x-amz-user-agent", &amz_user_agent)
+                .header("user-agent", &user_agent)
+                .header("host", &host)
+                .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+                .header("amz-sdk-request", "attempt=1; max=1")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("TokenType", "EXTERNAL_IDP")
+                .header("Connection", "close")
+                .body(r#"{"maxResults":10}"#)
+        } else {
+            let host = format!("q.{}.amazonaws.com", region);
+            let url = format!("https://{}/", host);
+            let mut req = client
+                .post(&url)
+                .header("content-type", "application/x-amz-json-1.0")
+                .header(
+                    "x-amz-target",
+                    "AmazonCodeWhispererService.ListAvailableProfiles",
+                )
+                .header("x-amz-user-agent", &amz_user_agent)
+                .header("user-agent", &user_agent)
+                .header("host", &host)
+                .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+                .header("amz-sdk-request", "attempt=1; max=1")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Connection", "close")
+                .body(r#"{"maxResults":10}"#);
+            if credentials.is_api_key_credential() {
+                req = req.header("tokentype", "API_KEY");
+            }
+            req
+        };
 
         let response = request.send().await?;
         let status = response.status();
@@ -666,8 +812,13 @@ pub(crate) async fn set_user_preference(
     };
 
     let mut last_error: Option<String> = None;
+    let is_external_idp = credentials.is_external_idp();
     for (idx, region) in candidates.iter().enumerate() {
-        let host = format!("q.{}.amazonaws.com", region);
+        let host = if is_external_idp {
+            format!("codewhisperer.{}.amazonaws.com", region)
+        } else {
+            format!("q.{}.amazonaws.com", region)
+        };
         let url = format!("https://{}/setUserPreference", host);
 
         let mut request = client
@@ -682,7 +833,9 @@ pub(crate) async fn set_user_preference(
             .header("Connection", "close")
             .json(&body);
 
-        if credentials.is_api_key_credential() {
+        if is_external_idp {
+            request = request.header("TokenType", "EXTERNAL_IDP");
+        } else if credentials.is_api_key_credential() {
             request = request.header("tokentype", "API_KEY");
         }
 
@@ -872,13 +1025,18 @@ pub struct MultiTokenManager {
     /// 下一个待分配凭据 ID。进程内单调递增，避免删除账号后新账号复用旧 ID，
     /// 从而继承旧账号按 credential_id 聚合的 trace/usage 历史。
     next_id: AtomicU64,
-    /// Token 刷新锁，确保同一时间只有一个刷新操作
-    refresh_lock: TokioMutex<()>,
+    /// Token 刷新锁，**按凭据 ID 分锁**：同一凭据的并发刷新串行化（保留双检去重），
+    /// 不同凭据的刷新互不阻塞、可并行。曾经是一把全局锁，导致 token 临近同时过期时，
+    /// 高并发下所有需刷新的请求（哪怕用不同账号）全堵在一把锁后排队、串行做网络刷新，
+    /// 首 token 集体暴涨。分锁后不同账号的刷新并行进行。
+    refresh_locks: Mutex<HashMap<u64, Arc<TokioMutex<()>>>>,
     /// 凭据文件路径（用于回写）
     credentials_path: Option<PathBuf>,
     /// 凭据文件写入锁。`persist_credentials` 用整文件覆写，并发调用会互相踩踏，
     /// 故用此锁串行化所有写盘操作（批量导入等场景会并发触发）。
     persist_lock: Mutex<()>,
+    /// 账号级并发租约。每个凭据最多持有配置数量的 permit，避免单账号无限并发。
+    credential_locks: Mutex<HashMap<u64, Arc<Semaphore>>>,
     /// 是否为多凭据格式（数组格式才回写；通过 add_credential 动态升级为 true）
     is_multiple_format: AtomicBool,
     /// 负载均衡模式（运行时可修改）
@@ -902,7 +1060,6 @@ const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 ///
 /// 绑定特定凭据的调用上下文，确保 token、credentials 和 id 的一致性
 /// 用于解决并发调用时 current_id 竞态问题
-#[derive(Clone)]
 pub struct CallContext {
     /// 凭据 ID（用于 report_success/report_failure）
     pub id: u64,
@@ -910,6 +1067,8 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+    /// 账号级并发租约；随上下文/响应生命周期释放。
+    _permit: OwnedSemaphorePermit,
 }
 
 /// 判断某账号的分组集合是否匹配请求所属分组（严格隔离）
@@ -1032,6 +1191,12 @@ impl MultiTokenManager {
             anyhow::bail!("检测到重复的凭据 ID: {:?}", duplicate_ids);
         }
 
+        let account_max_concurrency = config.account_max_concurrency.max(1);
+        let credential_locks = entries
+            .iter()
+            .map(|entry| (entry.id, Arc::new(Semaphore::new(account_max_concurrency))))
+            .collect();
+
         // 选择初始凭据：优先级最高（priority 最小）的可用凭据，无可用凭据时为 0
         let initial_id = entries
             .iter()
@@ -1049,9 +1214,10 @@ impl MultiTokenManager {
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
             next_id: AtomicU64::new(next_id),
-            refresh_lock: TokioMutex::new(()),
+            refresh_locks: Mutex::new(HashMap::new()),
             credentials_path,
             persist_lock: Mutex::new(()),
+            credential_locks: Mutex::new(credential_locks),
             is_multiple_format: AtomicBool::new(is_multiple_format),
             load_balancing_mode: Mutex::new(load_balancing_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
@@ -1139,7 +1305,12 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>, group: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    #[cfg(test)]
+    fn select_next_credential(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
 
@@ -1187,6 +1358,148 @@ impl MultiTokenManager {
         }
     }
 
+    fn lock_for_credential(&self, id: u64) -> Arc<Semaphore> {
+        let mut locks = self.credential_locks.lock();
+        locks
+            .entry(id)
+            .or_insert_with(|| Arc::new(Semaphore::new(self.config.account_max_concurrency.max(1))))
+            .clone()
+    }
+
+    /// 获取某凭据专属的刷新锁（不存在则创建）。
+    ///
+    /// 同一凭据的并发刷新通过这把锁串行化（配合双检，避免重复刷新）；不同凭据各持各的锁，
+    /// 刷新可并行——这是把原先单一全局 `refresh_lock` 改为按凭据分锁的关键，消除高并发下
+    /// token 同时过期导致的全局排队。
+    fn refresh_lock_for(&self, id: u64) -> Arc<TokioMutex<()>> {
+        let mut locks = self.refresh_locks.lock();
+        locks
+            .entry(id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
+    }
+
+    fn credential_in_flight(&self, id: u64) -> usize {
+        let capacity = self.config.account_max_concurrency.max(1);
+        let available = self.lock_for_credential(id).available_permits();
+        capacity.saturating_sub(available)
+    }
+
+    fn ranked_available_credentials(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> Vec<(u64, KiroCredentials)> {
+        let entries = self.entries.lock();
+        let now = Instant::now();
+        let mode = self.load_balancing_mode.lock().clone();
+        let mut available: Vec<_> = entries
+            .iter()
+            .filter(|e| {
+                !e.disabled
+                    && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                    && credential_matches_request(&e.credentials, model, group)
+            })
+            .collect();
+
+        if mode == "balanced" {
+            available.sort_by_key(|e| {
+                (
+                    self.credential_in_flight(e.id),
+                    e.success_count,
+                    e.credentials.priority,
+                    e.id,
+                )
+            });
+        } else {
+            available.sort_by_key(|e| {
+                (
+                    self.credential_in_flight(e.id),
+                    e.credentials.priority,
+                    e.id,
+                )
+            });
+        }
+
+        available
+            .into_iter()
+            .map(|e| (e.id, e.credentials.clone()))
+            .collect()
+    }
+
+    async fn acquire_idle_permit(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> anyhow::Result<(u64, KiroCredentials, OwnedSemaphorePermit)> {
+        let total = self.total_count_in_group(group).max(1);
+        let wait_timeout = StdDuration::from_secs(self.config.account_acquire_timeout_secs.max(1));
+        let started_at = Instant::now();
+        let mut logged_busy_wait = false;
+
+        loop {
+            let mut candidates = self.ranked_available_credentials(model, group);
+
+            if candidates.is_empty() {
+                let mut entries = self.entries.lock();
+                if entries.iter().any(|e| {
+                    e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
+                }) {
+                    tracing::warn!(
+                        "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
+                    );
+                    for e in entries.iter_mut() {
+                        if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                            e.disabled = false;
+                            e.disabled_reason = None;
+                            e.failure_count = 0;
+                        }
+                    }
+                    drop(entries);
+                    candidates = self.ranked_available_credentials(model, group);
+                }
+            }
+
+            if candidates.is_empty() {
+                let entries = self.entries.lock();
+                let available = entries.iter().filter(|e| !e.disabled).count();
+                anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+            };
+
+            for (id, credentials) in &candidates {
+                let semaphore = self.lock_for_credential(*id);
+                match semaphore.try_acquire_owned() {
+                    Ok(permit) => {
+                        *self.current_id.lock() = *id;
+                        tracing::trace!("凭据 #{} 获取账号并发租约", id);
+                        return Ok((*id, credentials.clone(), permit));
+                    }
+                    Err(tokio::sync::TryAcquireError::NoPermits) => {}
+                    Err(tokio::sync::TryAcquireError::Closed) => {
+                        anyhow::bail!("凭据 #{} 并发租约已关闭，无法获取账号", id);
+                    }
+                }
+            }
+
+            let elapsed = started_at.elapsed();
+            if elapsed >= wait_timeout {
+                anyhow::bail!(
+                    "等待账号并发槽超时（{}s），所有匹配凭据都在忙",
+                    wait_timeout.as_secs()
+                );
+            }
+
+            if !logged_busy_wait {
+                tracing::debug!(
+                    "所有匹配凭据的并发槽都已满，等待任一账号释放槽位（最多 {}s）",
+                    wait_timeout.as_secs()
+                );
+                logged_busy_wait = true;
+            }
+            sleep((wait_timeout - elapsed).min(StdDuration::from_millis(50))).await;
+        }
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
@@ -1197,7 +1510,11 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>) -> anyhow::Result<CallContext> {
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1211,73 +1528,10 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
-
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
-                    None
-                } else {
-                    let entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
-                    let now = Instant::now();
-                    entries
-                        .iter()
-                        .find(|e| {
-                            e.id == current_id
-                                && !e.disabled
-                                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                                && credential_matches_request(&e.credentials, model, group)
-                        })
-                        .map(|e| (e.id, e.credentials.clone()))
-                };
-
-                if let Some(hit) = current_hit {
-                    hit
-                } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model, group);
-
-                    // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
-                    if best.is_none() {
-                        let mut entries = self.entries.lock();
-                        if entries.iter().any(|e| {
-                            e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
-                        }) {
-                            tracing::warn!(
-                                "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
-                            );
-                            for e in entries.iter_mut() {
-                                if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
-                                    e.disabled = false;
-                                    e.disabled_reason = None;
-                                    e.failure_count = 0;
-                                }
-                            }
-                            drop(entries);
-                            best = self.select_next_credential(model, group);
-                        }
-                    }
-
-                    if let Some((new_id, new_creds)) = best {
-                        // 更新 current_id
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
-                        (new_id, new_creds)
-                    } else {
-                        let entries = self.entries.lock();
-                        // 注意：必须在 bail! 之前计算 available_count，
-                        // 因为 available_count() 会尝试获取 entries 锁，
-                        // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
-                    }
-                }
-            };
+            let (id, credentials, permit) = self.acquire_idle_permit(model, group).await?;
 
             // 尝试获取/刷新 Token
-            match self.try_ensure_token(id, &credentials).await {
+            match self.try_ensure_token(id, &credentials, permit).await {
                 Ok(ctx) => {
                     return Ok(ctx);
                 }
@@ -1339,6 +1593,7 @@ impl MultiTokenManager {
         &self,
         id: u64,
         credentials: &KiroCredentials,
+        permit: OwnedSemaphorePermit,
     ) -> anyhow::Result<CallContext> {
         // API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新
         if credentials.is_api_key_credential() {
@@ -1350,6 +1605,7 @@ impl MultiTokenManager {
                 id,
                 credentials: credentials.clone(),
                 token,
+                _permit: permit,
             });
         }
 
@@ -1357,8 +1613,9 @@ impl MultiTokenManager {
         let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
 
         let creds = if needs_refresh {
-            // 获取刷新锁，确保同一时间只有一个刷新操作
-            let _guard = self.refresh_lock.lock().await;
+            // 获取该凭据专属的刷新锁：同凭据串行去重，不同凭据并行刷新
+            let lock = self.refresh_lock_for(id);
+            let _guard = lock.lock().await;
 
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
             let current_creds = {
@@ -1420,6 +1677,7 @@ impl MultiTokenManager {
             id,
             credentials: creds,
             token,
+            _permit: permit,
         })
     }
 
@@ -2136,7 +2394,10 @@ impl MultiTokenManager {
                 .iter()
                 .filter(|e| {
                     !e.disabled
-                        && !e.throttled_until.map(|t| t > throttled_now).unwrap_or(false)
+                        && !e
+                            .throttled_until
+                            .map(|t| t > throttled_now)
+                            .unwrap_or(false)
                 })
                 .count()
         }
@@ -2309,76 +2570,10 @@ impl MultiTokenManager {
 
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
-
-        // API Key 凭据直接使用 kiro_api_key，无需刷新
-        let token = if credentials.is_api_key_credential() {
-            credentials
-                .kiro_api_key
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
-        } else {
-            // 检查是否需要刷新 token
-            let needs_refresh =
-                is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
-
-            if needs_refresh {
-                let _guard = self.refresh_lock.lock().await;
-                let current_creds = {
-                    let entries = self.entries.lock();
-                    entries
-                        .iter()
-                        .find(|e| e.id == id)
-                        .map(|e| e.credentials.clone())
-                        .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-                };
-
-                if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                    let global_proxy = self.proxy.lock().clone();
-                    let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
-                    let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
-                            .await?;
-                    {
-                        let mut entries = self.entries.lock();
-                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
-                        }
-                    }
-                    // 持久化失败只记录警告，不影响本次请求
-                    if let Err(e) = self.persist_credentials() {
-                        tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                    }
-                    new_creds
-                        .access_token
-                        .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
-                } else {
-                    current_creds
-                        .access_token
-                        .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-                }
-            } else {
-                credentials
-                    .access_token
-                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-            }
-        };
-
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
+        let (token, credentials) = self.prepare_request_token(id).await?;
+        let credentials = self
+            .resolve_profile_for_read_query(id, &token, credentials, "getUsageLimits")
+            .await;
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -2453,10 +2648,7 @@ impl MultiTokenManager {
     /// 复用 [`Self::get_usage_limits_for`] 的 token 准备流程：API Key 凭据直接用
     /// kiroApiKey；OAuth 凭据按需在 `refresh_lock` 内刷新并持久化。返回的凭据是
     /// 刷新后重新读取的最新快照，调用方据此构造请求。
-    async fn prepare_request_token(
-        &self,
-        id: u64,
-    ) -> anyhow::Result<(String, KiroCredentials)> {
+    async fn prepare_request_token(&self, id: u64) -> anyhow::Result<(String, KiroCredentials)> {
         let credentials = {
             let entries = self.entries.lock();
             entries
@@ -2473,7 +2665,8 @@ impl MultiTokenManager {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
         } else if is_token_expired(&credentials) || is_token_expiring_soon(&credentials) {
-            let _guard = self.refresh_lock.lock().await;
+            let lock = self.refresh_lock_for(id);
+            let _guard = lock.lock().await;
             let current_creds = {
                 let entries = self.entries.lock();
                 entries
@@ -2526,6 +2719,51 @@ impl MultiTokenManager {
         Ok((token, credentials))
     }
 
+    /// 余额 / 模型 / 用户偏好这类 REST 查询也可能需要 Enterprise 真实 profileArn。
+    ///
+    /// 聊天流式请求已有 `KiroProvider::ensure_profile_arn` 兜底；Admin 侧余额验活
+    /// 之前没有这个步骤，external_idp / Enterprise 账号会在缺少 profileArn 时直接
+    /// 用无 profile 的 bearer token 打 `getUsageLimits`，上游常以
+    /// `The bearer token included in the request is invalid` 拒绝。
+    async fn resolve_profile_for_read_query(
+        &self,
+        id: u64,
+        token: &str,
+        mut credentials: KiroCredentials,
+        operation: &str,
+    ) -> KiroCredentials {
+        use crate::kiro::model::credentials::is_placeholder_profile_arn;
+
+        if credentials.is_api_key_credential() {
+            return credentials;
+        }
+
+        let needs_profile = match credentials.profile_arn.as_deref() {
+            None => true,
+            Some(arn) => is_placeholder_profile_arn(arn),
+        };
+        if !needs_profile {
+            return credentials;
+        }
+
+        match self.resolve_profile_arn_for(id, token).await {
+            Ok(Some(arn)) => {
+                credentials.profile_arn = Some(arn);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "凭据 #{} 在 {} 前解析真实 profileArn 失败（继续按无 profile 查询）: {}",
+                    id,
+                    operation,
+                    e
+                );
+            }
+        }
+
+        credentials
+    }
+
     /// 获取指定凭据当前可用的模型列表（Admin API）
     ///
     /// 按需实时查询上游 `ListAvailableModels`，不做缓存。
@@ -2534,6 +2772,9 @@ impl MultiTokenManager {
         id: u64,
     ) -> anyhow::Result<ListAvailableModelsResponse> {
         let (token, credentials) = self.prepare_request_token(id).await?;
+        let credentials = self
+            .resolve_profile_for_read_query(id, &token, credentials, "ListAvailableModels")
+            .await;
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref()).await
@@ -2553,76 +2794,10 @@ impl MultiTokenManager {
             anyhow::bail!("overageStatus 必须是 ENABLED 或 DISABLED");
         }
 
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
-
-        // API Key 凭据：直接当 Bearer 用
-        let token = if credentials.is_api_key_credential() {
-            credentials
-                .kiro_api_key
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
-        } else {
-            // 复用与 get_usage_limits_for 完全相同的过期检查与刷新逻辑
-            let needs_refresh =
-                is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
-
-            if needs_refresh {
-                let _guard = self.refresh_lock.lock().await;
-                let current_creds = {
-                    let entries = self.entries.lock();
-                    entries
-                        .iter()
-                        .find(|e| e.id == id)
-                        .map(|e| e.credentials.clone())
-                        .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-                };
-
-                if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                    let global_proxy = self.proxy.lock().clone();
-                    let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
-                    let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
-                            .await?;
-                    {
-                        let mut entries = self.entries.lock();
-                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
-                        }
-                    }
-                    if let Err(e) = self.persist_credentials() {
-                        tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                    }
-                    new_creds
-                        .access_token
-                        .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
-                } else {
-                    current_creds
-                        .access_token
-                        .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-                }
-            } else {
-                credentials
-                    .access_token
-                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-            }
-        };
-
-        // 重新读取最新的凭据快照（refresh 可能已修改 access_token 之外的字段）
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
+        let (token, credentials) = self.prepare_request_token(id).await?;
+        let credentials = self
+            .resolve_profile_for_read_query(id, &token, credentials, "setUserPreference")
+            .await;
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -2711,6 +2886,22 @@ impl MultiTokenManager {
         // 3. 验证凭据有效性（API Key 无需网络刷新）
         let mut validated_cred = if new_cred.is_api_key_credential() {
             new_cred.clone()
+        } else if new_cred.is_external_idp()
+            && jwt_exp_unix(new_cred.access_token.as_deref())
+                .map(|exp| exp > Utc::now().timestamp() + 60)
+                .unwrap_or(false)
+        {
+            // 外部 IdP：导入时携带的 accessToken 是交互式登录签发的短期 token。
+            // 只要还没过期，先保留它；立刻 refresh 可能换回上游 Kiro 不接受的 token。
+            let mut c = new_cred.clone();
+            if c.expires_at.is_none() {
+                if let Some(exp) = jwt_exp_unix(c.access_token.as_deref()) {
+                    if let Some(dt) = chrono::DateTime::from_timestamp(exp, 0) {
+                        c.expires_at = Some(dt.to_rfc3339());
+                    }
+                }
+            }
+            c
         } else {
             let global_proxy = self.proxy.lock().clone();
             let effective_proxy = new_cred.effective_proxy(global_proxy.as_ref());
@@ -2742,6 +2933,11 @@ impl MultiTokenManager {
         validated_cred.auth_method = new_cred.auth_method.map(|m| {
             if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
                 "idc".to_string()
+            } else if m.eq_ignore_ascii_case("external-idp")
+                || m.eq_ignore_ascii_case("externalidp")
+                || m.eq_ignore_ascii_case("external_idp")
+            {
+                "external_idp".to_string()
             } else {
                 m
             }
@@ -2753,6 +2949,9 @@ impl MultiTokenManager {
         validated_cred.fill_default_profile_arn();
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
+        validated_cred.token_endpoint = new_cred.token_endpoint;
+        validated_cred.issuer_url = new_cred.issuer_url;
+        validated_cred.scopes = new_cred.scopes;
         validated_cred.region = new_cred.region;
         validated_cred.auth_region = new_cred.auth_region;
         validated_cred.api_region = new_cred.api_region;
@@ -2843,8 +3042,11 @@ impl MultiTokenManager {
                 entry.credentials.proxy_password = v.filter(|s| !s.is_empty());
             }
             if let Some(g) = groups {
-                entry.credentials.groups =
-                    g.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                entry.credentials.groups = g
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
             }
             if let Some(v) = source_channel {
                 entry.credentials.source_channel =
@@ -3083,8 +3285,9 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        // 获取刷新锁防止并发刷新
-        let _guard = self.refresh_lock.lock().await;
+        // 获取该凭据专属的刷新锁，防止同凭据并发刷新（不同凭据互不阻塞）
+        let lock = self.refresh_lock_for(id);
+        let _guard = lock.lock().await;
 
         // 无条件调用 refresh_token
         let global_proxy = self.proxy.lock().clone();
@@ -3214,7 +3417,11 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    fn persist_account_throttle_config(&self, failover: bool, cooldown_secs: u64) -> anyhow::Result<()> {
+    fn persist_account_throttle_config(
+        &self,
+        failover: bool,
+        cooldown_secs: u64,
+    ) -> anyhow::Result<()> {
         use anyhow::Context;
 
         let config_path = match self.config.config_path() {
@@ -4121,7 +4328,8 @@ mod tests {
     async fn test_concurrent_add_same_api_key_inserts_once() {
         let path = tmp_creds_path("concurrent_dedup");
         let manager = Arc::new(
-            MultiTokenManager::new(Config::default(), vec![], None, Some(path.clone()), true).unwrap(),
+            MultiTokenManager::new(Config::default(), vec![], None, Some(path.clone()), true)
+                .unwrap(),
         );
 
         const N: usize = 8;
@@ -4142,7 +4350,10 @@ mod tests {
                 ok_count += 1;
             }
         }
-        assert_eq!(ok_count, 1, "并发添加同一凭据应只成功一次，实际成功 {ok_count} 次");
+        assert_eq!(
+            ok_count, 1,
+            "并发添加同一凭据应只成功一次，实际成功 {ok_count} 次"
+        );
 
         let snapshot = manager.snapshot();
         assert_eq!(
@@ -4294,7 +4505,10 @@ mod tests {
         assert!(group_matches(&[], None));
         assert!(group_matches(&["g1".to_string()], None));
         // 绑定分组时只匹配 groups 含该名的账号
-        assert!(group_matches(&["g1".to_string(), "g2".to_string()], Some("g1")));
+        assert!(group_matches(
+            &["g1".to_string(), "g2".to_string()],
+            Some("g1")
+        ));
         assert!(!group_matches(&["g2".to_string()], Some("g1")));
         assert!(!group_matches(&[], Some("g1")));
     }
@@ -4336,9 +4550,14 @@ mod tests {
         pro_cred.subscription_title = Some("KIRO PRO".to_string());
         pro_cred.priority = 10;
 
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![free_cred, pro_cred], None, None, false)
-                .unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![free_cred, pro_cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
 
         // Warm current_id with the highest-priority Free account.
         let current = manager.acquire_context(None, None).await.unwrap();
@@ -4352,6 +4571,64 @@ mod tests {
             opus.id, 2,
             "priority current_id must not bypass Opus subscription filtering"
         );
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_prefers_less_busy_accounts() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let first = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(first.id, 1);
+
+        let second = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(
+            second.id, 2,
+            "account #2 is idle, so it should be preferred over a busy account #1"
+        );
+
+        let third = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(
+            third.id, 1,
+            "both accounts have one request in flight, so priority order should be used"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_waits_when_only_account_is_at_limit() {
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![grouped_cred("a", &[])],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+
+        let first = manager.acquire_context(None, None).await.unwrap();
+        let second = manager.acquire_context(None, None).await.unwrap();
+        let manager_for_task = Arc::clone(&manager);
+        let handle =
+            tokio::spawn(async move { manager_for_task.acquire_context(None, None).await });
+
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "third acquisition should wait while the only account is at its concurrency limit"
+        );
+
+        drop(first);
+        let third = handle.await.unwrap().unwrap();
+        assert_eq!(third.id, 1);
+        drop(second);
     }
 
     #[test]
@@ -4397,7 +4674,11 @@ mod tests {
         manager.report_success(1);
         manager.report_success(1);
         let pick = manager.select_next_credential(None, Some("g1"));
-        assert_eq!(pick.map(|(id, _)| id), Some(2), "balanced 应在 g1 内选 success_count 最小的 B");
+        assert_eq!(
+            pick.map(|(id, _)| id),
+            Some(2),
+            "balanced 应在 g1 内选 success_count 最小的 B"
+        );
         // g2 不受 g1 计数影响，仍只会选到 C(id3)
         let pick_g2 = manager.select_next_credential(None, Some("g2"));
         assert_eq!(pick_g2.map(|(id, _)| id), Some(3));

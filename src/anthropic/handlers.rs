@@ -4,10 +4,10 @@ use std::convert::Infallible;
 use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
-use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::admin::trace_db::{
     SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
 };
+use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -271,11 +271,17 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
                 if item.get("type").and_then(|v| v.as_str()) != Some("image") {
                     continue;
                 }
-                let Some(src) = item.get("source") else { continue };
+                let Some(src) = item.get("source") else {
+                    continue;
+                };
                 if src.get("type").and_then(|v| v.as_str()) != Some("base64") {
                     continue;
                 }
-                let n = src.get("data").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
+                let n = src
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.len())
+                    .unwrap_or(0);
                 count += 1;
                 total += n;
                 if n > largest {
@@ -361,6 +367,28 @@ fn resolve_usage_input_tokens(
     context_total_input_tokens: Option<i32>,
 ) -> i32 {
     context_total_input_tokens.unwrap_or(fallback_total_input_tokens)
+}
+
+fn compute_cache_usage_for_key(
+    state: &AppState,
+    payload: &MessagesRequest,
+    key_ctx: &KeyContext,
+) -> super::cache_metering::CacheUsage {
+    if key_ctx.cache_enabled {
+        state
+            .cache_meter
+            .as_ref()
+            .map(|cache| super::cache_metering::compute_cache_usage(cache, payload, key_ctx.key_id))
+            .unwrap_or_else(|| {
+                super::cache_metering::compute_standard_cache_usage(None, payload, key_ctx.key_id)
+            })
+    } else {
+        super::cache_metering::compute_standard_cache_usage(
+            state.cache_meter.as_deref(),
+            payload,
+            key_ctx.key_id,
+        )
+    }
 }
 
 fn available_models() -> Vec<Model> {
@@ -588,7 +616,11 @@ pub async fn post_messages(
 
         let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
         // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
-        let status = if resp.status().is_success() { "success" } else { "error" };
+        let status = if resp.status().is_success() {
+            "success"
+        } else {
+            "error"
+        };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
@@ -597,9 +629,17 @@ pub async fn post_messages(
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone())
-            .await;
+        tracing::info!(
+            "detected mixed tools containing web_search, entering the web_search agentic loop"
+        );
+        return super::websearch_loop::run_web_search_loop(
+            provider,
+            payload,
+            hook,
+            payload_stream,
+            key_ctx.group.clone(),
+        )
+        .await;
     }
 
     // 转换请求
@@ -668,13 +708,9 @@ pub async fn post_messages(
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
-    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
+    // Key 开启时使用中转层增强缓存；关闭时回退到标准 cache_control 口径。
     // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
-        .unwrap_or_default();
+    let cache_usage = compute_cache_usage_for_key(&state, &payload, &key_ctx);
 
     if payload.stream {
         // 流式响应
@@ -743,27 +779,39 @@ async fn handle_stream_request(
     group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider
+        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
             // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
-            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
+            tracer.finalize(
+                "error",
+                last_attempt_outcome(&tracer),
+                Some(&e.to_string()),
+                None,
+                TraceUsage::zero(),
+            );
             return map_provider_error(e);
         }
     };
-    let response = call_result.response;
-    let credential_id = call_result.credential_id;
-
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
+    let mut ctx = StreamContext::new_with_thinking(
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        known_tool_names,
+    );
     ctx.cache_usage = cache_usage;
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events, hook, credential_id, tracer);
+    let stream = create_sse_stream(call_result, ctx, initial_events, hook, tracer);
 
     // 返回 SSE 响应
     Response::builder()
@@ -785,11 +833,10 @@ fn create_ping_sse() -> Bytes {
 
 /// 创建 SSE 事件流
 fn create_sse_stream(
-    response: reqwest::Response,
+    call_result: crate::kiro::provider::KiroCallResult,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
     hook: UsageRecordHook,
-    credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
@@ -800,11 +847,17 @@ fn create_sse_stream(
     );
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
+    let credential_id = call_result.credential_id;
+    let crate::kiro::provider::KiroCallResult {
+        response,
+        account_guard,
+        ..
+    } = call_result;
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64, account_guard),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, account_guard)| async move {
             if finished {
                 return None;
             }
@@ -843,7 +896,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -862,7 +915,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard)))
                         }
                         None => {
                             // 流结束，发送最终事件
@@ -873,7 +926,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard)))
                         }
                     }
                 }
@@ -881,7 +934,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard)))
                 }
             }
         },
@@ -919,7 +972,11 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
         output_tokens: ctx.output_tokens.max(0) as u64,
         cache_creation_tokens: cache_creation.max(0) as u64,
         cache_read_tokens: cache_read.max(0) as u64,
-        credits: if ctx.credits.is_finite() && ctx.credits > 0.0 { ctx.credits } else { 0.0 },
+        credits: if ctx.credits.is_finite() && ctx.credits > 0.0 {
+            ctx.credits
+        } else {
+            0.0
+        },
     }
 }
 
@@ -942,11 +999,20 @@ async fn handle_non_stream_request(
     group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider
+        .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
+            tracer.finalize(
+                "error",
+                last_attempt_outcome(&tracer),
+                Some(&e.to_string()),
+                None,
+                TraceUsage::zero(),
+            );
             return map_provider_error(e);
         }
     };
@@ -1159,7 +1225,11 @@ async fn handle_non_stream_request(
             output_tokens: output_tokens.max(0) as u64,
             cache_creation_tokens: cache_creation_tokens.max(0) as u64,
             cache_read_tokens: cache_read_tokens.max(0) as u64,
-            credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+            credits: if credits.is_finite() && credits > 0.0 {
+                credits
+            } else {
+                0.0
+            },
         },
     );
     (StatusCode::OK, Json(response_body)).into_response()
@@ -1342,7 +1412,11 @@ pub async fn post_messages_cc(
         ) as i32;
 
         let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
-        let status = if resp.status().is_success() { "success" } else { "error" };
+        let status = if resp.status().is_success() {
+            "success"
+        } else {
+            "error"
+        };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
@@ -1351,9 +1425,17 @@ pub async fn post_messages_cc(
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone())
-            .await;
+        tracing::info!(
+            "detected mixed tools containing web_search, entering the web_search agentic loop"
+        );
+        return super::websearch_loop::run_web_search_loop(
+            provider,
+            payload,
+            hook,
+            payload_stream,
+            key_ctx.group.clone(),
+        )
+        .await;
     }
 
     // 转换请求
@@ -1422,12 +1504,8 @@ pub async fn post_messages_cc(
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
-    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（estimate 口径）。
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
-        .unwrap_or_default();
+    // Key 开启时使用中转层增强缓存；关闭时回退到标准 cache_control 口径。
+    let cache_usage = compute_cache_usage_for_key(&state, &payload, &key_ctx);
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -1499,11 +1577,20 @@ async fn handle_stream_request_buffered(
     group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider
+        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
+            tracer.finalize(
+                "error",
+                last_attempt_outcome(&tracer),
+                Some(&e.to_string()),
+                None,
+                TraceUsage::zero(),
+            );
             return map_provider_error(e);
         }
     };
@@ -1767,11 +1854,14 @@ mod tests {
 
     #[test]
     fn count_image_budget_handles_empty() {
-        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+        let req: super::super::types::MessagesRequest = serde_json::from_str(
+            r#"{
             "model": "claude-opus-4-7",
             "max_tokens": 100,
             "messages": []
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 0);
         assert_eq!(stats.total_b64_bytes, 0);
@@ -1801,7 +1891,8 @@ mod tests {
 
     #[test]
     fn count_image_budget_skips_url_only_images() {
-        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+        let req: super::super::types::MessagesRequest = serde_json::from_str(
+            r#"{
             "model": "claude-opus-4-7",
             "max_tokens": 100,
             "messages": [{
@@ -1810,7 +1901,9 @@ mod tests {
                     {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
                 ]
             }]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 0);
     }

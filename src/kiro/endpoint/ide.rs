@@ -28,7 +28,11 @@ impl IdeEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("q.{}.amazonaws.com", self.api_region(ctx))
+        if ctx.credentials.is_external_idp() {
+            format!("runtime.{}.kiro.dev", self.api_region(ctx))
+        } else {
+            format!("q.{}.amazonaws.com", self.api_region(ctx))
+        }
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
@@ -62,6 +66,12 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
+        if ctx.credentials.is_external_idp() {
+            return format!(
+                "https://runtime.{}.kiro.dev/generateAssistantResponse",
+                self.api_region(ctx)
+            );
+        }
         format!(
             "https://q.{}.amazonaws.com/generateAssistantResponse",
             self.api_region(ctx)
@@ -85,6 +95,8 @@ impl KiroEndpoint for IdeEndpoint {
 
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
+        } else if ctx.credentials.is_external_idp() {
+            req = req.header("TokenType", "EXTERNAL_IDP");
         }
         req
     }

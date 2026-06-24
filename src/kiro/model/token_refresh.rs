@@ -43,6 +43,22 @@ pub struct IdcRefreshResponse {
     pub profile_arn: Option<String>,
 }
 
+/// External IdP token 刷新响应体。
+///
+/// 企业组织账号导出的 tokenEndpoint 通常返回标准 OAuth snake_case 字段；
+/// 部分中间结构仍可能保留 camelCase，因此这里两种格式都接受。
+#[derive(Debug, Deserialize)]
+pub struct ExternalIdpRefreshResponse {
+    #[serde(alias = "accessToken")]
+    pub access_token: String,
+    #[serde(default, alias = "refreshToken")]
+    pub refresh_token: Option<String>,
+    #[serde(default, alias = "expiresIn")]
+    pub expires_in: Option<i64>,
+    #[serde(default, alias = "profileArn")]
+    pub profile_arn: Option<String>,
+}
+
 // ============ AWS SSO OIDC 设备授权流程 ============
 
 /// 注册 OIDC 客户端请求体

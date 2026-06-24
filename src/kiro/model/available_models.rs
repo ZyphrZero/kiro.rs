@@ -84,8 +84,7 @@ mod tests {
 
     #[test]
     fn test_deserialize_empty_models() {
-        let resp: ListAvailableModelsResponse =
-            serde_json::from_str(r#"{"models":[]}"#).unwrap();
+        let resp: ListAvailableModelsResponse = serde_json::from_str(r#"{"models":[]}"#).unwrap();
         assert!(resp.models.is_empty());
     }
 

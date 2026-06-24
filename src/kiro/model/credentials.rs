@@ -62,6 +62,18 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_url: Option<String>,
 
+    /// External IdP OAuth token endpoint（企业 external_idp 完整导入专用）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+
+    /// External IdP issuer URL（企业 external_idp 完整导入专用）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+
+    /// External IdP OAuth scopes（企业 external_idp 完整导入专用）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
+
     /// 凭据优先级（数字越小优先级越高，默认为 0）
     #[serde(default)]
     #[serde(skip_serializing_if = "is_zero")]
@@ -170,6 +182,9 @@ impl std::fmt::Debug for KiroCredentials {
             .field("client_id", &fmt_redacted(&self.client_id))
             .field("client_secret", &fmt_redacted(&self.client_secret))
             .field("start_url", &self.start_url)
+            .field("token_endpoint", &self.token_endpoint)
+            .field("issuer_url", &self.issuer_url)
+            .field("scopes", &self.scopes)
             .field("priority", &self.priority)
             .field("region", &self.region)
             .field("auth_region", &self.auth_region)
@@ -192,6 +207,11 @@ impl std::fmt::Debug for KiroCredentials {
 fn canonicalize_auth_method_value(value: &str) -> &str {
     if value.eq_ignore_ascii_case("builder-id") || value.eq_ignore_ascii_case("iam") {
         "idc"
+    } else if value.eq_ignore_ascii_case("external-idp")
+        || value.eq_ignore_ascii_case("externalidp")
+        || value.eq_ignore_ascii_case("external_idp")
+    {
+        "external_idp"
     } else if value.eq_ignore_ascii_case("api_key") || value.eq_ignore_ascii_case("apikey") {
         "api_key"
     } else {
@@ -341,6 +361,23 @@ impl KiroCredentials {
                 .unwrap_or(false)
     }
 
+    /// 是否为外部 IdP（企业 SSO，如 Azure AD）登录。
+    pub fn is_external_idp(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .map(|m| {
+                let norm = m.replace('-', "_");
+                norm.eq_ignore_ascii_case("external_idp")
+                    || norm.eq_ignore_ascii_case("externalidp")
+            })
+            .unwrap_or(false)
+            || self
+                .provider
+                .as_deref()
+                .map(|p| p.eq_ignore_ascii_case("externalidp"))
+                .unwrap_or(false)
+    }
+
     /// 凭据缺少显式 profileArn 时应使用的默认 ARN：
     /// Social 登录用共享 Social ARN，其余（BuilderID 等）用 BuilderID 占位符。
     fn default_profile_arn(&self) -> &'static str {
@@ -476,6 +513,9 @@ mod tests {
             client_id: None,
             client_secret: None,
             start_url: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -626,6 +666,30 @@ mod tests {
         assert_eq!(list[2].refresh_token, Some("t1".to_string())); // priority 2
     }
 
+    #[test]
+    fn test_external_idp_fields_roundtrip_and_canonicalize() {
+        let json = r#"{
+            "refreshToken": "refresh",
+            "authMethod": "external-idp",
+            "clientId": "client",
+            "tokenEndpoint": "https://idp.example.com/oauth/token",
+            "issuerUrl": "https://idp.example.com/",
+            "scopes": "openid profile"
+        }"#;
+        let config: CredentialsConfig = serde_json::from_str(json).unwrap();
+        let creds = config.into_sorted_credentials().remove(0);
+        assert_eq!(creds.auth_method.as_deref(), Some("external_idp"));
+        assert_eq!(
+            creds.token_endpoint.as_deref(),
+            Some("https://idp.example.com/oauth/token")
+        );
+        assert_eq!(
+            creds.issuer_url.as_deref(),
+            Some("https://idp.example.com/")
+        );
+        assert_eq!(creds.scopes.as_deref(), Some("openid profile"));
+    }
+
     // ============ Region 字段测试 ============
 
     #[test]
@@ -667,6 +731,9 @@ mod tests {
             client_id: None,
             client_secret: None,
             start_url: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 0,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
@@ -702,6 +769,9 @@ mod tests {
             client_id: None,
             client_secret: None,
             start_url: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -820,6 +890,9 @@ mod tests {
             client_id: None,
             client_secret: None,
             start_url: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 3,
             region: Some("us-west-2".to_string()),
             auth_region: None,

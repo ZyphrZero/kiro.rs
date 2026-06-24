@@ -139,6 +139,19 @@ pub struct Config {
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
+    /// 单账号最大并发请求数（默认 2）。
+    ///
+    /// 用于避免同一账号被无限并发打爆；不是串行，多个账号的整体并发约为
+    /// `账号数 * account_max_concurrency`。
+    #[serde(default = "default_account_max_concurrency")]
+    pub account_max_concurrency: usize,
+
+    /// 等待账号并发槽位的最长时间（秒，默认 30）。
+    ///
+    /// 所有匹配账号都满载时，请求会等待槽位释放；超时后返回错误，避免无限挂起。
+    #[serde(default = "default_account_acquire_timeout_secs")]
+    pub account_acquire_timeout_secs: u64,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -221,6 +234,14 @@ fn default_account_throttle_cooldown_secs() -> u64 {
     30 * 60
 }
 
+fn default_account_max_concurrency() -> usize {
+    2
+}
+
+fn default_account_acquire_timeout_secs() -> u64 {
+    30
+}
+
 fn default_update_auto_apply_time() -> String {
     "03:00".to_string()
 }
@@ -275,6 +296,8 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            account_max_concurrency: default_account_max_concurrency(),
+            account_acquire_timeout_secs: default_account_acquire_timeout_secs(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             trace_enabled: default_trace_enabled(),

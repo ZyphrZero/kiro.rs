@@ -137,6 +137,18 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub start_url: Option<String>,
 
+    /// External IdP OAuth token endpoint（企业 external_idp 完整导入专用）
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+
+    /// External IdP issuer URL（企业 external_idp 完整导入专用）
+    #[serde(default)]
+    pub issuer_url: Option<String>,
+
+    /// External IdP OAuth scopes（企业 external_idp 完整导入专用）
+    #[serde(default)]
+    pub scopes: Option<String>,
+
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
@@ -733,6 +745,7 @@ pub struct ClientKeyItem {
     pub total_output_tokens: u64,
     pub total_cache_creation_tokens: u64,
     pub total_cache_read_tokens: u64,
+    pub cache_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
@@ -757,6 +770,8 @@ pub struct CreateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    #[serde(default = "default_client_key_cache_enabled")]
+    pub cache_enabled: bool,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -777,6 +792,12 @@ pub struct UpdateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    #[serde(default)]
+    pub cache_enabled: Option<bool>,
+}
+
+fn default_client_key_cache_enabled() -> bool {
+    true
 }
 
 // ============ IdC 设备授权登录 ============
@@ -903,6 +924,12 @@ pub struct ExportedCredentials {
     pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
     pub expires_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,

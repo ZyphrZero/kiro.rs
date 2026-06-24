@@ -125,9 +125,8 @@ pub async fn download_release_binary(
         std::process::id(),
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
     ));
-    fs::create_dir_all(&tmp_dir).map_err(|e| {
-        AdminServiceError::InternalError(format!("创建更新临时目录失败: {}", e))
-    })?;
+    fs::create_dir_all(&tmp_dir)
+        .map_err(|e| AdminServiceError::InternalError(format!("创建更新临时目录失败: {}", e)))?;
     let archive_path = tmp_dir.join(&archive);
 
     download_to_file(&client, &archive_url, token.as_deref(), &archive_path).await?;
@@ -141,16 +140,14 @@ pub async fn download_release_binary(
     .await?;
 
     let extract_dir = tmp_dir.join("extract");
-    fs::create_dir_all(&extract_dir).map_err(|e| {
-        AdminServiceError::InternalError(format!("创建解压目录失败: {}", e))
-    })?;
+    fs::create_dir_all(&extract_dir)
+        .map_err(|e| AdminServiceError::InternalError(format!("创建解压目录失败: {}", e)))?;
     extract_archive(&archive_path, &extract_dir)?;
 
     let extracted = locate_binary(&extract_dir)?;
     // 复制到调用方指定的目标位置（通常是 exe 所在目录的临时文件，方便原子替换）
-    fs::copy(&extracted, dest).map_err(|e| {
-        AdminServiceError::InternalError(format!("拷贝新二进制失败: {}", e))
-    })?;
+    fs::copy(&extracted, dest)
+        .map_err(|e| AdminServiceError::InternalError(format!("拷贝新二进制失败: {}", e)))?;
     set_executable(dest)?;
 
     // 清理临时目录（失败仅记录，不影响主流程）
@@ -158,9 +155,7 @@ pub async fn download_release_binary(
     Ok(())
 }
 
-pub(super) fn build_http_client(
-    proxy: Option<&str>,
-) -> Result<reqwest::Client, AdminServiceError> {
+pub(super) fn build_http_client(proxy: Option<&str>) -> Result<reqwest::Client, AdminServiceError> {
     let mut builder = reqwest::Client::builder()
         .user_agent("kiro-rs-updater")
         .timeout(std::time::Duration::from_secs(180));
@@ -168,9 +163,8 @@ pub(super) fn build_http_client(
         let s = u.trim();
         if s.is_empty() { None } else { Some(s) }
     }) {
-        let proxy = reqwest::Proxy::all(url).map_err(|e| {
-            AdminServiceError::InternalError(format!("代理配置无效: {}", e))
-        })?;
+        let proxy = reqwest::Proxy::all(url)
+            .map_err(|e| AdminServiceError::InternalError(format!("代理配置无效: {}", e)))?;
         builder = builder.proxy(proxy);
     }
     builder
@@ -188,9 +182,10 @@ async fn download_to_file(
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {}", t));
     }
-    let resp = req.send().await.map_err(|e| {
-        AdminServiceError::InternalError(format!("下载 {} 失败: {}", url, e))
-    })?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| AdminServiceError::InternalError(format!("下载 {} 失败: {}", url, e)))?;
     if !resp.status().is_success() {
         return Err(AdminServiceError::InternalError(format!(
             "下载 {} 返回 {}",
@@ -207,9 +202,10 @@ async fn download_to_file(
         }
     }
 
-    let bytes = resp.bytes().await.map_err(|e| {
-        AdminServiceError::InternalError(format!("读取下载内容失败: {}", e))
-    })?;
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| AdminServiceError::InternalError(format!("读取下载内容失败: {}", e)))?;
     if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
         return Err(AdminServiceError::InternalError(format!(
             "实际下载体积 {} 字节超过上限",
@@ -317,37 +313,33 @@ fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<(), AdminServiceError> 
     })?;
     let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes));
     let mut tar = tar::Archive::new(gz);
-    tar.unpack(dest).map_err(|e| {
-        AdminServiceError::InternalError(format!("解压 tar.gz 失败: {}", e))
-    })
+    tar.unpack(dest)
+        .map_err(|e| AdminServiceError::InternalError(format!("解压 tar.gz 失败: {}", e)))
 }
 
 fn extract_zip(archive: &Path, dest: &Path) -> Result<(), AdminServiceError> {
     let file = fs::File::open(archive).map_err(|e| {
         AdminServiceError::InternalError(format!("打开 {} 失败: {}", archive.display(), e))
     })?;
-    let mut zip = zip::ZipArchive::new(file).map_err(|e| {
-        AdminServiceError::InternalError(format!("解析 zip 失败: {}", e))
-    })?;
+    let mut zip = zip::ZipArchive::new(file)
+        .map_err(|e| AdminServiceError::InternalError(format!("解析 zip 失败: {}", e)))?;
     for i in 0..zip.len() {
-        let mut entry = zip.by_index(i).map_err(|e| {
-            AdminServiceError::InternalError(format!("读取 zip 条目失败: {}", e))
-        })?;
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| AdminServiceError::InternalError(format!("读取 zip 条目失败: {}", e)))?;
         let entry_path = match entry.enclosed_name() {
             Some(p) => p.to_path_buf(),
             None => continue,
         };
         let target = dest.join(entry_path);
         if entry.is_dir() {
-            fs::create_dir_all(&target).map_err(|e| {
-                AdminServiceError::InternalError(format!("创建目录失败: {}", e))
-            })?;
+            fs::create_dir_all(&target)
+                .map_err(|e| AdminServiceError::InternalError(format!("创建目录失败: {}", e)))?;
             continue;
         }
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                AdminServiceError::InternalError(format!("创建目录失败: {}", e))
-            })?;
+            fs::create_dir_all(parent)
+                .map_err(|e| AdminServiceError::InternalError(format!("创建目录失败: {}", e)))?;
         }
         let mut out = fs::File::create(&target).map_err(|e| {
             AdminServiceError::InternalError(format!("创建文件 {} 失败: {}", target.display(), e))
@@ -367,9 +359,8 @@ fn locate_binary(root: &Path) -> Result<PathBuf, AdminServiceError> {
             AdminServiceError::InternalError(format!("读取目录 {} 失败: {}", dir.display(), e))
         })?;
         for entry in entries {
-            let entry = entry.map_err(|e| {
-                AdminServiceError::InternalError(format!("枚举目录项失败: {}", e))
-            })?;
+            let entry = entry
+                .map_err(|e| AdminServiceError::InternalError(format!("枚举目录项失败: {}", e)))?;
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
@@ -396,9 +387,8 @@ fn set_executable(path: &Path) -> Result<(), AdminServiceError> {
         .map_err(|e| AdminServiceError::InternalError(format!("读取权限失败: {}", e)))?
         .permissions();
     perms.set_mode(0o755);
-    fs::set_permissions(path, perms).map_err(|e| {
-        AdminServiceError::InternalError(format!("设置可执行权限失败: {}", e))
-    })?;
+    fs::set_permissions(path, perms)
+        .map_err(|e| AdminServiceError::InternalError(format!("设置可执行权限失败: {}", e)))?;
     Ok(())
 }
 
@@ -447,15 +437,11 @@ pub fn restore_backup(exe: &Path) -> Result<(), AdminServiceError> {
     rollback_tmp.push(".rollback-current");
     let rollback_tmp = PathBuf::from(rollback_tmp);
     let _ = fs::remove_file(&rollback_tmp);
-    fs::rename(exe, &rollback_tmp).map_err(|e| {
-        AdminServiceError::InternalError(format!("暂存当前 exe 失败: {}", e))
-    })?;
+    fs::rename(exe, &rollback_tmp)
+        .map_err(|e| AdminServiceError::InternalError(format!("暂存当前 exe 失败: {}", e)))?;
     if let Err(e) = fs::rename(&backup, exe) {
         let _ = fs::rename(&rollback_tmp, exe);
-        return Err(AdminServiceError::InternalError(format!(
-            "回退失败: {}",
-            e
-        )));
+        return Err(AdminServiceError::InternalError(format!("回退失败: {}", e)));
     }
     let _ = fs::remove_file(&rollback_tmp);
     Ok(())

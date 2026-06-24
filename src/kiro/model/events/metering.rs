@@ -44,8 +44,7 @@ mod tests {
 
     #[test]
     fn missing_usage_is_zero() {
-        let v: MeteringEvent =
-            serde_json::from_str(r#"{"unit":"credit"}"#).unwrap();
+        let v: MeteringEvent = serde_json::from_str(r#"{"unit":"credit"}"#).unwrap();
         assert_eq!(v.usage, 0.0);
     }
 }

@@ -43,9 +43,28 @@ interface KamAccount {
     authMethod?: string
     provider?: string
     startUrl?: string
+    tokenEndpoint?: string
+    issuerUrl?: string
+    scopes?: string
   }
   machineId?: string
   status?: string
+}
+
+function getString(obj: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = obj[key]
+    if (typeof value === 'string') return value
+  }
+  return undefined
+}
+
+function getStringOrNumber(obj: Record<string, unknown>, ...keys: string[]): string | number | undefined {
+  for (const key of keys) {
+    const value = obj[key]
+    if (typeof value === 'string' || typeof value === 'number') return value
+  }
+  return undefined
 }
 
 // 把 KAM 的 expiresAt 字段统一规范化为 RFC3339 字符串
@@ -82,8 +101,9 @@ function normalizeKamAccount(item: unknown): unknown {
   if (typeof item !== 'object' || item === null) return item
   const obj = item as Record<string, unknown>
   // 新格式：refreshToken 直接在账号对象上，无 credentials 嵌套
-  if (typeof obj.refreshToken === 'string' && typeof obj.credentials === 'undefined') {
-    const email = typeof obj.email === 'string' ? obj.email : undefined
+  const flatRefreshToken = getString(obj, 'refreshToken', 'refresh_token')
+  if (flatRefreshToken && typeof obj.credentials === 'undefined') {
+    const email = getString(obj, 'email')
     const userId =
       typeof obj.userId === 'string' || obj.userId === null ? (obj.userId as string | null) : undefined
     const nickname =
@@ -92,21 +112,21 @@ function normalizeKamAccount(item: unknown): unknown {
         : typeof obj.label === 'string'
           ? (obj.label as string)
           : undefined
-    const status = typeof obj.status === 'string' ? obj.status : undefined
-    const idp = typeof obj.idp === 'string' ? obj.idp : undefined
-    const machineId = typeof obj.machineId === 'string' ? obj.machineId : undefined
-    const accessToken = typeof obj.accessToken === 'string' ? obj.accessToken : undefined
-    const profileArn = typeof obj.profileArn === 'string' ? obj.profileArn : undefined
-    const expiresAt =
-      typeof obj.expiresAt === 'string' || typeof obj.expiresAt === 'number'
-        ? (obj.expiresAt as string | number)
-        : undefined
-    const clientId = typeof obj.clientId === 'string' ? obj.clientId : undefined
-    const clientSecret = typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined
-    const region = typeof obj.region === 'string' ? obj.region : undefined
-    const authMethod = typeof obj.authMethod === 'string' ? obj.authMethod : undefined
-    const provider = typeof obj.provider === 'string' ? obj.provider : undefined
-    const startUrl = typeof obj.startUrl === 'string' ? obj.startUrl : undefined
+    const status = getString(obj, 'status')
+    const idp = getString(obj, 'idp')
+    const machineId = getString(obj, 'machineId', 'machine_id')
+    const accessToken = getString(obj, 'accessToken', 'access_token')
+    const profileArn = getString(obj, 'profileArn', 'profile_arn')
+    const expiresAt = getStringOrNumber(obj, 'expiresAt', 'expires_at')
+    const clientId = getString(obj, 'clientId', 'client_id')
+    const clientSecret = getString(obj, 'clientSecret', 'client_secret')
+    const region = getString(obj, 'region')
+    const authMethod = getString(obj, 'authMethod', 'auth_method')
+    const provider = getString(obj, 'provider')
+    const startUrl = getString(obj, 'startUrl', 'start_url')
+    const tokenEndpoint = getString(obj, 'tokenEndpoint', 'token_endpoint')
+    const issuerUrl = getString(obj, 'issuerUrl', 'issuer_url')
+    const scopes = getString(obj, 'scopes')
 
     return {
       email,
@@ -116,7 +136,7 @@ function normalizeKamAccount(item: unknown): unknown {
       status,
       machineId,
       credentials: {
-        refreshToken: obj.refreshToken,
+        refreshToken: flatRefreshToken,
         accessToken,
         profileArn,
         expiresAt,
@@ -126,6 +146,34 @@ function normalizeKamAccount(item: unknown): unknown {
         authMethod,
         provider,
         startUrl,
+        tokenEndpoint,
+        issuerUrl,
+        scopes,
+      },
+    }
+  }
+  if (typeof obj.credentials === 'object' && obj.credentials !== null) {
+    const rawCred = obj.credentials as Record<string, unknown>
+    const refreshToken = getString(rawCred, 'refreshToken', 'refresh_token')
+    if (!refreshToken) return item
+    return {
+      ...obj,
+      machineId: getString(obj, 'machineId', 'machine_id'),
+      credentials: {
+        ...rawCred,
+        refreshToken,
+        accessToken: getString(rawCred, 'accessToken', 'access_token'),
+        profileArn: getString(rawCred, 'profileArn', 'profile_arn'),
+        expiresAt: getStringOrNumber(rawCred, 'expiresAt', 'expires_at'),
+        clientId: getString(rawCred, 'clientId', 'client_id'),
+        clientSecret: getString(rawCred, 'clientSecret', 'client_secret'),
+        region: getString(rawCred, 'region'),
+        authMethod: getString(rawCred, 'authMethod', 'auth_method'),
+        provider: getString(rawCred, 'provider'),
+        startUrl: getString(rawCred, 'startUrl', 'start_url'),
+        tokenEndpoint: getString(rawCred, 'tokenEndpoint', 'token_endpoint'),
+        issuerUrl: getString(rawCred, 'issuerUrl', 'issuer_url'),
+        scopes: getString(rawCred, 'scopes'),
       },
     }
   }
@@ -160,7 +208,7 @@ function parseKamJson(raw: string): KamAccount[] {
     rawItems = [parsed]
   }
   // 单个账号对象（新格式，refreshToken 平铺）
-  else if (typeof parsed.refreshToken === 'string') {
+  else if (typeof parsed.refreshToken === 'string' || typeof parsed.refresh_token === 'string') {
     rawItems = [parsed]
   }
   else {
@@ -352,12 +400,24 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
         const clientId = cred.clientId?.trim() || undefined
         const clientSecret = cred.clientSecret?.trim() || undefined
-        const authMethod = clientId && clientSecret ? 'idc' : 'social'
+        const tokenEndpoint = cred.tokenEndpoint?.trim() || undefined
+        const rawAuthMethod = cred.authMethod?.trim()
+        const authMethod = tokenEndpoint
+          ? 'external_idp'
+          : rawAuthMethod
+            ? rawAuthMethod
+            : clientId && clientSecret
+              ? 'idc'
+              : 'social'
         const provider = cred.provider?.trim() || account.idp?.trim() || undefined
 
         // idc 模式下必须同时提供 clientId 和 clientSecret
-        if (authMethod === 'social' && (clientId || clientSecret)) {
+        if (authMethod.toLowerCase() === 'idc' && (!clientId || !clientSecret)) {
           updateResult(i, { status: 'failed', error: 'idc 模式需要同时提供 clientId 和 clientSecret' })
+          continue
+        }
+        if (authMethod.toLowerCase() === 'external_idp' && (!clientId || !tokenEndpoint)) {
+          updateResult(i, { status: 'failed', error: 'external_idp 模式需要同时提供 clientId 和 tokenEndpoint' })
           continue
         }
 
@@ -377,6 +437,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             provider,
             authRegion: cred.region?.trim() || undefined,
             startUrl: cred.startUrl?.trim() || undefined,
+            tokenEndpoint,
+            issuerUrl: cred.issuerUrl?.trim() || undefined,
+            scopes: cred.scopes?.trim() || undefined,
             clientId,
             clientSecret,
             machineId: account.machineId?.trim() || undefined,
@@ -578,7 +641,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               </div>
             </div>
             <textarea
-              placeholder={'粘贴 Kiro Account Manager 导出的 JSON，或点击右上角“选择文件”导入\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
+              placeholder={'粘贴 Kiro Account Manager 导出的 JSON，或点击右上角“选择文件”导入\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n企业 external_idp 请保留完整字段：authMethod、tokenEndpoint、issuerUrl、scopes、profileArn。字段支持 camelCase / snake_case。\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "authMethod": "external_idp",\n        "clientId": "...",\n        "tokenEndpoint": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

@@ -5,6 +5,7 @@ mod common;
 mod http_client;
 mod image_resize;
 mod kiro;
+mod text_truncate;
 mod model;
 pub mod token;
 
@@ -182,7 +183,11 @@ async fn main() {
     let client_keys_path = admin::client_keys::default_path_in(&cache_dir);
     let client_key_manager = std::sync::Arc::new(
         admin::ClientKeyManager::load(&client_keys_path).unwrap_or_else(|e| {
-            tracing::warn!("加载客户端 Key 失败 ({}): {}", client_keys_path.display(), e);
+            tracing::warn!(
+                "加载客户端 Key 失败 ({}): {}",
+                client_keys_path.display(),
+                e
+            );
             admin::ClientKeyManager::new()
         }),
     );
@@ -197,12 +202,11 @@ async fn main() {
     // 启动时若文件不存在则首次创建，并把现有凭据 / 客户端 Key 的 groups 字段反向迁移进去，
     // 保证老用户升级后所有已用分组都自动注册，不会因为本次改造而消失。
     let groups_path = admin::groups::default_path_in(&cache_dir);
-    let group_manager = std::sync::Arc::new(
-        admin::GroupManager::load(&groups_path).unwrap_or_else(|e| {
+    let group_manager =
+        std::sync::Arc::new(admin::GroupManager::load(&groups_path).unwrap_or_else(|e| {
             tracing::warn!("加载分组注册表失败 ({}): {}", groups_path.display(), e);
             admin::GroupManager::new()
-        }),
-    );
+        }));
     {
         let mut all_used: Vec<String> = token_manager.list_credential_groups();
         all_used.extend(client_key_manager.used_group_names());
@@ -279,8 +283,7 @@ async fn main() {
             // Admin 查询需要一个确定的 store；traces.db 打开失败时用内存兜底（仅本进程有效）
             let admin_trace_store = trace_store.clone().unwrap_or_else(|| {
                 std::sync::Arc::new(
-                    admin::TraceStore::open_in_memory()
-                        .expect("内存 trace store 初始化失败"),
+                    admin::TraceStore::open_in_memory().expect("内存 trace store 初始化失败"),
                 )
             });
             let admin_service =
@@ -382,7 +385,10 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
         {
             Ok(_) => {
                 tracing::info!("已生成默认配置: {}", config_p.display());
-                tracing::info!("  apiKey      = {}（首次启动时将自动导入为第一条客户端 Key）", api_key);
+                tracing::info!(
+                    "  apiKey      = {}（首次启动时将自动导入为第一条客户端 Key）",
+                    api_key
+                );
                 tracing::info!("  adminApiKey = {}（管理面板登录密钥）", admin_api_key);
                 tracing::info!("请妥善保存上述密钥，可在配置文件中修改");
             }
@@ -402,7 +408,10 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
         if let Err(e) = std::fs::write(cred_p, "[]\n") {
             tracing::warn!("写入空凭证文件失败 {}: {}", cred_p.display(), e);
         } else {
-            tracing::info!("已生成空凭证文件: {}（可通过 Admin UI 添加凭据）", cred_p.display());
+            tracing::info!(
+                "已生成空凭证文件: {}（可通过 Admin UI 添加凭据）",
+                cred_p.display()
+            );
         }
     }
 }

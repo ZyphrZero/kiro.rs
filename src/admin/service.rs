@@ -19,18 +19,16 @@ use crate::model::config::Config;
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
-    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
-    AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse,
-    BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
-    CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse, EnableOverageAllResult,
-    GitHubRateLimitInfo, ImageUpdateResponse, ExportedAccount, ExportedCredentials,
-    CredentialsExportResponse,
-    LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
-    ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
-    QuotaExceededResult, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
-    SetLogGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
-    StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
-    UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
+    AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
+    BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialStatusItem,
+    CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount,
+    ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
+    LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
+    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, SetAccountThrottleConfigRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetUpdateConfigRequest,
+    StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
+    UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -305,7 +303,10 @@ const BUILD_TYPE: &str = "binary";
 /// 文件名中带版本号，便于 apply 复用 pull 已下载的二进制（命中时跳过重新下载）。
 fn staged_binary_path(exe: &std::path::Path, version: &str) -> std::path::PathBuf {
     let mut s = exe.as_os_str().to_os_string();
-    s.push(format!(".staged-{}", version.trim().trim_start_matches('v')));
+    s.push(format!(
+        ".staged-{}",
+        version.trim().trim_start_matches('v')
+    ));
     std::path::PathBuf::from(s)
 }
 
@@ -358,9 +359,12 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
             .filter(|s| !s.is_empty())
     }
 
-    // authMethod 规范化："idc" → "IdC"，其余按 social 处理
+    // authMethod 规范化："idc" → "IdC"，"external_idp" 原样保留，其余按 social 处理
+    let is_external_idp_cred = cred.is_external_idp();
     let auth_method = non_empty(cred.auth_method.clone()).map(|m| {
-        if m.eq_ignore_ascii_case("idc")
+        if is_external_idp_cred {
+            "external_idp".to_string()
+        } else if m.eq_ignore_ascii_case("idc")
             || m.eq_ignore_ascii_case("builder-id")
             || m.eq_ignore_ascii_case("iam")
         {
@@ -373,9 +377,16 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
 
     let provider = non_empty(cred.provider.clone());
     // idp 与 provider 同义；缺失时按认证方式回退到合法的身份提供商
-    let idp = provider
-        .clone()
-        .unwrap_or_else(|| if is_idc { "BuilderId" } else { "Google" }.to_string());
+    let idp = provider.clone().unwrap_or_else(|| {
+        if is_external_idp_cred {
+            "ExternalIdp"
+        } else if is_idc {
+            "BuilderId"
+        } else {
+            "Google"
+        }
+        .to_string()
+    });
 
     let status = if cred.disabled {
         "unknown".to_string()
@@ -417,6 +428,9 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
             .or_else(|| non_empty(cred.auth_region.clone()))
             .or_else(|| non_empty(cred.api_region.clone())),
         start_url: non_empty(cred.start_url.clone()),
+        token_endpoint: non_empty(cred.token_endpoint.clone()),
+        issuer_url: non_empty(cred.issuer_url.clone()),
+        scopes: non_empty(cred.scopes.clone()),
         expires_at: expires_at_ms,
         auth_method,
         provider: provider.clone(),
@@ -929,8 +943,8 @@ impl AdminService {
                         );
 
                         let hit = now.hour() == target_hour && now.minute() == target_minute;
-                        let already_ran_this_minute = last_run_marker.as_deref()
-                            == Some(date_minute_marker.as_str());
+                        let already_ran_this_minute =
+                            last_run_marker.as_deref() == Some(date_minute_marker.as_str());
 
                         if hit && !already_ran_this_minute {
                             last_run_marker = Some(date_minute_marker);
@@ -946,7 +960,7 @@ impl AdminService {
                                     info.latest_version,
                                     info.current_version
                                 );
-                            match svc.apply_image_update().await {
+                                match svc.apply_image_update().await {
                                     Ok(res) => {
                                         tracing::info!("自动更新完成：{}", res.message);
                                         last_applied_version = Some(info.latest_version);
@@ -1023,6 +1037,9 @@ impl AdminService {
             client_id: req.client_id,
             client_secret: req.client_secret,
             start_url: req.start_url,
+            token_endpoint: req.token_endpoint,
+            issuer_url: req.issuer_url,
+            scopes: req.scopes,
             priority: req.priority,
             region: req.region,
             auth_region: req.auth_region,
@@ -1082,8 +1099,7 @@ impl AdminService {
             Ok(r) => r,
             Err(e) => {
                 let msg = e.to_string();
-                let is_duplicate =
-                    msg.contains("凭据已存在") || msg.contains("重复");
+                let is_duplicate = msg.contains("凭据已存在") || msg.contains("重复");
                 return ImportItemResult {
                     status: if is_duplicate {
                         ImportStatus::Duplicate
@@ -1336,10 +1352,7 @@ impl AdminService {
             message: if reused {
                 format!("v{} 已下载并校验，可直接执行「更新并重启」", version)
             } else {
-                format!(
-                    "已下载并校验 v{} 二进制，可直接执行「更新并重启」",
-                    version
-                )
+                format!("已下载并校验 v{} 二进制，可直接执行「更新并重启」", version)
             },
             output: Some(format!(
                 "{}: v{}\nstaged: {}",
@@ -1604,10 +1617,7 @@ impl AdminService {
     /// `req.github_token` 不为空时使用该 token 验证（用于"保存前先试一下"），
     /// 否则使用配置中已保存的 `config.github_token`，再缺则匿名查询。
     /// `/rate_limit` 端点本身不消耗任何配额。
-    pub async fn check_rate_limit(
-        &self,
-        req: CheckRateLimitRequest,
-    ) -> GitHubRateLimitInfo {
+    pub async fn check_rate_limit(&self, req: CheckRateLimitRequest) -> GitHubRateLimitInfo {
         // 优先用入参 token；空字符串视作"尝试匿名"；缺省回退到已保存 token
         let token = req
             .github_token
@@ -1723,13 +1733,22 @@ impl AdminService {
             .get("resources")
             .and_then(|r| r.get("core"))
             .or_else(|| payload.get("rate"));
-        let limit = core.and_then(|c| c.get("limit")).and_then(|v| v.as_u64()).unwrap_or(0);
+        let limit = core
+            .and_then(|c| c.get("limit"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let remaining = core
             .and_then(|c| c.get("remaining"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        let used = core.and_then(|c| c.get("used")).and_then(|v| v.as_u64()).unwrap_or(0);
-        let reset = core.and_then(|c| c.get("reset")).and_then(|v| v.as_u64()).unwrap_or(0);
+        let used = core
+            .and_then(|c| c.get("used"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let reset = core
+            .and_then(|c| c.get("reset"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
 
         // 同时尝试拿 token 对应的用户名；失败不影响主结果
         let login = if authenticated {
@@ -1977,9 +1996,9 @@ impl AdminService {
                 skipped.push(entry.id);
                 continue;
             }
-            let cached = cache_snapshot.get(&entry.id).filter(|c| {
-                (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64
-            });
+            let cached = cache_snapshot
+                .get(&entry.id)
+                .filter(|c| (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64);
 
             match cached {
                 // 缓存命中：明确不可开启，跳过
@@ -2002,7 +2021,11 @@ impl AdminService {
         let mut failure_messages: Vec<String> = Vec::new();
 
         for id in targets {
-            match self.token_manager.set_user_preference_for(id, "ENABLED").await {
+            match self
+                .token_manager
+                .set_user_preference_for(id, "ENABLED")
+                .await
+            {
                 Ok(()) => {
                     enabled_ids.push(id);
                     // 失效本地缓存
@@ -2468,12 +2491,7 @@ impl AdminService {
             Some(base) => {
                 let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
                 // 远程模式：暂存 Sender，由公网 GET 回调路由投递回调数据
-                (
-                    base,
-                    None,
-                    Some(Mutex::new(Some(tx))),
-                    rx,
-                )
+                (base, None, Some(Mutex::new(Some(tx))), rx)
             }
             None => {
                 let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
@@ -3152,9 +3170,8 @@ mod tests {
         cred.email = Some("e@example.com".to_string());
         cred.expires_at = Some("2026-06-06T00:00:00Z".to_string());
         // 占位符 profileArn 应在导出时被剥离
-        cred.profile_arn = Some(
-            crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string(),
-        );
+        cred.profile_arn =
+            Some(crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN.to_string());
 
         let acc = credential_to_export_account(cred).expect("应生成账号");
 
@@ -3187,7 +3204,10 @@ mod tests {
         assert_eq!(subscription_type_from_title(Some("KIRO FREE")), "Free");
         assert_eq!(subscription_type_from_title(Some("KIRO PRO+")), "Pro_Plus");
         assert_eq!(subscription_type_from_title(Some("KIRO PRO")), "Pro");
-        assert_eq!(subscription_type_from_title(Some("KIRO POWER")), "Enterprise");
+        assert_eq!(
+            subscription_type_from_title(Some("KIRO POWER")),
+            "Enterprise"
+        );
         assert_eq!(subscription_type_from_title(None), "Free");
     }
 }

@@ -7,6 +7,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
 } from '@/components/ui/dropdown-menu'
@@ -56,6 +57,7 @@ export function ClientKeysPage() {
   const [createName, setCreateName] = useState('')
   const [createDesc, setCreateDesc] = useState('')
   const [createGroup, setCreateGroup] = useState('')
+  const [createCacheEnabled, setCreateCacheEnabled] = useState(true)
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -64,6 +66,7 @@ export function ClientKeysPage() {
   const [editName, setEditName] = useState('')
   const [editDesc, setEditDesc] = useState('')
   const [editGroup, setEditGroup] = useState('')
+  const [editCacheEnabled, setEditCacheEnabled] = useState(true)
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -77,12 +80,14 @@ export function ClientKeysPage() {
         name,
         description: createDesc.trim() || undefined,
         group: createGroup.trim() || undefined,
+        cacheEnabled: createCacheEnabled,
       })
       setCreatedKey(res)
       setCreateOpen(false)
       setCreateName('')
       setCreateDesc('')
       setCreateGroup('')
+      setCreateCacheEnabled(true)
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -164,6 +169,7 @@ export function ClientKeysPage() {
     setEditName(item.name)
     setEditDesc(item.description ?? '')
     setEditGroup(item.group ?? '')
+    setEditCacheEnabled(item.cacheEnabled)
     setEditOpen(true)
   }
 
@@ -173,7 +179,12 @@ export function ClientKeysPage() {
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
-        req: { name: editName.trim(), description: editDesc.trim(), group: editGroup.trim() },
+        req: {
+          name: editName.trim(),
+          description: editDesc.trim(),
+          group: editGroup.trim(),
+          cacheEnabled: editCacheEnabled,
+        },
       })
       toast.success('已更新')
       setEditOpen(false)
@@ -223,13 +234,14 @@ export function ClientKeysPage() {
       ) : (
         <Card>
           <CardContent className="overflow-x-auto p-0">
-            <table className="w-full min-w-[920px] text-sm">
+            <table className="w-full min-w-[980px] text-sm">
               <thead className="text-[12px] text-muted-foreground border-b border-border/60">
                 <tr className="whitespace-nowrap">
                   <th className="text-left font-medium px-4 py-3">ID</th>
                   <th className="text-left font-medium px-4 py-3">名称</th>
                   <th className="text-left font-medium px-4 py-3">Key</th>
                   <th className="text-left font-medium px-4 py-3">分组</th>
+                  <th className="text-left font-medium px-4 py-3">缓存</th>
                   <th className="text-left font-medium px-4 py-3">状态</th>
                   <th className="text-right font-medium px-4 py-3">总调用</th>
                   <th className="text-right font-medium px-4 py-3">输入</th>
@@ -283,6 +295,13 @@ export function ClientKeysPage() {
                         <Badge variant="outline">{k.group}</Badge>
                       ) : (
                         <span className="text-[12px] text-muted-foreground">全部账号</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      {k.cacheEnabled ? (
+                        <Badge variant="secondary">开启</Badge>
+                      ) : (
+                        <Badge variant="outline">关闭</Badge>
                       )}
                     </td>
                     <td className="px-4 py-3">
@@ -390,6 +409,19 @@ export function ClientKeysPage() {
                 绑定后该 Key 仅会使用含此分组的账号（严格隔离，分组内无可用账号时请求会失败）。
               </p>
             </div>
+            <div className="flex items-center justify-between gap-3 rounded-md border border-border/60 px-3 py-2">
+              <div>
+                <div className="text-sm font-medium">Prompt cache</div>
+                <p className="text-[11px] text-muted-foreground">
+                  关闭后仅按标准 cache_control 计量，不使用中转层增强命中。
+                </p>
+              </div>
+              <Switch
+                checked={createCacheEnabled}
+                onCheckedChange={setCreateCacheEnabled}
+                disabled={createKey.isPending}
+              />
+            </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
                 取消
@@ -483,6 +515,19 @@ export function ClientKeysPage() {
               <p className="mt-1 text-[11px] text-muted-foreground">
                 绑定后仅调度该分组内账号（严格隔离）。选「不绑定」表示解除绑定。
               </p>
+            </div>
+            <div className="flex items-center justify-between gap-3 rounded-md border border-border/60 px-3 py-2">
+              <div>
+                <div className="text-sm font-medium">Prompt cache</div>
+                <p className="text-[11px] text-muted-foreground">
+                  关闭后仅按标准 cache_control 计量，不使用中转层增强命中。
+                </p>
+              </div>
+              <Switch
+                checked={editCacheEnabled}
+                onCheckedChange={setEditCacheEnabled}
+                disabled={updateKey.isPending}
+              />
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>

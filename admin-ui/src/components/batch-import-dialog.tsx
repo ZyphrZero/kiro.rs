@@ -27,6 +27,9 @@ interface BatchImportDialogProps {
 
 interface CredentialInput {
   refreshToken?: string
+  accessToken?: string
+  profileArn?: string
+  expiresAt?: string | number
   clientId?: string
   clientSecret?: string
   region?: string
@@ -36,6 +39,11 @@ interface CredentialInput {
   machineId?: string
   kiroApiKey?: string
   authMethod?: string
+  provider?: string
+  startUrl?: string
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
   endpoint?: string
   email?: string
   proxyUrl?: string
@@ -52,6 +60,108 @@ interface VerificationResult {
   credentialId?: number
   rollbackStatus?: 'success' | 'failed' | 'skipped'
   rollbackError?: string
+}
+
+function getString(obj: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = obj[key]
+    if (typeof value === 'string') return value
+  }
+  return undefined
+}
+
+function getStringOrNumber(obj: Record<string, unknown>, ...keys: string[]): string | number | undefined {
+  for (const key of keys) {
+    const value = obj[key]
+    if (typeof value === 'string' || typeof value === 'number') return value
+  }
+  return undefined
+}
+
+function getNumber(obj: Record<string, unknown>, ...keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = obj[key]
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+  }
+  return undefined
+}
+
+function normalizeExpiresAt(value: unknown): string | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const date = new Date(value)
+    return Number.isNaN(date.getTime()) ? undefined : date.toISOString()
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed.length > 0 ? trimmed : undefined
+  }
+  return undefined
+}
+
+function readAccessTokenEmail(accessToken?: string): string | undefined {
+  if (!accessToken) return undefined
+  const parts = accessToken.split('.')
+  if (parts.length < 2) return undefined
+  try {
+    const payload = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    const padded = payload.padEnd(Math.ceil(payload.length / 4) * 4, '=')
+    const data = JSON.parse(atob(padded)) as Record<string, unknown>
+    return getString(data, 'preferred_username', 'email', 'upn')
+  } catch {
+    return undefined
+  }
+}
+
+function normalizeCredentialInput(item: unknown): CredentialInput {
+  if (typeof item !== 'object' || item === null) return {}
+
+  const obj = item as Record<string, unknown>
+  const rawCred =
+    typeof obj.credentials === 'object' && obj.credentials !== null
+      ? (obj.credentials as Record<string, unknown>)
+      : obj
+
+  const accessToken = getString(rawCred, 'accessToken', 'access_token')
+
+  return {
+    refreshToken: getString(rawCred, 'refreshToken', 'refresh_token'),
+    accessToken,
+    profileArn: getString(rawCred, 'profileArn', 'profile_arn'),
+    expiresAt: getStringOrNumber(rawCred, 'expiresAt', 'expires_at'),
+    clientId: getString(rawCred, 'clientId', 'client_id'),
+    clientSecret: getString(rawCred, 'clientSecret', 'client_secret'),
+    region: getString(rawCred, 'region'),
+    authRegion: getString(rawCred, 'authRegion', 'auth_region'),
+    apiRegion: getString(rawCred, 'apiRegion', 'api_region'),
+    priority: getNumber(rawCred, 'priority') ?? getNumber(obj, 'priority'),
+    machineId: getString(rawCred, 'machineId', 'machine_id') ?? getString(obj, 'machineId', 'machine_id'),
+    kiroApiKey: getString(rawCred, 'kiroApiKey', 'kiro_api_key'),
+    authMethod: getString(rawCred, 'authMethod', 'auth_method'),
+    provider: getString(rawCred, 'provider') ?? getString(obj, 'provider', 'idp'),
+    startUrl: getString(rawCred, 'startUrl', 'start_url'),
+    tokenEndpoint: getString(rawCred, 'tokenEndpoint', 'token_endpoint'),
+    issuerUrl: getString(rawCred, 'issuerUrl', 'issuer_url'),
+    scopes: getString(rawCred, 'scopes'),
+    endpoint: getString(rawCred, 'endpoint'),
+    email:
+      getString(rawCred, 'email') ??
+      getString(obj, 'email', 'preferredUsername', 'preferred_username') ??
+      readAccessTokenEmail(accessToken),
+    proxyUrl: getString(rawCred, 'proxyUrl', 'proxy_url'),
+    proxyUsername: getString(rawCred, 'proxyUsername', 'proxy_username'),
+    proxyPassword: getString(rawCred, 'proxyPassword', 'proxy_password'),
+  }
+}
+
+function parseCredentialJson(raw: string): CredentialInput[] {
+  const parsed = JSON.parse(raw)
+  const rawItems =
+    parsed && typeof parsed === 'object' && Array.isArray(parsed.accounts)
+      ? parsed.accounts
+      : Array.isArray(parsed)
+        ? parsed
+        : [parsed]
+  return rawItems.map(normalizeCredentialInput)
 }
 
 
@@ -94,8 +204,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     // 先单独解析 JSON，给出精准的错误提示
     let credentials: CredentialInput[]
     try {
-      const parsed = JSON.parse(jsonInput)
-      credentials = Array.isArray(parsed) ? parsed : [parsed]
+      credentials = parseCredentialJson(jsonInput)
     } catch (error) {
       toast.error('JSON 格式错误: ' + extractErrorMessage(error))
       return
@@ -202,11 +311,35 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
-          const authMethod = clientId && clientSecret ? 'idc' : 'social'
-          if (authMethod === 'social' && (clientId || clientSecret)) {
+          const tokenEndpoint = cred.tokenEndpoint?.trim() || undefined
+          const rawAuthMethod = cred.authMethod?.trim()
+          const authMethod = tokenEndpoint
+            ? 'external_idp'
+            : rawAuthMethod
+              ? rawAuthMethod
+              : clientId && clientSecret
+                ? 'idc'
+                : 'social'
+          const normalizedAuthMethod = authMethod.toLowerCase().replace(/[-_]/g, '')
+
+          if (normalizedAuthMethod === 'idc' && (!clientId || !clientSecret)) {
             updateResult(i, {
               status: 'failed',
               error: 'idc 模式需要同时提供 clientId 和 clientSecret',
+            })
+            continue
+          }
+          if (normalizedAuthMethod === 'externalidp' && (!clientId || !tokenEndpoint)) {
+            updateResult(i, {
+              status: 'failed',
+              error: 'external_idp 模式需要同时提供 clientId 和 tokenEndpoint',
+            })
+            continue
+          }
+          if (normalizedAuthMethod !== 'idc' && normalizedAuthMethod !== 'externalidp' && (clientId || clientSecret)) {
+            updateResult(i, {
+              status: 'failed',
+              error: 'social 模式不应携带 clientId/clientSecret；企业 SSO 请提供 tokenEndpoint',
             })
             continue
           }
@@ -215,9 +348,17 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             index: i,
             req: {
               refreshToken: token,
+              accessToken: cred.accessToken?.trim() || undefined,
+              profileArn: cred.profileArn?.trim() || undefined,
+              expiresAt: normalizeExpiresAt(cred.expiresAt),
               authMethod,
+              provider: cred.provider?.trim() || undefined,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
+              startUrl: cred.startUrl?.trim() || undefined,
+              tokenEndpoint,
+              issuerUrl: cred.issuerUrl?.trim() || undefined,
+              scopes: cred.scopes?.trim() || undefined,
               clientId,
               clientSecret,
               priority: cred.priority || 0,
@@ -395,7 +536,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象、数组，或 { "accounts": [...] }）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\n企业 SSO external_idp: [{"refreshToken":"...","accessToken":"...","authMethod":"external_idp","clientId":"...","tokenEndpoint":"...","issuerUrl":"...","scopes":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion；字段支持 camelCase / snake_case'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

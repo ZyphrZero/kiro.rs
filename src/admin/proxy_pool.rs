@@ -506,7 +506,9 @@ mod tests {
     #[test]
     fn set_enabled_true_clears_auto_disable_state() {
         let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
-        let entry = mgr.add("socks5://127.0.0.1:1080".to_string(), None).unwrap();
+        let entry = mgr
+            .add("socks5://127.0.0.1:1080".to_string(), None)
+            .unwrap();
         // 模拟自动禁用状态
         {
             let mut entries = mgr.entries.lock();
