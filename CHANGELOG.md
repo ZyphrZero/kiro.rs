@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.14] - 2026-06-25
+
+主题：**修复连接池陈旧连接导致的 `socket closed unexpectedly`(0.6.12 回归)**。
+
+### 🐛 修复 — 连接池陈旧连接(0.6.12 回归)
+
+- 0.6.12 移除上游 `Connection: close` 启用连接池复用后,生产环境**概率性**出现
+  `API Error: The socket connection was closed unexpectedly`。根因:`pool_idle_timeout` 设为
+  **90s,长于上游服务端(AWS ALB)的空闲关闭时间(~60s)**——连接空闲 60~90s 时已被服务端
+  RST/FIN,但 reqwest 仍认为它在有效期内并复用,下一个请求取到这条"半死"连接直接报 socket 关闭。
+- 修复:把 `pool_idle_timeout` 降到 **15s**(远低于 60s),使陈旧连接在被复用前先被池淘汰;
+  取连接瞬间撞上服务端刚关闭的残留竞态由既有重试循环兜底(`execute` 失败即换新连接重试)。
+  新增环境变量 `KIRO_RS_HTTP_POOL_IDLE_TIMEOUT_SECS`(默认 15)可覆盖。
+- 连接复用收益保留:活跃流量(15s 内连续请求)仍复用连接、省握手;只是不再把连接留到陈旧。
+
 ## [0.6.13] - 2026-06-25
 
 主题：**原生模式非语义优化(连接/调度/观测)**。在不改 prompt、不删历史、不做代理侧摘要的前提下,做一批保持 Claude 原生一致的优化:质量感知路由、减少代理自身开销、long-context 分级观测,并修正多账号并发下的"活跃"语义。

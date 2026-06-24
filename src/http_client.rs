@@ -66,6 +66,11 @@ pub fn build_client(
     let connect_timeout = env_secs("KIRO_RS_HTTP_CONNECT_TIMEOUT_SECS", 15);
     let read_timeout = env_secs("KIRO_RS_HTTP_READ_TIMEOUT_SECS", 300);
     let keepalive = env_secs("KIRO_RS_HTTP_TCP_KEEPALIVE_SECS", 60);
+    // 连接池空闲超时**必须短于上游服务端的空闲关闭时间**(AWS ALB 默认 ~60s),
+    // 否则池里会留存已被服务端 RST/FIN 的"半死"连接,下一个请求取到它直接
+    // "socket closed unexpectedly"。取 15s 远低于 60s,使陈旧连接在被复用前先被淘汰;
+    // 取连接瞬间仍可能撞上服务端刚关闭的竞态,由上层重试循环兜底(execute 失败即重试)。
+    let pool_idle = env_secs("KIRO_RS_HTTP_POOL_IDLE_TIMEOUT_SECS", 15);
 
     let mut builder = Client::builder()
         // 总超时仍保留为大兜底（含完整流式响应）；read_timeout 才是挂死探测主力。
@@ -73,8 +78,8 @@ pub fn build_client(
         .connect_timeout(Duration::from_secs(connect_timeout))
         .read_timeout(Duration::from_secs(read_timeout))
         .tcp_keepalive(Duration::from_secs(keepalive))
-        // 复用空闲连接，省掉重复 TCP+TLS 握手，直接降低首 token。
-        .pool_idle_timeout(Duration::from_secs(90))
+        // 复用空闲连接省掉重复 TCP+TLS 握手；但空闲超时短于上游关闭时间,避免取到死连接。
+        .pool_idle_timeout(Duration::from_secs(pool_idle))
         .pool_max_idle_per_host(8);
 
     match tls_backend {
