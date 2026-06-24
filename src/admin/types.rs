@@ -74,6 +74,22 @@ pub struct CredentialStatusItem {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 有效并发上限（凭据级覆盖优先，否则全局值）
+    pub max_concurrency: usize,
+    /// 凭据级并发覆盖原始值（None=未覆盖，用全局）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrency_override: Option<usize>,
+    /// 当前在途请求数
+    pub in_flight: usize,
+    /// 最老在途请求年龄（秒）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_in_flight_secs: Option<u64>,
+    /// 请求耗时 EWMA（毫秒）
+    pub ewma_duration_ms: u64,
+    /// 近期错误率 EWMA（0~100 整数百分比）
+    pub recent_error_rate: u32,
+    /// 累计调度次数
+    pub total_scheduled: u64,
     /// 凭据余额（从缓存中读取的最近一次结果，可能为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,

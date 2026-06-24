@@ -584,6 +584,13 @@ impl AdminService {
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
+                    max_concurrency: entry.max_concurrency,
+                    max_concurrency_override: entry.max_concurrency_override,
+                    in_flight: entry.in_flight,
+                    oldest_in_flight_secs: entry.oldest_in_flight_secs,
+                    ewma_duration_ms: entry.ewma_duration_ms,
+                    recent_error_rate: entry.recent_error_rate,
+                    total_scheduled: entry.total_scheduled,
                     balance,
                     balance_updated_at,
                 }
