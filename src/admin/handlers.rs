@@ -23,10 +23,11 @@ use super::{
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
         CreateClientKeyResponse, GlobalProxyResponse, SetAccountThrottleConfigRequest,
-        SetDisabledRequest, SetGlobalProxyRequest, SetLoadBalancingModeRequest,
-        SetLogGovernanceConfigRequest, SetPriorityRequest, SetUpdateConfigRequest,
-        StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest,
-        UpdateClientKeyRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+        SetConcurrencyRequest, SetDisabledRequest, SetGlobalProxyRequest,
+        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
+        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
+        UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
+        UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -97,6 +98,24 @@ pub async fn set_credential_priority(
             "凭据 #{} 优先级已设置为 {}",
             id, payload.priority
         )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/concurrency
+/// 设置单账号并发覆盖（maxConcurrency=null/0 清除覆盖）
+pub async fn set_credential_concurrency(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetConcurrencyRequest>,
+) -> impl IntoResponse {
+    let value = payload.max_concurrency.filter(|n| *n > 0);
+    match state.service.set_concurrency(id, value) {
+        Ok(_) => Json(SuccessResponse::new(match value {
+            Some(n) => format!("凭据 #{} 并发上限已设为 {}", id, n),
+            None => format!("凭据 #{} 并发覆盖已清除（回退全局值）", id),
+        }))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

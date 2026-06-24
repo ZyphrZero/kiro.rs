@@ -100,6 +100,14 @@ pub struct SetPriorityRequest {
     pub priority: u32,
 }
 
+/// 设置单账号并发覆盖请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetConcurrencyRequest {
+    /// 并发上限；null 或 0 表示清除覆盖、回退全局值
+    pub max_concurrency: Option<usize>,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

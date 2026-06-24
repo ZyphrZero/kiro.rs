@@ -133,6 +133,18 @@ export async function setCredentialPriority(
   return data
 }
 
+// 设置单账号并发覆盖（value=null/0 清除覆盖，回退全局值）
+export async function setCredentialConcurrency(
+  id: number,
+  maxConcurrency: number | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/concurrency`,
+    { maxConcurrency }
+  )
+  return data
+}
+
 // 重置失败计数
 export async function resetCredentialFailure(
   id: number

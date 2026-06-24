@@ -36,6 +36,20 @@ export interface CredentialStatusItem {
   groups?: string[]
   /** 账号来源渠道（纯备注） */
   sourceChannel?: string
+  /** 有效并发上限（凭据级覆盖优先，否则全局值） */
+  maxConcurrency?: number
+  /** 凭据级并发覆盖原始值（未设则用全局） */
+  maxConcurrencyOverride?: number
+  /** 当前在途请求数 */
+  inFlight?: number
+  /** 最老在途请求年龄（秒） */
+  oldestInFlightSecs?: number
+  /** 请求耗时 EWMA（毫秒） */
+  ewmaDurationMs?: number
+  /** 近期错误率 EWMA（0~100 整数百分比） */
+  recentErrorRate?: number
+  /** 累计调度次数 */
+  totalScheduled?: number
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */

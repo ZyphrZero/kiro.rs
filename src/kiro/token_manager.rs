@@ -994,6 +994,22 @@ pub struct CredentialEntrySnapshot {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 有效并发上限（凭据级覆盖优先，否则全局值）
+    pub max_concurrency: usize,
+    /// 凭据级并发覆盖原始值（None=未覆盖，用全局）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrency_override: Option<usize>,
+    /// 当前在途请求数
+    pub in_flight: usize,
+    /// 最老在途请求年龄（秒）；无在途则不返回
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_in_flight_secs: Option<u64>,
+    /// 请求耗时 EWMA（毫秒，整数）
+    pub ewma_duration_ms: u64,
+    /// 近期错误率 EWMA（0~100 整数百分比）
+    pub recent_error_rate: u32,
+    /// 累计调度次数（acquire 成功）
+    pub total_scheduled: u64,
 }
 
 /// 凭据管理器状态快照
@@ -1049,12 +1065,66 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 按凭据运行时调度指标（进程内，不持久化）
+    metrics: MetricsStore,
 }
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+
+/// EWMA 平滑系数（新样本权重）。0.3 ≈ 取最近若干次的指数加权平均，既反映近期变化又不过分抖动。
+const EWMA_ALPHA: f64 = 0.3;
+
+/// 单凭据运行时调度指标（进程内，不持久化）。
+///
+/// 用于 Admin 卡片观测每账号的实时调度状态：当前在途、最老在途请求年龄、
+/// 耗时 EWMA、近期错误率 EWMA、累计调度次数。
+#[derive(Default)]
+pub struct CredMetrics {
+    /// 累计被调度（acquire 成功）的次数
+    pub total_scheduled: u64,
+    /// 请求耗时的指数加权移动平均（毫秒）
+    pub ewma_duration_ms: f64,
+    /// 近期错误率 EWMA（0.0~1.0；每次成功喂 0、失败喂 1）
+    pub ewma_error: f64,
+    /// 在途请求：req_id -> 起始时刻。用于计算"最老在途请求年龄"与当前在途数。
+    pub active: HashMap<u64, Instant>,
+    /// 进程内自增的请求序号
+    next_req: u64,
+}
+
+impl CredMetrics {
+    fn on_acquire(&mut self) -> u64 {
+        self.total_scheduled += 1;
+        let req = self.next_req;
+        self.next_req += 1;
+        self.active.insert(req, Instant::now());
+        req
+    }
+    fn on_finish(&mut self, req: u64) {
+        if let Some(start) = self.active.remove(&req) {
+            let ms = start.elapsed().as_millis() as f64;
+            self.ewma_duration_ms = if self.ewma_duration_ms == 0.0 {
+                ms
+            } else {
+                EWMA_ALPHA * ms + (1.0 - EWMA_ALPHA) * self.ewma_duration_ms
+            };
+        }
+    }
+    fn feed_error(&mut self, is_error: bool) {
+        let sample = if is_error { 1.0 } else { 0.0 };
+        self.ewma_error = EWMA_ALPHA * sample + (1.0 - EWMA_ALPHA) * self.ewma_error;
+    }
+    /// 最老在途请求年龄（秒）；无在途则 None
+    fn oldest_in_flight_secs(&self) -> Option<u64> {
+        self.active.values().map(|t| t.elapsed().as_secs()).max()
+    }
+}
+
+/// 共享的按凭据指标表
+type MetricsStore = Arc<Mutex<HashMap<u64, CredMetrics>>>;
 
 /// API 调用上下文
 ///
@@ -1069,6 +1139,19 @@ pub struct CallContext {
     pub token: String,
     /// 账号级并发租约；随上下文/响应生命周期释放。
     _permit: OwnedSemaphorePermit,
+    /// 本次请求在指标表中的序号；Drop 时据此结算耗时并移除在途记录。
+    req_id: u64,
+    /// 指标表句柄（用于 Drop 时结算）
+    metrics: MetricsStore,
+}
+
+impl Drop for CallContext {
+    fn drop(&mut self) {
+        // 请求结束（permit 释放）时结算耗时 EWMA 并移除在途记录
+        if let Some(m) = self.metrics.lock().get_mut(&self.id) {
+            m.on_finish(self.req_id);
+        }
+    }
 }
 
 /// 判断某账号的分组集合是否匹配请求所属分组（严格隔离）
@@ -1194,7 +1277,14 @@ impl MultiTokenManager {
         let account_max_concurrency = config.account_max_concurrency.max(1);
         let credential_locks = entries
             .iter()
-            .map(|entry| (entry.id, Arc::new(Semaphore::new(account_max_concurrency))))
+            .map(|entry| {
+                let cap = entry
+                    .credentials
+                    .max_concurrency
+                    .filter(|n| *n > 0)
+                    .unwrap_or(account_max_concurrency);
+                (entry.id, Arc::new(Semaphore::new(cap)))
+            })
             .collect();
 
         // 选择初始凭据：优先级最高（priority 最小）的可用凭据，无可用凭据时为 0
@@ -1224,6 +1314,7 @@ impl MultiTokenManager {
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            metrics: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -1359,6 +1450,9 @@ impl MultiTokenManager {
     }
 
     fn lock_for_credential(&self, id: u64) -> Arc<Semaphore> {
+        // 首次创建用全局默认容量；凭据级覆盖由构造器与 set_credential_concurrency 权威设置，
+        // 不在此处锁 entries（ranked_available_credentials 持有 entries 时会调用本函数，
+        // 再锁 entries 会造成不可重入死锁）。
         let mut locks = self.credential_locks.lock();
         locks
             .entry(id)
@@ -1379,10 +1473,17 @@ impl MultiTokenManager {
             .clone()
     }
 
-    fn credential_in_flight(&self, id: u64) -> usize {
-        let capacity = self.config.account_max_concurrency.max(1);
+    /// 当前在途数 = 容量 - 可用 permit。容量由调用方传入（避免在持有 entries 锁时再锁 entries）。
+    fn in_flight_with_cap(&self, id: u64, capacity: usize) -> usize {
         let available = self.lock_for_credential(id).available_permits();
         capacity.saturating_sub(available)
+    }
+
+    /// 某凭据的有效并发上限（直接由其 credentials 计算，不锁 entries）。
+    fn cap_of(&self, c: &KiroCredentials) -> usize {
+        c.max_concurrency
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| self.config.account_max_concurrency.max(1))
     }
 
     fn ranked_available_credentials(
@@ -1404,8 +1505,9 @@ impl MultiTokenManager {
 
         if mode == "balanced" {
             available.sort_by_key(|e| {
+                let cap = self.cap_of(&e.credentials);
                 (
-                    self.credential_in_flight(e.id),
+                    self.in_flight_with_cap(e.id, cap),
                     e.success_count,
                     e.credentials.priority,
                     e.id,
@@ -1413,8 +1515,9 @@ impl MultiTokenManager {
             });
         } else {
             available.sort_by_key(|e| {
+                let cap = self.cap_of(&e.credentials);
                 (
-                    self.credential_in_flight(e.id),
+                    self.in_flight_with_cap(e.id, cap),
                     e.credentials.priority,
                     e.id,
                 )
@@ -1601,12 +1704,7 @@ impl MultiTokenManager {
                 .kiro_api_key
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
-            return Ok(CallContext {
-                id,
-                credentials: credentials.clone(),
-                token,
-                _permit: permit,
-            });
+            return Ok(self.make_call_context(id, credentials.clone(), token, permit));
         }
 
         // 第一次检查（无锁）：快速判断是否需要刷新
@@ -1673,12 +1771,29 @@ impl MultiTokenManager {
             }
         }
 
-        Ok(CallContext {
+        Ok(self.make_call_context(id, creds, token, permit))
+    }
+
+    /// 构造 CallContext 并登记调度指标（acquire 计数 + 在途起始时刻）。
+    fn make_call_context(
+        &self,
+        id: u64,
+        credentials: KiroCredentials,
+        token: String,
+        permit: OwnedSemaphorePermit,
+    ) -> CallContext {
+        let req_id = {
+            let mut m = self.metrics.lock();
+            m.entry(id).or_default().on_acquire()
+        };
+        CallContext {
             id,
-            credentials: creds,
+            credentials,
             token,
             _permit: permit,
-        })
+            req_id,
+            metrics: self.metrics.clone(),
+        }
     }
 
     /// 将凭据列表回写到源文件
@@ -1956,6 +2071,9 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_success(&self, id: u64) {
+        if let Some(m) = self.metrics.lock().get_mut(&id) {
+            m.feed_error(false);
+        }
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -1983,6 +2101,9 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
+        if let Some(m) = self.metrics.lock().get_mut(&id) {
+            m.feed_error(true);
+        }
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -2251,6 +2372,32 @@ impl MultiTokenManager {
 
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
+        let global_conc = self.config.account_max_concurrency.max(1);
+        // 先于 entries 锁采集 semaphore 可用数与指标，避免锁顺序倒置
+        let avail_permits: HashMap<u64, usize> = {
+            let locks = self.credential_locks.lock();
+            locks
+                .iter()
+                .map(|(k, v)| (*k, v.available_permits()))
+                .collect()
+        };
+        let metrics_map: HashMap<u64, (usize, Option<u64>, f64, f64, u64)> = {
+            let m = self.metrics.lock();
+            m.iter()
+                .map(|(k, cm)| {
+                    (
+                        *k,
+                        (
+                            cm.active.len(),
+                            cm.oldest_in_flight_secs(),
+                            cm.ewma_duration_ms,
+                            cm.ewma_error,
+                            cm.total_scheduled,
+                        ),
+                    )
+                })
+                .collect()
+        };
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let now = Instant::now();
@@ -2331,6 +2478,31 @@ impl MultiTokenManager {
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
+                    max_concurrency: e
+                        .credentials
+                        .max_concurrency
+                        .filter(|n| *n > 0)
+                        .unwrap_or(global_conc),
+                    max_concurrency_override: e.credentials.max_concurrency.filter(|n| *n > 0),
+                    in_flight: {
+                        let cap = e
+                            .credentials
+                            .max_concurrency
+                            .filter(|n| *n > 0)
+                            .unwrap_or(global_conc);
+                        let avail = avail_permits.get(&e.id).copied().unwrap_or(cap);
+                        cap.saturating_sub(avail)
+                    },
+                    oldest_in_flight_secs: metrics_map.get(&e.id).and_then(|m| m.1),
+                    ewma_duration_ms: metrics_map
+                        .get(&e.id)
+                        .map(|m| m.2.round() as u64)
+                        .unwrap_or(0),
+                    recent_error_rate: metrics_map
+                        .get(&e.id)
+                        .map(|m| (m.3 * 100.0).round() as u32)
+                        .unwrap_or(0),
+                    total_scheduled: metrics_map.get(&e.id).map(|m| m.4).unwrap_or(0),
                 })
                 .collect(),
             current_id,
@@ -2450,6 +2622,36 @@ impl MultiTokenManager {
             .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
         entry.throttled_until = None;
         tracing::info!("凭据 #{} 风控冷却已被手动解除", id);
+        Ok(())
+    }
+
+    /// 设置单账号并发覆盖（Admin API）。
+    ///
+    /// `value = Some(n)`：该账号专属并发上限设为 n；`None`：清除覆盖，回退全局值。
+    /// 更新凭据字段并持久化，然后用新容量重建该账号的并发信号量——已持有的旧 permit
+    /// 仍绑定在旧信号量上、释放无副作用，新请求按新容量获取。
+    pub fn set_credential_concurrency(&self, id: u64, value: Option<usize>) -> anyhow::Result<()> {
+        let new_cap = {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.max_concurrency = value.filter(|n| *n > 0);
+            entry
+                .credentials
+                .max_concurrency
+                .unwrap_or_else(|| self.config.account_max_concurrency.max(1))
+        };
+        // 用新容量替换信号量
+        {
+            let mut locks = self.credential_locks.lock();
+            locks.insert(id, Arc::new(Semaphore::new(new_cap)));
+        }
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("设置并发覆盖后持久化失败（已生效，仅未落盘）: {}", e);
+        }
+        tracing::info!("凭据 #{} 并发上限已设为 {}", id, new_cap);
         Ok(())
     }
 

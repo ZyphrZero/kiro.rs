@@ -708,6 +708,13 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
+    /// 设置单账号并发覆盖（None = 清除，回退全局值）
+    pub fn set_concurrency(&self, id: u64, value: Option<usize>) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_credential_concurrency(id, value)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
     /// 重置失败计数并重新启用
     pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
@@ -1041,6 +1048,7 @@ impl AdminService {
             issuer_url: req.issuer_url,
             scopes: req.scopes,
             priority: req.priority,
+            max_concurrency: None,
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,

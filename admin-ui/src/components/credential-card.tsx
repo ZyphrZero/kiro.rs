@@ -44,6 +44,7 @@ import { maskProxyUrl, extractErrorMessage, overageFailureMessage } from "@/lib/
 import {
   useSetDisabled,
   useSetPriority,
+  useSetConcurrency,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
@@ -85,6 +86,43 @@ function formatLastUsed(lastUsedAt: string | null): string {
   const h = Math.floor(m / 60);
   if (h < 24) return `${h} 小时前`;
   return `${Math.floor(h / 24)} 天前`;
+}
+
+/** 在途请求年龄（秒）格式化 */
+function formatAgeSecs(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return s > 0 ? `${m}m${s}s` : `${m}m`;
+}
+
+/** 耗时 EWMA（毫秒）格式化 */
+function formatEwmaMs(ms: number): string {
+  if (ms <= 0) return "—";
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+/** 调度信息小项（label 上、value 下，紧凑展示） */
+function SchedStat({
+  label,
+  value,
+  danger,
+}: {
+  label: string;
+  value: string;
+  danger?: boolean;
+}) {
+  return (
+    <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:flex-col min-[420px]:items-start min-[420px]:gap-0.5">
+      <dt className="shrink-0 text-muted-foreground">{label}</dt>
+      <dd
+        className={`font-semibold tabular-nums ${danger ? "text-destructive" : ""}`}
+      >
+        {value}
+      </dd>
+    </div>
+  );
 }
 
 function formatNumber(n: number): string {
@@ -207,9 +245,16 @@ export function CredentialCard({
   const [showReloginDialog, setShowReloginDialog] = useState(false);
   const [showFailuresDialog, setShowFailuresDialog] = useState(false);
   const [showModelsDialog, setShowModelsDialog] = useState(false);
+  const [editingConc, setEditingConc] = useState(false);
+  const [concValue, setConcValue] = useState(
+    credential.maxConcurrencyOverride != null
+      ? String(credential.maxConcurrencyOverride)
+      : "",
+  );
 
   const setDisabled = useSetDisabled();
   const setPriority = useSetPriority();
+  const setConcurrency = useSetConcurrency();
   const resetFailure = useResetFailure();
   const deleteCredential = useDeleteCredential();
   const forceRefresh = useForceRefreshToken();
@@ -303,6 +348,26 @@ export function CredentialCard({
         onSuccess: (res) => {
           toast.success(res.message);
           setEditingPriority(false);
+        },
+        onError: (err) => toast.error("操作失败: " + (err as Error).message),
+      },
+    );
+  };
+
+  const handleConcurrencyChange = () => {
+    const trimmed = concValue.trim();
+    // 空 = 清除覆盖（回退全局）
+    const val = trimmed === "" ? null : parseInt(trimmed, 10);
+    if (val !== null && (isNaN(val) || val < 0)) {
+      toast.error("并发上限必须是非负整数（留空为清除覆盖）");
+      return;
+    }
+    setConcurrency.mutate(
+      { id: credential.id, maxConcurrency: val },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message);
+          setEditingConc(false);
         },
         onError: (err) => toast.error("操作失败: " + (err as Error).message),
       },
@@ -979,6 +1044,85 @@ export function CredentialCard({
               </div>
             )}
           </dl>
+
+          {/* 调度信息面板：实时在途 / 并发上限(可覆盖) / 错误率 / 耗时 / 最老在途 / 总调度 */}
+          <div className="rounded-xl border border-border/60 bg-secondary/30 p-3 sm:p-4">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                调度
+              </span>
+              {credential.oldestInFlightSecs != null && (
+                <span className="text-[11px] text-muted-foreground">
+                  最老在途 {formatAgeSecs(credential.oldestInFlightSecs)}
+                </span>
+              )}
+            </div>
+            <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm min-[420px]:grid-cols-3">
+              <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-1 min-[420px]:flex-col min-[420px]:items-start min-[420px]:gap-0.5">
+                <dt className="shrink-0 text-muted-foreground">当前并发</dt>
+                <dd className="font-semibold tabular-nums">
+                  <span
+                    className={
+                      (credential.inFlight ?? 0) >= (credential.maxConcurrency ?? 1)
+                        ? "text-amber-600 dark:text-amber-400"
+                        : ""
+                    }
+                  >
+                    {credential.inFlight ?? 0}
+                  </span>
+                  <span className="text-muted-foreground/60"> / </span>
+                  {editingConc ? (
+                    <input
+                      autoFocus
+                      type="number"
+                      min={0}
+                      value={concValue}
+                      onChange={(e) => setConcValue(e.target.value)}
+                      onBlur={handleConcurrencyChange}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") handleConcurrencyChange();
+                        if (e.key === "Escape") {
+                          setConcValue(
+                            credential.maxConcurrencyOverride != null
+                              ? String(credential.maxConcurrencyOverride)
+                              : "",
+                          );
+                          setEditingConc(false);
+                        }
+                      }}
+                      placeholder="全局"
+                      className="w-16 rounded border border-input bg-background px-1 py-0.5 text-sm tabular-nums"
+                    />
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setEditingConc(true)}
+                      className="cursor-pointer rounded px-1 tabular-nums transition-colors hover:bg-accent hover:text-primary"
+                      title="点击编辑该账号并发上限（留空=用全局值）"
+                    >
+                      {credential.maxConcurrency ?? "—"}
+                      {credential.maxConcurrencyOverride != null && (
+                        <span className="ml-0.5 text-[10px] text-primary">覆盖</span>
+                      )}
+                    </button>
+                  )}
+                </dd>
+              </div>
+              <SchedStat
+                label="近期错误率"
+                value={`${credential.recentErrorRate ?? 0}%`}
+                danger={(credential.recentErrorRate ?? 0) >= 20}
+              />
+              <SchedStat
+                label="耗时"
+                value={formatEwmaMs(credential.ewmaDurationMs ?? 0)}
+              />
+              <SchedStat
+                label="总调度"
+                value={String(credential.totalScheduled ?? 0)}
+              />
+            </dl>
+          </div>
 
           {/* 余额面板 */}
           <div

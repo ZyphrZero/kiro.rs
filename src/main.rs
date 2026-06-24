@@ -5,8 +5,8 @@ mod common;
 mod http_client;
 mod image_resize;
 mod kiro;
-mod text_truncate;
 mod model;
+mod text_truncate;
 pub mod token;
 
 use std::collections::HashMap;

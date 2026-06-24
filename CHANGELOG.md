@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.10] - 2026-06-24
+
+主题：**账号卡片调度可观测性 + 单账号并发覆盖**。账号卡片新增"调度"信息面板，实时展示每账号的当前在途并发(N/上限)、近期错误率、耗时 EWMA、最老在途请求年龄、累计调度次数，方便直观判断各账号的调度负载与健康度；并支持给单个账号设置独立于全局的并发上限（点击"当前并发"的上限数字即可编辑，留空回退全局值）。
+
+### ✨ 新功能 — 卡片调度展示
+
+- **按凭据运行时指标**：`MultiTokenManager` 新增进程内 `CredMetrics`，跟踪每账号的累计调度次数、耗时 EWMA(α=0.3)、近期错误率 EWMA、在途请求集合(用于最老在途年龄)。通过 `CallContext` 的 Drop 结算耗时、acquire 时登记在途、`report_success/failure` 喂错误率样本。
+- **快照暴露**：`CredentialEntrySnapshot` 新增 `inFlight`、`maxConcurrency`(有效值)、`maxConcurrencyOverride`、`recentErrorRate`、`ewmaDurationMs`、`oldestInFlightSecs`、`totalScheduled`。
+- **前端卡片**：新增"调度"面板展示上述指标；当前并发达到上限时高亮提示。
+
+### ✨ 新功能 — 单账号并发覆盖
+
+- `KiroCredentials` 新增持久化字段 `maxConcurrency`(可选)；调度信号量按"凭据级覆盖 ?? 全局值"创建。
+- 新增 Admin API `POST /credentials/{id}/concurrency`(maxConcurrency=null/0 清除覆盖)与 `set_credential_concurrency`，运行时重建该账号信号量即时生效。
+- 前端卡片支持点击编辑单账号并发上限。
+
+### 🐛 修复
+
+- 修复调度热路径潜在重入死锁：`ranked_available_credentials` 持有 `entries` 锁时计算在途数不再二次锁 `entries`（容量改由调用方传入）。
+
 ## [0.6.9] - 2026-06-24
 
 主题：**单账号请求速率超限（429 `USER_REQUEST_RATE_EXCEEDED`）快速切换账号**。基于线上 trace 分析发现：高并发下 72% 的失败是 per-user 速率超限 429，而原逻辑把它当作通用瞬态错误重试——重试时 `acquire_context` 按在途数排序、并不排除刚超限的账号，常把同一账号重复选中（实测平均重试 4 次、每次空占并发槽约 26s 后仍失败），白白浪费重试预算与稀缺并发槽，同时其它有速率余量的账号闲置。本版新增对该 429 的精确识别与短冷却切换：命中后对该账号施加 `rateLimitCooldownSecs`（默认 5s）短冷却并立即切换到其它账号，速率窗口恢复后该账号自动重新参与调度。

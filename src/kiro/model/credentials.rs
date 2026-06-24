@@ -79,6 +79,11 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "is_zero")]
     pub priority: u32,
 
+    /// 单账号并发覆盖（None = 用全局 accountMaxConcurrency；Some(n) = 该账号专属并发上限）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<usize>,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -517,6 +522,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 0,
+            max_concurrency: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -735,6 +741,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 0,
+            max_concurrency: None,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
@@ -773,6 +780,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 0,
+            max_concurrency: None,
             region: None,
             auth_region: None,
             api_region: None,
@@ -894,6 +902,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 3,
+            max_concurrency: None,
             region: Some("us-west-2".to_string()),
             auth_region: None,
             api_region: None,
