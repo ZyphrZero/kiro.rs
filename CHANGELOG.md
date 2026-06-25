@@ -4,6 +4,39 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.17] - 2026-06-25
+
+主题：**工具调用三连修 —— 参数类型还原 + tool_use/tool_result 邻接校验 + SSE 不压缩（Caddy）**。
+
+### 🐛 修复 — Invalid tool parameters（工具参数被全字符串化）
+
+- `<invoke>` 文本回收路径 `parse_invoke_block` 此前把**每个参数值无条件塞成字符串**：
+  `{"offset":50}` → `{"offset":"50"}`、`true` → `"true"`、`[1,2,3]` → `"[1,2,3]"`。
+  客户端（Claude Code）拿自己的原始 schema 本地校验时类型不符 → "Invalid tool parameters"。
+- 修复：新增 `coerce_param_value` 启发式——值当 JSON 解析，仅当是 number/bool/null/array/object
+  时按类型还原；裸字符串、前导零编号（`007`）、带引号字面量、路径、多行文本一律保留为字符串，
+  保守取舍只在"明确非字符串结构"时改类型，最大还原而不误伤。仅影响文本泄漏回收路径，
+  结构化 `toolUseEvent` 路径本就保真、不受影响。
+
+### 🐛 修复 — TOOL_USE_RESULT_MISMATCH 400（tool_result 结果非邻接）
+
+- Bedrock 要求每个 `tool_use` 的 `tool_result` 必须在**紧邻的下一条 user 消息**里。原
+  `validate_tool_pairing` 用 flat-set 只看"历史里是否存在该结果"，会漏掉"中间夹了纯文本轮
+  等导致结果非邻接"的情况 → 上游报 `tool_use ids were found without tool_result blocks
+  immediately after` 400（生产日志高频成对出现）。
+- 修复：新增 `remove_non_adjacent_tool_uses` 位置校验——遍历 history，移除"结果不在紧邻
+  下一条 user 消息"的 `tool_use`。history 末尾 assistant 的 tool_use 结果通常在**当前消息**
+  里（assistant 调工具→当前 user 返回结果的常规流），故把当前消息的 tool_result id 作为
+  "末尾之后的下一条"参与配对，避免误删合法 tool_use。
+
+### 🐛 修复 — ZstdDecompressionError（Caddy 压缩 SSE 流）
+
+- 生产 Caddy `encode zstd gzip` 把 `text/event-stream` 也压缩，Claude Code 解流式 zstd 帧
+  失败 → 客户端 `ZstdDecompressionError`、流中断重试（生产日志 3084 条 SSE 带
+  `Content-Encoding: zstd`）。属基础设施层，不在 Rust 代码内。
+- 修复方案与应用/回退步骤见 `docs/caddy-sse-no-compress.md`：`encode` 加
+  `match { not header Content-Type text/event-stream* }`，SSE 不压缩、其余仍压缩。
+
 ## [0.6.16] - 2026-06-25
 
 主题：**账号级临时封锁（403 temporarily suspended）按长冷却处理 + 池空报错说人话**。

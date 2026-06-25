@@ -378,7 +378,7 @@ fn parse_invoke_block(block: &str) -> Option<(String, String)> {
             None => break, // 值未闭合，停止
         };
         let value = &body[val_start..close_start];
-        map.insert(key, serde_json::Value::String(value.to_string()));
+        map.insert(key, coerce_param_value(value));
         // 推进到闭标签之后
         cursor = close_end;
     }
@@ -386,6 +386,35 @@ fn parse_invoke_block(block: &str) -> Option<(String, String)> {
     let obj = serde_json::Value::Object(map);
     let s = serde_json::to_string(&obj).ok()?;
     Some((tool_name, s))
+}
+
+/// 把 `<parameter>` 文本值还原成最贴近原始类型的 JSON 值。
+///
+/// `<invoke>` 文本格式不携带类型信息，参数值天然是字符串。但工具 schema 里参数常是
+/// number/boolean/array/object——若一律塞成字符串(旧行为)，客户端(如 Claude Code)拿
+/// 自己的原始 schema 本地校验时会因类型不符报 "Invalid tool parameters"。
+///
+/// 启发式：把值当 JSON 解析，仅当解析出的是 number/bool/array/object/null 时采用其类型；
+/// 其余(包括解析失败、或解析出的恰是 JSON 字符串字面量)一律保留为原始字符串，避免把本就
+/// 该是字符串的值(如 `"123"` 这种语义上的字符串、含前导零的编号)误转。保守取舍：只在
+/// "明确是非字符串结构"时改类型，最大限度还原而不误伤。
+fn coerce_param_value(raw: &str) -> serde_json::Value {
+    let trimmed = raw.trim();
+    // 只对看起来像 JSON 非字符串字面量的值尝试解析：数字/true/false/null/数组/对象。
+    // 不处理裸字符串(无引号)——它们就是字符串；也不把带引号的 JSON 字符串解开，
+    // 以免改变语义。
+    let looks_typed = matches!(
+        trimmed.as_bytes().first(),
+        Some(b'{' | b'[' | b'-' | b'0'..=b'9')
+    ) || matches!(trimmed, "true" | "false" | "null");
+    if looks_typed {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if !v.is_string() {
+                return v;
+            }
+        }
+    }
+    serde_json::Value::String(raw.to_string())
 }
 
 /// 从 `from` 开始查找第一个 parameter 闭标签，返回 (起始位置, 结束位置 exclusive)
@@ -3184,6 +3213,72 @@ mod tests {
     }
 
     #[test]
+    fn test_coerce_param_value_restores_types() {
+        // number / bool / null / array / object 应还原为对应 JSON 类型
+        assert_eq!(coerce_param_value("50"), serde_json::json!(50));
+        assert_eq!(coerce_param_value("-3"), serde_json::json!(-3));
+        assert_eq!(coerce_param_value("1.5"), serde_json::json!(1.5));
+        assert_eq!(coerce_param_value("true"), serde_json::json!(true));
+        assert_eq!(coerce_param_value("false"), serde_json::json!(false));
+        assert_eq!(coerce_param_value("null"), serde_json::Value::Null);
+        assert_eq!(coerce_param_value("[1,2,3]"), serde_json::json!([1, 2, 3]));
+        assert_eq!(
+            coerce_param_value(r#"{"a":1}"#),
+            serde_json::json!({"a":1})
+        );
+        // 前后空白容忍
+        assert_eq!(coerce_param_value("  42  "), serde_json::json!(42));
+    }
+
+    #[test]
+    fn test_coerce_param_value_keeps_strings() {
+        // 裸字符串、含前导零的编号、路径、像 JSON 字符串字面量的值 → 保留为字符串
+        assert_eq!(
+            coerce_param_value("hello"),
+            serde_json::json!("hello")
+        );
+        assert_eq!(
+            coerce_param_value("/tmp/file.txt"),
+            serde_json::json!("/tmp/file.txt")
+        );
+        // 前导零编号：语义是字符串，不能转成数字 7
+        assert_eq!(coerce_param_value("007"), serde_json::json!("007"));
+        // 带引号的 JSON 字符串字面量：保留原样(不解开)，避免改变语义
+        assert_eq!(
+            coerce_param_value("\"quoted\""),
+            serde_json::json!("\"quoted\"")
+        );
+        // 多行中文文本不应被误判
+        assert_eq!(
+            coerce_param_value("第一行\n第二行"),
+            serde_json::json!("第一行\n第二行")
+        );
+    }
+
+    #[test]
+    fn test_invoke_block_numeric_param_not_stringified() {
+        // 端到端：invoke 文本里的 number 参数应在合成的 tool_use input 里是数字而非字符串
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let chunk = "<invoke name=\"write_file\"><parameter name=\"offset\">50</parameter><parameter name=\"enabled\">true</parameter></invoke>";
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(chunk));
+        all.extend(ctx.generate_final_events());
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 1, "应合成 1 个 tool_use: {:?}", tools);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&tools[0].1).expect("input 应为合法 JSON");
+        assert_eq!(parsed["offset"], serde_json::json!(50), "offset 应是数字");
+        assert_eq!(parsed["enabled"], serde_json::json!(true), "enabled 应是布尔");
+    }
+
+    #[test]
     fn test_invoke_sniff_two_invokes_sequential() {
         // 🟢 2 个 invoke 串联 → 2 个 tool_use
         let mut ctx = StreamContext::new_with_thinking(
@@ -4140,8 +4235,9 @@ mod tests {
         let a: serde_json::Value = serde_json::from_str(&tools[0].1).expect("合法 JSON");
         let b: serde_json::Value = serde_json::from_str(&tools[1].1).expect("合法 JSON");
         assert!(a.get("y").is_none(), "B 的参数 y 不应串进 A: {a:?}");
-        assert_eq!(a["x"], "1");
-        assert_eq!(b["y"], "2");
+        // 纯数字参数现按类型还原为 number（修复 Invalid tool parameters）
+        assert_eq!(a["x"], serde_json::json!(1));
+        assert_eq!(b["y"], serde_json::json!(2));
     }
 
     /// 🟢 正常连发 burst（块紧贴、A 以 </parameter> 收尾）仍应正确拆成两个。
@@ -4198,7 +4294,11 @@ mod tests {
             "cmd 参数应完整保留: {:?}",
             parsed
         );
-        assert_eq!(parsed["yield_time_ms"], "60000", "yield_time_ms 参数应保留");
+        assert_eq!(
+            parsed["yield_time_ms"],
+            serde_json::json!(60000),
+            "yield_time_ms 数字参数应按类型还原为 number"
+        );
         // 关键：字面 <invoke> 不应泄漏到 text
         let text = collect_text_content(&all);
         assert!(
