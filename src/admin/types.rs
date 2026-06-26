@@ -770,12 +770,6 @@ pub struct ClientKeyItem {
     pub total_cache_creation_tokens: u64,
     pub total_cache_read_tokens: u64,
     pub cache_enabled: bool,
-    /// History Cap 三态：None=随全局默认；Some(true/false)=强制开/关。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub history_cap: Option<bool>,
-    /// Fast Mode 三态：None=随全局默认；Some(true/false)=强制开/关。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fast_mode: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
@@ -802,12 +796,6 @@ pub struct CreateClientKeyRequest {
     pub group: Option<String>,
     #[serde(default = "default_client_key_cache_enabled")]
     pub cache_enabled: bool,
-    /// History Cap 三态。省略=随全局默认。
-    #[serde(default)]
-    pub history_cap: Option<bool>,
-    /// Fast Mode 三态。省略=随全局默认。
-    #[serde(default)]
-    pub fast_mode: Option<bool>,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -830,24 +818,6 @@ pub struct UpdateClientKeyRequest {
     pub group: Option<String>,
     #[serde(default)]
     pub cache_enabled: Option<bool>,
-    /// History Cap 更新（三态 × 是否变更）：
-    /// 字段缺省 → None（不变更）；显式 `null` → Some(None)（改为随全局）；
-    /// `true`/`false` → Some(Some(v))（强制开/关）。
-    #[serde(default, deserialize_with = "deserialize_some")]
-    pub history_cap: Option<Option<bool>>,
-    /// Fast Mode 更新（三态 × 是否变更），语义同 history_cap。
-    #[serde(default, deserialize_with = "deserialize_some")]
-    pub fast_mode: Option<Option<bool>>,
-}
-
-/// serde 辅助：区分「字段缺省」与「字段显式为 null」。
-/// 缺省时 serde 用 `default`（→ None）；字段存在（含 null）则进入此函数返回 `Some(..)`。
-fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    T: serde::Deserialize<'de>,
-    D: serde::Deserializer<'de>,
-{
-    T::deserialize(deserializer).map(Some)
 }
 
 fn default_client_key_cache_enabled() -> bool {

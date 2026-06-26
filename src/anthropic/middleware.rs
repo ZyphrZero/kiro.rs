@@ -28,10 +28,6 @@ pub struct KeyContext {
     pub group: Option<String>,
     /// 是否为该入口 Key 启用中转层 prompt cache。
     pub cache_enabled: bool,
-    /// 是否为该入口 Key 启用历史上限（已结合 per-key 三态覆盖与全局默认的最终判定）。
-    pub history_cap_enabled: bool,
-    /// 是否为该入口 Key 启用快速模式（已结合 per-key 三态覆盖与全局默认的最终判定）。
-    pub fast_mode_enabled: bool,
     /// 命中的入口 Key 类型。
     pub key_source: TraceKeySource,
 }
@@ -54,69 +50,9 @@ pub struct AppState {
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
-    /// 历史上限全局配置。`enabled` 是全局默认；per-key 三态可覆盖。
-    pub history_cap: HistoryCapState,
-    /// 快速模式全局配置快照（来自 config.fast_mode_*）。
-    pub fast_mode: FastModeState,
-}
-
-/// AppState 内的快速模式配置快照。
-#[derive(Clone, Copy, Debug)]
-pub struct FastModeState {
-    /// 全局默认开关（per-key `fastMode` 为 None 时采用）。
-    pub default_enabled: bool,
-    /// 快速模式下历史裁剪的字节预算（比普通 cap 更激进）。
-    pub history_cap_max_bytes: usize,
-}
-
-impl Default for FastModeState {
-    fn default() -> Self {
-        Self {
-            default_enabled: false,
-            history_cap_max_bytes: 400_000,
-        }
-    }
-}
-
-impl FastModeState {
-    /// 快速模式下的历史裁剪配置（更激进预算，head 保留 1 轮）。
-    pub fn to_cap_config(self) -> super::converter::HistoryCapConfig {
-        super::converter::HistoryCapConfig {
-            max_bytes: self.history_cap_max_bytes,
-            head_turns: 1,
-        }
-    }
-}
-
-/// AppState 内的历史上限配置快照（来自 config.history_cap_*）。
-#[derive(Clone, Copy, Debug)]
-pub struct HistoryCapState {
-    /// 全局默认开关（per-key `historyCap` 为 None 时采用）。
-    pub default_enabled: bool,
-    /// 字节预算上限。
-    pub max_bytes: usize,
-    /// 始终保留的头部条数。
-    pub head_turns: usize,
-}
-
-impl Default for HistoryCapState {
-    fn default() -> Self {
-        Self {
-            default_enabled: false,
-            max_bytes: 900_000,
-            head_turns: 1,
-        }
-    }
-}
-
-impl HistoryCapState {
-    /// 转换为转换器侧的运行时配置。
-    pub fn to_cap_config(self) -> super::converter::HistoryCapConfig {
-        super::converter::HistoryCapConfig {
-            max_bytes: self.max_bytes,
-            head_turns: self.head_turns,
-        }
-    }
+    /// `/cc/v1` usage-gated streaming 开关（来自 config.usage_gated_streaming_enabled）。
+    /// true（默认）= 首包优化；false = 回退全缓冲。
+    pub usage_gated_streaming: bool,
 }
 
 impl AppState {
@@ -131,8 +67,7 @@ impl AppState {
             usage_aggregator: None,
             cache_meter: None,
             trace_store: None,
-            history_cap: HistoryCapState::default(),
-            fast_mode: FastModeState::default(),
+            usage_gated_streaming: true,
         }
     }
 
@@ -142,15 +77,9 @@ impl AppState {
         self
     }
 
-    /// 注入历史上限全局配置
-    pub fn with_history_cap(mut self, cap: HistoryCapState) -> Self {
-        self.history_cap = cap;
-        self
-    }
-
-    /// 注入快速模式全局配置
-    pub fn with_fast_mode(mut self, fm: FastModeState) -> Self {
-        self.fast_mode = fm;
+    /// 注入 `/cc/v1` usage-gated streaming 开关
+    pub fn with_usage_gated_streaming(mut self, enabled: bool) -> Self {
+        self.usage_gated_streaming = enabled;
         self
     }
 
@@ -202,19 +131,10 @@ pub async fn auth_middleware(
         if let Some(id) = mgr.verify_and_touch(&presented) {
             let group = mgr.group_of(id);
             let cache_enabled = mgr.cache_enabled_of(id);
-            // 三态解析：per-key 覆盖优先，否则随全局默认。
-            let history_cap_enabled = mgr
-                .history_cap_of(id)
-                .unwrap_or(state.history_cap.default_enabled);
-            let fast_mode_enabled = mgr
-                .fast_mode_of(id)
-                .unwrap_or(state.fast_mode.default_enabled);
             request.extensions_mut().insert(KeyContext {
                 key_id: id,
                 group,
                 cache_enabled,
-                history_cap_enabled,
-                fast_mode_enabled,
                 key_source: TraceKeySource::ClientKey,
             });
             return next.run(request).await;

@@ -396,10 +396,6 @@ export interface ClientKeyItem {
   totalCacheReadTokens: number
   /** 是否启用中转层 prompt cache */
   cacheEnabled: boolean
-  /** 历史上限三态：undefined=随全局默认；true/false=强制开/关 */
-  historyCap?: boolean
-  /** 快速模式三态：undefined=随全局默认；true/false=强制开/关 */
-  fastMode?: boolean
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
   /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
@@ -416,10 +412,6 @@ export interface CreateClientKeyRequest {
   description?: string
   group?: string
   cacheEnabled?: boolean
-  /** 历史上限三态：省略=随全局默认；true/false=强制开/关 */
-  historyCap?: boolean | null
-  /** 快速模式三态：省略=随全局默认；true/false=强制开/关 */
-  fastMode?: boolean | null
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -435,10 +427,6 @@ export interface UpdateClientKeyRequest {
   description?: string
   group?: string
   cacheEnabled?: boolean
-  /** 历史上限三态更新：省略=不变更；null=改为随全局；true/false=强制开/关 */
-  historyCap?: boolean | null
-  /** 快速模式三态更新：语义同 historyCap */
-  fastMode?: boolean | null
 }
 
 // ============ 用量统计 ============
@@ -559,6 +547,18 @@ export interface TraceRecord {
   localInputTokens?: number
   /** 上游 contextUsage 折算输入 token（无 contextUsageEvent 时为 null） */
   contextInputTokens?: number | null
+  /** 等待账号并发槽耗时（毫秒）：高并发排队的直接度量 */
+  credentialWaitMs?: number | null
+  /** Anthropic→Kiro 转换 + 序列化耗时（毫秒，本地 CPU 开销） */
+  conversionMs?: number | null
+  /** 本地 count_all_tokens 估算耗时（毫秒） */
+  tokenCountMs?: number | null
+  /** 下游首个内容事件延迟（毫秒）：客户端真正"开始吐字"的时刻 */
+  downstreamFirstEventMs?: number | null
+  /** 中转层缓冲拖慢（毫秒）= downstreamFirstEventMs − firstTokenMs；/cc 全缓冲时显著 */
+  bufferingDelayMs?: number | null
+  /** 最终命中端点名（ide / cli） */
+  endpoint?: string | null
   attempts: TraceAttempt[]
 }
 

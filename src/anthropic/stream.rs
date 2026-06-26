@@ -2316,7 +2316,164 @@ impl BufferedStreamContext {
     }
 }
 
-/// 简单的 token 估算（中英文字符混合）
+/// usage-gated 流式上下文（A1：`/cc/v1` 首包优化）。
+///
+/// 与 [`BufferedStreamContext`]（全缓冲，等整条上游流结束才一次性发）不同：本上下文只
+/// 缓冲到**能确定 `message_start.usage.input_tokens` 的那一刻**就放闸（"开门"），之后边收
+/// 边发。放闸触发条件二选一（先到先放）：
+/// 1. 收到 `contextUsageEvent`（`inner.context_input_tokens` 变 `Some`）——拿到上游折算口径；
+/// 2. 出现首个**可见内容**事件（content_block_start/delta/stop）而 contextUsage 仍未到——
+///    用本地 fallback 估算开门，避免无限等待。
+///
+/// 不变量：`message_start` 一旦发出，其 `input_tokens` 不可再改（与 Anthropic 语义一致，
+/// 最终值由 `message_delta.usage` 兜底）；放闸时按 [`StreamContext::resolved_usage`] 口径
+/// 回填 `message_start` 的 usage；事件顺序与全缓冲完全一致（thinking 块在 text 前、
+/// tool_use 块序不变），仅改变"何时把字节发出去"。
+pub struct GatedStreamContext {
+    /// 内部流处理上下文（复用 [`StreamContext`] 的全部事件转换逻辑）
+    inner: StreamContext,
+    /// 放闸前缓冲的事件（含 message_start 及其后、首个可见内容前的所有事件）
+    pre_gate_buffer: Vec<SseEvent>,
+    /// 是否已放闸（true 后所有事件立即透传）
+    gate_open: bool,
+    /// 是否已生成初始事件（message_start 等）
+    initial_events_generated: bool,
+}
+
+impl GatedStreamContext {
+    /// 创建 gated 流上下文
+    pub fn new(
+        model: impl Into<String>,
+        estimated_input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+        known_tool_names: std::collections::HashSet<String>,
+    ) -> Self {
+        let inner = StreamContext::new_with_thinking(
+            model,
+            estimated_input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            known_tool_names,
+        );
+        Self {
+            inner,
+            pre_gate_buffer: Vec::new(),
+            gate_open: false,
+            initial_events_generated: false,
+        }
+    }
+
+    /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），放闸时按真值分摊。
+    pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
+        self.inner.cache_usage = cache_usage;
+    }
+
+    /// 判断一个 SSE 事件是否为"可见内容"（客户端真正看到模型在吐字）。
+    /// message_start / ping / message_delta / message_stop 不算——它们不触发放闸。
+    fn is_visible_content_event(ev: &SseEvent) -> bool {
+        matches!(
+            ev.event.as_str(),
+            "content_block_start" | "content_block_delta" | "content_block_stop"
+        )
+    }
+
+    /// 喂入一个上游事件，返回**本次应立即发往客户端**的 SSE 事件。
+    ///
+    /// 放闸前：缓冲所有产物，返回空（客户端此期间只收到 ping 保活）。
+    /// 放闸瞬间：返回 `[回填后的 message_start, ...缓冲事件, ...本次新事件]`。
+    /// 放闸后：直接返回本次新事件（边收边发）。
+    pub fn feed_event(&mut self, event: &crate::kiro::model::events::Event) -> Vec<SseEvent> {
+        // 首次喂入：先生成初始事件（message_start 等），但不立即发——压入缓冲，等放闸。
+        if !self.initial_events_generated {
+            let initial = self.inner.generate_initial_events();
+            self.pre_gate_buffer.extend(initial);
+            self.initial_events_generated = true;
+        }
+
+        // 处理事件（复用 StreamContext 逻辑）。处理 contextUsageEvent 时 inner 会把
+        // context_input_tokens 置为 Some，这正是放闸触发条件之一。
+        let produced = self.inner.process_kiro_event(event);
+
+        if self.gate_open {
+            // 已放闸：直接透传。
+            return produced;
+        }
+
+        // 放闸条件①：contextUsage 已折算出 input_tokens。
+        let context_resolved = self.inner.context_input_tokens.is_some();
+        // 放闸条件②：出现首个可见内容事件（contextUsage 尚未到，用 fallback 开门）。
+        let has_visible = produced.iter().any(Self::is_visible_content_event);
+
+        if context_resolved || has_visible {
+            self.open_gate(produced)
+        } else {
+            // 仍在缓冲窗口：把本次产物压入缓冲，客户端本轮无可见数据。
+            self.pre_gate_buffer.extend(produced);
+            Vec::new()
+        }
+    }
+
+    /// 放闸：回填 message_start 的 usage，吐出 `[message_start, ...缓冲, ...本次新事件]`。
+    /// `current_events` 为触发放闸的那一批新事件（拼在缓冲之后，保持原始顺序）。
+    fn open_gate(&mut self, current_events: Vec<SseEvent>) -> Vec<SseEvent> {
+        // 互斥口径分摊：total 真值 − 缓存覆盖 = 未缓存 input（与 inner 收尾一致）。
+        let (final_input_tokens, cache_creation, cache_read) = self.inner.resolved_usage();
+        for event in &mut self.pre_gate_buffer {
+            if event.event == "message_start" {
+                if let Some(message) = event.data.get_mut("message") {
+                    if let Some(usage) = message.get_mut("usage") {
+                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
+                        usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
+                    }
+                }
+            }
+        }
+        self.gate_open = true;
+        let mut out = std::mem::take(&mut self.pre_gate_buffer);
+        out.extend(current_events);
+        out
+    }
+
+    /// 上游流结束：生成最终事件（message_delta / message_stop）并吐出全部剩余。
+    /// 若从未放闸（如空流 / 纯 contextUsage 后即结束），先放闸把缓冲与 message_start 发出。
+    pub fn finish(&mut self) -> Vec<SseEvent> {
+        // 从未喂过任何事件也要生成 message_start。
+        if !self.initial_events_generated {
+            let initial = self.inner.generate_initial_events();
+            self.pre_gate_buffer.extend(initial);
+            self.initial_events_generated = true;
+        }
+        let final_events = self.inner.generate_final_events();
+        if self.gate_open {
+            // 已放闸：缓冲早已清空，直接返回收尾事件。
+            final_events
+        } else {
+            // 未放闸：先放闸吐出 message_start + 缓冲，再接收尾事件。
+            self.open_gate(final_events)
+        }
+    }
+
+    /// 取最终用量（在 finish 之后调用）。
+    /// 返回 (input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits)。
+    pub fn final_usage(&self) -> (i32, i32, i32, i32, f64) {
+        let (input, creation, read) = self.inner.resolved_usage();
+        (
+            input,
+            self.inner.output_tokens,
+            creation,
+            read,
+            self.inner.credits,
+        )
+    }
+
+    /// 上游 contextUsage 折算的输入 token（无 contextUsageEvent 时为 None），用于 trace 落库。
+    pub fn context_input_tokens(&self) -> Option<i32> {
+        self.inner.context_input_tokens
+    }
+}
+
 ///
 /// 公开供 cache_meter 等模块复用同一估算口径。
 pub fn estimate_tokens(text: &str) -> i32 {
@@ -2357,6 +2514,197 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect()
+    }
+
+    // ---- A1: GatedStreamContext usage-gated streaming ----
+
+    /// 收集一组事件喂入 BufferedStreamContext 后的全部输出（含 message_start 回填）。
+    fn run_buffered(events: &[crate::kiro::model::events::Event]) -> Vec<SseEvent> {
+        let mut ctx = BufferedStreamContext::new(
+            "test-model",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        for ev in events {
+            ctx.process_and_buffer(ev);
+        }
+        ctx.finish_and_get_all_events()
+    }
+
+    /// 收集同一组事件喂入 GatedStreamContext（feed_event + finish）的全部输出。
+    fn run_gated(events: &[crate::kiro::model::events::Event]) -> Vec<SseEvent> {
+        let mut ctx = GatedStreamContext::new(
+            "test-model",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let mut out = Vec::new();
+        for ev in events {
+            out.extend(ctx.feed_event(ev));
+        }
+        out.extend(ctx.finish());
+        out
+    }
+
+    fn assistant(content: &str) -> crate::kiro::model::events::Event {
+        use crate::kiro::model::events::AssistantResponseEvent;
+        // 经 JSON 反序列化构造，避开私有 extra 字段，且与真实 wire 路径一致。
+        let ev: AssistantResponseEvent =
+            serde_json::from_value(serde_json::json!({ "content": content })).unwrap();
+        crate::kiro::model::events::Event::AssistantResponse(ev)
+    }
+
+    fn context_usage(pct: f64) -> crate::kiro::model::events::Event {
+        use crate::kiro::model::events::ContextUsageEvent;
+        let ev: ContextUsageEvent =
+            serde_json::from_value(serde_json::json!({ "contextUsagePercentage": pct })).unwrap();
+        crate::kiro::model::events::Event::ContextUsage(ev)
+    }
+
+    /// 把事件序列归一为 (event名, data) 列表，并抹掉随机 message_id（每次不同，非语义）。
+    fn normalize(events: &[SseEvent]) -> Vec<(String, serde_json::Value)> {
+        events
+            .iter()
+            .map(|e| {
+                let mut data = e.data.clone();
+                if e.event == "message_start" {
+                    if let Some(msg) = data.get_mut("message") {
+                        if let Some(obj) = msg.as_object_mut() {
+                            obj.remove("id");
+                        }
+                    }
+                }
+                (e.event.clone(), data)
+            })
+            .collect()
+    }
+
+    /// 取 message_start / message_delta 的 usage.input_tokens（用于口径断言）。
+    fn input_tokens_of(events: &[SseEvent], event_name: &str) -> Option<i64> {
+        let ev = events.iter().find(|e| e.event == event_name)?;
+        let usage = if event_name == "message_start" {
+            ev.data.get("message")?.get("usage")?
+        } else {
+            ev.data.get("usage")?
+        };
+        usage.get("input_tokens")?.as_i64()
+    }
+
+    /// 等价性（contextUsage 在内容前到达，典型情形）：gated 与 buffered 输出**完全一致**
+    /// （抹掉随机 id 后），因为放闸时 contextUsage 已可用，message_start 口径与 buffered 相同。
+    #[test]
+    fn gated_matches_buffered_context_first() {
+        let events = vec![context_usage(15.0), assistant("hello"), assistant(" world")];
+        assert_eq!(
+            normalize(&run_gated(&events)),
+            normalize(&run_buffered(&events)),
+            "contextUsage 先到时 gated 与 buffered 输出必须完全一致"
+        );
+    }
+
+    /// 内容先到、contextUsage 后到（fallback 放闸）：除 message_start.usage.input_tokens
+    /// 外其余事件序列一致；这是 A1 文档约定的取舍——message_start 用"当时已知最佳值"
+    /// （fallback），最终值由 message_delta.usage 兜底（与 buffered 相同）。
+    #[test]
+    fn gated_content_first_defers_final_usage_to_message_delta() {
+        let events = vec![assistant("hi"), context_usage(20.0), assistant(" there")];
+        let gated = run_gated(&events);
+        let buffered = run_buffered(&events);
+
+        // 1) message_start：gated 用 fallback（100），buffered 用已解析真值（40000）。
+        assert_eq!(input_tokens_of(&gated, "message_start"), Some(100));
+        assert!(input_tokens_of(&buffered, "message_start").unwrap() > 100);
+
+        // 2) message_delta（最终口径）：两者必须一致且为解析真值。
+        assert_eq!(
+            input_tokens_of(&gated, "message_delta"),
+            input_tokens_of(&buffered, "message_delta"),
+            "最终 message_delta.usage 必须与 buffered 一致"
+        );
+        assert!(input_tokens_of(&gated, "message_delta").unwrap() > 100);
+
+        // 3) 除 message_start 外的事件序列必须完全一致。
+        let strip_ms = |evs: &[SseEvent]| -> Vec<(String, serde_json::Value)> {
+            normalize(evs).into_iter().filter(|(n, _)| n != "message_start").collect()
+        };
+        assert_eq!(
+            strip_ms(&gated),
+            strip_ms(&buffered),
+            "除 message_start 外，gated 与 buffered 事件序列必须一致"
+        );
+    }
+
+    /// gated 必须在收到 contextUsageEvent 后立即放闸（发出 message_start），
+    /// 不能像 buffered 那样等到流结束。
+    #[test]
+    fn gated_releases_on_context_usage_event() {
+        let mut ctx = GatedStreamContext::new(
+            "test-model",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        // 仅喂 contextUsageEvent：应放闸并发出 message_start（缓冲里那条）。
+        let out = ctx.feed_event(&context_usage(15.0));
+        assert!(
+            out.iter().any(|e| e.event == "message_start"),
+            "收到 contextUsageEvent 后应立即放闸发出 message_start"
+        );
+    }
+
+    /// gated 必须在首个可见内容事件时放闸（即便 contextUsageEvent 尚未到）。
+    #[test]
+    fn gated_releases_on_first_visible_content() {
+        let mut ctx = GatedStreamContext::new(
+            "test-model",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let out = ctx.feed_event(&assistant("first token"));
+        assert!(
+            out.iter().any(|e| e.event == "message_start"),
+            "首个可见内容事件应触发放闸"
+        );
+        assert!(
+            out.iter().any(|e| e.event == "content_block_delta"),
+            "放闸批次应包含内容增量"
+        );
+    }
+
+    /// message_start 的 input_tokens：收到 contextUsageEvent 时应反映折算真值
+    /// （max(context, fallback)），而非仅 fallback。
+    #[test]
+    fn gated_message_start_uses_resolved_input_tokens() {
+        // context 15% × 200000 window = 30000 >> fallback 100，应取 30000。
+        let events = vec![context_usage(15.0), assistant("x")];
+        let gated = run_gated(&events);
+        let ms = gated.iter().find(|e| e.event == "message_start").unwrap();
+        let it = ms.data["message"]["usage"]["input_tokens"].as_i64().unwrap();
+        assert!(
+            it > 100,
+            "message_start.input_tokens 应反映 contextUsage 折算值（得到 {it}）"
+        );
+    }
+
+    /// 空流（无任何事件）：finish 仍须产出合法 message_start + 收尾事件，不 panic。
+    #[test]
+    fn gated_empty_stream_still_emits_message_start() {
+        let gated = run_gated(&[]);
+        assert!(
+            gated.iter().any(|e| e.event == "message_start"),
+            "空流也须发出 message_start"
+        );
+        assert!(
+            gated.iter().any(|e| e.event == "message_stop"),
+            "空流也须发出 message_stop"
+        );
     }
 
     // ---- extract_invoke_content_blocks: one-shot (non-streaming) reclamation ----

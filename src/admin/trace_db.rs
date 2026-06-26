@@ -137,6 +137,27 @@ pub struct TraceRecord {
     /// 与 local_input_tokens 对比可看出上游自报口径与本地真值的差异。
     #[serde(default)]
     pub context_input_tokens: Option<u64>,
+    /// 等待账号并发槽的耗时（毫秒）：从请求 setup 完成到拿到可用凭据。
+    /// 高并发下排队的直接度量——大则说明账号池容量不足或调度倾斜。
+    #[serde(default)]
+    pub credential_wait_ms: Option<u64>,
+    /// Anthropic→Kiro 请求转换 + 序列化耗时（毫秒，本地 CPU 开销）。
+    #[serde(default)]
+    pub conversion_ms: Option<u64>,
+    /// 本地 count_all_tokens 估算耗时（毫秒）。
+    #[serde(default)]
+    pub token_count_ms: Option<u64>,
+    /// 客户端收到首个**内容**事件的延迟（毫秒）：区别于 first_token_ms（上游首字节），
+    /// 这是下游真正"开始吐字"的时刻。/cc 全缓冲模式下远晚于 first_token_ms。
+    #[serde(default)]
+    pub downstream_first_event_ms: Option<u64>,
+    /// 中转层缓冲拖慢（毫秒）= downstream_first_event_ms − first_token_ms（钳到 ≥0）。
+    /// /v1 边收边发 ≈0；/cc 全缓冲 ≈ 整条上游流时长。usage-gated 后应趋近 0。
+    #[serde(default)]
+    pub buffering_delay_ms: Option<u64>,
+    /// 最终命中（或最后尝试）的端点名（ide / cli），便于按端点对比首字节延迟。
+    #[serde(default)]
+    pub endpoint: Option<String>,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
 }
@@ -176,6 +197,10 @@ pub fn truncate_snippet(body: &str) -> Option<String> {
 /// 链路上报接收端：provider 在重试循环里每跳调用 [`Self::on_attempt`]
 pub trait TraceSink: Send + Sync {
     fn on_attempt(&self, attempt: TraceAttempt);
+
+    /// provider 首次成功拿到可用凭据（acquire_context 返回 Ok）时调用，
+    /// 用于度量"等账号并发槽"的耗时。默认空操作，非 trace 实现无需关心。
+    fn on_credential_acquired(&self) {}
 }
 
 /// 查询过滤条件
@@ -325,8 +350,10 @@ impl TraceStore {
              is_stream, final_status, final_credential_id, error_type, error_message, \
              total_attempts, duration_ms, interrupted_after_bytes, \
              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
-             credits, first_token_ms, request_bytes, local_input_tokens, context_input_tokens) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+             credits, first_token_ms, request_bytes, local_input_tokens, context_input_tokens, \
+             credential_wait_ms, conversion_ms, token_count_ms, downstream_first_event_ms, \
+             buffering_delay_ms, endpoint) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)",
             rusqlite::params![
                 rec.trace_id,
                 rec.ts,
@@ -351,6 +378,12 @@ impl TraceStore {
                 rec.request_bytes as i64,
                 rec.local_input_tokens as i64,
                 rec.context_input_tokens.map(|v| v as i64),
+                rec.credential_wait_ms.map(|v| v as i64),
+                rec.conversion_ms.map(|v| v as i64),
+                rec.token_count_ms.map(|v| v as i64),
+                rec.downstream_first_event_ms.map(|v| v as i64),
+                rec.buffering_delay_ms.map(|v| v as i64),
+                rec.endpoint,
             ],
         )?;
         for a in &rec.attempts {
@@ -387,7 +420,7 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 10] = [
+        let columns: [(&str, &str); 16] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -398,6 +431,12 @@ impl TraceStore {
             ("request_bytes", "INTEGER NOT NULL DEFAULT 0"),
             ("local_input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("context_input_tokens", "INTEGER"),
+            ("credential_wait_ms", "INTEGER"),
+            ("conversion_ms", "INTEGER"),
+            ("token_count_ms", "INTEGER"),
+            ("downstream_first_event_ms", "INTEGER"),
+            ("buffering_delay_ms", "INTEGER"),
+            ("endpoint", "TEXT"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
@@ -561,7 +600,9 @@ impl TraceStore {
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, \
-             request_bytes, local_input_tokens, context_input_tokens \
+             request_bytes, local_input_tokens, context_input_tokens, \
+             credential_wait_ms, conversion_ms, token_count_ms, downstream_first_event_ms, \
+             buffering_delay_ms, endpoint \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -591,6 +632,12 @@ impl TraceStore {
                 request_bytes: row.get::<_, i64>(19)? as u64,
                 local_input_tokens: row.get::<_, i64>(20)? as u64,
                 context_input_tokens: row.get::<_, Option<i64>>(21)?.map(|v| v as u64),
+                credential_wait_ms: row.get::<_, Option<i64>>(22)?.map(|v| v as u64),
+                conversion_ms: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
+                token_count_ms: row.get::<_, Option<i64>>(24)?.map(|v| v as u64),
+                downstream_first_event_ms: row.get::<_, Option<i64>>(25)?.map(|v| v as u64),
+                buffering_delay_ms: row.get::<_, Option<i64>>(26)?.map(|v| v as u64),
+                endpoint: row.get::<_, Option<String>>(27)?,
                 attempts: Vec::new(),
             })
         })?;
@@ -770,7 +817,13 @@ CREATE TABLE IF NOT EXISTS traces (
     first_token_ms    INTEGER,
     request_bytes        INTEGER NOT NULL DEFAULT 0,
     local_input_tokens   INTEGER NOT NULL DEFAULT 0,
-    context_input_tokens INTEGER
+    context_input_tokens INTEGER,
+    credential_wait_ms        INTEGER,
+    conversion_ms             INTEGER,
+    token_count_ms            INTEGER,
+    downstream_first_event_ms INTEGER,
+    buffering_delay_ms        INTEGER,
+    endpoint                  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -833,6 +886,12 @@ mod tests {
             request_bytes: 0,
             local_input_tokens: 0,
             context_input_tokens: None,
+            credential_wait_ms: None,
+            conversion_ms: None,
+            token_count_ms: None,
+            downstream_first_event_ms: None,
+            buffering_delay_ms: None,
+            endpoint: None,
             attempts: vec![
                 TraceAttempt {
                     attempt: 0,
@@ -912,6 +971,12 @@ mod tests {
         rec.local_input_tokens = 198_000;
         rec.context_input_tokens = Some(165_000);
         rec.first_token_ms = Some(8_300);
+        rec.credential_wait_ms = Some(120);
+        rec.conversion_ms = Some(7);
+        rec.token_count_ms = Some(3);
+        rec.downstream_first_event_ms = Some(8_450);
+        rec.buffering_delay_ms = Some(150);
+        rec.endpoint = Some("ide".to_string());
         store.insert(&rec);
 
         let out = store.query(&TraceQuery {
@@ -923,6 +988,12 @@ mod tests {
         assert_eq!(out[0].local_input_tokens, 198_000);
         assert_eq!(out[0].context_input_tokens, Some(165_000));
         assert_eq!(out[0].first_token_ms, Some(8_300));
+        assert_eq!(out[0].credential_wait_ms, Some(120));
+        assert_eq!(out[0].conversion_ms, Some(7));
+        assert_eq!(out[0].token_count_ms, Some(3));
+        assert_eq!(out[0].downstream_first_event_ms, Some(8_450));
+        assert_eq!(out[0].buffering_delay_ms, Some(150));
+        assert_eq!(out[0].endpoint.as_deref(), Some("ide"));
     }
 
     #[test]

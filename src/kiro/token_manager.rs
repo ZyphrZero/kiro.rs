@@ -1019,6 +1019,15 @@ impl CredentialCandidate {
         let penalty = (self.ewma_error * ERROR_PENALTY_SCALE as f64) as usize;
         self.load_per_mille().saturating_add(penalty)
     }
+
+    /// 大请求(Long 档,≥128K token)排序用的有效负载 = effective_load + 在途数×惩罚千分比。
+    /// `large_penalty=0` 时与 effective_load 完全等价(普通请求不受影响)。
+    /// 惩罚按在途数缩放,使大请求优先选当前更空闲的账号、避免多个大请求堆到同一账号
+    /// 拖垮其首字节;仅改排序偏好,不改并发上限、不硬阻塞、不破坏 P2C/priority。
+    fn biased_load(&self, large_penalty: usize) -> usize {
+        self.effective_load()
+            .saturating_add(self.in_flight.saturating_mul(large_penalty))
+    }
 }
 
 impl CredentialRuntime {
@@ -1752,6 +1761,7 @@ impl MultiTokenManager {
         &self,
         model: Option<&str>,
         group: Option<&str>,
+        large_penalty: usize,
     ) -> Vec<CredentialCandidate> {
         let now = Instant::now();
         let available_entries: Vec<_> = {
@@ -1797,7 +1807,9 @@ impl MultiTokenManager {
         // balanced 不再以 success_count(单调累计+持久化)作次键——那会让老账号/曾被禁账号
         // 长期垫底,且对生病账号失察。balanced 与 priority 的差异改由 acquire_idle_permit
         // 的 P2C 抽选体现(balanced 随机分散抗羊群,priority 严格按序)。
-        available.sort_by_key(|e| (e.effective_load(), e.priority, e.id));
+        // large_penalty>0(Long 档大请求)时改用 biased_load:在途多的账号进一步降权,
+        // 避免大请求扎堆;普通请求 large_penalty=0,biased_load≡effective_load,行为不变。
+        available.sort_by_key(|e| (e.biased_load(large_penalty), e.priority, e.id));
 
         available
     }
@@ -1828,23 +1840,22 @@ impl MultiTokenManager {
         &self,
         model: Option<&str>,
         group: Option<&str>,
-        fast_mode: bool,
+        large_penalty: usize,
     ) -> anyhow::Result<(u64, KiroCredentials, CredentialLease)> {
         let total = self.total_count_in_group(group).max(1);
-        // 快速模式用短超时(fast_mode_acquire_timeout_ms,默认 800ms)而非
-        // account_acquire_timeout_secs(默认 30s):高峰期所有账号都在 429 冷却/并发满时,
-        // 宁可尽快返回"池忙"让客户端重试,也不让单请求死等数秒——这是打 429 重试链
-        // (实测每成功请求平均吃 1.45 次 429、每次 attempt 阻塞 ~4.3s)的最大杠杆。
-        let wait_timeout = if fast_mode {
-            StdDuration::from_millis(self.config.fast_mode_acquire_timeout_ms.max(50))
-        } else {
-            StdDuration::from_secs(self.config.account_acquire_timeout_secs.max(1))
-        };
+        // 默认非阻塞快速失败:非阻塞 sweep 一圈所有匹配凭据,全忙即返回"池忙",由
+        // provider 的重试链(退避后换 attempt)兜底——这是打 429 重试链(实测每成功
+        // 请求平均吃 1.45 次 429、每次阻塞 ~4.3s)的最大杠杆,避免单请求在高峰期死等数秒。
+        // account_acquire_blocking=true 时回退到旧行为:等待最多
+        // account_acquire_timeout_secs(默认 30s)直到任一账号释放槽位,适用于账号极少、
+        // 宁可排队也不要"池忙"报错的部署。
+        let blocking = self.config.account_acquire_blocking;
+        let wait_timeout = StdDuration::from_secs(self.config.account_acquire_timeout_secs.max(1));
         let started_at = Instant::now();
         let mut logged_busy_wait = false;
 
         'acquire_loop: loop {
-            let mut candidates = self.ranked_available_credentials(model, group);
+            let mut candidates = self.ranked_available_credentials(model, group, large_penalty);
 
             if candidates.is_empty() {
                 let mut entries = self.entries.lock();
@@ -1862,7 +1873,7 @@ impl MultiTokenManager {
                         }
                     }
                     drop(entries);
-                    candidates = self.ranked_available_credentials(model, group);
+                    candidates = self.ranked_available_credentials(model, group, large_penalty);
                 }
             }
 
@@ -1933,6 +1944,11 @@ impl MultiTokenManager {
                 }
             }
 
+            // 非阻塞默认:sweep 一圈全忙,立即返回"池忙",交给 provider 重试链。
+            if !blocking {
+                anyhow::bail!("所有匹配凭据的并发槽都已满（非阻塞快速失败，交由上层重试）");
+            }
+
             let elapsed = started_at.elapsed();
             if elapsed >= wait_timeout {
                 anyhow::bail!(
@@ -2000,7 +2016,20 @@ impl MultiTokenManager {
         &self,
         model: Option<&str>,
         group: Option<&str>,
-        fast_mode: bool,
+    ) -> anyhow::Result<CallContext> {
+        // 默认非大请求(large_penalty=0)，行为与历史完全一致；大请求走 acquire_context_sized。
+        self.acquire_context_sized(model, group, 0).await
+    }
+
+    /// 带大请求排序惩罚的 acquire（A4a）。
+    ///
+    /// `large_penalty`(整数千分比)>0 时,Long 档大请求按命中账号在途数加排序惩罚,
+    /// 避免多个大请求堆到同一账号拖垮其首字节;=0 时与 [`acquire_context`] 等价。
+    pub async fn acquire_context_sized(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        large_penalty: usize,
     ) -> anyhow::Result<CallContext> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
@@ -2015,8 +2044,9 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials, permit) =
-                self.acquire_idle_permit(model, group, fast_mode).await?;
+            let (id, credentials, permit) = self
+                .acquire_idle_permit(model, group, large_penalty)
+                .await?;
 
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials, permit).await {
@@ -2441,6 +2471,20 @@ impl MultiTokenManager {
         if should_flush {
             self.save_stats();
         }
+    }
+
+    /// 全池近期错误率(所有凭据 ewma_error 的均值,0.0~1.0)。
+    ///
+    /// 用于事故熔断:当上游发生全局性故障(如 hr20 事故:QPS 2640、错误率 53.5%、
+    /// 并发 375 > 容量 275)时,全池 ewma_error 会同时飙高。provider 据此对瞬态错误
+    /// 改用更长退避,避免重试风暴把错误率进一步放大。空池返回 0.0(不触发熔断)。
+    pub fn pool_ewma_error(&self) -> f64 {
+        let metrics = self.metrics.lock();
+        if metrics.is_empty() {
+            return 0.0;
+        }
+        let sum: f64 = metrics.values().map(|m| m.ewma_error).sum();
+        sum / metrics.len() as f64
     }
 
     /// 报告指定凭据 API 调用成功
@@ -4080,6 +4124,29 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// A4b 熔断：pool_ewma_error 空池返回 0、有数据返回各凭据 ewma_error 均值。
+    #[test]
+    fn test_pool_ewma_error_average() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        // 空池：返回 0.0，不触发熔断。
+        assert_eq!(manager.pool_ewma_error(), 0.0);
+
+        // 注入两个凭据指标：error 0.6 与 0.2 → 均值 0.4。
+        {
+            let mut metrics = manager.metrics.lock();
+            let mut a = CredMetrics::default();
+            a.ewma_error = 0.6;
+            metrics.insert(1, a);
+            let mut b = CredMetrics::default();
+            b.ewma_error = 0.2;
+            metrics.insert(2, b);
+        }
+        let avg = manager.pool_ewma_error();
+        assert!((avg - 0.4).abs() < 1e-9, "期望均值 0.4，实得 {avg}");
+    }
+
     #[test]
     fn test_is_token_expired_with_expired_token() {
         let mut credentials = KiroCredentials::default();
@@ -4502,7 +4569,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None, None, false).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -4525,7 +4592,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None, None, false).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -4571,7 +4638,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None, None, false)
+            .acquire_context(None, None)
             .await
             .err()
             .unwrap()
@@ -4616,7 +4683,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None, None, false)
+            .acquire_context(None, None)
             .await
             .err()
             .unwrap()
@@ -5270,11 +5337,11 @@ mod tests {
         .unwrap();
 
         // Warm current_id with the highest-priority Free account.
-        let current = manager.acquire_context(None, None, false).await.unwrap();
+        let current = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(current.id, 1);
 
         let opus = manager
-            .acquire_context(Some("claude-opus-4.6"), None, false)
+            .acquire_context(Some("claude-opus-4.6"), None)
             .await
             .unwrap();
         assert_eq!(
@@ -5294,16 +5361,16 @@ mod tests {
         )
         .unwrap();
 
-        let first = manager.acquire_context(None, None, false).await.unwrap();
+        let first = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(first.id, 1);
 
-        let second = manager.acquire_context(None, None, false).await.unwrap();
+        let second = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(
             second.id, 2,
             "account #2 is idle, so it should be preferred over a busy account #1"
         );
 
-        let third = manager.acquire_context(None, None, false).await.unwrap();
+        let third = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(
             third.id, 1,
             "both accounts have one request in flight, so priority order should be used"
@@ -5321,19 +5388,19 @@ mod tests {
             MultiTokenManager::new(Config::default(), vec![small, large], None, None, false)
                 .unwrap();
 
-        let a1 = manager.acquire_context(None, Some("small"), false).await.unwrap();
+        let a1 = manager.acquire_context(None, Some("small")).await.unwrap();
         assert_eq!(a1.id, 1);
-        let a2 = manager.acquire_context(None, Some("small"), false).await.unwrap();
+        let a2 = manager.acquire_context(None, Some("small")).await.unwrap();
         assert_eq!(a2.id, 1);
 
         let mut large_contexts = Vec::new();
         for _ in 0..5 {
-            let ctx = manager.acquire_context(None, Some("large"), false).await.unwrap();
+            let ctx = manager.acquire_context(None, Some("large")).await.unwrap();
             assert_eq!(ctx.id, 2);
             large_contexts.push(ctx);
         }
 
-        let next = manager.acquire_context(None, None, false).await.unwrap();
+        let next = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(
             next.id, 2,
             "small account is 2/2 busy while large is 5/20 busy, so load ratio should pick large"
@@ -5366,7 +5433,7 @@ mod tests {
         }
 
         // 两者都空闲(load=0)。无惩罚时按 id 升序选 1;惩罚生效则应选健康的 2。
-        let ctx = manager.acquire_context(None, None, false).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(
             ctx.id, 2,
             "高错误率的 id=1 应被降权,即便 id 更小、负载相同也应选健康的 id=2"
@@ -5378,13 +5445,16 @@ mod tests {
     async fn test_set_credential_concurrency_shrinks_without_replacing_runtime() {
         let mut cred = grouped_cred("a", &[]);
         cred.max_concurrency = Some(3);
+        // 本测试断言满槽时新请求排队等待，需 opt-in 阻塞获取。
+        let mut config = Config::default();
+        config.account_acquire_blocking = true;
         let manager = Arc::new(
-            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
+            MultiTokenManager::new(config, vec![cred], None, None, false).unwrap(),
         );
 
-        let first = manager.acquire_context(None, None, false).await.unwrap();
-        let second = manager.acquire_context(None, None, false).await.unwrap();
-        let third = manager.acquire_context(None, None, false).await.unwrap();
+        let first = manager.acquire_context(None, None).await.unwrap();
+        let second = manager.acquire_context(None, None).await.unwrap();
+        let third = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(manager.snapshot().entries[0].in_flight, 3);
 
         manager.set_credential_concurrency(1, Some(1)).unwrap();
@@ -5397,7 +5467,7 @@ mod tests {
 
         let manager_for_task = Arc::clone(&manager);
         let handle =
-            tokio::spawn(async move { manager_for_task.acquire_context(None, None, false).await });
+            tokio::spawn(async move { manager_for_task.acquire_context(None, None).await });
         tokio::time::sleep(StdDuration::from_millis(20)).await;
         assert!(
             !handle.is_finished(),
@@ -5425,8 +5495,11 @@ mod tests {
     async fn stress_in_flight_never_exceeds_cap_under_load_and_shrink() {
         let mut cred = grouped_cred("a", &[]);
         cred.max_concurrency = Some(4);
+        // 200 个并发任务必须各自最终拿到租约（满槽时排队），需 opt-in 阻塞获取。
+        let mut config = Config::default();
+        config.account_acquire_blocking = true;
         let manager = Arc::new(
-            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
+            MultiTokenManager::new(config, vec![cred], None, None, false).unwrap(),
         );
 
         // 全局观测到的最大同时在途数
@@ -5454,7 +5527,7 @@ mod tests {
             let max_seen = Arc::clone(&max_seen);
             let live = Arc::clone(&live);
             tasks.push(tokio::spawn(async move {
-                let ctx = m.acquire_context(None, None, false).await.unwrap();
+                let ctx = m.acquire_context(None, None).await.unwrap();
                 // 进入临界区:当前真实在途 = live+1。断言不超过 acquire 当下的 cap。
                 let now_live = live.fetch_add(1, Ordering::SeqCst) + 1;
                 max_seen.fetch_max(now_live, Ordering::SeqCst);
@@ -5485,9 +5558,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_acquire_context_waits_when_only_account_is_at_limit() {
+        // 阻塞等待已改为 opt-in：本测试验证 account_acquire_blocking=true 的回退路径
+        // （唯一账号满槽时第三个请求排队等待，而非默认的非阻塞快速失败）。
+        let mut config = Config::default();
+        config.account_acquire_blocking = true;
         let manager = Arc::new(
             MultiTokenManager::new(
-                Config::default(),
+                config,
                 vec![grouped_cred("a", &[])],
                 None,
                 None,
@@ -5496,11 +5573,11 @@ mod tests {
             .unwrap(),
         );
 
-        let first = manager.acquire_context(None, None, false).await.unwrap();
-        let second = manager.acquire_context(None, None, false).await.unwrap();
+        let first = manager.acquire_context(None, None).await.unwrap();
+        let second = manager.acquire_context(None, None).await.unwrap();
         let manager_for_task = Arc::clone(&manager);
         let handle =
-            tokio::spawn(async move { manager_for_task.acquire_context(None, None, false).await });
+            tokio::spawn(async move { manager_for_task.acquire_context(None, None).await });
 
         tokio::time::sleep(StdDuration::from_millis(50)).await;
         assert!(
@@ -5594,6 +5671,36 @@ mod tests {
         }
     }
 
+    /// A4a：biased_load。penalty=0 时等价 effective_load；penalty>0 时按在途数加码，
+    /// 且不改变同负载账号的相对顺序（仅放大在途差异），不影响普通请求路径。
+    #[test]
+    fn test_biased_load_penalizes_in_flight_for_large_requests() {
+        let mk = |id: u64, in_flight: usize| CredentialCandidate {
+            id,
+            priority: 0,
+            capacity: 100,
+            in_flight,
+            ewma_error: 0.0,
+            runtime: Arc::new(CredentialRuntime::new(100)),
+        };
+        let low = mk(1, 5); // load_per_mille = 50
+        let high = mk(2, 40); // load_per_mille = 400
+
+        // penalty=0：biased_load 必须恒等于 effective_load（普通请求行为不变）。
+        assert_eq!(low.biased_load(0), low.effective_load());
+        assert_eq!(high.biased_load(0), high.effective_load());
+
+        // penalty=500：low = 50 + 5*500 = 2550；high = 400 + 40*500 = 20400。
+        assert_eq!(low.biased_load(500), 50 + 5 * 500);
+        assert_eq!(high.biased_load(500), 400 + 40 * 500);
+
+        // 大请求下，在途多的账号惩罚后差距被显著放大，仍排在低负载账号之后。
+        assert!(
+            low.biased_load(500) < high.biased_load(500),
+            "大请求应优先选在途更少的账号"
+        );
+    }
+
     #[tokio::test]
     async fn test_acquire_context_strict_isolation_fails_when_group_empty() {
         // g1 只有一个账号 A(id1)，禁用后绑定 g1 的请求应直接失败，不回退到 g2/无分组
@@ -5611,16 +5718,16 @@ mod tests {
         .unwrap();
 
         // 正常情况下 g1 能拿到 context
-        assert!(manager.acquire_context(None, Some("g1"), false).await.is_ok());
+        assert!(manager.acquire_context(None, Some("g1")).await.is_ok());
 
         // 手动禁用 g1 内唯一账号 A(id1)
         manager.set_disabled(1, true).unwrap();
 
         // 严格隔离：g1 无可用账号 → Err，且不会选到 B/C
-        let res = manager.acquire_context(None, Some("g1"), false).await;
+        let res = manager.acquire_context(None, Some("g1")).await;
         assert!(res.is_err(), "g1 内全部账号禁用后应失败，不回退到其他分组");
 
         // 但 g2 仍可用
-        assert!(manager.acquire_context(None, Some("g2"), false).await.is_ok());
+        assert!(manager.acquire_context(None, Some("g2")).await.is_ok());
     }
 }

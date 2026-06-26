@@ -50,6 +50,10 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 配合 429 专用长退避（见 retry_delay_throttle），被限时尽早返回而非耗尽配额。
 const MAX_TOTAL_RETRIES: usize = 4;
 
+/// A4a 大请求字节阈值（~512KB）。请求体超此值视为 Long 档（约对应 128K token 的
+/// Anthropic JSON 体量），触发调度排序惩罚以分散大请求、避免扎堆同账号拖垮首字节。
+const LARGE_REQUEST_BYTES: usize = 512 * 1024;
+
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
 const CLIENT_CACHE_CAP: usize = 64;
@@ -281,9 +285,8 @@ impl KiroProvider {
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
-        fast_mode: bool,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, false, sink, group, fast_mode)
+        self.call_api_with_retry(request_body, false, sink, group)
             .await
     }
 
@@ -293,9 +296,8 @@ impl KiroProvider {
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
-        fast_mode: bool,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, true, sink, group, fast_mode)
+        self.call_api_with_retry(request_body, true, sink, group)
             .await
     }
 
@@ -313,7 +315,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，也不参与分组隔离；不启用快速模式
-            let ctx = match self.token_manager.acquire_context(None, None, false).await {
+            let ctx = match self.token_manager.acquire_context(None, None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -471,7 +473,6 @@ impl KiroProvider {
         is_stream: bool,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
-        fast_mode: bool,
     ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
@@ -483,15 +484,30 @@ impl KiroProvider {
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
 
+        // A4a 大请求调度惩罚：请求体 ≥ LARGE_REQUEST_BYTES(~512KB,约对应 128K token 的
+        // Anthropic JSON 体量)视为 Long 档,按命中账号在途数加排序惩罚,避免大请求扎堆同账号。
+        // 普通请求 large_penalty=0,调度行为与历史完全一致。
+        let large_penalty = if request_body.len() >= LARGE_REQUEST_BYTES {
+            self.token_manager.config().large_request_rank_penalty
+        } else {
+            0
+        };
+
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self
                 .token_manager
-                .acquire_context(model.as_deref(), group, fast_mode)
+                .acquire_context_sized(model.as_deref(), group, large_penalty)
                 .await
             {
-                Ok(c) => c,
+                Ok(c) => {
+                    // 首次成功拿到凭据：标记"等账号槽"结束（幂等，sink 内部只记第一次）。
+                    if let Some(s) = sink {
+                        s.on_credential_acquired();
+                    }
+                    c
+                }
                 Err(e) => {
                     Self::emit_attempt(
                         sink,
@@ -504,6 +520,13 @@ impl KiroProvider {
                         attempt_start,
                     );
                     last_error = Some(e);
+                    // acquire 默认非阻塞返回"池忙"。attempt 之间加短退避(指数 200ms 起),
+                    // 既防 busy-spin、又给账号释放并发槽的窗口。MAX_TOTAL_RETRIES=4 兜底,
+                    // 全忙时总延迟 ~1.5s 内返回。account_acquire_blocking=true 时 acquire 自身
+                    // 已阻塞等待,这里的退避不会过度叠加(下一轮 acquire 仍受 30s 上限约束)。
+                    if attempt + 1 < max_retries {
+                        sleep(Self::retry_delay(attempt)).await;
+                    }
                     continue;
                 }
             };
@@ -551,9 +574,11 @@ impl KiroProvider {
 
             // 流式请求默认用禁用连接复用的专用 Client(每条流新连接,杜绝长流被上游
             // 中途掐断的"断流");非流式走复用连接的 Client,保留首 token 优化。
-            // 快速模式(fast_mode)下流式也复用连接池:省每请求新 TLS 握手(~100-200ms),
-            // 代价是可能偶发断流——由该入口 Key 显式选择"要速度、接受偶发断流"。
-            let http_client = if is_stream && !fast_mode {
+            // 全局 stream_conn_reuse_enabled=true 时流式也复用连接池(省每请求新 TLS 握手
+            // ~100-200ms,代价是可能偶发断流):复用走 client_for(pool_idle=15s < ALB 60s,
+            // 陈旧连接复用前先淘汰;取连接竞态由 execute 失败重试兜底——仅首字节前可重试)。
+            let stream_reuse = config.stream_conn_reuse_enabled;
+            let http_client = if is_stream && !stream_reuse {
                 self.streaming_client_for(&ctx.credentials)?
             } else {
                 self.client_for(&ctx.credentials)?
@@ -965,11 +990,22 @@ impl KiroProvider {
                 ));
                 if attempt + 1 < max_retries {
                     // 429 限流用更长退避给账号配额恢复时间；408/5xx 仍用通用快速退避
-                    let delay = if status.as_u16() == 429 {
+                    let mut delay = if status.as_u16() == 429 {
                         Self::retry_delay_throttle(attempt)
                     } else {
                         Self::retry_delay(attempt)
                     };
+                    // 事故熔断（A4）：全池错误率飙高时判定上游全局事故，瞬态错误 3× 退避，
+                    // 避免重试风暴把错误率进一步放大、把稀缺并发槽耗在注定失败的重试上。
+                    let threshold = config.circuit_breaker_threshold;
+                    if threshold < 1.0 && self.token_manager.pool_ewma_error() > threshold {
+                        delay *= 3;
+                        tracing::warn!(
+                            "全池错误率超阈值（>{:.2}），判定上游事故，瞬态错误退避 3×（{}ms）",
+                            threshold,
+                            delay.as_millis()
+                        );
+                    }
                     sleep(delay).await;
                 }
                 continue;

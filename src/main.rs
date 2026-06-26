@@ -275,15 +275,7 @@ async fn main() {
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
-        anthropic::middleware::HistoryCapState {
-            default_enabled: config.history_cap_enabled,
-            max_bytes: config.history_cap_max_bytes,
-            head_turns: config.history_cap_head_turns,
-        },
-        anthropic::middleware::FastModeState {
-            default_enabled: config.fast_mode_enabled,
-            history_cap_max_bytes: config.fast_mode_history_cap_max_bytes,
-        },
+        config.usage_gated_streaming_enabled,
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）

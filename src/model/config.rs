@@ -195,47 +195,48 @@ pub struct Config {
     #[serde(default = "default_cache_meter_capacity")]
     pub cache_meter_capacity: usize,
 
-    /// 历史上限（History Cap）全局默认开关。默认 false（关）。
+    /// 账号并发槽获取是否阻塞等待。默认 false（非阻塞快速失败）。
     ///
-    /// 开启后，发往上游的 `messages` 会按字节预算裁剪（保留头部若干轮 + 预算内的
-    /// 最近若干轮，中间插占位说明），用于压住超长会话的 prefill 成本、追平
-    /// 速度优先的同类实现。per-client-key 的 `historyCap` 可三态覆盖此默认值。
-    ///
-    /// 注意：裁剪会让缓存前缀逐轮变动，与 prompt cache 部分冲突——要缓存命中率
-    /// 的 Key 不要开 cap，要速度的 Key 才开。
+    /// false（默认）：所有匹配凭据的并发槽都满时，acquire 立即返回"池忙"，由 provider
+    /// 的重试链（退避后换 attempt）兜底——打 429 重试链这一最大瓶颈，避免单请求在高峰期
+    /// 死等数秒。true：回退到旧行为，等待最多 `account_acquire_timeout_secs`(默认 30s)
+    /// 直到任一账号释放槽位，适用于账号极少、宁可排队也不要"池忙"报错的部署。
     #[serde(default)]
-    pub history_cap_enabled: bool,
+    pub account_acquire_blocking: bool,
 
-    /// 历史上限的字节预算（序列化后的 messages 累计字节）。默认 900_000（~900KB）。
-    /// 运行时 clamp 到 `>= 50_000`，避免配得过小把当前轮也挤掉。
-    #[serde(default = "default_history_cap_max_bytes")]
-    pub history_cap_max_bytes: usize,
-
-    /// 历史上限始终保留的头部轮数（原始任务上下文）。默认 1。
-    #[serde(default = "default_history_cap_head_turns")]
-    pub history_cap_head_turns: usize,
-
-    /// 快速模式（Fast Mode）全局默认开关。默认 false（关）。
+    /// `/cc/v1/messages` usage-gated streaming 开关（A1 首包优化）。
     ///
-    /// 面向"速度优先"客户群体。开启后对该入口 Key 的请求：
-    /// 1. 拿不到空闲账号时不死等（用 `fast_mode_acquire_timeout_ms` 短超时而非
-    ///    `account_acquire_timeout_secs`(30s)），尽快换号/返回——打 429 重试链这一最大瓶颈；
-    /// 2. 流式请求复用连接池（省每请求新 TLS 握手），代价是可能偶发断流；
-    /// 3. 历史裁剪用更激进的 `fast_mode_history_cap_max_bytes` 预算压 prefill。
-    /// per-client-key 的 `fastMode` 可三态覆盖此默认值。
+    /// 开启（默认）：`/cc` 流式只缓冲到能确定 `message_start.usage.input_tokens`
+    /// 的那一刻（收到 contextUsageEvent 或首个可见内容事件）即放闸边收边发，
+    /// 大幅降低 Claude Code 首包延迟，且保持 SSE 顺序与 usage 兼容。
+    /// 关闭：回退到原全缓冲行为（等整条上游流结束才一次性下发）。
+    #[serde(default = "default_usage_gated_streaming_enabled")]
+    pub usage_gated_streaming_enabled: bool,
+
+    /// 全局流式连接复用开关（A2）。默认 false（保守：每条流新连接，杜绝偶发断流）。
+    ///
+    /// true：流式请求复用连接池（走 `client_for`，pool_idle=15s < ALB 60s），
+    /// 省每请求 ~100-200ms 的 TCP+TLS 握手，高并发下显著降首字节延迟。代价是上游 ALB 若在
+    /// 长 prefill 静默期掐断复用连接，可能偶发"断流"（仅首字节前可由重试兜底）。
     #[serde(default)]
-    pub fast_mode_enabled: bool,
+    pub stream_conn_reuse_enabled: bool,
 
-    /// 快速模式下获取空闲账号并发槽的最长等待（毫秒）。默认 800。
-    /// 普通模式用 `account_acquire_timeout_secs`(30s)；快速模式用此短超时，
-    /// 高峰期宁可尽快换号/返回也不让单请求死等 4s+。运行时 clamp 到 `>= 50`。
-    #[serde(default = "default_fast_mode_acquire_timeout_ms")]
-    pub fast_mode_acquire_timeout_ms: u64,
+    /// 事故熔断阈值（A4，0.0~1.0，默认 0.5）。
+    ///
+    /// 全池近期错误率 EWMA(`pool_ewma_error`)超过此值时,判定为上游全局性事故(如 hr20:
+    /// QPS 2640、错误率 53.5%、并发 375 > 容量 275),provider 对瞬态错误(408/429/5xx)
+    /// 改用 3× 退避,避免重试风暴把错误率进一步放大、把稀缺并发槽全耗在注定失败的重试上。
+    /// 设为 >= 1.0 即关闭熔断(永不触发)。不影响非事故期的正常重试节奏。
+    #[serde(default = "default_circuit_breaker_threshold")]
+    pub circuit_breaker_threshold: f64,
 
-    /// 快速模式下历史裁剪的字节预算。默认 400_000（~400KB，比普通 cap 的 900KB 激进）。
-    /// 运行时 clamp 到 `>= 50_000`。
-    #[serde(default = "default_fast_mode_history_cap_max_bytes")]
-    pub fast_mode_history_cap_max_bytes: usize,
+    /// 大请求(≥128K token)调度排序惩罚（A4，整数千分比，默认 500）。
+    ///
+    /// Long 档请求按命中账号的在途数 × (此值/1000) 加排序惩罚,使其优先选当前更空闲的账号、
+    /// 避免多个大请求堆到同一账号拖垮该账号首字节。仅改排序偏好,不改并发上限、不硬阻塞、
+    /// 不破坏 P2C/priority 语义。设为 0 即关闭(退化到纯 effective_load 排序)。
+    #[serde(default = "default_large_request_rank_penalty")]
+    pub large_request_rank_penalty: usize,
 
     /// 端点特定的配置
     ///
@@ -247,6 +248,21 @@ pub struct Config {
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+/// serde 默认值：`usage_gated_streaming_enabled` 默认开启。
+fn default_usage_gated_streaming_enabled() -> bool {
+    true
+}
+
+/// serde 默认值：事故熔断阈值（全池错误率 EWMA 超此值则瞬态错误 3× 退避）。
+fn default_circuit_breaker_threshold() -> f64 {
+    0.5
+}
+
+/// serde 默认值：大请求调度排序惩罚（整数千分比，按在途数缩放）。
+fn default_large_request_rank_penalty() -> usize {
+    500
 }
 
 fn default_host() -> String {
@@ -333,22 +349,6 @@ fn default_cache_meter_capacity() -> usize {
     131072
 }
 
-fn default_history_cap_max_bytes() -> usize {
-    900_000
-}
-
-fn default_history_cap_head_turns() -> usize {
-    1
-}
-
-fn default_fast_mode_acquire_timeout_ms() -> u64 {
-    800
-}
-
-fn default_fast_mode_history_cap_max_bytes() -> usize {
-    400_000
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -388,12 +388,11 @@ impl Default for Config {
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             cache_meter_capacity: default_cache_meter_capacity(),
-            history_cap_enabled: false,
-            history_cap_max_bytes: default_history_cap_max_bytes(),
-            history_cap_head_turns: default_history_cap_head_turns(),
-            fast_mode_enabled: false,
-            fast_mode_acquire_timeout_ms: default_fast_mode_acquire_timeout_ms(),
-            fast_mode_history_cap_max_bytes: default_fast_mode_history_cap_max_bytes(),
+            account_acquire_blocking: false,
+            usage_gated_streaming_enabled: default_usage_gated_streaming_enabled(),
+            stream_conn_reuse_enabled: false,
+            circuit_breaker_threshold: default_circuit_breaker_threshold(),
+            large_request_rank_penalty: default_large_request_rank_penalty(),
             endpoints: HashMap::new(),
             config_path: None,
         }
