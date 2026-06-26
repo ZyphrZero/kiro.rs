@@ -224,11 +224,16 @@ async fn run_round(
         }
     };
 
-    let kiro_request = KiroRequest {
+    let mut kiro_request = KiroRequest {
         conversation_state: conversion.conversation_state,
         profile_arn: None,
         additional_model_request_fields: conversion.additional_model_request_fields,
     };
+    // 整体 payload 字节上限（与 /v1、/cc 主路径同款防线）。
+    crate::payload_truncate::truncate_payload_to_limit(
+        &mut kiro_request,
+        &crate::payload_truncate::PayloadLimitConfig::from_env(),
+    );
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(b) => b,
         Err(e) => {

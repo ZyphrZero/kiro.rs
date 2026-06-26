@@ -6,6 +6,7 @@ mod http_client;
 mod image_resize;
 mod kiro;
 mod model;
+mod payload_truncate;
 mod text_truncate;
 pub mod token;
 

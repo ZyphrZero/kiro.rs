@@ -757,11 +757,18 @@ pub async fn post_messages(
 
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
     // credentials; additional_model_request_fields is already filtered by converter model support.
-    let kiro_request = KiroRequest {
+    let mut kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
         additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
+
+    // 整体 payload 字节上限：丢弃最旧历史使序列化体不超上游 CONTENT_LENGTH 阈值
+    // （per-field 的 text_truncate/image_resize 之上的累加防线）。
+    crate::payload_truncate::truncate_payload_to_limit(
+        &mut kiro_request,
+        &crate::payload_truncate::PayloadLimitConfig::from_env(),
+    );
 
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(body) => body,
@@ -1589,11 +1596,18 @@ pub async fn post_messages_cc(
 
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
     // credentials; additional_model_request_fields is already filtered by converter model support.
-    let kiro_request = KiroRequest {
+    let mut kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
         additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
+
+    // 整体 payload 字节上限：丢弃最旧历史使序列化体不超上游 CONTENT_LENGTH 阈值
+    // （per-field 的 text_truncate/image_resize 之上的累加防线）。
+    crate::payload_truncate::truncate_payload_to_limit(
+        &mut kiro_request,
+        &crate::payload_truncate::PayloadLimitConfig::from_env(),
+    );
 
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(body) => body,
