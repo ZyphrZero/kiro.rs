@@ -281,8 +281,9 @@ impl KiroProvider {
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        fast_mode: bool,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, false, sink, group)
+        self.call_api_with_retry(request_body, false, sink, group, fast_mode)
             .await
     }
 
@@ -292,8 +293,9 @@ impl KiroProvider {
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        fast_mode: bool,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, true, sink, group)
+        self.call_api_with_retry(request_body, true, sink, group, fast_mode)
             .await
     }
 
@@ -310,8 +312,8 @@ impl KiroProvider {
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
-            // MCP 调用（WebSearch 等工具）不涉及模型选择，也不参与分组隔离
-            let ctx = match self.token_manager.acquire_context(None, None).await {
+            // MCP 调用（WebSearch 等工具）不涉及模型选择，也不参与分组隔离；不启用快速模式
+            let ctx = match self.token_manager.acquire_context(None, None, false).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -469,6 +471,7 @@ impl KiroProvider {
         is_stream: bool,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        fast_mode: bool,
     ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
@@ -485,7 +488,7 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self
                 .token_manager
-                .acquire_context(model.as_deref(), group)
+                .acquire_context(model.as_deref(), group, fast_mode)
                 .await
             {
                 Ok(c) => c,
@@ -546,9 +549,11 @@ impl KiroProvider {
                 tracing::debug!("实际发送请求体: {}", truncate_for_log(&body));
             }
 
-            // 流式请求用禁用连接复用的专用 Client(每条流新连接,杜绝长流被上游中途
-            // 掐断的"断流");非流式仍走复用连接的 Client,保留首 token 优化。
-            let http_client = if is_stream {
+            // 流式请求默认用禁用连接复用的专用 Client(每条流新连接,杜绝长流被上游
+            // 中途掐断的"断流");非流式走复用连接的 Client,保留首 token 优化。
+            // 快速模式(fast_mode)下流式也复用连接池:省每请求新 TLS 握手(~100-200ms),
+            // 代价是可能偶发断流——由该入口 Key 显式选择"要速度、接受偶发断流"。
+            let http_client = if is_stream && !fast_mode {
                 self.streaming_client_for(&ctx.credentials)?
             } else {
                 self.client_for(&ctx.credentials)?

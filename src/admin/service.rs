@@ -1155,6 +1155,28 @@ impl AdminService {
             },
             Err(e) => {
                 let msg = e.to_string();
+                // external_idp（企业 SSO，如 Azure AD）账号通常只有
+                // codewhisperer:conversations/completions scope，无用量 API 权限，
+                // getUsageLimits 必 403。但 add_credential 已通过 token 刷新证明其存活
+                // （刷新失败会在 add 阶段就报错，根本到不了这里）。故对 external_idp，
+                // 余额拉取失败视为「存活但无余额」，标记 Verified 而非回滚删除——
+                // 否则会把完全可用于聊天的账号误杀。（对齐 kiro-go-plus 导入不验余额的模型。）
+                if self.token_manager.is_external_idp_for(resp.credential_id) {
+                    tracing::info!(
+                        "external_idp 凭据 #{} 余额拉取失败（通常因无用量 scope），\
+                         token 刷新已证明存活，按验活通过处理（不回滚）: {}",
+                        resp.credential_id,
+                        msg
+                    );
+                    return ImportItemResult {
+                        status: ImportStatus::Verified,
+                        credential_id: Some(resp.credential_id),
+                        email: resp.email,
+                        balance: None,
+                        error: None,
+                        rolled_back: false,
+                    };
+                }
                 tracing::warn!(
                     "批量导入凭据 #{} 验活失败，回滚删除: {}",
                     resp.credential_id,

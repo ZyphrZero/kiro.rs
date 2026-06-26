@@ -947,6 +947,7 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         total_cache_read_tokens: k.total_cache_read_tokens,
         cache_enabled: k.cache_enabled,
         history_cap: k.history_cap,
+        fast_mode: k.fast_mode,
         group: k.group.clone(),
         is_system: k.is_system,
     }
@@ -990,11 +991,17 @@ pub async fn create_client_key(
             .filter(|g| !g.is_empty()),
         payload.cache_enabled,
     );
-    // 创建后若指定了 historyCap，立即落定（create 保持原签名，新 Key 默认随全局）。
-    if let Some(hc) = payload.history_cap {
-        state
-            .client_keys
-            .update_meta(entry.id, None, None, None, None, Some(Some(hc)));
+    // 创建后若指定了 historyCap / fastMode，立即落定（create 保持原签名，新 Key 默认随全局）。
+    if payload.history_cap.is_some() || payload.fast_mode.is_some() {
+        state.client_keys.update_meta(
+            entry.id,
+            None,
+            None,
+            None,
+            None,
+            payload.history_cap.map(Some),
+            payload.fast_mode.map(Some),
+        );
     }
     Json(CreateClientKeyResponse {
         id: entry.id,
@@ -1061,6 +1068,7 @@ pub async fn update_client_key(
             group,
             payload.cache_enabled,
             payload.history_cap,
+            payload.fast_mode,
         )
     {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()

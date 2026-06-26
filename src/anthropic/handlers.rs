@@ -434,18 +434,29 @@ fn compute_cache_usage_for_key(
 /// 按 per-key 开关应用历史上限（History Cap）。仅在该 Key 启用时裁剪 payload.messages。
 /// 必须在 count_all_tokens / convert_request / cache 计量之前调用，使下游都基于裁剪后的口径。
 fn maybe_apply_history_cap(state: &AppState, payload: &mut MessagesRequest, key_ctx: &KeyContext) {
-    if !key_ctx.history_cap_enabled {
+    // fast_mode 有効時は激進予算（fast_mode_history_cap_max_bytes）で裁断。
+    // history_cap のみ有効なら通常予算。どちらも無効なら何もしない。
+    let cfg = if key_ctx.fast_mode_enabled {
+        state.fast_mode.to_cap_config()
+    } else if key_ctx.history_cap_enabled {
+        state.history_cap.to_cap_config()
+    } else {
         return;
-    }
+    };
+    let mode = if key_ctx.fast_mode_enabled {
+        "Fast Mode"
+    } else {
+        "History Cap"
+    };
     let before = payload.messages.len();
-    let cfg = state.history_cap.to_cap_config();
     if super::converter::apply_history_cap(&mut payload.messages, &cfg) {
         tracing::info!(
             key_id = key_ctx.key_id,
+            mode = mode,
             messages_before = before,
             messages_after = payload.messages.len(),
             max_bytes = cfg.max_bytes,
-            "History Cap 命中：已裁剪历史以贴合字节预算"
+            "历史裁剪命中：已裁剪历史以贴合字节预算"
         );
     }
 }
@@ -700,6 +711,7 @@ pub async fn post_messages(
             hook,
             payload_stream,
             key_ctx.group.clone(),
+            key_ctx.fast_mode_enabled,
         )
         .await;
     }
@@ -815,6 +827,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            key_ctx.fast_mode_enabled,
         )
         .await
     } else {
@@ -842,6 +855,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            key_ctx.fast_mode_enabled,
         )
         .await
     }
@@ -860,10 +874,11 @@ async fn handle_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    fast_mode: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref(), fast_mode)
         .await
     {
         Ok(resp) => resp,
@@ -1081,10 +1096,11 @@ async fn handle_non_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    fast_mode: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api(request_body, Some(tracer.as_ref()), group.as_deref(), fast_mode)
         .await
     {
         Ok(resp) => resp,
@@ -1521,6 +1537,7 @@ pub async fn post_messages_cc(
             hook,
             payload_stream,
             key_ctx.group.clone(),
+            key_ctx.fast_mode_enabled,
         )
         .await;
     }
@@ -1635,6 +1652,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            key_ctx.fast_mode_enabled,
         )
         .await
     } else {
@@ -1662,6 +1680,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            key_ctx.fast_mode_enabled,
         )
         .await
     }
@@ -1683,10 +1702,11 @@ async fn handle_stream_request_buffered(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    fast_mode: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref(), fast_mode)
         .await
     {
         Ok(resp) => resp,

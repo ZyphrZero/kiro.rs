@@ -56,6 +56,11 @@ pub struct ClientKey {
     /// `converter::apply_history_cap`）。老数据无此字段时为 None（随全局，默认关）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_cap: Option<bool>,
+    /// 快速模式（Fast Mode）三态开关。`None`=随全局默认；`Some(true/false)`=强制开/关。
+    /// 开启后：不死等账号（短超时换号）+ 流式复用连接池 + 更激进历史预算。
+    /// 老数据无此字段时为 None（随全局，默认关）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_mode: Option<bool>,
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
@@ -220,6 +225,7 @@ impl ClientKeyManager {
             total_cache_read_tokens: 0,
             cache_enabled,
             history_cap: None,
+            fast_mode: None,
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
@@ -295,6 +301,7 @@ impl ClientKeyManager {
                     total_cache_read_tokens: 0,
                     cache_enabled: true,
                     history_cap: None,
+                    fast_mode: None,
                     total_credits: 0.0,
                     group: None,
                     is_system: true,
@@ -348,6 +355,7 @@ impl ClientKeyManager {
         group: Option<Option<String>>,
         cache_enabled: Option<bool>,
         history_cap: Option<Option<bool>>,
+        fast_mode: Option<Option<bool>>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -367,6 +375,9 @@ impl ClientKeyManager {
                 // 外层 Some 表示"本次更新此字段"；内层值即三态设定（None=随全局）。
                 if let Some(hc) = history_cap {
                     e.history_cap = hc;
+                }
+                if let Some(fm) = fast_mode {
+                    e.fast_mode = fm;
                 }
                 true
             }
@@ -404,6 +415,15 @@ impl ClientKeyManager {
             .entries
             .get(&id)
             .and_then(|e| e.history_cap)
+    }
+
+    /// 返回指定 Key 的 Fast Mode 三态设定（None=随全局默认；Key 不存在亦为 None）。
+    pub fn fast_mode_of(&self, id: u64) -> Option<bool> {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .and_then(|e| e.fast_mode)
     }
 
     /// 列出所有当前被引用的分组名（仅去重，不带计数）。
@@ -664,7 +684,7 @@ mod tests {
         let mgr = ClientKeyManager::new();
         let entry = mgr.create("test".to_string(), None, None, false);
         assert!(!mgr.cache_enabled_of(entry.id));
-        assert!(mgr.update_meta(entry.id, None, None, None, Some(true), None));
+        assert!(mgr.update_meta(entry.id, None, None, None, Some(true), None, None));
         assert!(mgr.cache_enabled_of(entry.id));
     }
 
@@ -675,17 +695,38 @@ mod tests {
         // 默认随全局（None）。
         assert_eq!(mgr.history_cap_of(entry.id), None);
         // 强制开。
-        assert!(mgr.update_meta(entry.id, None, None, None, None, Some(Some(true))));
+        assert!(mgr.update_meta(entry.id, None, None, None, None, Some(Some(true)), None));
         assert_eq!(mgr.history_cap_of(entry.id), Some(true));
         // 强制关。
-        assert!(mgr.update_meta(entry.id, None, None, None, None, Some(Some(false))));
+        assert!(mgr.update_meta(entry.id, None, None, None, None, Some(Some(false)), None));
         assert_eq!(mgr.history_cap_of(entry.id), Some(false));
         // 改回随全局。
-        assert!(mgr.update_meta(entry.id, None, None, None, None, Some(None)));
+        assert!(mgr.update_meta(entry.id, None, None, None, None, Some(None), None));
         assert_eq!(mgr.history_cap_of(entry.id), None);
         // 外层 None = 不动该字段。
-        assert!(mgr.update_meta(entry.id, None, None, None, None, None));
+        assert!(mgr.update_meta(entry.id, None, None, None, None, None, None));
         assert_eq!(mgr.history_cap_of(entry.id), None);
+    }
+
+    #[test]
+    fn fast_mode_three_state_update() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("fm".to_string(), None, None, true);
+        // 默认随全局（None）。
+        assert_eq!(mgr.fast_mode_of(entry.id), None);
+        // 强制开（仅动 fast_mode，history_cap 不受影响）。
+        assert!(mgr.update_meta(entry.id, None, None, None, None, None, Some(Some(true))));
+        assert_eq!(mgr.fast_mode_of(entry.id), Some(true));
+        assert_eq!(mgr.history_cap_of(entry.id), None);
+        // 强制关。
+        assert!(mgr.update_meta(entry.id, None, None, None, None, None, Some(Some(false))));
+        assert_eq!(mgr.fast_mode_of(entry.id), Some(false));
+        // 改回随全局。
+        assert!(mgr.update_meta(entry.id, None, None, None, None, None, Some(None)));
+        assert_eq!(mgr.fast_mode_of(entry.id), None);
+        // 外层 None 不动。
+        assert!(mgr.update_meta(entry.id, None, None, None, None, None, None));
+        assert_eq!(mgr.fast_mode_of(entry.id), None);
     }
 
     #[test]

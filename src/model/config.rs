@@ -215,6 +215,28 @@ pub struct Config {
     #[serde(default = "default_history_cap_head_turns")]
     pub history_cap_head_turns: usize,
 
+    /// 快速模式（Fast Mode）全局默认开关。默认 false（关）。
+    ///
+    /// 面向"速度优先"客户群体。开启后对该入口 Key 的请求：
+    /// 1. 拿不到空闲账号时不死等（用 `fast_mode_acquire_timeout_ms` 短超时而非
+    ///    `account_acquire_timeout_secs`(30s)），尽快换号/返回——打 429 重试链这一最大瓶颈；
+    /// 2. 流式请求复用连接池（省每请求新 TLS 握手），代价是可能偶发断流；
+    /// 3. 历史裁剪用更激进的 `fast_mode_history_cap_max_bytes` 预算压 prefill。
+    /// per-client-key 的 `fastMode` 可三态覆盖此默认值。
+    #[serde(default)]
+    pub fast_mode_enabled: bool,
+
+    /// 快速模式下获取空闲账号并发槽的最长等待（毫秒）。默认 800。
+    /// 普通模式用 `account_acquire_timeout_secs`(30s)；快速模式用此短超时，
+    /// 高峰期宁可尽快换号/返回也不让单请求死等 4s+。运行时 clamp 到 `>= 50`。
+    #[serde(default = "default_fast_mode_acquire_timeout_ms")]
+    pub fast_mode_acquire_timeout_ms: u64,
+
+    /// 快速模式下历史裁剪的字节预算。默认 400_000（~400KB，比普通 cap 的 900KB 激进）。
+    /// 运行时 clamp 到 `>= 50_000`。
+    #[serde(default = "default_fast_mode_history_cap_max_bytes")]
+    pub fast_mode_history_cap_max_bytes: usize,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -319,6 +341,14 @@ fn default_history_cap_head_turns() -> usize {
     1
 }
 
+fn default_fast_mode_acquire_timeout_ms() -> u64 {
+    800
+}
+
+fn default_fast_mode_history_cap_max_bytes() -> usize {
+    400_000
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -361,6 +391,9 @@ impl Default for Config {
             history_cap_enabled: false,
             history_cap_max_bytes: default_history_cap_max_bytes(),
             history_cap_head_turns: default_history_cap_head_turns(),
+            fast_mode_enabled: false,
+            fast_mode_acquire_timeout_ms: default_fast_mode_acquire_timeout_ms(),
+            fast_mode_history_cap_max_bytes: default_fast_mode_history_cap_max_bytes(),
             endpoints: HashMap::new(),
             config_path: None,
         }

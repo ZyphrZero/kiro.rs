@@ -73,6 +73,7 @@ export function ClientKeysPage() {
   const [createGroup, setCreateGroup] = useState('')
   const [createCacheEnabled, setCreateCacheEnabled] = useState(true)
   const [createHistoryCap, setCreateHistoryCap] = useState<'inherit' | 'on' | 'off'>('inherit')
+  const [createFastMode, setCreateFastMode] = useState<'inherit' | 'on' | 'off'>('inherit')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -83,6 +84,7 @@ export function ClientKeysPage() {
   const [editGroup, setEditGroup] = useState('')
   const [editCacheEnabled, setEditCacheEnabled] = useState(true)
   const [editHistoryCap, setEditHistoryCap] = useState<'inherit' | 'on' | 'off'>('inherit')
+  const [editFastMode, setEditFastMode] = useState<'inherit' | 'on' | 'off'>('inherit')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -98,6 +100,7 @@ export function ClientKeysPage() {
         group: createGroup.trim() || undefined,
         cacheEnabled: createCacheEnabled,
         historyCap: historyCapToValue(createHistoryCap),
+        fastMode: historyCapToValue(createFastMode),
       })
       setCreatedKey(res)
       setCreateOpen(false)
@@ -106,6 +109,7 @@ export function ClientKeysPage() {
       setCreateGroup('')
       setCreateCacheEnabled(true)
       setCreateHistoryCap('inherit')
+      setCreateFastMode('inherit')
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -189,6 +193,7 @@ export function ClientKeysPage() {
     setEditGroup(item.group ?? '')
     setEditCacheEnabled(item.cacheEnabled)
     setEditHistoryCap(valueToHistoryCap(item.historyCap))
+    setEditFastMode(valueToHistoryCap(item.fastMode))
     setEditOpen(true)
   }
 
@@ -204,6 +209,7 @@ export function ClientKeysPage() {
           group: editGroup.trim(),
           cacheEnabled: editCacheEnabled,
           historyCap: historyCapToValue(editHistoryCap),
+          fastMode: historyCapToValue(editFastMode),
         },
       })
       toast.success('已更新')
@@ -326,6 +332,8 @@ export function ClientKeysPage() {
                         )}
                         {k.historyCap === true && <Badge variant="secondary">Cap开</Badge>}
                         {k.historyCap === false && <Badge variant="outline">Cap关</Badge>}
+                        {k.fastMode === true && <Badge variant="secondary">Fast开</Badge>}
+                        {k.fastMode === false && <Badge variant="outline">Fast关</Badge>}
                       </div>
                     </td>
                     <td className="px-4 py-3">
@@ -470,6 +478,30 @@ export function ClientKeysPage() {
                 </div>
               </div>
             </div>
+            <div className="rounded-md border border-border/60 px-3 py-2">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium">快速模式 Fast Mode</div>
+                  <p className="text-[11px] text-muted-foreground">
+                    速度优先：拿不到空闲账号时不死等（短超时换号）+ 流式复用连接池 + 更激进历史预算。代价：可能偶发断流、历史截断更多。
+                  </p>
+                </div>
+                <div className="flex shrink-0 gap-1">
+                  {(['inherit', 'on', 'off'] as const).map((opt) => (
+                    <Button
+                      key={opt}
+                      type="button"
+                      size="sm"
+                      variant={createFastMode === opt ? 'default' : 'outline'}
+                      onClick={() => setCreateFastMode(opt)}
+                      disabled={createKey.isPending}
+                    >
+                      {opt === 'inherit' ? '随全局' : opt === 'on' ? '开' : '关'}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+            </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
                 取消
@@ -593,6 +625,30 @@ export function ClientKeysPage() {
                       size="sm"
                       variant={editHistoryCap === opt ? 'default' : 'outline'}
                       onClick={() => setEditHistoryCap(opt)}
+                      disabled={updateKey.isPending}
+                    >
+                      {opt === 'inherit' ? '随全局' : opt === 'on' ? '开' : '关'}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div className="rounded-md border border-border/60 px-3 py-2">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium">快速模式 Fast Mode</div>
+                  <p className="text-[11px] text-muted-foreground">
+                    随全局=跟随服务端默认；开/关=对此 Key 强制。开启=速度优先（不死等账号+流式连接池+激进历史预算），代价是可能偶发断流。
+                  </p>
+                </div>
+                <div className="flex shrink-0 gap-1">
+                  {(['inherit', 'on', 'off'] as const).map((opt) => (
+                    <Button
+                      key={opt}
+                      type="button"
+                      size="sm"
+                      variant={editFastMode === opt ? 'default' : 'outline'}
+                      onClick={() => setEditFastMode(opt)}
                       disabled={updateKey.isPending}
                     >
                       {opt === 'inherit' ? '随全局' : opt === 'on' ? '开' : '关'}

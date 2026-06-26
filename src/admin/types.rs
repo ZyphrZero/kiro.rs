@@ -773,6 +773,9 @@ pub struct ClientKeyItem {
     /// History Cap 三态：None=随全局默认；Some(true/false)=强制开/关。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history_cap: Option<bool>,
+    /// Fast Mode 三态：None=随全局默认；Some(true/false)=强制开/关。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fast_mode: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
@@ -802,6 +805,9 @@ pub struct CreateClientKeyRequest {
     /// History Cap 三态。省略=随全局默认。
     #[serde(default)]
     pub history_cap: Option<bool>,
+    /// Fast Mode 三态。省略=随全局默认。
+    #[serde(default)]
+    pub fast_mode: Option<bool>,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -829,6 +835,9 @@ pub struct UpdateClientKeyRequest {
     /// `true`/`false` → Some(Some(v))（强制开/关）。
     #[serde(default, deserialize_with = "deserialize_some")]
     pub history_cap: Option<Option<bool>>,
+    /// Fast Mode 更新（三态 × 是否变更），语义同 history_cap。
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub fast_mode: Option<Option<bool>>,
 }
 
 /// serde 辅助：区分「字段缺省」与「字段显式为 null」。

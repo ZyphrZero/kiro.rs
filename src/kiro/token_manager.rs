@@ -438,18 +438,23 @@ async fn refresh_external_idp_token(
 /// 官方 Kiro 用量 / 模型 REST 接口（getUsageLimits / ListAvailableModels /
 /// setUserPreference）的区域候选列表。
 ///
-/// 采用「自适应」策略，不再硬编码固定两区：
-/// 1. 凭据自身 SSO 区域优先（账号在哪个区，就先打哪个区）；
-/// 2. 再追加已知长期可用的兜底区域 `us-east-1` 与 `eu-central-1`；
-/// 3. 去重，保持首次出现顺序。
+/// 按凭据类型区分主机族，候选区域也随之不同：
+/// - **external_idp**（host `codewhisperer.{region}.amazonaws.com`）：该主机族
+///   **实测仅在 `us-east-1` 存在 DNS 记录**，`eu-central-1` 为 NXDOMAIN。追加
+///   eu-central-1 只会产生误导性的传输层错误并盖住真实结果，故 external_idp
+///   **只用 us-east-1**（凭据自身区域若非 us-east-1 也强制回落，因为别的区域无主机）。
+/// - **非 external_idp**（host `q.{region}.amazonaws.com`）：保留自适应策略——
+///   凭据自身区域优先，再追加兜底 `us-east-1` / `eu-central-1`，去重保序。
 ///
-/// 配合调用处的「传输层错误也回退到下一个候选」逻辑，即使某区域端点
-/// 不存在（如 external IdP 的 `codewhisperer.*` 仅在 us-east-1 有 DNS 记录），
-/// 或日后上游新增/调整了区域，都能自动适配而无需改这张表：
-/// - 命中自身区域 → 直接成功；
-/// - 自身区域无端点/无权限 → 自动回退到 us-east-1 / eu-central-1。
-fn rest_api_region_candidates(sso_region: &str) -> Vec<String> {
-    // 已知长期提供这些 REST 接口的兜底区域，顺序即回退优先级
+/// 配合调用处「传输层错误也回退下一个候选」的逻辑，自适应分支即使某区域端点
+/// 暂不可用也能自动切换。
+fn rest_api_region_candidates(sso_region: &str, is_external_idp: bool) -> Vec<String> {
+    // external_idp：codewhisperer.* 仅 us-east-1 有 DNS，单候选即可，杜绝 NXDOMAIN 噪声。
+    if is_external_idp {
+        return vec!["us-east-1".to_string()];
+    }
+
+    // 非 external_idp（q.*）：自适应两区兜底。顺序即回退优先级。
     const FALLBACK_REGIONS: [&str; 2] = ["us-east-1", "eu-central-1"];
 
     let mut candidates: Vec<String> = Vec::with_capacity(FALLBACK_REGIONS.len() + 1);
@@ -482,7 +487,7 @@ pub(crate) async fn get_usage_limits(
     // getUsageLimits 仅在 us-east-1 / eu-central-1 提供服务，
     // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
     let sso_region = credentials.effective_auth_region(config);
-    let candidates = rest_api_region_candidates(sso_region);
+    let candidates = rest_api_region_candidates(sso_region, credentials.is_external_idp());
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     // 用量类接口固定用 USAGE_API_KIRO_VERSION：新版 IDE 会强制要求 profileArn，
     // 对 Enterprise/IdC 账号失败；该版本无需 profileArn。
@@ -604,7 +609,7 @@ pub(crate) async fn get_available_models(
     // ListAvailableModels 仅在 us-east-1 / eu-central-1 提供服务，
     // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
     let sso_region = credentials.effective_auth_region(config);
-    let candidates = rest_api_region_candidates(sso_region);
+    let candidates = rest_api_region_candidates(sso_region, credentials.is_external_idp());
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
@@ -729,7 +734,7 @@ pub(crate) async fn list_available_profiles(
     tracing::debug!("正在获取可用 profile 列表...");
 
     let sso_region = credentials.effective_auth_region(config);
-    let candidates = rest_api_region_candidates(sso_region);
+    let candidates = rest_api_region_candidates(sso_region, credentials.is_external_idp());
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
@@ -839,7 +844,7 @@ pub(crate) async fn set_user_preference(
     // setUserPreference 仅在 us-east-1 / eu-central-1 提供服务，
     // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
     let sso_region = credentials.effective_auth_region(config);
-    let candidates = rest_api_region_candidates(sso_region);
+    let candidates = rest_api_region_candidates(sso_region, credentials.is_external_idp());
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
@@ -1823,9 +1828,18 @@ impl MultiTokenManager {
         &self,
         model: Option<&str>,
         group: Option<&str>,
+        fast_mode: bool,
     ) -> anyhow::Result<(u64, KiroCredentials, CredentialLease)> {
         let total = self.total_count_in_group(group).max(1);
-        let wait_timeout = StdDuration::from_secs(self.config.account_acquire_timeout_secs.max(1));
+        // 快速模式用短超时(fast_mode_acquire_timeout_ms,默认 800ms)而非
+        // account_acquire_timeout_secs(默认 30s):高峰期所有账号都在 429 冷却/并发满时,
+        // 宁可尽快返回"池忙"让客户端重试,也不让单请求死等数秒——这是打 429 重试链
+        // (实测每成功请求平均吃 1.45 次 429、每次 attempt 阻塞 ~4.3s)的最大杠杆。
+        let wait_timeout = if fast_mode {
+            StdDuration::from_millis(self.config.fast_mode_acquire_timeout_ms.max(50))
+        } else {
+            StdDuration::from_secs(self.config.account_acquire_timeout_secs.max(1))
+        };
         let started_at = Instant::now();
         let mut logged_busy_wait = false;
 
@@ -1986,6 +2000,7 @@ impl MultiTokenManager {
         &self,
         model: Option<&str>,
         group: Option<&str>,
+        fast_mode: bool,
     ) -> anyhow::Result<CallContext> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
@@ -2000,7 +2015,8 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials, permit) = self.acquire_idle_permit(model, group).await?;
+            let (id, credentials, permit) =
+                self.acquire_idle_permit(model, group, fast_mode).await?;
 
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials, permit).await {
@@ -3034,6 +3050,20 @@ impl MultiTokenManager {
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
+    }
+
+    /// 指定凭据是否为 external_idp（企业 SSO，如 Azure AD）。凭据不存在时返回 false。
+    ///
+    /// 导入验活用：external_idp 账号通常只持有 `codewhisperer:conversations/completions`
+    /// scope，无用量 API 权限，getUsageLimits 必 403——故此类账号的存活以 token 刷新
+    /// 成功为准（见 admin 导入流程），而非余额拉取。
+    pub fn is_external_idp_for(&self, id: u64) -> bool {
+        self.entries
+            .lock()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.credentials.is_external_idp())
+            .unwrap_or(false)
     }
 
     /// 重置凭据失败计数并重新启用（Admin API）
@@ -4472,7 +4502,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None, None).await.unwrap();
+        let ctx = manager.acquire_context(None, None, false).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -4495,7 +4525,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None, None).await.unwrap();
+        let ctx = manager.acquire_context(None, None, false).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -4541,7 +4571,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None, None)
+            .acquire_context(None, None, false)
             .await
             .err()
             .unwrap()
@@ -4586,7 +4616,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None, None)
+            .acquire_context(None, None, false)
             .await
             .err()
             .unwrap()
@@ -4728,16 +4758,16 @@ mod tests {
     fn test_rest_api_region_candidates_us_default() {
         // 自身区域优先，再追加兜底区域；自身已是 us-east-1 时去重
         assert_eq!(
-            rest_api_region_candidates("us-east-1"),
+            rest_api_region_candidates("us-east-1", false),
             ["us-east-1", "eu-central-1"]
         );
         // 自身区域非兜底区 → 排首位，兜底区依次追加
         assert_eq!(
-            rest_api_region_candidates("us-east-2"),
+            rest_api_region_candidates("us-east-2", false),
             ["us-east-2", "us-east-1", "eu-central-1"]
         );
         assert_eq!(
-            rest_api_region_candidates("ap-southeast-1"),
+            rest_api_region_candidates("ap-southeast-1", false),
             ["ap-southeast-1", "us-east-1", "eu-central-1"]
         );
     }
@@ -4746,29 +4776,39 @@ mod tests {
     fn test_rest_api_region_candidates_eu() {
         // eu-central-1 自身即兜底区 → 去重后排首位
         assert_eq!(
-            rest_api_region_candidates("eu-central-1"),
+            rest_api_region_candidates("eu-central-1", false),
             ["eu-central-1", "us-east-1"]
         );
         // 其他 EU 区域 → 自身优先，再回退 us-east-1 / eu-central-1
         assert_eq!(
-            rest_api_region_candidates("eu-west-1"),
+            rest_api_region_candidates("eu-west-1", false),
             ["eu-west-1", "us-east-1", "eu-central-1"]
         );
         assert_eq!(
-            rest_api_region_candidates("eu-north-1"),
+            rest_api_region_candidates("eu-north-1", false),
             ["eu-north-1", "us-east-1", "eu-central-1"]
         );
+    }
+
+    #[test]
+    fn test_rest_api_region_candidates_external_idp_us_only() {
+        // external_idp 的 codewhisperer.* 主机仅 us-east-1 有 DNS：
+        // 无论自身 SSO 区域是什么，都只返回 us-east-1，杜绝 eu-central-1 NXDOMAIN 噪声。
+        assert_eq!(rest_api_region_candidates("us-east-1", true), ["us-east-1"]);
+        assert_eq!(rest_api_region_candidates("eu-central-1", true), ["us-east-1"]);
+        assert_eq!(rest_api_region_candidates("eu-west-1", true), ["us-east-1"]);
+        assert_eq!(rest_api_region_candidates("", true), ["us-east-1"]);
     }
 
     #[test]
     fn test_rest_api_region_candidates_empty_falls_back() {
         // 空/空白自身区域被忽略，直接用兜底区域
         assert_eq!(
-            rest_api_region_candidates(""),
+            rest_api_region_candidates("", false),
             ["us-east-1", "eu-central-1"]
         );
         assert_eq!(
-            rest_api_region_candidates("  "),
+            rest_api_region_candidates("  ", false),
             ["us-east-1", "eu-central-1"]
         );
     }
@@ -4783,7 +4823,7 @@ mod tests {
         eu_cred.region = Some("eu-west-1".to_string());
         let sso_region = eu_cred.effective_auth_region(&config);
         assert_eq!(
-            rest_api_region_candidates(sso_region),
+            rest_api_region_candidates(sso_region, false),
             ["eu-west-1", "us-east-1", "eu-central-1"]
         );
 
@@ -4791,7 +4831,7 @@ mod tests {
         let plain_cred = KiroCredentials::default();
         let sso_region = plain_cred.effective_auth_region(&config);
         assert_eq!(
-            rest_api_region_candidates(sso_region),
+            rest_api_region_candidates(sso_region, false),
             ["us-east-1", "eu-central-1"]
         );
     }
@@ -5230,11 +5270,11 @@ mod tests {
         .unwrap();
 
         // Warm current_id with the highest-priority Free account.
-        let current = manager.acquire_context(None, None).await.unwrap();
+        let current = manager.acquire_context(None, None, false).await.unwrap();
         assert_eq!(current.id, 1);
 
         let opus = manager
-            .acquire_context(Some("claude-opus-4.6"), None)
+            .acquire_context(Some("claude-opus-4.6"), None, false)
             .await
             .unwrap();
         assert_eq!(
@@ -5254,16 +5294,16 @@ mod tests {
         )
         .unwrap();
 
-        let first = manager.acquire_context(None, None).await.unwrap();
+        let first = manager.acquire_context(None, None, false).await.unwrap();
         assert_eq!(first.id, 1);
 
-        let second = manager.acquire_context(None, None).await.unwrap();
+        let second = manager.acquire_context(None, None, false).await.unwrap();
         assert_eq!(
             second.id, 2,
             "account #2 is idle, so it should be preferred over a busy account #1"
         );
 
-        let third = manager.acquire_context(None, None).await.unwrap();
+        let third = manager.acquire_context(None, None, false).await.unwrap();
         assert_eq!(
             third.id, 1,
             "both accounts have one request in flight, so priority order should be used"
@@ -5281,19 +5321,19 @@ mod tests {
             MultiTokenManager::new(Config::default(), vec![small, large], None, None, false)
                 .unwrap();
 
-        let a1 = manager.acquire_context(None, Some("small")).await.unwrap();
+        let a1 = manager.acquire_context(None, Some("small"), false).await.unwrap();
         assert_eq!(a1.id, 1);
-        let a2 = manager.acquire_context(None, Some("small")).await.unwrap();
+        let a2 = manager.acquire_context(None, Some("small"), false).await.unwrap();
         assert_eq!(a2.id, 1);
 
         let mut large_contexts = Vec::new();
         for _ in 0..5 {
-            let ctx = manager.acquire_context(None, Some("large")).await.unwrap();
+            let ctx = manager.acquire_context(None, Some("large"), false).await.unwrap();
             assert_eq!(ctx.id, 2);
             large_contexts.push(ctx);
         }
 
-        let next = manager.acquire_context(None, None).await.unwrap();
+        let next = manager.acquire_context(None, None, false).await.unwrap();
         assert_eq!(
             next.id, 2,
             "small account is 2/2 busy while large is 5/20 busy, so load ratio should pick large"
@@ -5326,7 +5366,7 @@ mod tests {
         }
 
         // 两者都空闲(load=0)。无惩罚时按 id 升序选 1;惩罚生效则应选健康的 2。
-        let ctx = manager.acquire_context(None, None).await.unwrap();
+        let ctx = manager.acquire_context(None, None, false).await.unwrap();
         assert_eq!(
             ctx.id, 2,
             "高错误率的 id=1 应被降权,即便 id 更小、负载相同也应选健康的 id=2"
@@ -5342,9 +5382,9 @@ mod tests {
             MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
         );
 
-        let first = manager.acquire_context(None, None).await.unwrap();
-        let second = manager.acquire_context(None, None).await.unwrap();
-        let third = manager.acquire_context(None, None).await.unwrap();
+        let first = manager.acquire_context(None, None, false).await.unwrap();
+        let second = manager.acquire_context(None, None, false).await.unwrap();
+        let third = manager.acquire_context(None, None, false).await.unwrap();
         assert_eq!(manager.snapshot().entries[0].in_flight, 3);
 
         manager.set_credential_concurrency(1, Some(1)).unwrap();
@@ -5357,7 +5397,7 @@ mod tests {
 
         let manager_for_task = Arc::clone(&manager);
         let handle =
-            tokio::spawn(async move { manager_for_task.acquire_context(None, None).await });
+            tokio::spawn(async move { manager_for_task.acquire_context(None, None, false).await });
         tokio::time::sleep(StdDuration::from_millis(20)).await;
         assert!(
             !handle.is_finished(),
@@ -5414,7 +5454,7 @@ mod tests {
             let max_seen = Arc::clone(&max_seen);
             let live = Arc::clone(&live);
             tasks.push(tokio::spawn(async move {
-                let ctx = m.acquire_context(None, None).await.unwrap();
+                let ctx = m.acquire_context(None, None, false).await.unwrap();
                 // 进入临界区:当前真实在途 = live+1。断言不超过 acquire 当下的 cap。
                 let now_live = live.fetch_add(1, Ordering::SeqCst) + 1;
                 max_seen.fetch_max(now_live, Ordering::SeqCst);
@@ -5456,11 +5496,11 @@ mod tests {
             .unwrap(),
         );
 
-        let first = manager.acquire_context(None, None).await.unwrap();
-        let second = manager.acquire_context(None, None).await.unwrap();
+        let first = manager.acquire_context(None, None, false).await.unwrap();
+        let second = manager.acquire_context(None, None, false).await.unwrap();
         let manager_for_task = Arc::clone(&manager);
         let handle =
-            tokio::spawn(async move { manager_for_task.acquire_context(None, None).await });
+            tokio::spawn(async move { manager_for_task.acquire_context(None, None, false).await });
 
         tokio::time::sleep(StdDuration::from_millis(50)).await;
         assert!(
@@ -5571,16 +5611,16 @@ mod tests {
         .unwrap();
 
         // 正常情况下 g1 能拿到 context
-        assert!(manager.acquire_context(None, Some("g1")).await.is_ok());
+        assert!(manager.acquire_context(None, Some("g1"), false).await.is_ok());
 
         // 手动禁用 g1 内唯一账号 A(id1)
         manager.set_disabled(1, true).unwrap();
 
         // 严格隔离：g1 无可用账号 → Err，且不会选到 B/C
-        let res = manager.acquire_context(None, Some("g1")).await;
+        let res = manager.acquire_context(None, Some("g1"), false).await;
         assert!(res.is_err(), "g1 内全部账号禁用后应失败，不回退到其他分组");
 
         // 但 g2 仍可用
-        assert!(manager.acquire_context(None, Some("g2")).await.is_ok());
+        assert!(manager.acquire_context(None, Some("g2"), false).await.is_ok());
     }
 }
