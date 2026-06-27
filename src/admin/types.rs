@@ -505,9 +505,9 @@ pub struct RuntimeGovernanceConfigResponse {
     pub response_cache_enabled: bool,
     /// 全局响应缓存默认 TTL（秒）。
     pub response_cache_ttl_secs: u64,
-    /// 缓存计量全局命中率 R ∈ [0,1]：可缓存前缀（system+tools+历史）有多大比例计作
-    /// cache_read，其余计作 cache_creation。首轮（无历史）恒全部计作 creation。
-    /// 0 = 从不命中；可被 per-key `cacheReadRatio` 覆盖。
+    /// 缓存计量全局 read 留存阻尼 R ∈ [0,1]：read 桶保留 `read × R`，其余推回 input
+    /// （不给缓存折扣），不触碰 creation。delta-based 拆桶下 creation 每轮有界。
+    /// R=1=给足真实折扣；0=完全不给。可被 per-key `cacheReadRatio` 覆盖。
     pub cache_read_ratio: f64,
 }
 
@@ -524,7 +524,7 @@ pub struct SetRuntimeGovernanceConfigRequest {
     /// 全局响应缓存默认 TTL（秒），范围 1..=86400；缺省不修改。
     #[serde(default)]
     pub response_cache_ttl_secs: Option<u64>,
-    /// 缓存计量全局命中率 R，范围 0..=1；缺省不修改。
+    /// 缓存计量全局 read 留存阻尼 R，范围 0..=1；缺省不修改。
     #[serde(default)]
     pub cache_read_ratio: Option<f64>,
 }

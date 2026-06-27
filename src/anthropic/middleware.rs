@@ -35,7 +35,7 @@ pub struct KeyContext {
     /// 响应缓存 per-key 覆盖（None = 跟随全局配置）。
     pub response_cache_enabled: Option<bool>,
     pub response_cache_ttl_secs: Option<u32>,
-    /// 缓存命中率 R per-key 覆盖（None = 跟随全局 `MeterGovernance`）。
+    /// 缓存计量 read 留存阻尼 R per-key 覆盖（None = 跟随全局 `MeterGovernance`）。
     pub cache_read_ratio: Option<f64>,
     /// 命中的入口 Key 类型。
     pub key_source: TraceKeySource,

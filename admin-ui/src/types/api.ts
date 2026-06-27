@@ -404,7 +404,7 @@ export interface ClientKeyItem {
   responseCacheEnabled?: boolean
   /** 响应缓存 TTL 覆盖（秒；undefined = 跟随全局默认） */
   responseCacheTtlSecs?: number
-  /** 缓存命中率 R 覆盖 ∈ [0,1]（undefined = 跟随全局 cacheReadRatio） */
+  /** 缓存 read 留存阻尼 R 覆盖 ∈ [0,1]（undefined = 跟随全局 cacheReadRatio） */
   cacheReadRatio?: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
@@ -445,7 +445,7 @@ export interface UpdateClientKeyRequest {
   responseCacheEnabled?: boolean | null
   /** 响应缓存 TTL 覆盖（秒；省略=不变更；0=复位为跟随全局） */
   responseCacheTtlSecs?: number
-  /** 缓存命中率 R 覆盖更新 ∈ [0,1]（省略=不变更；null=复位为跟随全局；数值=强制） */
+  /** 缓存 read 留存阻尼 R 覆盖更新 ∈ [0,1]（省略=不变更；null=复位为跟随全局；数值=强制） */
   cacheReadRatio?: number | null
 }
 

@@ -479,7 +479,7 @@ export interface RuntimeGovernanceConfig {
   quotaDisableThreshold: number
   responseCacheEnabled: boolean
   responseCacheTtlSecs: number
-  /** 缓存计量全局命中率 R ∈ [0,1]：可缓存前缀里计作 cache_read 的比例（其余计 creation）。 */
+  /** 缓存计量 read 留存阻尼 R ∈ [0,1]：read 桶保留 read×R，其余推回 input（不触碰 creation）。 */
   cacheReadRatio: number
 }
 

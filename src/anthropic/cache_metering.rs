@@ -1,61 +1,60 @@
-//! 中转层 prompt cache 计量（无状态、确定性）
+//! 中转层 prompt cache 计量（无状态、确定性、delta-based）
 //!
 //! Kiro 上游既不做 prompt cache、也不下发 cache_creation / cache_read 字段（实测
 //! meteringEvent 只给 credit 计费量），所以中转层上报的缓存计费**纯粹是合成给下游看
-//! 的数字**，不对应任何真实缓存命中、也不影响真实成本。
+//! 的数字**，不对应任何真实缓存命中、也不影响真实成本。下游按 read/creation **分别计价**
+//! （creation 贵、read 便宜），所以合成数字必须**经济上自洽**：creation 每轮只应反映
+//! 「本轮新增的那一段」，不能随对话变长而虚高。
 //!
-//! 既然底层没有真实缓存，就没有必要去"忠实模拟"真实缓存那套随时间 / 负载漂移的不确定
-//! 行为。本模块用一个**纯函数式、确定性**的结构化拆分取而代之：
+//! 既然底层没有真实缓存，就不该去"忠实模拟"真实缓存那套随时间/负载漂移的不确定行为。
+//! 本模块按**多轮对话缓存实际怎么累积**做纯函数式、确定性的结构化拆分（delta-based）：
 //!
 //! ```text
-//! last_input_est   = estimate(最后一条 message)            // 本轮新输入
-//! prompt_total_est = estimate(system + tools + 全部 messages)
-//! first_turn       = messages.len() <= 1                   // 无历史 → 全新建
-//! R                = cache_read_ratio（运行时旋钮，可 per-key 覆盖）
-//!
-//! // 对真实 total（contextUsage 真值优先，否则 count_tokens 估算）分摊：
-//! input     = round(total_real × last_input_est / prompt_total_est)
-//! cacheable = total_real − input
-//! first_turn → read = 0、creation = cacheable             // 首轮写缓存
-//! 否则       → read = round(cacheable × R)、creation = cacheable − read
-//! // 恒等：input + creation + read == total_real
+//! input    = 最后一条 message（本轮新问题）          —— 未缓存
+//! creation = 倒数第二条 message（刚完成、本轮才写入缓存的那段响应）—— 有界，恒为一条
+//! read     = system + tools + 更早的全部历史          —— 上一轮已缓存
+//! 首轮(messages 仅 1 条) → creation = system+tools（首次写缓存）、read = 0
 //! ```
 //!
-//! 比例 `last_input_est / prompt_total_est` 是无量纲量，跨估算器成立，所以即便 estimate
-//! 口径与真实 total 口径不同，分摊仍自洽。命中率 `R` 是直接旋钮：想呈现 95% 缓存折扣就
-//! 设 0.95，想关就设 0。同一段对话无论何时重放、负载如何，结果**完全相同**。
+//! 关键性质：**creation 每轮有界（≈一条消息），read 随历史累积增长**。对话越长 read 越大、
+//! read:creation 比值自然往上漂——既真实又不死板，且贵的 creation 桶不会被历史规模放大。
+//! 同一段对话无论何时重放、负载如何，结果**完全相同**（请求结构的纯函数）。
+//!
+//! 命中率 `R` ∈ [0,1] 是 **read 留存阻尼**（默认 1.0）：`read_final = read × R`，被砍掉的
+//! `read × (1−R)` 推回 input（相当于"假装这段前缀没命中缓存"→ 不给折扣）。R **不触碰
+//! creation**，所以贵桶始终经济正确；R=1 给足缓存折扣（真实），调低则更保守。可全局设也可
+//! per-key 覆盖。
 //!
 //! 无后台任务、无落盘、无内存增长——计量只是请求级的纯计算。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// `compute_structural_cache_usage` 的结果：按 estimate 口径算出的结构化比例基准 +
-/// 命中率，最终由 [`CacheUsage::split_against_total`] 对真实 total 做互斥分摊。
+/// `compute_structural_cache_usage` 的结果：按 estimate 口径算出的三桶基准 + read 留存
+/// 阻尼，最终由 [`CacheUsage::split_against_total`] 对真实 total 做互斥分摊。
 ///
-/// 三个数共同决定 `(input, cache_creation, cache_read)` 的拆分，但都不是最终值——
-/// 真正的 token 数要在拿到真实 total（contextUsage 真值或 count_tokens 估算）后才算出，
-/// 因为流式响应直到末尾才知道真实 total。
+/// 三个 estimate 是比例基准（不是最终值）——真正的 token 数要在拿到真实 total（contextUsage
+/// 真值或 count_tokens 估算）后才按比例算出，因为流式响应直到末尾才知道真实 total。
 #[derive(Debug, Clone, Copy)]
 pub struct CacheUsage {
     /// 本轮新输入（最后一条 message）的 estimate token——这部分永不计入缓存。
-    pub last_input_est: i32,
+    pub input_est: i32,
+    /// 本轮新写入缓存的 delta（倒数第二条 message；首轮为 system+tools）的 estimate token。
+    pub creation_est: i32,
     /// 整个 prompt（system + tools + 全部 messages）的 estimate token，比例分摊的分母。
     pub prompt_total_est: i32,
-    /// 缓存命中率 R ∈ [0,1]：可缓存前缀里有多大比例计作 cache_read（其余计 creation）。
+    /// read 留存阻尼 R ∈ [0,1]：read 桶保留 `read × R`，其余推回 input（不给缓存折扣）。
     pub read_ratio: f64,
-    /// 是否首轮（无历史）：首轮强制 read = 0、可缓存前缀全部计作 cache_creation。
-    pub first_turn: bool,
 }
 
 impl Default for CacheUsage {
     /// 默认 = 不模拟缓存：`prompt_total_est == 0` 使 `split_against_total` 全量计入 input。
     fn default() -> Self {
         Self {
-            last_input_est: 0,
+            input_est: 0,
+            creation_est: 0,
             prompt_total_est: 0,
-            read_ratio: 0.0,
-            first_turn: true,
+            read_ratio: 1.0,
         }
     }
 }
@@ -64,56 +63,60 @@ impl CacheUsage {
     /// 按真实 total 口径做互斥分摊，返回 `(input_tokens, cache_creation, cache_read)`，
     /// 三者满足 `input + creation + read == total_real`。
     ///
-    /// `total_real` 是最终上报口径的全量 prompt token。无可缓存前缀（`prompt_total_est <= 0`
-    /// 或 estimate 显示整个 prompt 都是本轮新输入）时，全部计入 input，不凭空造缓存计数。
+    /// `total_real` 是最终上报口径的全量 prompt token。input / creation 各按其 estimate 占比
+    /// 折算到真实 total，剩余即 read；再对 read 施加留存阻尼 R（砍掉的部分推回 input）。
+    /// 无可缓存内容（`prompt_total_est <= 0`）时全部计入 input，不凭空造缓存计数。
     pub fn split_against_total(&self, total_real: i32) -> (i32, i32, i32) {
         let total = total_real.max(0);
         if self.prompt_total_est <= 0 || total == 0 {
             return (total, 0, 0);
         }
-        // 本轮新输入占比（无量纲，跨估算器成立）；clamp 防 estimate 偏差越界。
-        let input_ratio =
-            (self.last_input_est as f64 / self.prompt_total_est as f64).clamp(0.0, 1.0);
-        let input = ((total as f64) * input_ratio).round() as i32;
-        let input = input.clamp(0, total);
-        let cacheable = total - input;
-        if cacheable <= 0 {
-            return (total, 0, 0);
+        let denom = self.prompt_total_est as f64;
+        let input_share = (self.input_est as f64 / denom).clamp(0.0, 1.0);
+        let creation_share = (self.creation_est as f64 / denom).clamp(0.0, 1.0);
+
+        // input / creation 按占比折算，clamp 保证 input + creation <= total。
+        let mut input = ((total as f64) * input_share).round() as i32;
+        input = input.clamp(0, total);
+        let mut creation = ((total as f64) * creation_share).round() as i32;
+        creation = creation.clamp(0, total - input);
+
+        // 剩余即已缓存前缀（read 基数）。
+        let read_base = total - input - creation;
+        if read_base <= 0 {
+            return (input, creation, 0);
         }
-        // 首轮：可缓存前缀全部计作 creation（模拟"第一次把 system / 历史写进缓存"）。
-        if self.first_turn {
-            return (input, cacheable, 0);
-        }
+        // read 留存阻尼：保留 read_base × R，被砍部分推回 input（无缓存折扣），creation 不动。
         let r = self.read_ratio.clamp(0.0, 1.0);
-        let read = ((cacheable as f64) * r).round() as i32;
-        let read = read.clamp(0, cacheable);
-        let creation = cacheable - read;
+        let read = ((read_base as f64) * r).round() as i32;
+        let read = read.clamp(0, read_base);
+        input += read_base - read;
         (input, creation, read)
     }
 }
 
-/// 计量运行时治理：持有全局缓存命中率 R（运行时可经 Admin API 调整）。
+/// 计量运行时治理：持有全局 read 留存阻尼 R（运行时可经 Admin API 调整）。
 ///
 /// 取代旧的有状态 `CacheMeter`——不再需要容量 / TTL / 落盘 / 会话级开关，只剩一个原子旋钮。
 pub struct MeterGovernance {
-    /// 全局缓存命中率 R 的 bit 表示（f64 → u64，原子读写）。per-key 未覆盖时用此值。
+    /// 全局 R 的 bit 表示（f64 → u64，原子读写）。per-key 未覆盖时用此值。
     read_ratio_bits: AtomicU64,
 }
 
 impl MeterGovernance {
-    /// 用初始命中率构造（clamp 到 [0,1]）。
+    /// 用初始 R 构造（clamp 到 [0,1]）。
     pub fn new(read_ratio: f64) -> Self {
         Self {
             read_ratio_bits: AtomicU64::new(read_ratio.clamp(0.0, 1.0).to_bits()),
         }
     }
 
-    /// 当前全局命中率 R。
+    /// 当前全局 R。
     pub fn read_ratio(&self) -> f64 {
         f64::from_bits(self.read_ratio_bits.load(Ordering::Relaxed))
     }
 
-    /// 设置全局命中率 R（clamp 到 [0,1]），运行时立即对后续请求生效。
+    /// 设置全局 R（clamp 到 [0,1]），运行时立即对后续请求生效。
     pub fn set_read_ratio(&self, ratio: f64) {
         self.read_ratio_bits
             .store(ratio.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
@@ -130,40 +133,53 @@ pub type SharedMeterGovernance = Arc<MeterGovernance>;
 use super::stream::estimate_tokens;
 use super::types::{MessagesRequest, SystemMessage, Tool};
 
-/// 计算本次请求的结构化缓存覆盖情况。纯函数：只看请求结构与命中率，不依赖任何跨请求
-/// 状态、时间、负载。返回 [`CacheUsage`]，由调用方在拿到真实 total 后做互斥分摊。
+/// 计算本次请求的 delta-based 结构化缓存覆盖情况。纯函数：只看请求结构与 R，不依赖任何
+/// 跨请求状态、时间、负载。返回 [`CacheUsage`]，由调用方在拿到真实 total 后做互斥分摊。
 ///
-/// `read_ratio` 是该请求生效的命中率（per-key 覆盖优先，否则全局 [`MeterGovernance`]）。
+/// 桶划分（见模块文档）：input = 最后一条 message；creation = 倒数第二条 message（首轮为
+/// system+tools）；read = 其余前缀。`read_ratio` 是该请求生效的 R（per-key 覆盖优先，否则
+/// 全局 [`MeterGovernance`]）。
 pub fn compute_structural_cache_usage(req: &MessagesRequest, read_ratio: f64) -> CacheUsage {
-    // 整个 prompt 的 estimate：tools + system + 全部 messages。
-    let mut prompt_total_est: i32 = 0;
+    // system + tools 开销（首轮即首次写入缓存的那段）。
+    let mut overhead: i32 = 0;
     if let Some(tools) = req.tools.as_ref() {
         for t in tools {
-            prompt_total_est = prompt_total_est.saturating_add(tool_tokens(t));
+            overhead = overhead.saturating_add(tool_tokens(t));
         }
     }
     if let Some(systems) = req.system.as_ref() {
         for sys in systems {
-            prompt_total_est = prompt_total_est.saturating_add(system_tokens(sys));
+            overhead = overhead.saturating_add(system_tokens(sys));
         }
     }
-    for msg in &req.messages {
-        prompt_total_est = prompt_total_est.saturating_add(message_tokens(msg));
+
+    let n = req.messages.len();
+    if n == 0 {
+        // 无 message：无可缓存内容，全入 input（prompt_total_est=0 触发默认分摊）。
+        return CacheUsage {
+            input_est: 0,
+            creation_est: 0,
+            prompt_total_est: 0,
+            read_ratio: read_ratio.clamp(0.0, 1.0),
+        };
     }
 
-    // 本轮新输入 = 最后一条 message 的 estimate（无 message 时为 0）。
-    let last_input_est = req
-        .messages
-        .last()
-        .map(message_tokens)
-        .unwrap_or(0);
+    let msg_est: Vec<i32> = req.messages.iter().map(message_tokens).collect();
+    let msgs_total: i32 = msg_est.iter().fold(0, |a, b| a.saturating_add(*b));
+    let prompt_total_est = overhead.saturating_add(msgs_total);
+
+    // input = 最后一条 message（本轮新问题）。
+    let input_est = msg_est[n - 1];
+    // creation = 本轮新写入缓存的 delta：
+    //   首轮(n==1) → system+tools（第一次把 system/tools 写进缓存）
+    //   否则       → 倒数第二条 message（刚完成、本轮才补进缓存的那段响应，有界）
+    let creation_est = if n == 1 { overhead } else { msg_est[n - 2] };
 
     CacheUsage {
-        last_input_est,
+        input_est,
+        creation_est,
         prompt_total_est,
         read_ratio: read_ratio.clamp(0.0, 1.0),
-        // 首轮 = 没有历史可缓存（messages 只有本轮这一条，或为空）。
-        first_turn: req.messages.len() <= 1,
     }
 }
 
@@ -300,75 +316,86 @@ mod tests {
     }
 
     #[test]
-    fn split_first_turn_all_creation() {
-        // 首轮：input 占比 60%，剩余 40% 全部 creation、read = 0。
+    fn split_three_buckets_by_share() {
+        // input 占比 10%、creation 占比 5%，剩余 85% 为 read（R=1 全留存）。
         let u = CacheUsage {
-            last_input_est: 60,
-            prompt_total_est: 100,
-            read_ratio: 0.8,
-            first_turn: true,
-        };
-        let (input, creation, read) = u.split_against_total(1000);
-        assert_eq!(input, 600);
-        assert_eq!(creation, 400);
-        assert_eq!(read, 0);
-        assert_eq!(input + creation + read, 1000);
-    }
-
-    #[test]
-    fn split_subsequent_turn_applies_ratio() {
-        // 非首轮：input 占比 20%，可缓存 80%（=800）内按 R=0.8 拆 → read=640、creation=160。
-        let u = CacheUsage {
-            last_input_est: 20,
-            prompt_total_est: 100,
-            read_ratio: 0.8,
-            first_turn: false,
-        };
-        let (input, creation, read) = u.split_against_total(1000);
-        assert_eq!(input, 200);
-        assert_eq!(read, 640);
-        assert_eq!(creation, 160);
-        assert_eq!(input + creation + read, 1000);
-    }
-
-    #[test]
-    fn split_ratio_zero_all_creation() {
-        // R=0：可缓存前缀全部计作 creation（等价于"从不命中"）。
-        let u = CacheUsage {
-            last_input_est: 10,
-            prompt_total_est: 100,
-            read_ratio: 0.0,
-            first_turn: false,
-        };
-        let (input, creation, read) = u.split_against_total(1000);
-        assert_eq!(input, 100);
-        assert_eq!(creation, 900);
-        assert_eq!(read, 0);
-    }
-
-    #[test]
-    fn split_ratio_one_all_read() {
-        // R=1：可缓存前缀全部计作 read。
-        let u = CacheUsage {
-            last_input_est: 10,
+            input_est: 10,
+            creation_est: 5,
             prompt_total_est: 100,
             read_ratio: 1.0,
-            first_turn: false,
         };
         let (input, creation, read) = u.split_against_total(1000);
         assert_eq!(input, 100);
-        assert_eq!(creation, 0);
-        assert_eq!(read, 900);
+        assert_eq!(creation, 50);
+        assert_eq!(read, 850);
+        assert_eq!(input + creation + read, 1000);
+    }
+
+    #[test]
+    fn split_creation_bounded_independent_of_history() {
+        // creation 只随 creation_est 占比走，不随 read 基数（历史规模）变化——贵桶有界。
+        // 短历史：total 小
+        let short = CacheUsage {
+            input_est: 10,
+            creation_est: 20,
+            prompt_total_est: 100,
+            read_ratio: 1.0,
+        };
+        // 长历史：同样的 input/creation 占比，但 prompt_total 大得多（read 基数暴涨）
+        let long = CacheUsage {
+            input_est: 10,
+            creation_est: 20,
+            prompt_total_est: 1000,
+            read_ratio: 1.0,
+        };
+        let (_, c_short, _) = short.split_against_total(300);
+        let (_, c_long, r_long) = long.split_against_total(3000);
+        // creation 占比相同（20/100 vs 20/1000 → 真实 total 也等比放大），关键是 read 吃掉增量
+        assert_eq!(c_short, 60); // 300 × 20/100
+        assert_eq!(c_long, 60); // 3000 × 20/1000 —— creation 不被历史放大
+        assert!(r_long > 2000, "历史增长全进 read（便宜桶），不进 creation");
+    }
+
+    #[test]
+    fn split_read_retention_pushes_to_input_not_creation() {
+        // R<1：read 被砍的部分推回 input，creation 纹丝不动（贵桶经济正确）。
+        let u = CacheUsage {
+            input_est: 10,
+            creation_est: 10,
+            prompt_total_est: 100,
+            read_ratio: 0.5,
+        };
+        let (input, creation, read) = u.split_against_total(1000);
+        // base: input=100, creation=100, read_base=800
+        // R=0.5 → read=400，被砍 400 推回 input → input=500
+        assert_eq!(input, 500);
+        assert_eq!(creation, 100, "creation 不受 R 影响");
+        assert_eq!(read, 400);
+        assert_eq!(input + creation + read, 1000);
+    }
+
+    #[test]
+    fn split_ratio_zero_no_read() {
+        // R=0：完全不给缓存折扣，read 全部推回 input；creation 仍按其占比保留。
+        let u = CacheUsage {
+            input_est: 10,
+            creation_est: 10,
+            prompt_total_est: 100,
+            read_ratio: 0.0,
+        };
+        let (input, creation, read) = u.split_against_total(1000);
+        assert_eq!(creation, 100);
+        assert_eq!(read, 0);
+        assert_eq!(input, 900);
     }
 
     #[test]
     fn split_is_deterministic() {
-        // 同输入多次调用结果完全一致（无状态）。
         let u = CacheUsage {
-            last_input_est: 33,
+            input_est: 33,
+            creation_est: 41,
             prompt_total_est: 207,
-            read_ratio: 0.8,
-            first_turn: false,
+            read_ratio: 1.0,
         };
         let a = u.split_against_total(4096);
         let b = u.split_against_total(4096);
@@ -379,10 +406,10 @@ mod tests {
     #[test]
     fn split_zero_total_safe() {
         let u = CacheUsage {
-            last_input_est: 10,
+            input_est: 10,
+            creation_est: 10,
             prompt_total_est: 100,
-            read_ratio: 0.8,
-            first_turn: false,
+            read_ratio: 1.0,
         };
         assert_eq!(u.split_against_total(0), (0, 0, 0));
     }
@@ -390,27 +417,45 @@ mod tests {
     // ---- compute_structural_cache_usage ------------------------------------
 
     #[test]
-    fn compute_single_message_is_first_turn() {
-        let req = req_with(vec![msg("user", "hello there")], None);
-        let u = compute_structural_cache_usage(&req, 0.8);
-        assert!(u.first_turn, "单条消息 = 首轮");
-        // 本轮新输入 == 整个 prompt（无 system/tools/历史）→ split 全入 input。
-        assert_eq!(u.last_input_est, u.prompt_total_est);
-        let total = u.prompt_total_est.max(1);
-        let (input, creation, read) = u.split_against_total(total);
-        assert_eq!(input, total);
-        assert_eq!(creation, 0);
-        assert_eq!(read, 0);
+    fn compute_single_message_first_write() {
+        // 单条 message + system：input=该 message，creation=system(首次写缓存)，read=0。
+        let req = req_with(
+            vec![msg("user", "hello there friend")],
+            Some(vec![SystemMessage {
+                text: "you are helpful ".repeat(20),
+                cache_control: None,
+            }]),
+        );
+        let u = compute_structural_cache_usage(&req, 1.0);
+        assert!(u.input_est > 0);
+        assert!(u.creation_est > 0, "首轮 system+tools 计作 creation");
+        let (input, creation, read) = u.split_against_total(u.prompt_total_est);
+        assert_eq!(read, 0, "首轮无 read");
+        assert!(input > 0 && creation > 0);
+        assert_eq!(input + creation + read, u.prompt_total_est);
     }
 
     #[test]
-    fn compute_multi_turn_has_cacheable_prefix() {
-        // 历史(user,assistant) + 本轮(user)：本轮新输入 < 整个 prompt → 有可缓存前缀。
-        let body = "the quick brown fox ".repeat(20);
+    fn compute_single_message_no_overhead_all_input() {
+        // 单条 message、无 system/tools：creation_est=0 → 全入 input。
+        let req = req_with(vec![msg("user", "hi")], None);
+        let u = compute_structural_cache_usage(&req, 1.0);
+        assert_eq!(u.creation_est, 0);
+        assert_eq!(u.input_est, u.prompt_total_est);
+        let (input, creation, read) = u.split_against_total(u.prompt_total_est.max(1));
+        assert_eq!(creation, 0);
+        assert_eq!(read, 0);
+        assert_eq!(input, u.prompt_total_est.max(1));
+    }
+
+    #[test]
+    fn compute_multi_turn_delta_creation_is_prev_message() {
+        // 历史(u1,a1) + 本轮 u2：input=u2，creation=a1(倒数第二条)，read=system+tools+u1。
+        let big = "the quick brown fox ".repeat(40);
         let req = req_with(
             vec![
-                msg("user", &body),
-                msg("assistant", &body),
+                msg("user", &big),
+                msg("assistant", &big),
                 msg("user", "short new question"),
             ],
             Some(vec![SystemMessage {
@@ -418,33 +463,65 @@ mod tests {
                 cache_control: None,
             }]),
         );
-        let u = compute_structural_cache_usage(&req, 0.8);
-        assert!(!u.first_turn);
-        assert!(u.last_input_est < u.prompt_total_est, "本轮新输入应小于全量");
+        let u = compute_structural_cache_usage(&req, 1.0);
+        let a1_est = message_tokens(&msg("assistant", &big));
+        let u2_est = message_tokens(&msg("user", "short new question"));
+        assert_eq!(u.creation_est, a1_est, "creation = 倒数第二条 message");
+        assert_eq!(u.input_est, u2_est, "input = 最后一条 message");
         let (input, creation, read) = u.split_against_total(u.prompt_total_est);
         assert!(read > 0, "非首轮应有 cache_read");
-        assert!(creation > 0, "R<1 时仍有少量 creation");
+        assert!(creation > 0);
+        assert!(read > creation, "read（system+u1）应远大于 creation（仅 a1）");
         assert_eq!(input + creation + read, u.prompt_total_est);
     }
 
     #[test]
-    fn compute_ratio_directly_controls_read_share() {
-        // 命中率旋钮线性可调：同一请求，R 越大 read 越多、creation 越少。
-        let body = "lorem ipsum dolor sit amet ".repeat(20);
-        let req = req_with(
-            vec![
-                msg("user", &body),
-                msg("assistant", &body),
-                msg("user", "q"),
-            ],
+    fn compute_creation_does_not_grow_with_history() {
+        // 核心经济性质：对话越长，creation 仍≈一条 message，不随历史线性增长。
+        let unit = "lorem ipsum dolor sit amet ".repeat(10);
+        let short = req_with(
+            vec![msg("user", &unit), msg("assistant", &unit), msg("user", "q")],
             None,
         );
-        let total = compute_structural_cache_usage(&req, 0.5).prompt_total_est;
-        let (_, c_low, r_low) = compute_structural_cache_usage(&req, 0.5).split_against_total(total);
-        let (_, c_high, r_high) =
-            compute_structural_cache_usage(&req, 0.9).split_against_total(total);
-        assert!(r_high > r_low, "R 越大 read 越多");
-        assert!(c_high < c_low, "R 越大 creation 越少");
+        // 长对话：20 条历史 + 本轮
+        let mut long_msgs: Vec<Message> = Vec::new();
+        for i in 0..10 {
+            long_msgs.push(msg("user", &format!("{unit} {i}")));
+            long_msgs.push(msg("assistant", &unit));
+        }
+        long_msgs.push(msg("user", "q"));
+        let long = req_with(long_msgs, None);
+
+        let cu_short = compute_structural_cache_usage(&short, 1.0);
+        let cu_long = compute_structural_cache_usage(&long, 1.0);
+        // creation_est 都≈一条 assistant 消息，长对话不放大
+        let a_est = message_tokens(&msg("assistant", &unit));
+        assert_eq!(cu_short.creation_est, a_est);
+        assert_eq!(cu_long.creation_est, a_est, "长对话 creation 仍是一条 message");
+        // 而 prompt_total（→read 基数）长对话远大于短对话
+        assert!(cu_long.prompt_total_est > cu_short.prompt_total_est * 5);
+
+        let (_, c_short, _) = cu_short.split_against_total(cu_short.prompt_total_est);
+        let (_, c_long, r_long) = cu_long.split_against_total(cu_long.prompt_total_est);
+        assert!(r_long > c_long * 5, "长对话增量几乎全进便宜的 read 桶");
+        // creation 真实 token 不爆炸（两者同数量级，长对话甚至更小，因占比被摊薄）
+        assert!(c_long <= c_short + 5);
+    }
+
+    #[test]
+    fn compute_read_retention_controls_discount() {
+        // R 越大，read 越多、input 越少；creation 不变。
+        let body = "lorem ipsum dolor sit amet ".repeat(20);
+        let req = req_with(
+            vec![msg("user", &body), msg("assistant", &body), msg("user", "q")],
+            None,
+        );
+        let total = compute_structural_cache_usage(&req, 1.0).prompt_total_est;
+        let (i_lo, c_lo, r_lo) = compute_structural_cache_usage(&req, 0.5).split_against_total(total);
+        let (i_hi, c_hi, r_hi) = compute_structural_cache_usage(&req, 1.0).split_against_total(total);
+        assert!(r_hi > r_lo, "R 越大 read 越多");
+        assert!(i_hi < i_lo, "R 越大 input 越少（折扣更足）");
+        assert_eq!(c_lo, c_hi, "creation 不受 R 影响");
     }
 
     #[test]
@@ -466,20 +543,19 @@ mod tests {
             ],
             None,
         );
-        let u = compute_structural_cache_usage(&req, 0.8);
-        // 含图历史在前缀里 → prompt_total 应远大于本轮纯文本新输入。
+        let u = compute_structural_cache_usage(&req, 1.0);
+        // 含图历史(u1)在 read 前缀里 → prompt_total 应远大于本轮纯文本新输入。
         assert!(u.prompt_total_est >= img_tokens, "prompt_total 应含图片 token");
-        assert!(!u.first_turn);
         let (_, _, read) = u.split_against_total(u.prompt_total_est);
-        assert!(read > 0);
+        assert!(read > img_tokens / 2, "含图历史进 read 桶");
     }
 
     #[test]
     fn compute_empty_messages_safe() {
         let req = req_with(vec![], None);
-        let u = compute_structural_cache_usage(&req, 0.8);
-        assert!(u.first_turn);
-        assert_eq!(u.last_input_est, 0);
+        let u = compute_structural_cache_usage(&req, 1.0);
+        assert_eq!(u.input_est, 0);
+        assert_eq!(u.creation_est, 0);
         assert_eq!(u.split_against_total(100), (100, 0, 0));
     }
 

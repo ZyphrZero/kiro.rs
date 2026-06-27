@@ -655,9 +655,9 @@ export function ClientKeysPage() {
                 </div>
                 <div className="flex items-center justify-between gap-3">
                   <div>
-                    <div className="text-sm">缓存命中率 R 覆盖</div>
+                    <div className="text-sm">缓存 read 留存 R 覆盖</div>
                     <p className="text-[11px] text-muted-foreground">
-                      留空＝跟随全局；0~1。可缓存前缀里计作 cache_read 的比例（其余 creation）。
+                      留空＝跟随全局；0~1。read 桶留存比例（其余推回 input，不触碰 creation）。
                     </p>
                   </div>
                   <Input

@@ -383,11 +383,11 @@ function RuntimeGovernanceButton() {
           </Button>
         </form>
         <DropdownMenuLabel className="pt-1">
-          缓存命中率 R（当前 {cfg?.cacheReadRatio ?? '—'}）
+          缓存 read 留存 R（当前 {cfg?.cacheReadRatio ?? '—'}）
         </DropdownMenuLabel>
         <div className="px-2 pb-1 text-[11px] leading-snug text-muted-foreground">
-          可缓存前缀（system+tools+历史）里计作 cache_read 的比例，其余计 cache_creation；
-          首轮恒全部为 creation。0=从不命中，0.95=呈现 95% 缓存折扣。可被各 Key 单独覆盖。
+          delta 计量：creation 每轮只算新增一段（有界），历史增量进 read。R 是 read 留存阻尼，
+          保留 read×R、其余按未命中推回 input，不触碰贵的 creation。1=给足折扣，0=不给。可被各 Key 覆盖。
         </div>
         <form onSubmit={submitRatio} className="flex items-center gap-1.5 px-2 pb-2">
           <Input

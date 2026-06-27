@@ -186,14 +186,15 @@ pub struct Config {
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
 
-    /// 中转层 prompt cache 计量的**全局命中率 R** ∈ [0,1]（默认 0.8）。
+    /// 中转层 prompt cache 计量的**全局 read 留存阻尼 R** ∈ [0,1]（默认 1.0）。
     ///
     /// 上游不做真实缓存，cache_creation/cache_read 是中转层合成给下游看的数字（见
-    /// `crate::anthropic::cache_metering`）。本旋钮直接控制：非首轮请求里，可缓存前缀
-    /// （system + tools + 历史）有多大比例计作 cache_read，其余计作 cache_creation。
-    /// 首轮（无历史）恒全部计作 creation。设 0 = 从不命中（全 creation）；设 0.95 =
-    /// 呈现 95% 缓存折扣。运行时可经 Admin API `/config/runtime-governance` 调整，
-    /// 并可被 per-key `cacheReadRatio` 覆盖。clamp 到 [0,1]。
+    /// `crate::anthropic::cache_metering`）。计量按 delta-based 拆三桶：input=本轮新问题、
+    /// creation=本轮新写入缓存的一条 delta（有界）、read=已缓存的更早前缀。R 是 read 留存
+    /// 阻尼：保留 `read × R`，被砍部分推回 input（不给缓存折扣），**不触碰 creation**。
+    /// R=1（默认）给足真实缓存折扣;调低则更保守（少认缓存命中）;0 = 完全不给折扣。
+    /// 运行时可经 Admin API `/config/runtime-governance` 调整，并可被 per-key
+    /// `cacheReadRatio` 覆盖。clamp 到 [0,1]。
     #[serde(default = "default_cache_read_ratio")]
     pub cache_read_ratio: f64,
 
@@ -370,7 +371,7 @@ fn default_usage_log_retention_days() -> u32 {
 }
 
 fn default_cache_read_ratio() -> f64 {
-    0.8
+    1.0
 }
 
 fn default_response_cache_ttl_secs() -> u64 {

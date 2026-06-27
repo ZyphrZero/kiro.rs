@@ -68,8 +68,8 @@ pub struct ClientKey {
     /// 响应缓存 TTL per-key 覆盖（秒；None 或 0 = 跟随全局 `responseCacheTtlSecs`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_cache_ttl_secs: Option<u32>,
-    /// 缓存命中率 R per-key 覆盖 ∈ [0,1]（None = 跟随全局 `cacheReadRatio`）。
-    /// 控制该 Key 的请求里可缓存前缀有多大比例计作 cache_read。老数据无此字段时为 None。
+    /// 缓存计量 read 留存阻尼 R per-key 覆盖 ∈ [0,1]（None = 跟随全局 `cacheReadRatio`）。
+    /// 控制该 Key 的 read 桶留存比例（被砍部分推回 input，不触碰 creation）。老数据无此字段时为 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_ratio: Option<f64>,
     /// 累计 credit 计费量（meteringEvent.usage 累加）
