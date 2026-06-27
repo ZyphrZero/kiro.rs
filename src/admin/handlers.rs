@@ -1079,7 +1079,7 @@ pub async fn update_client_key(
             payload.simplify_cc_prompt,
             payload.strip_boundary_markers,
             payload.strip_env_noise,
-            payload.response_cache_enabled.map(Some),
+            payload.response_cache_enabled,
             payload.response_cache_ttl_secs.map(Some),
         )
     {

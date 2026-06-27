@@ -70,6 +70,10 @@ export function ClientKeysPage() {
   const [editSimplifyCc, setEditSimplifyCc] = useState(false)
   const [editStripBoundary, setEditStripBoundary] = useState(false)
   const [editStripEnvNoise, setEditStripEnvNoise] = useState(false)
+  // 响应缓存 per-key 覆盖：'global'=跟随全局 / 'on'=强制开 / 'off'=强制关
+  const [editRespCache, setEditRespCache] = useState<'global' | 'on' | 'off'>('global')
+  // 响应缓存 TTL 覆盖（秒）；空串=跟随全局
+  const [editRespCacheTtl, setEditRespCacheTtl] = useState('')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -176,12 +180,25 @@ export function ClientKeysPage() {
     setEditSimplifyCc(item.simplifyCcPrompt)
     setEditStripBoundary(item.stripBoundaryMarkers)
     setEditStripEnvNoise(item.stripEnvNoise)
+    setEditRespCache(
+      item.responseCacheEnabled == null ? 'global' : item.responseCacheEnabled ? 'on' : 'off',
+    )
+    setEditRespCacheTtl(item.responseCacheTtlSecs != null ? String(item.responseCacheTtlSecs) : '')
     setEditOpen(true)
   }
 
   const handleEditSave = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!editTarget) return
+    // 响应缓存覆盖映射到三态线协议：'global'→null（复位跟随全局）/ 'on'→true / 'off'→false
+    const respCacheEnabled = editRespCache === 'global' ? null : editRespCache === 'on'
+    // TTL：空串→0（复位跟随全局）；否则解析为秒
+    const ttlRaw = editRespCacheTtl.trim()
+    const respCacheTtl = ttlRaw === '' ? 0 : parseInt(ttlRaw, 10)
+    if (ttlRaw !== '' && (isNaN(respCacheTtl) || respCacheTtl < 1 || respCacheTtl > 86400)) {
+      toast.error('缓存 TTL 需在 1..=86400 秒，或留空跟随全局')
+      return
+    }
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
@@ -193,6 +210,8 @@ export function ClientKeysPage() {
           simplifyCcPrompt: editSimplifyCc,
           stripBoundaryMarkers: editStripBoundary,
           stripEnvNoise: editStripEnvNoise,
+          responseCacheEnabled: respCacheEnabled,
+          responseCacheTtlSecs: respCacheTtl,
         },
       })
       toast.success('已更新')
@@ -580,6 +599,47 @@ export function ClientKeysPage() {
                     checked={editStripEnvNoise}
                     onCheckedChange={setEditStripEnvNoise}
                     disabled={updateKey.isPending}
+                  />
+                </div>
+              </div>
+            </div>
+            <div className="rounded-md border border-border/60 px-3 py-2">
+              <div className="mb-2 text-sm font-medium">响应缓存（per-key 覆盖）</div>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm">缓存策略</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      相同请求命中即回放、跳过上游。「跟随全局」沿用全局默认开关。
+                    </p>
+                  </div>
+                  <select
+                    value={editRespCache}
+                    onChange={(e) => setEditRespCache(e.target.value as 'global' | 'on' | 'off')}
+                    disabled={updateKey.isPending}
+                    className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                  >
+                    <option value="global">跟随全局</option>
+                    <option value="on">强制开启</option>
+                    <option value="off">强制关闭</option>
+                  </select>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm">TTL 覆盖（秒）</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      留空＝跟随全局默认 TTL；范围 1..=86400。
+                    </p>
+                  </div>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={86400}
+                    placeholder="跟随全局"
+                    value={editRespCacheTtl}
+                    onChange={(e) => setEditRespCacheTtl(e.target.value)}
+                    disabled={updateKey.isPending}
+                    className="h-8 w-28 text-xs"
                   />
                 </div>
               </div>

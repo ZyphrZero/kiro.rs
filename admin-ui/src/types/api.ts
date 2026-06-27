@@ -439,8 +439,9 @@ export interface UpdateClientKeyRequest {
   simplifyCcPrompt?: boolean
   stripBoundaryMarkers?: boolean
   stripEnvNoise?: boolean
-  /** 响应缓存覆盖更新（省略=不变更；ttl 传 0 表示清除覆盖、跟随全局） */
-  responseCacheEnabled?: boolean
+  /** 响应缓存覆盖更新（省略=不变更；null=复位为跟随全局；true/false=强制开关） */
+  responseCacheEnabled?: boolean | null
+  /** 响应缓存 TTL 覆盖（秒；省略=不变更；0=复位为跟随全局） */
   responseCacheTtlSecs?: number
 }
 
