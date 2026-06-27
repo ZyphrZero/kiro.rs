@@ -28,6 +28,10 @@ pub struct KeyContext {
     pub group: Option<String>,
     /// 是否为该入口 Key 启用中转层 prompt cache。
     pub cache_enabled: bool,
+    /// 提示词过滤开关（per-key，默认关）：精简 CC 提示 / 去边界标记 / 去环境噪音。
+    pub simplify_cc_prompt: bool,
+    pub strip_boundary_markers: bool,
+    pub strip_env_noise: bool,
     /// 命中的入口 Key 类型。
     pub key_source: TraceKeySource,
 }
@@ -131,10 +135,15 @@ pub async fn auth_middleware(
         if let Some(id) = mgr.verify_and_touch(&presented) {
             let group = mgr.group_of(id);
             let cache_enabled = mgr.cache_enabled_of(id);
+            let (simplify_cc_prompt, strip_boundary_markers, strip_env_noise) =
+                mgr.prompt_filters_of(id);
             request.extensions_mut().insert(KeyContext {
                 key_id: id,
                 group,
                 cache_enabled,
+                simplify_cc_prompt,
+                strip_boundary_markers,
+                strip_env_noise,
                 key_source: TraceKeySource::ClientKey,
             });
             return next.run(request).await;

@@ -396,6 +396,10 @@ export interface ClientKeyItem {
   totalCacheReadTokens: number
   /** 是否启用中转层 prompt cache */
   cacheEnabled: boolean
+  /** 提示词过滤开关（per-key，默认关） */
+  simplifyCcPrompt: boolean
+  stripBoundaryMarkers: boolean
+  stripEnvNoise: boolean
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
   /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
@@ -427,6 +431,10 @@ export interface UpdateClientKeyRequest {
   description?: string
   group?: string
   cacheEnabled?: boolean
+  /** 提示词过滤开关更新（省略=不变更） */
+  simplifyCcPrompt?: boolean
+  stripBoundaryMarkers?: boolean
+  stripEnvNoise?: boolean
 }
 
 // ============ 用量统计 ============

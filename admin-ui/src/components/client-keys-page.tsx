@@ -67,6 +67,9 @@ export function ClientKeysPage() {
   const [editDesc, setEditDesc] = useState('')
   const [editGroup, setEditGroup] = useState('')
   const [editCacheEnabled, setEditCacheEnabled] = useState(true)
+  const [editSimplifyCc, setEditSimplifyCc] = useState(false)
+  const [editStripBoundary, setEditStripBoundary] = useState(false)
+  const [editStripEnvNoise, setEditStripEnvNoise] = useState(false)
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -170,6 +173,9 @@ export function ClientKeysPage() {
     setEditDesc(item.description ?? '')
     setEditGroup(item.group ?? '')
     setEditCacheEnabled(item.cacheEnabled)
+    setEditSimplifyCc(item.simplifyCcPrompt)
+    setEditStripBoundary(item.stripBoundaryMarkers)
+    setEditStripEnvNoise(item.stripEnvNoise)
     setEditOpen(true)
   }
 
@@ -184,6 +190,9 @@ export function ClientKeysPage() {
           description: editDesc.trim(),
           group: editGroup.trim(),
           cacheEnabled: editCacheEnabled,
+          simplifyCcPrompt: editSimplifyCc,
+          stripBoundaryMarkers: editStripBoundary,
+          stripEnvNoise: editStripEnvNoise,
         },
       })
       toast.success('已更新')
@@ -530,6 +539,50 @@ export function ClientKeysPage() {
                 onCheckedChange={setEditCacheEnabled}
                 disabled={updateKey.isPending}
               />
+            </div>
+            <div className="rounded-md border border-border/60 px-3 py-2">
+              <div className="mb-2 text-sm font-medium text-pink-600">提示词过滤</div>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm">精简CC提示</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      检测到 Claude Code 系统提示则整段替换为精简后端提示（降 prefill，代价：丢失 CC 指令）。
+                    </p>
+                  </div>
+                  <Switch
+                    checked={editSimplifyCc}
+                    onCheckedChange={setEditSimplifyCc}
+                    disabled={updateKey.isPending}
+                  />
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm">去边界标记</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      删除 <code>--- SYSTEM PROMPT ---</code> 等分隔行。
+                    </p>
+                  </div>
+                  <Switch
+                    checked={editStripBoundary}
+                    onCheckedChange={setEditStripBoundary}
+                    disabled={updateKey.isPending}
+                  />
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm">去环境噪音</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      删除 # Environment 段、gitStatus、最近提交、知识截点等环境注入行。
+                    </p>
+                  </div>
+                  <Switch
+                    checked={editStripEnvNoise}
+                    onCheckedChange={setEditStripEnvNoise}
+                    disabled={updateKey.isPending}
+                  />
+                </div>
+              </div>
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>

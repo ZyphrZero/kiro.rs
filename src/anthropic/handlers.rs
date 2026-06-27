@@ -734,6 +734,10 @@ pub async fn post_messages(
 
     // 转换请求
     let conversion_started = Instant::now();
+    // 提示词过滤（per-key，默认关）：精简 CC / 去边界标记 / 去环境噪音。只作用于客户端原始
+    // system，在转换前；kiro.rs 自注入的 SYSTEM_CHUNKED_POLICY/thinking_prefix 在转换器内部
+    // 追加，不受影响。
+    super::prompt_filter::apply(&mut payload.system, &key_ctx);
     // 转换 + 整体 payload 字节上限：在转换前裁最旧历史使转换后 Kiro 体不超上游 CONTENT_LENGTH
     // 阈值；转换(含 tool 配对清理)在裁剪后跑，保证输出永远配对合法。
     let conversion_result = match super::payload_truncate::convert_within_limit(
@@ -1571,6 +1575,10 @@ pub async fn post_messages_cc(
 
     // 转换请求
     let conversion_started = Instant::now();
+    // 提示词过滤（per-key，默认关）：精简 CC / 去边界标记 / 去环境噪音。只作用于客户端原始
+    // system，在转换前；kiro.rs 自注入的 SYSTEM_CHUNKED_POLICY/thinking_prefix 在转换器内部
+    // 追加，不受影响。
+    super::prompt_filter::apply(&mut payload.system, &key_ctx);
     // 转换 + 整体 payload 字节上限：在转换前裁最旧历史使转换后 Kiro 体不超上游 CONTENT_LENGTH
     // 阈值；转换(含 tool 配对清理)在裁剪后跑，保证输出永远配对合法。
     let conversion_result = match super::payload_truncate::convert_within_limit(

@@ -51,6 +51,16 @@ pub struct ClientKey {
     /// 老数据无此字段时默认 true，避免升级后已有 Key 行为变化。
     #[serde(default = "default_cache_enabled")]
     pub cache_enabled: bool,
+    /// 提示词过滤（per-key，默认关）：精简 Claude Code system prompt（检测到则整段替换）。
+    /// 老数据无此字段时默认 false（不过滤，行为不变）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub simplify_cc_prompt: bool,
+    /// 提示词过滤（per-key，默认关）：去边界标记（删 `--- SYSTEM PROMPT ---` 等分隔行）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strip_boundary_markers: bool,
+    /// 提示词过滤（per-key，默认关）：去环境噪音（删 # Environment 段、gitStatus 等行）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strip_env_noise: bool,
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
@@ -214,6 +224,9 @@ impl ClientKeyManager {
             total_cache_creation_tokens: 0,
             total_cache_read_tokens: 0,
             cache_enabled,
+            simplify_cc_prompt: false,
+            strip_boundary_markers: false,
+            strip_env_noise: false,
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
@@ -288,6 +301,9 @@ impl ClientKeyManager {
                     total_cache_creation_tokens: 0,
                     total_cache_read_tokens: 0,
                     cache_enabled: true,
+                    simplify_cc_prompt: false,
+                    strip_boundary_markers: false,
+                    strip_env_noise: false,
                     total_credits: 0.0,
                     group: None,
                     is_system: true,
@@ -340,6 +356,9 @@ impl ClientKeyManager {
         description: Option<Option<String>>,
         group: Option<Option<String>>,
         cache_enabled: Option<bool>,
+        simplify_cc_prompt: Option<bool>,
+        strip_boundary_markers: Option<bool>,
+        strip_env_noise: Option<bool>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -355,6 +374,15 @@ impl ClientKeyManager {
                 }
                 if let Some(enabled) = cache_enabled {
                     e.cache_enabled = enabled;
+                }
+                if let Some(v) = simplify_cc_prompt {
+                    e.simplify_cc_prompt = v;
+                }
+                if let Some(v) = strip_boundary_markers {
+                    e.strip_boundary_markers = v;
+                }
+                if let Some(v) = strip_env_noise {
+                    e.strip_env_noise = v;
                 }
                 true
             }
@@ -383,6 +411,23 @@ impl ClientKeyManager {
             .get(&id)
             .map(|e| e.cache_enabled)
             .unwrap_or(false)
+    }
+
+    /// 返回指定 Key 的三个提示词过滤开关 (simplify_cc, strip_boundary, strip_env_noise)。
+    /// Key 不存在时全 false（不过滤）。
+    pub fn prompt_filters_of(&self, id: u64) -> (bool, bool, bool) {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .map(|e| {
+                (
+                    e.simplify_cc_prompt,
+                    e.strip_boundary_markers,
+                    e.strip_env_noise,
+                )
+            })
+            .unwrap_or((false, false, false))
     }
 
     /// 列出所有当前被引用的分组名（仅去重，不带计数）。
@@ -643,7 +688,7 @@ mod tests {
         let mgr = ClientKeyManager::new();
         let entry = mgr.create("test".to_string(), None, None, false);
         assert!(!mgr.cache_enabled_of(entry.id));
-        assert!(mgr.update_meta(entry.id, None, None, None, Some(true)));
+        assert!(mgr.update_meta(entry.id, None, None, None, Some(true), None, None, None));
         assert!(mgr.cache_enabled_of(entry.id));
     }
 

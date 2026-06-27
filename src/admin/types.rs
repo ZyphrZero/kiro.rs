@@ -770,6 +770,10 @@ pub struct ClientKeyItem {
     pub total_cache_creation_tokens: u64,
     pub total_cache_read_tokens: u64,
     pub cache_enabled: bool,
+    /// 提示词过滤开关（per-key，默认关）。
+    pub simplify_cc_prompt: bool,
+    pub strip_boundary_markers: bool,
+    pub strip_env_noise: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
@@ -818,6 +822,13 @@ pub struct UpdateClientKeyRequest {
     pub group: Option<String>,
     #[serde(default)]
     pub cache_enabled: Option<bool>,
+    /// 提示词过滤开关更新（None=不变更）。
+    #[serde(default)]
+    pub simplify_cc_prompt: Option<bool>,
+    #[serde(default)]
+    pub strip_boundary_markers: Option<bool>,
+    #[serde(default)]
+    pub strip_env_noise: Option<bool>,
 }
 
 fn default_client_key_cache_enabled() -> bool {
