@@ -28,7 +28,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::ConversionError;
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, GatedStreamContext, SseEvent, StreamContext};
 use super::types::{
@@ -734,7 +734,12 @@ pub async fn post_messages(
 
     // 转换请求
     let conversion_started = Instant::now();
-    let conversion_result = match convert_request(&payload) {
+    // 转换 + 整体 payload 字节上限：在转换前裁最旧历史使转换后 Kiro 体不超上游 CONTENT_LENGTH
+    // 阈值；转换(含 tool 配对清理)在裁剪后跑，保证输出永远配对合法。
+    let conversion_result = match super::payload_truncate::convert_within_limit(
+        &mut payload,
+        &super::payload_truncate::PayloadLimitConfig::from_env(),
+    ) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -757,18 +762,11 @@ pub async fn post_messages(
 
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
     // credentials; additional_model_request_fields is already filtered by converter model support.
-    let mut kiro_request = KiroRequest {
+    let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
         additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
-
-    // 整体 payload 字节上限：丢弃最旧历史使序列化体不超上游 CONTENT_LENGTH 阈值
-    // （per-field 的 text_truncate/image_resize 之上的累加防线）。
-    crate::payload_truncate::truncate_payload_to_limit(
-        &mut kiro_request,
-        &crate::payload_truncate::PayloadLimitConfig::from_env(),
-    );
 
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(body) => body,
@@ -1573,7 +1571,12 @@ pub async fn post_messages_cc(
 
     // 转换请求
     let conversion_started = Instant::now();
-    let conversion_result = match convert_request(&payload) {
+    // 转换 + 整体 payload 字节上限：在转换前裁最旧历史使转换后 Kiro 体不超上游 CONTENT_LENGTH
+    // 阈值；转换(含 tool 配对清理)在裁剪后跑，保证输出永远配对合法。
+    let conversion_result = match super::payload_truncate::convert_within_limit(
+        &mut payload,
+        &super::payload_truncate::PayloadLimitConfig::from_env(),
+    ) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -1596,18 +1599,11 @@ pub async fn post_messages_cc(
 
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
     // credentials; additional_model_request_fields is already filtered by converter model support.
-    let mut kiro_request = KiroRequest {
+    let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
         additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
-
-    // 整体 payload 字节上限：丢弃最旧历史使序列化体不超上游 CONTENT_LENGTH 阈值
-    // （per-field 的 text_truncate/image_resize 之上的累加防线）。
-    crate::payload_truncate::truncate_payload_to_limit(
-        &mut kiro_request,
-        &crate::payload_truncate::PayloadLimitConfig::from_env(),
-    );
 
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(body) => body,

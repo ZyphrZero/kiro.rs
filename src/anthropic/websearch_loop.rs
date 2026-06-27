@@ -26,7 +26,7 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
-use super::converter::{ConversionError, convert_request, get_context_window_size};
+use super::converter::{ConversionError, get_context_window_size};
 use super::handlers::{UsageRecordHook, map_provider_error};
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, Message, MessagesRequest};
@@ -206,7 +206,13 @@ async fn run_round(
     fallback_input_tokens: i32,
     group: Option<&str>,
 ) -> Result<(RoundOutcome, u64), Response> {
-    let conversion = match convert_request(payload) {
+    // 转换 + 整体 payload 字节上限（与 /v1、/cc 同款防线；转换前裁剪，配对清理转换时兜底）。
+    // run_round 以不可变借用持有 payload，这里克隆一份可变本地副本用于裁剪转换。
+    let mut local_payload = payload.clone();
+    let conversion = match super::payload_truncate::convert_within_limit(
+        &mut local_payload,
+        &super::payload_truncate::PayloadLimitConfig::from_env(),
+    ) {
         Ok(c) => c,
         Err(e) => {
             let (et, msg) = match &e {
@@ -224,16 +230,11 @@ async fn run_round(
         }
     };
 
-    let mut kiro_request = KiroRequest {
+    let kiro_request = KiroRequest {
         conversation_state: conversion.conversation_state,
         profile_arn: None,
         additional_model_request_fields: conversion.additional_model_request_fields,
     };
-    // 整体 payload 字节上限（与 /v1、/cc 主路径同款防线）。
-    crate::payload_truncate::truncate_payload_to_limit(
-        &mut kiro_request,
-        &crate::payload_truncate::PayloadLimitConfig::from_env(),
-    );
     let request_body = match serde_json::to_string(&kiro_request) {
         Ok(b) => b,
         Err(e) => {
