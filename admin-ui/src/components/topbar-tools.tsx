@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck,
+  MoreHorizontal, ShieldAlert, ShieldCheck, DatabaseZap,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -19,6 +19,7 @@ import {
 import {
   useLoadBalancingMode, useSetLoadBalancingMode,
   useAccountThrottleConfig, useSetAccountThrottleConfig,
+  useRuntimeGovernanceConfig, useSetRuntimeGovernanceConfig,
 } from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
 import { updateAdminKey } from '@/api/credentials'
@@ -248,10 +249,129 @@ function FullTools({ controls }: { controls: ToolControls }) {
         onToggleFailover={controls.handleToggleFailover}
         onChangeCooldown={controls.updateCooldown}
       />
+      <RuntimeGovernanceButton />
       <RefreshButton onRefresh={controls.handleRefresh} />
       <ImageUpdateButton controls={controls} />
       <KeySettingsMenu onOpenKeyDialog={controls.openKeyDialog} />
     </>
+  )
+}
+
+/**
+ * 运行时治理设置（紧凑下拉）：配额自动禁用阈值 + 全局响应缓存默认开关/TTL。
+ * 三项均为运行时生效并持久化到 config.json。
+ */
+function RuntimeGovernanceButton() {
+  const [open, setOpen] = useState(false)
+  const { data: cfg, isLoading } = useRuntimeGovernanceConfig()
+  const { mutate, isPending } = useSetRuntimeGovernanceConfig()
+  const [threshold, setThreshold] = useState('')
+  const [ttl, setTtl] = useState('')
+
+  const cacheEnabled = cfg?.responseCacheEnabled ?? false
+
+  const save = (patch: Record<string, unknown>, ok: string) => {
+    mutate(patch, {
+      onSuccess: () => toast.success(ok),
+      onError: (err) => toast.error('保存失败：' + extractErrorMessage(err)),
+    })
+  }
+
+  const submitThreshold = (e: React.FormEvent) => {
+    e.preventDefault()
+    const n = parseFloat(threshold)
+    if (isNaN(n) || n < 1 || n > 100) {
+      toast.error('阈值需在 1..=100')
+      return
+    }
+    save({ quotaDisableThreshold: n }, '配额阈值已更新')
+    setThreshold('')
+  }
+
+  const submitTtl = (e: React.FormEvent) => {
+    e.preventDefault()
+    const n = parseInt(ttl, 10)
+    if (isNaN(n) || n < 1 || n > 86400) {
+      toast.error('TTL 需在 1..=86400 秒')
+      return
+    }
+    save({ responseCacheTtlSecs: n }, '缓存 TTL 已更新')
+    setTtl('')
+  }
+
+  return (
+    <DropdownMenu open={open} onOpenChange={setOpen}>
+      <DropdownMenuTrigger asChild>
+        <Button size="sm" variant="outline">
+          <DatabaseZap className="h-3.5 w-3.5" />
+          缓存 / 配额
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-72">
+        <DropdownMenuLabel>
+          配额自动禁用阈值（当前 {cfg ? `${cfg.quotaDisableThreshold}%` : '—'}）
+        </DropdownMenuLabel>
+        <div className="px-2 pb-1 text-[11px] leading-snug text-muted-foreground">
+          账号用量达此百分比自动禁用，回落后自动恢复；设为 100 则关闭。
+        </div>
+        <form onSubmit={submitThreshold} className="flex items-center gap-1.5 px-2 pb-2">
+          <Input
+            type="number"
+            min={1}
+            max={100}
+            step="0.1"
+            placeholder="百分比"
+            value={threshold}
+            onChange={(e) => setThreshold(e.target.value)}
+            disabled={isPending}
+            className="h-7 text-xs"
+          />
+          <Button type="submit" size="sm" variant="outline" className="h-7 text-xs" disabled={isPending || !threshold.trim()}>
+            保存
+          </Button>
+        </form>
+        <DropdownMenuLabel className="pt-1">响应缓存（全局默认）</DropdownMenuLabel>
+        <div className="px-2 pb-2">
+          <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
+            <div className="text-xs">
+              <div className="font-medium text-foreground">
+                {cacheEnabled ? '已启用' : '已关闭'}
+              </div>
+              <div className="leading-snug text-muted-foreground">
+                {cacheEnabled
+                  ? '相同请求命中即回放、跳过上游'
+                  : '可被各 Key 单独覆盖开启'}
+              </div>
+            </div>
+            <Switch
+              checked={cacheEnabled}
+              disabled={isLoading || isPending}
+              onCheckedChange={(v) =>
+                save({ responseCacheEnabled: v }, v ? '已开启响应缓存' : '已关闭响应缓存')
+              }
+            />
+          </div>
+        </div>
+        <DropdownMenuLabel className="pt-1">
+          缓存 TTL 秒（当前 {cfg?.responseCacheTtlSecs ?? '—'}）
+        </DropdownMenuLabel>
+        <form onSubmit={submitTtl} className="flex items-center gap-1.5 px-2 pb-2">
+          <Input
+            type="number"
+            min={1}
+            max={86400}
+            placeholder="秒"
+            value={ttl}
+            onChange={(e) => setTtl(e.target.value)}
+            disabled={isPending}
+            className="h-7 text-xs"
+          />
+          <Button type="submit" size="sm" variant="outline" className="h-7 text-xs" disabled={isPending || !ttl.trim()}>
+            保存
+          </Button>
+        </form>
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }
 

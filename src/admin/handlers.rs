@@ -25,9 +25,9 @@ use super::{
         CreateClientKeyResponse, GlobalProxyResponse, SetAccountThrottleConfigRequest,
         SetConcurrencyRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
-        UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
-        UpdateRefreshTokenRequest,
+        SetRuntimeGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
+        StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest, UpdateClientKeyRequest,
+        UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -573,6 +573,24 @@ pub async fn set_log_governance_config(
     Json(payload): Json<SetLogGovernanceConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_log_governance_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/runtime-governance
+/// 获取运行时治理配置（配额自动禁用阈值 + 全局响应缓存默认开关/TTL）
+pub async fn get_runtime_governance_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_runtime_governance_config())
+}
+
+/// PUT /api/admin/config/runtime-governance
+/// 更新运行时治理配置（运行时生效 + 持久化 config.json）
+pub async fn set_runtime_governance_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetRuntimeGovernanceConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_runtime_governance_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

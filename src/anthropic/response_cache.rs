@@ -21,6 +21,7 @@ use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::types::MessagesRequest;
 
@@ -69,17 +70,29 @@ struct Inner {
 pub struct ResponseCache {
     inner: Mutex<Inner>,
     capacity: usize,
+    /// 全局默认开关（运行时可经 Admin API 改）。per-key 覆盖优先于此值。
+    default_enabled: AtomicBool,
+    /// 全局默认 TTL 秒（运行时可经 Admin API 改）。per-key ttl>0 时覆盖此值。
+    default_ttl_secs: AtomicU64,
 }
 
 impl ResponseCache {
     /// 创建空缓存。`capacity` 会被 clamp 到 `>= MIN_CAPACITY`。
-    pub fn new(capacity: usize) -> Self {
+    /// `default_enabled` / `default_ttl_secs` 为全局默认（来自 config，运行时可改）。
+    pub fn new(capacity: usize, default_enabled: bool, default_ttl_secs: u64) -> Self {
+        let ttl = if default_ttl_secs == 0 {
+            DEFAULT_TTL_SECS
+        } else {
+            default_ttl_secs
+        };
         Self {
             inner: Mutex::new(Inner {
                 entries: HashMap::new(),
                 seq: 0,
             }),
             capacity: capacity.max(MIN_CAPACITY),
+            default_enabled: AtomicBool::new(default_enabled),
+            default_ttl_secs: AtomicU64::new(ttl),
         }
     }
 
@@ -182,6 +195,38 @@ impl ResponseCache {
         });
     }
 
+    /// 全局默认开关（运行时值）。
+    pub fn default_enabled(&self) -> bool {
+        self.default_enabled.load(Ordering::Relaxed)
+    }
+
+    /// 全局默认 TTL 秒（运行时值）。
+    pub fn default_ttl_secs(&self) -> u64 {
+        self.default_ttl_secs.load(Ordering::Relaxed)
+    }
+
+    /// 运行时更新全局默认开关（Admin API）。
+    pub fn set_default_enabled(&self, enabled: bool) {
+        self.default_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// 运行时更新全局默认 TTL 秒（Admin API）。`secs=0` 退回 [`DEFAULT_TTL_SECS`]。
+    pub fn set_default_ttl_secs(&self, secs: u64) {
+        let ttl = if secs == 0 { DEFAULT_TTL_SECS } else { secs };
+        self.default_ttl_secs.store(ttl, Ordering::Relaxed);
+    }
+
+    /// 解析「该 Key 生效的响应缓存配置」：per-key 覆盖优先，否则回退本缓存的全局默认（运行时值）。
+    /// 返回 `(enabled, ttl_secs)`；`enabled=false` 时调用方直接跳过查询/写入。
+    pub fn effective_config(&self, key_enabled: Option<bool>, key_ttl_secs: Option<u32>) -> (bool, u64) {
+        effective_cache_config(
+            key_enabled,
+            key_ttl_secs,
+            self.default_enabled(),
+            self.default_ttl_secs(),
+        )
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.lock().entries.len()
@@ -233,7 +278,7 @@ mod tests {
 
     #[test]
     fn put_get_roundtrip() {
-        let cache = ResponseCache::new(64);
+        let cache = ResponseCache::new(64, true, 180);
         cache.put("k1".to_string(), b"hello".to_vec(), false, 180);
         let got = cache.get("k1").expect("should hit");
         assert_eq!(got.body, b"hello");
@@ -242,13 +287,13 @@ mod tests {
 
     #[test]
     fn miss_on_unknown_key() {
-        let cache = ResponseCache::new(64);
+        let cache = ResponseCache::new(64, true, 180);
         assert!(cache.get("nope").is_none());
     }
 
     #[test]
     fn expired_entry_is_evicted_on_get() {
-        let cache = ResponseCache::new(64);
+        let cache = ResponseCache::new(64, true, 180);
         // ttl=0 → DEFAULT_TTL, so force expiry by inserting a manually-expired entry.
         cache.put("k1".to_string(), b"x".to_vec(), false, 1);
         {
@@ -261,7 +306,7 @@ mod tests {
 
     #[test]
     fn lru_evicts_least_recently_hit() {
-        let cache = ResponseCache::new(MIN_CAPACITY);
+        let cache = ResponseCache::new(MIN_CAPACITY, true, 180);
         for i in 0..MIN_CAPACITY {
             cache.put(format!("k{i}"), vec![i as u8], false, 180);
         }

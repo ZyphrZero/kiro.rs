@@ -510,12 +510,8 @@ fn resolve_response_cache(
     key_ctx: &KeyContext,
 ) -> Option<(super::response_cache::SharedResponseCache, String, u64)> {
     let cache = state.response_cache.as_ref()?;
-    let (enabled, ttl) = super::response_cache::effective_cache_config(
-        key_ctx.response_cache_enabled,
-        key_ctx.response_cache_ttl_secs,
-        state.response_cache_default_enabled,
-        state.response_cache_default_ttl_secs,
-    );
+    let (enabled, ttl) =
+        cache.effective_config(key_ctx.response_cache_enabled, key_ctx.response_cache_ttl_secs);
     if !enabled {
         return None;
     }

@@ -25,10 +25,11 @@ use super::types::{
     CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount,
     ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
     LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
-    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, SetAccountThrottleConfigRequest,
-    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetUpdateConfigRequest,
-    StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
-    UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, RuntimeGovernanceConfigResponse,
+    SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+    SetRuntimeGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
+    StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
+    UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -164,6 +165,11 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    /// 响应体缓存（与 anthropic 路由共享；运行时读写全局缓存开关 / TTL）
+    response_cache: Option<crate::anthropic::response_cache::SharedResponseCache>,
+    /// 配额自动禁用阈值（用量百分比，运行时可改）。>= 100 表示关闭自动禁用/恢复。
+    /// 初始值取自 config.quota_disable_threshold，setter 同时持久化到 config.json。
+    quota_disable_threshold: Mutex<f64>,
 }
 
 /// Social 登录会话状态
@@ -489,6 +495,7 @@ impl AdminService {
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
+        let quota_threshold = token_manager.config().quota_disable_threshold;
 
         let svc = Self {
             token_manager,
@@ -502,6 +509,8 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
+            response_cache: None,
+            quota_disable_threshold: Mutex::new(quota_threshold),
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -535,6 +544,15 @@ impl AdminService {
     ) -> Self {
         self.trace_store = trace_store;
         self.usage_recorder = usage_recorder;
+        self
+    }
+
+    /// 注入响应体缓存句柄（与 anthropic 路由共享），用于运行时读写全局缓存开关 / TTL。
+    pub fn with_response_cache(
+        mut self,
+        response_cache: Option<crate::anthropic::response_cache::SharedResponseCache>,
+    ) -> Self {
+        self.response_cache = response_cache;
         self
     }
 
@@ -843,7 +861,7 @@ impl AdminService {
     pub async fn refresh_all_balances(&self) -> (usize, usize) {
         let snapshot = self.token_manager.snapshot();
         let current_id = snapshot.current_id;
-        let threshold = self.token_manager.config().quota_disable_threshold;
+        let threshold = *self.quota_disable_threshold.lock();
         // 阈值 >= 100 视为关闭自动配额禁用：行为与旧版一致（只刷新启用账号、不自动增减禁用状态）。
         let auto_quota = threshold < 100.0;
 
@@ -2024,6 +2042,84 @@ impl AdminService {
         }
 
         Ok(self.get_log_governance_config())
+    }
+
+    /// 读取运行时治理配置：配额自动禁用阈值 + 全局响应缓存默认（开关 / TTL）。
+    pub fn get_runtime_governance_config(&self) -> RuntimeGovernanceConfigResponse {
+        let (rc_enabled, rc_ttl) = self
+            .response_cache
+            .as_ref()
+            .map(|c| (c.default_enabled(), c.default_ttl_secs()))
+            .unwrap_or((false, crate::anthropic::response_cache::DEFAULT_TTL_SECS));
+        RuntimeGovernanceConfigResponse {
+            quota_disable_threshold: *self.quota_disable_threshold.lock(),
+            response_cache_enabled: rc_enabled,
+            response_cache_ttl_secs: rc_ttl,
+        }
+    }
+
+    /// 更新运行时治理配置：改运行时值（配额阈值 / 缓存开关 / 缓存 TTL）+ 持久化 config.json。
+    /// 任一字段缺省表示不修改。
+    pub fn set_runtime_governance_config(
+        &self,
+        req: SetRuntimeGovernanceConfigRequest,
+    ) -> Result<RuntimeGovernanceConfigResponse, AdminServiceError> {
+        if req.quota_disable_threshold.is_none()
+            && req.response_cache_enabled.is_none()
+            && req.response_cache_ttl_secs.is_none()
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 quotaDisableThreshold / responseCacheEnabled / responseCacheTtlSecs 一个字段"
+                    .to_string(),
+            ));
+        }
+        // 校验范围
+        if let Some(t) = req.quota_disable_threshold {
+            if !(1.0..=100.0).contains(&t) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "quotaDisableThreshold 必须在 1..=100 内: {}",
+                    t
+                )));
+            }
+        }
+        if let Some(ttl) = req.response_cache_ttl_secs {
+            if !(1..=86400).contains(&ttl) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "responseCacheTtlSecs 必须在 1..=86400 内: {}",
+                    ttl
+                )));
+            }
+        }
+
+        // 先改运行时值
+        if let Some(t) = req.quota_disable_threshold {
+            *self.quota_disable_threshold.lock() = t;
+        }
+        if let Some(enabled) = req.response_cache_enabled {
+            if let Some(c) = &self.response_cache {
+                c.set_default_enabled(enabled);
+            }
+        }
+        if let Some(ttl) = req.response_cache_ttl_secs {
+            if let Some(c) = &self.response_cache {
+                c.set_default_ttl_secs(ttl);
+            }
+        }
+
+        // 持久化到 config.json（从磁盘重载再写，避免覆盖并发修改）
+        self.update_config_file(|c| {
+            if let Some(t) = req.quota_disable_threshold {
+                c.quota_disable_threshold = t;
+            }
+            if let Some(enabled) = req.response_cache_enabled {
+                c.response_cache_enabled = enabled;
+            }
+            if let Some(ttl) = req.response_cache_ttl_secs {
+                c.response_cache_ttl_secs = ttl;
+            }
+        });
+
+        Ok(self.get_runtime_governance_config())
     }
 
     fn persist_log_governance_config(

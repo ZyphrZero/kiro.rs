@@ -55,12 +55,8 @@ pub struct AppState {
     pub usage_aggregator: Option<SharedAggregator>,
     /// 中转层缓存计量（基于 cache_control 断点的内存缓存）
     pub cache_meter: Option<SharedCacheMeter>,
-    /// 响应体缓存（真实响应回放；可选，未启用时为 None）
+    /// 响应体缓存（真实响应回放；全局开关 + TTL 作为运行时原子值存于缓存内部）
     pub response_cache: Option<super::response_cache::SharedResponseCache>,
-    /// 响应缓存全局默认开关（来自 config.response_cache_enabled）。
-    pub response_cache_default_enabled: bool,
-    /// 响应缓存全局默认 TTL 秒（来自 config.response_cache_ttl_secs）。
-    pub response_cache_default_ttl_secs: u64,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
     /// `/cc/v1` usage-gated streaming 开关（来自 config.usage_gated_streaming_enabled）。
@@ -80,8 +76,6 @@ impl AppState {
             usage_aggregator: None,
             cache_meter: None,
             response_cache: None,
-            response_cache_default_enabled: false,
-            response_cache_default_ttl_secs: super::response_cache::DEFAULT_TTL_SECS,
             trace_store: None,
             usage_gated_streaming: true,
         }
@@ -118,16 +112,12 @@ impl AppState {
         self
     }
 
-    /// 注入响应体缓存及其全局默认（开关 + TTL 秒）。
+    /// 注入响应体缓存（全局默认开关 + TTL 已作为运行时原子值存于缓存内部）。
     pub fn with_response_cache(
         mut self,
         cache: Option<super::response_cache::SharedResponseCache>,
-        default_enabled: bool,
-        default_ttl_secs: u64,
     ) -> Self {
         self.response_cache = cache;
-        self.response_cache_default_enabled = default_enabled;
-        self.response_cache_default_ttl_secs = default_ttl_secs;
         self
     }
 

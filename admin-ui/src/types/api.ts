@@ -400,6 +400,10 @@ export interface ClientKeyItem {
   simplifyCcPrompt: boolean
   stripBoundaryMarkers: boolean
   stripEnvNoise: boolean
+  /** 响应缓存开关覆盖（undefined = 跟随全局默认） */
+  responseCacheEnabled?: boolean
+  /** 响应缓存 TTL 覆盖（秒；undefined = 跟随全局默认） */
+  responseCacheTtlSecs?: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
   /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
@@ -435,6 +439,9 @@ export interface UpdateClientKeyRequest {
   simplifyCcPrompt?: boolean
   stripBoundaryMarkers?: boolean
   stripEnvNoise?: boolean
+  /** 响应缓存覆盖更新（省略=不变更；ttl 传 0 表示清除覆盖、跟随全局） */
+  responseCacheEnabled?: boolean
+  responseCacheTtlSecs?: number
 }
 
 // ============ 用量统计 ============

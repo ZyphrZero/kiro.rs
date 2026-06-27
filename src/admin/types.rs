@@ -495,6 +495,33 @@ pub struct SetLogGovernanceConfigRequest {
     pub usage_log_retention_days: Option<u32>,
 }
 
+/// 运行时治理配置响应：配额自动禁用阈值 + 全局响应缓存默认（开关 / TTL）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeGovernanceConfigResponse {
+    /// 配额自动禁用阈值（用量百分比）。>= 100 表示关闭自动禁用/恢复。
+    pub quota_disable_threshold: f64,
+    /// 全局响应缓存默认开关。
+    pub response_cache_enabled: bool,
+    /// 全局响应缓存默认 TTL（秒）。
+    pub response_cache_ttl_secs: u64,
+}
+
+/// 更新运行时治理配置（字段缺省表示不修改）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRuntimeGovernanceConfigRequest {
+    /// 配额自动禁用阈值（用量百分比），范围 1..=100；缺省不修改。100 表示关闭自动禁用/恢复。
+    #[serde(default)]
+    pub quota_disable_threshold: Option<f64>,
+    /// 全局响应缓存默认开关；缺省不修改。
+    #[serde(default)]
+    pub response_cache_enabled: Option<bool>,
+    /// 全局响应缓存默认 TTL（秒），范围 1..=86400；缺省不修改。
+    #[serde(default)]
+    pub response_cache_ttl_secs: Option<u64>,
+}
+
 // ============ 代理池 ============
 
 /// 代理池条目

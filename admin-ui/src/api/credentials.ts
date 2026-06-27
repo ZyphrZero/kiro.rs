@@ -474,6 +474,27 @@ export async function setLogGovernanceConfig(
   return data
 }
 
+// 运行时治理配置：配额自动禁用阈值 + 全局响应缓存默认（开关 / TTL）
+export interface RuntimeGovernanceConfig {
+  quotaDisableThreshold: number
+  responseCacheEnabled: boolean
+  responseCacheTtlSecs: number
+}
+
+// 获取运行时治理配置
+export async function getRuntimeGovernanceConfig(): Promise<RuntimeGovernanceConfig> {
+  const { data } = await api.get<RuntimeGovernanceConfig>('/config/runtime-governance')
+  return data
+}
+
+// 更新运行时治理配置
+export async function setRuntimeGovernanceConfig(
+  patch: Partial<RuntimeGovernanceConfig>,
+): Promise<RuntimeGovernanceConfig> {
+  const { data } = await api.put<RuntimeGovernanceConfig>('/config/runtime-governance', patch)
+  return data
+}
+
 // 发起 IdC 设备授权登录
 export async function startIdcLogin(
   req: StartIdcLoginRequest

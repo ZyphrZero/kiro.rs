@@ -19,6 +19,8 @@ import {
   setAccountThrottleConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
+  getRuntimeGovernanceConfig,
+  setRuntimeGovernanceConfig,
   resetSuccessCount,
   resetAllSuccessCount,
 } from '@/api/credentials'
@@ -244,6 +246,25 @@ export function useSetLogGovernanceConfig() {
     mutationFn: setLogGovernanceConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['logGovernanceConfig'] })
+    },
+  })
+}
+
+// 获取运行时治理配置（配额阈值 + 全局响应缓存默认）
+export function useRuntimeGovernanceConfig() {
+  return useQuery({
+    queryKey: ['runtimeGovernanceConfig'],
+    queryFn: getRuntimeGovernanceConfig,
+  })
+}
+
+// 更新运行时治理配置
+export function useSetRuntimeGovernanceConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setRuntimeGovernanceConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['runtimeGovernanceConfig'] })
     },
   })
 }

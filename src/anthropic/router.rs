@@ -40,8 +40,6 @@ pub fn create_router_with_provider(
         None,
         true,
         None,
-        false,
-        super::response_cache::DEFAULT_TTL_SECS,
     )
 }
 
@@ -57,8 +55,6 @@ pub fn create_router(
     trace_store: Option<SharedTraceStore>,
     usage_gated_streaming: bool,
     response_cache: Option<SharedResponseCache>,
-    response_cache_default_enabled: bool,
-    response_cache_default_ttl_secs: u64,
 ) -> Router {
     let mut state = AppState::new(extract_thinking);
     if let Some(provider) = kiro_provider {
@@ -66,11 +62,7 @@ pub fn create_router(
     }
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);
-    state = state.with_response_cache(
-        response_cache,
-        response_cache_default_enabled,
-        response_cache_default_ttl_secs,
-    );
+    state = state.with_response_cache(response_cache);
     state = state.with_trace_store(trace_store);
     state = state.with_usage_gated_streaming(usage_gated_streaming);
 
