@@ -1213,6 +1213,34 @@ enum DisabledReason {
     InvalidConfig,
 }
 
+impl DisabledReason {
+    /// 持久化用的稳定短标识（写入 credentials.json 的 disabledReason 字段）。
+    fn as_str(self) -> &'static str {
+        match self {
+            DisabledReason::Manual => "manual",
+            DisabledReason::TooManyFailures => "too_many_failures",
+            DisabledReason::TooManyRefreshFailures => "too_many_refresh_failures",
+            DisabledReason::QuotaExceeded => "quota_exceeded",
+            DisabledReason::InvalidRefreshToken => "invalid_refresh_token",
+            DisabledReason::InvalidConfig => "invalid_config",
+        }
+    }
+
+    /// 从持久化短标识还原。无法识别（含旧文件无此字段）时返回 None，
+    /// 由调用方决定默认（disabled 但无 reason 时回退到 Manual，保持旧行为）。
+    fn from_persisted(s: &str) -> Option<Self> {
+        match s {
+            "manual" => Some(DisabledReason::Manual),
+            "too_many_failures" => Some(DisabledReason::TooManyFailures),
+            "too_many_refresh_failures" => Some(DisabledReason::TooManyRefreshFailures),
+            "quota_exceeded" => Some(DisabledReason::QuotaExceeded),
+            "invalid_refresh_token" => Some(DisabledReason::InvalidRefreshToken),
+            "invalid_config" => Some(DisabledReason::InvalidConfig),
+            _ => None,
+        }
+    }
+}
+
 /// 统计数据持久化条目
 #[derive(Serialize, Deserialize)]
 struct StatsEntry {
@@ -1509,8 +1537,14 @@ impl MultiTokenManager {
                     total_failure_count: 0,
                     refresh_failure_count: 0,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
+                    // 从持久化的 disabledReason 还原；disabled 但无（或无法识别）reason
+                    // 时回退到 Manual（兼容旧文件）。这让配额自动禁用的账号重启后仍能
+                    // 被余额巡检识别为 QuotaExceeded 而自动恢复。
                     disabled_reason: if cred.disabled {
-                        Some(DisabledReason::Manual)
+                        cred.disabled_reason
+                            .as_deref()
+                            .and_then(DisabledReason::from_persisted)
+                            .or(Some(DisabledReason::Manual))
                     } else {
                         None
                     },
@@ -2264,6 +2298,12 @@ impl MultiTokenManager {
                     cred.canonicalize_auth_method();
                     // 同步 disabled 状态到凭据对象
                     cred.disabled = e.disabled;
+                    // 同步禁用原因（持久化，供重启后还原；未禁用时清空）。
+                    cred.disabled_reason = if e.disabled {
+                        e.disabled_reason.map(|r| r.as_str().to_string())
+                    } else {
+                        None
+                    };
                     cred
                 })
                 .collect()
@@ -2813,6 +2853,11 @@ impl MultiTokenManager {
                 let mut cred = e.credentials.clone();
                 cred.canonicalize_auth_method();
                 cred.disabled = e.disabled;
+                cred.disabled_reason = if e.disabled {
+                    e.disabled_reason.map(|r| r.as_str().to_string())
+                } else {
+                    None
+                };
                 cred.id = Some(e.id);
                 cred
             })
@@ -4777,6 +4822,68 @@ mod tests {
 
         // 不存在的 ID：返回错误
         assert!(manager.reenable_if_quota_recovered(999).is_err());
+    }
+
+    #[test]
+    fn test_persisted_quota_reason_survives_reload_and_can_recover() {
+        // 回归 BUG-1：配额自动禁用的账号，其 disabled_reason 必须随 credentials 持久化，
+        // 重启（= 重新 load）后仍被识别为 QuotaExceeded，从而能被余额巡检自动恢复。
+        let config = Config::default();
+
+        // 模拟从磁盘加载的凭据：#1 配额禁用、#2 手动禁用（旧文件无 reason 字段）。
+        let mut quota_disabled = KiroCredentials::default();
+        quota_disabled.disabled = true;
+        quota_disabled.disabled_reason = Some("quota_exceeded".to_string());
+
+        let mut manual_disabled = KiroCredentials::default();
+        manual_disabled.disabled = true;
+        manual_disabled.disabled_reason = None; // 旧文件：disabled 但无 reason
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![quota_disabled, manual_disabled],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 两者都处于禁用态。
+        assert_eq!(manager.available_count(), 0);
+
+        // #1 配额禁用 → 重载后仍可自动恢复（修复前会被当作 Manual，永久卡死）。
+        assert!(
+            manager.reenable_if_quota_recovered(1).unwrap(),
+            "配额禁用账号重启后应能自动恢复"
+        );
+        // #2 无 reason 的旧禁用 → 回退 Manual，不被自动恢复（保持旧的保守行为）。
+        assert!(
+            !manager.reenable_if_quota_recovered(2).unwrap(),
+            "无 reason 的禁用账号应回退 Manual、不被自动恢复"
+        );
+        assert_eq!(manager.available_count(), 1);
+    }
+
+    #[test]
+    fn test_persist_credentials_writes_disabled_reason() {
+        // 配额禁用后 clone_all_credentials（导出/持久化口径）应带出 quota_exceeded，
+        // 未禁用账号不带 reason。
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        manager.report_quota_exhausted(1);
+        let dumped = manager.clone_all_credentials();
+        let c1 = dumped.iter().find(|c| c.id == Some(1)).unwrap();
+        let c2 = dumped.iter().find(|c| c.id == Some(2)).unwrap();
+        assert_eq!(c1.disabled_reason.as_deref(), Some("quota_exceeded"));
+        assert_eq!(c2.disabled_reason, None, "未禁用账号不应带 reason");
     }
 
 

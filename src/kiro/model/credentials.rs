@@ -130,6 +130,15 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub disabled: bool,
 
+    /// 禁用原因（持久化，用于重启后区分手动禁用 vs 自动禁用）。
+    /// 取值与运行时 `DisabledReason` 对齐的短标识：manual / too_many_failures /
+    /// too_many_refresh_failures / quota_exceeded / invalid_refresh_token / invalid_config。
+    /// 关键用途：让「配额自动禁用」的账号在进程重启后仍能被余额巡检自动恢复
+    /// （否则会被一律当作 manual，永久卡死）。`disabled=false` 时应为 None。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
@@ -587,6 +596,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -877,6 +887,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -916,6 +927,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -1038,6 +1050,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
