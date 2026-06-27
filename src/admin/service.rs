@@ -35,6 +35,57 @@ use super::types::{
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
 
+/// 平台超额积分上限（固定常量）：开启超额的账号最多可在基础额度之上再用 10000 积分。
+/// 余额查询里 `remaining = 基础额度 - 当前用量`，超额账号 `remaining` 为负即「已吃进超额池」，
+/// `remaining <= -OVERAGE_CREDIT_CAP` 表示超额池也耗尽（与上游 OVERAGE_REQUEST_LIMIT_EXCEEDED 对应）。
+const OVERAGE_CREDIT_CAP: f64 = 10000.0;
+
+/// 一次余额巡检对单个凭据应采取的配额动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuotaAction {
+    /// 不动
+    None,
+    /// 以 QuotaExceeded 原因自动禁用（用量达阈值）
+    Disable,
+    /// 自动重新启用（仅限此前因配额被禁用的）
+    Reenable,
+}
+
+/// 纯函数：根据一次余额结果决定配额动作。从 `refresh_all_balances` 的异步网络循环抽出，便于单测。
+///
+/// - `auto_quota` 关闭（阈值 ≥ 100）：一律 None。
+/// - **开启超额**的账号：不按百分比禁用（超额本就要跑过基础额度）；仅当此前因配额被禁用、
+///   且超额池仍有余量（`remaining > -OVERAGE_CREDIT_CAP`）时 Reenable；超额池耗尽则 None
+///   （保持禁用，真实耗尽靠上游 OVERAGE_REQUEST_LIMIT_EXCEEDED 兜底，避免在真实上限处 flapping）。
+/// - 未开超额：当前启用且 `pct >= threshold` → Disable；此前因配额禁用且 `pct < threshold` → Reenable。
+fn decide_quota_action(
+    auto_quota: bool,
+    disabled: bool,
+    is_quota_disabled: bool,
+    overage_on: bool,
+    pct: f64,
+    remaining: f64,
+    threshold: f64,
+) -> QuotaAction {
+    if !auto_quota {
+        return QuotaAction::None;
+    }
+    if overage_on {
+        let overage_pool_exhausted = remaining <= -OVERAGE_CREDIT_CAP;
+        if is_quota_disabled && !overage_pool_exhausted {
+            return QuotaAction::Reenable;
+        }
+        return QuotaAction::None;
+    }
+    if !disabled && pct >= threshold {
+        QuotaAction::Disable
+    } else if is_quota_disabled && pct < threshold {
+        QuotaAction::Reenable
+    } else {
+        QuotaAction::None
+    }
+}
+
 /// 在线检查更新结果缓存时间（秒），30 分钟。
 /// 在线检查更新结果缓存时间（秒），30 分钟。
 /// Docker Hub 的 tags 接口对匿名访问有 IP 维度的限流，30 分钟 TTL 既能让用户
@@ -894,6 +945,10 @@ impl AdminService {
             match self.fetch_balance(entry.id).await {
                 Ok(balance) => {
                     let pct = balance.usage_percentage;
+                    // 在 balance 被移入缓存前，先取出配额判定所需字段：
+                    // 是否开启超额、基础额度剩余（负值=已吃进超额池多少）。
+                    let overage_on = balance.overage_enabled == Some(true);
+                    let remaining = balance.remaining;
                     {
                         let mut cache = self.balance_cache.lock();
                         cache.insert(
@@ -906,9 +961,16 @@ impl AdminService {
                     }
                     success += 1;
 
-                    if auto_quota {
-                        if !entry.disabled && pct >= threshold {
-                            // 用量达阈值：自动以 QuotaExceeded 原因禁用
+                    match decide_quota_action(
+                        auto_quota,
+                        entry.disabled,
+                        is_quota_disabled,
+                        overage_on,
+                        pct,
+                        remaining,
+                        threshold,
+                    ) {
+                        QuotaAction::Disable => {
                             match self.token_manager.disable_quota_exceeded(entry.id) {
                                 Ok(()) => {
                                     auto_disabled += 1;
@@ -926,17 +988,26 @@ impl AdminService {
                                     tracing::warn!("配额自动禁用凭据 #{} 失败: {}", entry.id, e)
                                 }
                             }
-                        } else if is_quota_disabled && pct < threshold {
-                            // 用量回落到阈值以下：自动重新启用（仅限因配额禁用的）
+                        }
+                        QuotaAction::Reenable => {
                             match self.token_manager.reenable_if_quota_recovered(entry.id) {
                                 Ok(true) => {
                                     auto_reenabled += 1;
-                                    tracing::info!(
-                                        "配额自动恢复：凭据 #{} 用量 {:.1}% < 阈值 {:.1}%，已重新启用",
-                                        entry.id,
-                                        pct,
-                                        threshold
-                                    );
+                                    if overage_on {
+                                        tracing::info!(
+                                            "配额自动恢复：凭据 #{} 已开启超额且超额池仍有余量（剩余 {:.0}/{:.0}），已重新启用",
+                                            entry.id,
+                                            OVERAGE_CREDIT_CAP + remaining,
+                                            OVERAGE_CREDIT_CAP
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            "配额自动恢复：凭据 #{} 用量 {:.1}% < 阈值 {:.1}%，已重新启用",
+                                            entry.id,
+                                            pct,
+                                            threshold
+                                        );
+                                    }
                                 }
                                 Ok(false) => {}
                                 Err(e) => {
@@ -944,6 +1015,7 @@ impl AdminService {
                                 }
                             }
                         }
+                        QuotaAction::None => {}
                     }
                 }
                 Err(e) => {
@@ -3382,6 +3454,72 @@ impl AdminService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_action_off_when_auto_quota_disabled() {
+        // 阈值 >= 100 → auto_quota=false：任何情况都不动
+        assert_eq!(
+            decide_quota_action(false, false, false, false, 500.0, -9000.0, 100.0),
+            QuotaAction::None
+        );
+    }
+
+    #[test]
+    fn quota_action_non_overage_disable_and_reenable() {
+        // 未开超额、启用中、用量达阈值 → 禁用
+        assert_eq!(
+            decide_quota_action(true, false, false, false, 95.0, 50.0, 90.0),
+            QuotaAction::Disable
+        );
+        // 未开超额、此前因配额禁用、用量回落 → 恢复
+        assert_eq!(
+            decide_quota_action(true, true, true, false, 80.0, 200.0, 90.0),
+            QuotaAction::Reenable
+        );
+        // 未开超额、用量未达阈值、未禁用 → 不动
+        assert_eq!(
+            decide_quota_action(true, false, false, false, 80.0, 200.0, 90.0),
+            QuotaAction::None
+        );
+    }
+
+    #[test]
+    fn quota_action_overage_never_disabled_by_pct() {
+        // 生产 #54 形态：开超额、usage% 962%（对基础额度）、超额池只用了 8617/10000（remaining=-8617）
+        // → 绝不按百分比禁用。当前启用时不动。
+        assert_eq!(
+            decide_quota_action(true, false, false, true, 962.0, -8617.0, 90.0),
+            QuotaAction::None
+        );
+    }
+
+    #[test]
+    fn quota_action_overage_reenabled_when_pool_has_room() {
+        // 生产 #53/#54/#64-67 形态：开超额、此前被错误地按百分比禁用（is_quota_disabled）、
+        // 超额池仍有余量（remaining > -10000）→ 自动恢复
+        assert_eq!(
+            decide_quota_action(true, true, true, true, 487.0, -7737.0, 90.0),
+            QuotaAction::Reenable
+        );
+        // #64：remaining=-506，余量充足 → 恢复
+        assert_eq!(
+            decide_quota_action(true, true, true, true, 110.0, -506.0, 90.0),
+            QuotaAction::Reenable
+        );
+    }
+
+    #[test]
+    fn quota_action_overage_stays_disabled_when_pool_exhausted() {
+        // 超额池真耗尽（remaining <= -10000）→ 保持禁用，不恢复（防真实上限处 flapping）
+        assert_eq!(
+            decide_quota_action(true, true, true, true, 1100.0, -10000.0, 90.0),
+            QuotaAction::None
+        );
+        assert_eq!(
+            decide_quota_action(true, true, true, true, 1200.0, -10500.0, 90.0),
+            QuotaAction::None
+        );
+    }
 
     #[test]
     fn semver_compares_correctly() {
