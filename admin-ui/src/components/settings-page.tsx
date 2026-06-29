@@ -82,6 +82,7 @@ function CacheQuotaSection() {
   const [threshold, setThreshold] = useState('')
   const [ttl, setTtl] = useState('')
   const [ratio, setRatio] = useState('')
+  const [meterTtl, setMeterTtl] = useState('')
 
   const save = (patch: Record<string, unknown>, ok: string) =>
     mutate(patch, {
@@ -145,6 +146,16 @@ function CacheQuotaSection() {
         <form onSubmit={num(ratio, 0, 1, parseFloat, 'cacheReadRatio', '缓存命中率已更新', () => setRatio(''))} className="flex items-center gap-1.5">
           <Input type="number" min={0} max={1} step={0.05} placeholder="0 ~ 1" value={ratio} onChange={(e) => setRatio(e.target.value)} disabled={isPending} className="h-8 max-w-[160px] text-xs" />
           <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={isPending || !ratio.trim()}>保存</Button>
+        </form>
+      </div>
+      <div>
+        <div className="mb-1.5 text-sm font-medium text-pink-600">Prompt cache 计量 · 缓存热度 TTL 秒（当前 {cfg?.cacheMeterTtlSecs ?? '—'}）</div>
+        <div className="mb-2 text-[11px] leading-snug text-muted-foreground">
+          会话首次出现、或距上次请求超此秒数（缓存已凉）→ 本轮判 cold：整段可缓存前缀按 creation（贵桶）重写计费、read=0，如同首轮。TTL 越短越多请求判 cold（creation 多、下游折扣少）；越长越易判 warm（更多 0.1× read 折扣）。默认 300（5min，对齐 Anthropic ephemeral）。
+        </div>
+        <form onSubmit={num(meterTtl, 1, 86400, (s) => parseInt(s, 10), 'cacheMeterTtlSecs', '缓存热度 TTL 已更新', () => setMeterTtl(''))} className="flex items-center gap-1.5">
+          <Input type="number" min={1} max={86400} placeholder="秒" value={meterTtl} onChange={(e) => setMeterTtl(e.target.value)} disabled={isPending} className="h-8 max-w-[160px] text-xs" />
+          <Button type="submit" size="sm" variant="outline" className="h-8 text-xs" disabled={isPending || !meterTtl.trim()}>保存</Button>
         </form>
       </div>
     </SettingSection>

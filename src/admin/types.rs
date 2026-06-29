@@ -509,6 +509,9 @@ pub struct RuntimeGovernanceConfigResponse {
     /// （不给缓存折扣），不触碰 creation。delta-based 拆桶下 creation 每轮有界。
     /// R=1=给足真实折扣；0=完全不给。可被 per-key `cacheReadRatio` 覆盖。
     pub cache_read_ratio: f64,
+    /// 缓存计量热度 TTL（秒）：某会话首次出现 / 距上次超此值（缓存凉）→ 本轮判 cold，整段
+    /// 可缓存前缀按 creation 重写计费、read=0。TTL 越短越多请求判 cold（creation 多、折扣少）。
+    pub cache_meter_ttl_secs: u64,
 }
 
 /// 更新运行时治理配置（字段缺省表示不修改）。
@@ -527,6 +530,9 @@ pub struct SetRuntimeGovernanceConfigRequest {
     /// 缓存计量全局 read 留存阻尼 R，范围 0..=1；缺省不修改。
     #[serde(default)]
     pub cache_read_ratio: Option<f64>,
+    /// 缓存计量热度 TTL（秒），范围 1..=86400；缺省不修改。
+    #[serde(default)]
+    pub cache_meter_ttl_secs: Option<u64>,
 }
 
 /// 新建 Key 提示词过滤默认值（响应）。

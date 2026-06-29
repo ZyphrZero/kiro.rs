@@ -198,6 +198,19 @@ pub struct Config {
     #[serde(default = "default_cache_read_ratio")]
     pub cache_read_ratio: f64,
 
+    /// 中转层 prompt cache 计量的**缓存热度 TTL**（秒，默认 300 = 5min，对齐 Anthropic
+    /// ephemeral 缓存默认有效期）。
+    ///
+    /// 方案 2 的 cold/TTL 语义旋钮：按会话（isolation_seed）记 last_seen。某会话**首次出现**、
+    /// 或距上次请求**超过此 TTL**（缓存已凉）→ 本轮视为 cold，整段可缓存前缀按 **creation**
+    /// （贵桶 1.25~2.0×）计费、read=0，如同首轮重写缓存；TTL 内的连续请求才算 warm，走
+    /// delta 拆分（creation 只一条、其余 read 0.1× 便宜桶）。
+    ///
+    /// 这是真实、可解释的 margin 旋钮：TTL 短 → 更多请求判 cold → creation 多 / read 少 →
+    /// 下游折扣自然收紧；TTL 长 → 更易判 warm → 更多 0.1× 折扣。运行时可经 Admin API 调整。
+    #[serde(default = "default_cache_meter_ttl_secs")]
+    pub cache_meter_ttl_secs: u64,
+
     /// 响应缓存全局开关（默认 false）。开启后，对同会话、同 model、同 messages、同 tools 的
     /// 请求命中缓存时直接回放上次完整响应，跳过上游调用。可被 per-key 覆盖（见 ClientKey）。
     /// 注意：这与 `cache_read_ratio`（只合成 token 计量数字）是两回事，本项缓存真实响应体。
@@ -390,6 +403,10 @@ fn default_cache_read_ratio() -> f64 {
     1.0
 }
 
+fn default_cache_meter_ttl_secs() -> u64 {
+    300
+}
+
 fn default_response_cache_ttl_secs() -> u64 {
     crate::anthropic::response_cache::DEFAULT_TTL_SECS
 }
@@ -441,6 +458,7 @@ impl Default for Config {
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             cache_read_ratio: default_cache_read_ratio(),
+            cache_meter_ttl_secs: default_cache_meter_ttl_secs(),
             response_cache_enabled: false,
             response_cache_ttl_secs: default_response_cache_ttl_secs(),
             response_cache_capacity: default_response_cache_capacity(),

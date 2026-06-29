@@ -258,10 +258,13 @@ async fn main() {
         );
     }
 
-    // 缓存计量运行时治理：持有全局命中率 R（无状态结构化拆分，per-key 可覆盖）。
-    // 取代旧的有状态 CacheMeter——不再需要容量 / TTL / 落盘 / 后台任务。
+    // 缓存计量运行时治理：持有全局命中率 R + 缓存热度 TTL（按会话判 warm/cold）。
+    // 比旧的有状态 CacheMeter 轻：只存 session→last_seen，不存全前缀哈希链、不落盘。
     let meter_governance = std::sync::Arc::new(
-        anthropic::cache_metering::MeterGovernance::new(config.cache_read_ratio),
+        anthropic::cache_metering::MeterGovernance::new(
+            config.cache_read_ratio,
+            config.cache_meter_ttl_secs,
+        ),
     );
 
     // ResponseCache：真实响应体缓存（命中即回放、跳过上游）。始终构造（即使全局默认关闭），

@@ -95,19 +95,31 @@ impl CacheUsage {
     }
 }
 
-/// 计量运行时治理：持有全局 read 留存阻尼 R（运行时可经 Admin API 调整）。
+/// 计量运行时治理：持有全局 read 留存阻尼 R + 缓存热度 TTL + 按会话的 last_seen 表
+/// （运行时可经 Admin API 调整 R 与 TTL）。
 ///
-/// 取代旧的有状态 `CacheMeter`——不再需要容量 / TTL / 落盘 / 会话级开关，只剩一个原子旋钮。
+/// 比旧的有状态 `CacheMeter` 轻得多：不存全前缀哈希链、不落盘，只存 `session → 上次请求秒`
+/// 一个表，用于判定「本轮 cold 还是 warm」（见 [`Self::touch_and_is_warm`]）。
 pub struct MeterGovernance {
     /// 全局 R 的 bit 表示（f64 → u64，原子读写）。per-key 未覆盖时用此值。
     read_ratio_bits: AtomicU64,
+    /// 缓存热度 TTL（秒，原子）。距某会话上次请求超过此值即判 cold（缓存已凉）。
+    ttl_secs: AtomicU64,
+    /// 会话热度表：`isolation_seed → 上次请求 unix 秒`。判 warm/cold 并刷新。
+    last_seen: parking_lot::Mutex<std::collections::HashMap<String, i64>>,
 }
 
+/// `last_seen` 表的清理阈值：超过此条目数时，借一次请求顺手清掉所有已过 2×TTL 的死会话，
+/// 避免长期运行内存无界增长（纯防护，不影响判定语义）。
+const LAST_SEEN_SWEEP_THRESHOLD: usize = 4096;
+
 impl MeterGovernance {
-    /// 用初始 R 构造（clamp 到 [0,1]）。
-    pub fn new(read_ratio: f64) -> Self {
+    /// 用初始 R + TTL 构造（R clamp 到 [0,1]）。
+    pub fn new(read_ratio: f64, ttl_secs: u64) -> Self {
         Self {
             read_ratio_bits: AtomicU64::new(read_ratio.clamp(0.0, 1.0).to_bits()),
+            ttl_secs: AtomicU64::new(ttl_secs),
+            last_seen: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -121,10 +133,50 @@ impl MeterGovernance {
         self.read_ratio_bits
             .store(ratio.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
+
+    /// 当前缓存热度 TTL（秒）。
+    pub fn ttl_secs(&self) -> u64 {
+        self.ttl_secs.load(Ordering::Relaxed)
+    }
+
+    /// 设置缓存热度 TTL（秒），运行时立即对后续请求生效。
+    pub fn set_ttl_secs(&self, ttl: u64) {
+        self.ttl_secs.store(ttl, Ordering::Relaxed);
+    }
+
+    /// 记录本会话本次请求时间，并返回**本轮是否 warm**（缓存是否还热）。
+    ///
+    /// warm = 该会话此前出现过 **且** 距上次请求 `<= TTL`（缓存未凉）。首次出现、或间隔超
+    /// TTL → cold（返回 false，调用方据此把整段前缀按 creation 重写计费）。`now` 为当前 unix 秒
+    /// （参数化便于测试）。调用即刷新 last_seen 为 `now`。
+    pub fn touch_and_is_warm(&self, session: &str, now: i64) -> bool {
+        let ttl = self.ttl_secs.load(Ordering::Relaxed) as i64;
+        let mut map = self.last_seen.lock();
+        // 偶发清理：表过大时清掉死会话（超 2×TTL 没来过的）。
+        if map.len() > LAST_SEEN_SWEEP_THRESHOLD {
+            let dead_before = now - ttl.saturating_mul(2).max(0);
+            map.retain(|_, &mut last| last >= dead_before);
+        }
+        let warm = match map.get(session) {
+            Some(&last) => now.saturating_sub(last) <= ttl,
+            None => false,
+        };
+        map.insert(session.to_string(), now);
+        warm
+    }
 }
 
 /// `Arc<MeterGovernance>` 别名
 pub type SharedMeterGovernance = Arc<MeterGovernance>;
+
+/// 当前 unix 秒（i64）。用于会话热度判定的时间基准。
+pub fn now_unix_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 // ============================================================================
 // 与请求体协议层的接线
@@ -136,10 +188,20 @@ use super::types::{MessagesRequest, SystemMessage, Tool};
 /// 计算本次请求的 delta-based 结构化缓存覆盖情况。纯函数：只看请求结构与 R，不依赖任何
 /// 跨请求状态、时间、负载。返回 [`CacheUsage`]，由调用方在拿到真实 total 后做互斥分摊。
 ///
-/// 桶划分（见模块文档）：input = 最后一条 message；creation = 倒数第二条 message（首轮为
-/// system+tools）；read = 其余前缀。`read_ratio` 是该请求生效的 R（per-key 覆盖优先，否则
-/// 全局 [`MeterGovernance`]）。
-pub fn compute_structural_cache_usage(req: &MessagesRequest, read_ratio: f64) -> CacheUsage {
+/// 桶划分（见模块文档）：input = 最后一条 message；read = 其余前缀。`read_ratio` 是该请求
+/// 生效的 R（per-key 覆盖优先，否则全局 [`MeterGovernance`]）。
+///
+/// `warm` 是本轮缓存热度（见 [`MeterGovernance::touch_and_is_warm`]）:
+/// - **warm**（缓存还热）→ creation = 倒数第二条 message（首轮为 system+tools），即只把本轮
+///   新写入的一条 delta 计 creation，其余前缀走 read 便宜桶；
+/// - **cold**（首次出现 / 超 TTL 缓存已凉）→ 整段可缓存前缀（system+tools+除最后一条外的全部
+///   历史）按 **creation** 重写计费、read 基数=0，如同首轮重建缓存。这让"凉了的会话"不再白
+///   拿 0.1× 折扣。
+pub fn compute_structural_cache_usage(
+    req: &MessagesRequest,
+    read_ratio: f64,
+    warm: bool,
+) -> CacheUsage {
     // system + tools 开销（首轮即首次写入缓存的那段）。
     let mut overhead: i32 = 0;
     if let Some(tools) = req.tools.as_ref() {
@@ -168,12 +230,20 @@ pub fn compute_structural_cache_usage(req: &MessagesRequest, read_ratio: f64) ->
     let msgs_total: i32 = msg_est.iter().fold(0, |a, b| a.saturating_add(*b));
     let prompt_total_est = overhead.saturating_add(msgs_total);
 
-    // input = 最后一条 message（本轮新问题）。
+    // input = 最后一条 message（本轮新问题），永不计入缓存。
     let input_est = msg_est[n - 1];
-    // creation = 本轮新写入缓存的 delta：
-    //   首轮(n==1) → system+tools（第一次把 system/tools 写进缓存）
-    //   否则       → 倒数第二条 message（刚完成、本轮才补进缓存的那段响应，有界）
-    let creation_est = if n == 1 { overhead } else { msg_est[n - 2] };
+    // creation = 本轮"写入缓存"的部分：
+    //   cold（首次/超TTL，缓存已凉）→ 整段可缓存前缀 = prompt_total − input，全部重写计 creation
+    //     （read 基数随之为 0），如同首轮；
+    //   warm 且 n==1 → system+tools（第一次把 system/tools 写进缓存）；
+    //   warm 且 n>1  → 倒数第二条 message（刚完成、本轮才补进缓存的那条 delta，有界）。
+    let creation_est = if !warm {
+        prompt_total_est.saturating_sub(input_est)
+    } else if n == 1 {
+        overhead
+    } else {
+        msg_est[n - 2]
+    };
 
     CacheUsage {
         input_est,
@@ -459,6 +529,40 @@ mod tests {
     // ---- compute_structural_cache_usage ------------------------------------
 
     #[test]
+    fn compute_cold_charges_whole_prefix_as_creation() {
+        // cold(首次/超TTL,缓存凉了)：整段可缓存前缀(system+历史,除最后一条)按 creation 重写、
+        // read=0,如同首轮。对比同请求 warm 时只把倒数第二条计 creation、其余进 read。
+        let big = "the quick brown fox ".repeat(40);
+        let req = req_with(
+            vec![
+                msg("user", &big),
+                msg("assistant", &big),
+                msg("user", "short new question"),
+            ],
+            Some(vec![SystemMessage {
+                text: "you are helpful ".repeat(50),
+                cache_control: None,
+            }]),
+        );
+        let warm = compute_structural_cache_usage(&req, 1.0, true);
+        let cold = compute_structural_cache_usage(&req, 1.0, false);
+
+        // 两者 input 相同(都是最后一条),prompt_total 相同。
+        assert_eq!(cold.input_est, warm.input_est);
+        assert_eq!(cold.prompt_total_est, warm.prompt_total_est);
+        // cold 的 creation = 整段前缀 = total − input;warm 的 creation 只一条,远小于 cold。
+        assert_eq!(cold.creation_est, cold.prompt_total_est - cold.input_est);
+        assert!(cold.creation_est > warm.creation_est * 2, "cold 把整段前缀都计 creation");
+
+        let (ci, cc, cr) = cold.split_against_total(cold.prompt_total_est);
+        assert_eq!(cr, 0, "cold 无 read(整段重写)");
+        assert_eq!(ci + cc, cold.prompt_total_est);
+        let (_, wc, wr) = warm.split_against_total(warm.prompt_total_est);
+        assert!(wr > 0, "warm 有 read");
+        assert!(cc > wc, "cold 的 creation(贵桶)远多于 warm");
+    }
+
+    #[test]
     fn compute_single_message_first_write() {
         // 单条 message + system：input=该 message，creation=system(首次写缓存)，read=0。
         let req = req_with(
@@ -468,7 +572,7 @@ mod tests {
                 cache_control: None,
             }]),
         );
-        let u = compute_structural_cache_usage(&req, 1.0);
+        let u = compute_structural_cache_usage(&req, 1.0, true);
         assert!(u.input_est > 0);
         assert!(u.creation_est > 0, "首轮 system+tools 计作 creation");
         let (input, creation, read) = u.split_against_total(u.prompt_total_est);
@@ -481,7 +585,7 @@ mod tests {
     fn compute_single_message_no_overhead_all_input() {
         // 单条 message、无 system/tools：creation_est=0 → 全入 input。
         let req = req_with(vec![msg("user", "hi")], None);
-        let u = compute_structural_cache_usage(&req, 1.0);
+        let u = compute_structural_cache_usage(&req, 1.0, true);
         assert_eq!(u.creation_est, 0);
         assert_eq!(u.input_est, u.prompt_total_est);
         let (input, creation, read) = u.split_against_total(u.prompt_total_est.max(1));
@@ -505,7 +609,7 @@ mod tests {
                 cache_control: None,
             }]),
         );
-        let u = compute_structural_cache_usage(&req, 1.0);
+        let u = compute_structural_cache_usage(&req, 1.0, true);
         let a1_est = message_tokens(&msg("assistant", &big));
         let u2_est = message_tokens(&msg("user", "short new question"));
         assert_eq!(u.creation_est, a1_est, "creation = 倒数第二条 message");
@@ -534,8 +638,8 @@ mod tests {
         long_msgs.push(msg("user", "q"));
         let long = req_with(long_msgs, None);
 
-        let cu_short = compute_structural_cache_usage(&short, 1.0);
-        let cu_long = compute_structural_cache_usage(&long, 1.0);
+        let cu_short = compute_structural_cache_usage(&short, 1.0, true);
+        let cu_long = compute_structural_cache_usage(&long, 1.0, true);
         // creation_est 都≈一条 assistant 消息，长对话不放大
         let a_est = message_tokens(&msg("assistant", &unit));
         assert_eq!(cu_short.creation_est, a_est);
@@ -558,9 +662,9 @@ mod tests {
             vec![msg("user", &body), msg("assistant", &body), msg("user", "q")],
             None,
         );
-        let total = compute_structural_cache_usage(&req, 1.0).prompt_total_est;
-        let (i_lo, c_lo, r_lo) = compute_structural_cache_usage(&req, 0.5).split_against_total(total);
-        let (i_hi, c_hi, r_hi) = compute_structural_cache_usage(&req, 1.0).split_against_total(total);
+        let total = compute_structural_cache_usage(&req, 1.0, true).prompt_total_est;
+        let (i_lo, c_lo, r_lo) = compute_structural_cache_usage(&req, 0.5, true).split_against_total(total);
+        let (i_hi, c_hi, r_hi) = compute_structural_cache_usage(&req, 1.0, true).split_against_total(total);
         assert!(r_hi > r_lo, "R 越大 read 越多");
         assert!(i_hi < i_lo, "R 越大 input 越少（折扣更足）");
         assert_eq!(c_lo, c_hi, "creation 不受 R 影响");
@@ -585,7 +689,7 @@ mod tests {
             ],
             None,
         );
-        let u = compute_structural_cache_usage(&req, 1.0);
+        let u = compute_structural_cache_usage(&req, 1.0, true);
         // 含图历史(u1)在 read 前缀里 → prompt_total 应远大于本轮纯文本新输入。
         assert!(u.prompt_total_est >= img_tokens, "prompt_total 应含图片 token");
         let (_, _, read) = u.split_against_total(u.prompt_total_est);
@@ -612,7 +716,7 @@ mod tests {
             vec![msg("user", "do something"), tool_use, msg("user", "next")],
             None,
         );
-        let u = compute_structural_cache_usage(&req, 1.0);
+        let u = compute_structural_cache_usage(&req, 1.0, true);
         assert_eq!(u.creation_est, toolu_est, "creation 应等于 tool_use message 的 token");
         let (input, creation, read) = u.split_against_total(u.prompt_total_est);
         assert!(creation > 0, "修复后 cache_creation 不再塌成 0");
@@ -636,14 +740,14 @@ mod tests {
             vec![tool_result, msg("assistant", "ok"), msg("user", "q")],
             None,
         );
-        let u = compute_structural_cache_usage(&req, 1.0);
+        let u = compute_structural_cache_usage(&req, 1.0, true);
         assert!(u.prompt_total_est > tr_est, "prompt_total 应含 tool_result token");
     }
 
     #[test]
     fn compute_empty_messages_safe() {
         let req = req_with(vec![], None);
-        let u = compute_structural_cache_usage(&req, 1.0);
+        let u = compute_structural_cache_usage(&req, 1.0, true);
         assert_eq!(u.input_est, 0);
         assert_eq!(u.creation_est, 0);
         assert_eq!(u.split_against_total(100), (100, 0, 0));
@@ -653,7 +757,7 @@ mod tests {
 
     #[test]
     fn governance_get_set_and_clamp() {
-        let g = MeterGovernance::new(0.8);
+        let g = MeterGovernance::new(0.8, 300);
         assert!((g.read_ratio() - 0.8).abs() < 1e-9);
         g.set_read_ratio(0.95);
         assert!((g.read_ratio() - 0.95).abs() < 1e-9);
@@ -662,7 +766,30 @@ mod tests {
         assert!((g.read_ratio() - 1.0).abs() < 1e-9);
         g.set_read_ratio(-0.2);
         assert!((g.read_ratio() - 0.0).abs() < 1e-9);
-        assert!((MeterGovernance::new(2.0).read_ratio() - 1.0).abs() < 1e-9);
+        assert!((MeterGovernance::new(2.0, 300).read_ratio() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn governance_ttl_get_set() {
+        let g = MeterGovernance::new(1.0, 300);
+        assert_eq!(g.ttl_secs(), 300);
+        g.set_ttl_secs(60);
+        assert_eq!(g.ttl_secs(), 60);
+    }
+
+    #[test]
+    fn governance_warmth_cold_then_warm_then_expired() {
+        let g = MeterGovernance::new(1.0, 300);
+        // 首次出现 → cold
+        assert!(!g.touch_and_is_warm("sess:a", 1000), "首次出现应判 cold");
+        // TTL 内再来 → warm
+        assert!(g.touch_and_is_warm("sess:a", 1200), "TTL(300)内应判 warm");
+        // 超 TTL → cold(缓存凉了)
+        assert!(!g.touch_and_is_warm("sess:a", 1600), "距上次>300s 应判 cold");
+        // 刚刷新过,紧接着再来 → warm
+        assert!(g.touch_and_is_warm("sess:a", 1700), "刷新后 TTL 内应 warm");
+        // 不同会话互不影响 → cold
+        assert!(!g.touch_and_is_warm("sess:b", 1700), "另一会话首次应 cold");
     }
 
     // ---- isolation_seed ----------------------------------------------------

@@ -2169,6 +2169,11 @@ impl AdminService {
                 .as_ref()
                 .map(|g| g.read_ratio())
                 .unwrap_or(0.0),
+            cache_meter_ttl_secs: self
+                .meter_governance
+                .as_ref()
+                .map(|g| g.ttl_secs())
+                .unwrap_or(300),
         }
     }
 
@@ -2213,6 +2218,14 @@ impl AdminService {
                 )));
             }
         }
+        if let Some(ttl) = req.cache_meter_ttl_secs {
+            if !(1..=86400).contains(&ttl) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "cacheMeterTtlSecs 必须在 1..=86400 内: {}",
+                    ttl
+                )));
+            }
+        }
 
         // 先改运行时值
         if let Some(t) = req.quota_disable_threshold {
@@ -2233,6 +2246,11 @@ impl AdminService {
                 g.set_read_ratio(r);
             }
         }
+        if let Some(ttl) = req.cache_meter_ttl_secs {
+            if let Some(g) = &self.meter_governance {
+                g.set_ttl_secs(ttl);
+            }
+        }
 
         // 持久化到 config.json（从磁盘重载再写，避免覆盖并发修改）
         self.update_config_file(|c| {
@@ -2247,6 +2265,9 @@ impl AdminService {
             }
             if let Some(r) = req.cache_read_ratio {
                 c.cache_read_ratio = r;
+            }
+            if let Some(ttl) = req.cache_meter_ttl_secs {
+                c.cache_meter_ttl_secs = ttl;
             }
         });
 

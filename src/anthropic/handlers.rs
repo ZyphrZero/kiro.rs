@@ -459,11 +459,12 @@ fn resolve_usage_input_tokens(
         .unwrap_or(fallback_total_input_tokens)
 }
 
-/// 计算本次请求的结构化缓存覆盖（无状态、确定性）。
+/// 计算本次请求的结构化缓存覆盖。
 ///
 /// `cache_enabled=false` 的 Key 直接返回默认（不模拟缓存，全量计入 input）。否则取该请求
-/// 生效的命中率 R——per-key `cache_read_ratio` 覆盖优先，否则全局 `MeterGovernance`（默认
-/// 0.8）——交给 `compute_structural_cache_usage` 做纯函数拆分。
+/// 生效的命中率 R——per-key `cache_read_ratio` 覆盖优先，否则全局 `MeterGovernance`——并按会话
+/// 热度判 warm/cold（`touch_and_is_warm`：首次出现或距上次超 TTL → cold，整段前缀按 creation
+/// 重写计费），交给 `compute_structural_cache_usage` 拆分。
 pub(crate) fn compute_cache_usage_for_key(
     state: &AppState,
     payload: &MessagesRequest,
@@ -479,7 +480,16 @@ pub(crate) fn compute_cache_usage_for_key(
             .map(|g| g.read_ratio())
             .unwrap_or(0.0)
     });
-    super::cache_metering::compute_structural_cache_usage(payload, read_ratio)
+    // 会话热度：首次出现 / 超 TTL（缓存凉了）→ cold。无 governance 时退化为恒 warm（保持旧行为）。
+    let warm = state
+        .meter_governance
+        .as_ref()
+        .map(|g| {
+            let session = super::cache_metering::isolation_seed(payload, key_ctx.key_id);
+            g.touch_and_is_warm(&session, super::cache_metering::now_unix_secs())
+        })
+        .unwrap_or(true);
+    super::cache_metering::compute_structural_cache_usage(payload, read_ratio, warm)
 }
 
 /// `prepare_kiro_request` 的产物：已转换 + 序列化的上游请求体及其派生计量信息。

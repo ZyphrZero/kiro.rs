@@ -481,6 +481,8 @@ export interface RuntimeGovernanceConfig {
   responseCacheTtlSecs: number
   /** 缓存计量 read 留存阻尼 R ∈ [0,1]：read 桶保留 read×R，其余推回 input（不触碰 creation）。 */
   cacheReadRatio: number
+  /** 缓存计量热度 TTL（秒）：会话首次出现 / 距上次超此值（缓存凉）→ 本轮判 cold，整段前缀按 creation 重写、read=0。 */
+  cacheMeterTtlSecs: number
 }
 
 // 获取运行时治理配置
