@@ -45,6 +45,10 @@ interface KamAccount {
     authMethod?: string
     provider?: string
     startUrl?: string
+    // 企业 SSO（external_idp / Entra ID / Azure AD）：有 clientId + tokenEndpoint，无 clientSecret
+    tokenEndpoint?: string
+    issuerUrl?: string
+    scopes?: string
   }
   machineId?: string
   status?: string
@@ -109,6 +113,9 @@ function normalizeKamAccount(item: unknown): unknown {
     const authMethod = typeof obj.authMethod === 'string' ? obj.authMethod : undefined
     const provider = typeof obj.provider === 'string' ? obj.provider : undefined
     const startUrl = typeof obj.startUrl === 'string' ? obj.startUrl : undefined
+    const tokenEndpoint = typeof obj.tokenEndpoint === 'string' ? obj.tokenEndpoint : undefined
+    const issuerUrl = typeof obj.issuerUrl === 'string' ? obj.issuerUrl : undefined
+    const scopes = typeof obj.scopes === 'string' ? obj.scopes : undefined
 
     return {
       email,
@@ -128,6 +135,9 @@ function normalizeKamAccount(item: unknown): unknown {
         authMethod,
         provider,
         startUrl,
+        tokenEndpoint,
+        issuerUrl,
+        scopes,
       },
     }
   }
@@ -358,14 +368,48 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
         const clientId = cred.clientId?.trim() || undefined
         const clientSecret = cred.clientSecret?.trim() || undefined
-        const authMethod = clientId && clientSecret ? 'idc' : 'social'
-        const provider = cred.provider?.trim() || account.idp?.trim() || undefined
+        const tokenEndpoint = cred.tokenEndpoint?.trim() || undefined
+        const issuerUrl = cred.issuerUrl?.trim() || undefined
+        const scopes = cred.scopes?.trim() || undefined
 
-        // idc 模式下必须同时提供 clientId 和 clientSecret
-        if (authMethod === 'social' && (clientId || clientSecret)) {
+        // 认证方式优先取显式 authMethod；未声明时按字段推断：
+        // 有 tokenEndpoint → external_idp（企业 SSO / Entra ID）；
+        // 有 clientId+clientSecret → idc；否则 social。
+        const declared = cred.authMethod?.trim().toLowerCase()
+        let authMethod: 'social' | 'idc' | 'external_idp'
+        if (declared === 'external_idp') {
+          authMethod = 'external_idp'
+        } else if (declared === 'idc' || declared === 'builder-id' || declared === 'iam') {
+          authMethod = 'idc'
+        } else if (declared === 'social') {
+          authMethod = 'social'
+        } else if (tokenEndpoint) {
+          authMethod = 'external_idp'
+        } else if (clientId && clientSecret) {
+          authMethod = 'idc'
+        } else {
+          authMethod = 'social'
+        }
+
+        const provider =
+          cred.provider?.trim() ||
+          account.idp?.trim() ||
+          (authMethod === 'external_idp' ? 'AzureAD' : undefined)
+
+        // 各方式的必填字段校验
+        if (authMethod === 'idc' && !(clientId && clientSecret)) {
           updateResult(i, { status: 'failed', error: 'idc 模式需要同时提供 clientId 和 clientSecret' })
           continue
         }
+        if (authMethod === 'external_idp' && !(clientId && tokenEndpoint)) {
+          updateResult(i, {
+            status: 'failed',
+            error: 'external_idp（企业 SSO / Entra ID）需要同时提供 clientId 和 tokenEndpoint',
+          })
+          continue
+        }
+
+        const isExternalIdp = authMethod === 'external_idp'
 
         // KAM 账号无 proxyUrl 字段，无代理时从池中随机分配一个
         const proxyUrl = enabledProxies.length > 0
@@ -384,7 +428,11 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             authRegion: cred.region?.trim() || undefined,
             startUrl: cred.startUrl?.trim() || undefined,
             clientId,
-            clientSecret,
+            // external_idp 为公共客户端，不携带 clientSecret
+            clientSecret: isExternalIdp ? undefined : clientSecret,
+            tokenEndpoint: isExternalIdp ? tokenEndpoint : undefined,
+            issuerUrl: isExternalIdp ? issuerUrl : undefined,
+            scopes: isExternalIdp ? scopes : undefined,
             machineId: account.machineId?.trim() || undefined,
             email: account.email?.trim() || undefined,
             proxyUrl,
