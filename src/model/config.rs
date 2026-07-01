@@ -171,6 +171,19 @@ pub struct Config {
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
+    /// Preferred endpoint name when endpoint fallback is enabled.
+    ///
+    /// If unset, fallback order starts from `default_endpoint`. Per-credential
+    /// `endpoint` still has highest priority.
+    #[serde(default)]
+    pub preferred_endpoint: Option<String>,
+
+    /// Whether to try Kiro-Go-compatible fallback endpoints on the same credential.
+    ///
+    /// Default false preserves existing single-endpoint behavior.
+    #[serde(default = "default_endpoint_fallback")]
+    pub endpoint_fallback: bool,
+
     /// 是否启用请求链路追踪（写 traces.db）。默认 true。
     ///
     /// 关闭后：不再写入 trace 记录、不走 TraceSink，但 `GET /api/admin/traces`
@@ -333,6 +346,10 @@ fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
+fn default_endpoint_fallback() -> bool {
+    false
+}
+
 fn default_trace_enabled() -> bool {
     true
 }
@@ -384,6 +401,8 @@ impl Default for Config {
             account_acquire_timeout_secs: default_account_acquire_timeout_secs(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
+            preferred_endpoint: None,
+            endpoint_fallback: default_endpoint_fallback(),
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
