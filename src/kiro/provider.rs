@@ -282,11 +282,7 @@ impl KiroProvider {
         }).collect()
     }
 
-    fn is_fallbackable_status(
-        status: reqwest::StatusCode,
-        _body: &str,
-        _endpoint: &dyn KiroEndpoint,
-    ) -> bool {
+    fn is_fallbackable_status(status: reqwest::StatusCode) -> bool {
         // 对齐 Kiro-Go (proxy/kiro.go:401-419): 除账号级状态(401/402/403)外,
         // 其余非 200 一律 fallback 到下一个端点(含 524 网关超时、400 客户端校验错误)。
         // 401/403/402 由下方账号级状态处理分支负责,在同一账号上换端点无意义。
@@ -683,7 +679,7 @@ impl KiroProvider {
                     return Ok(KiroCallResult { response, credential_id: ctx.id, account_guard: ctx });
                 }
                 let body = response.text().await.unwrap_or_default();
-                if Self::is_fallbackable_status(status, &body, endpoint.as_ref()) && endpoint_index + 1 < endpoint_count {
+                if Self::is_fallbackable_status(status) && endpoint_index + 1 < endpoint_count {
                     tracing::warn!("Endpoint {} returned {}; trying next fallback on #{}", endpoint_name, status, ctx.id);
                     Self::emit_attempt(sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()), outcome::TRANSIENT, Some(&body), endpoint_attempt_start);
                     continue;
