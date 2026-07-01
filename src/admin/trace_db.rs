@@ -351,14 +351,20 @@ impl TraceStore {
                     rec.first_token_ms.map(|v| v as i64),
                 ],
             )?;
-            for a in &rec.attempts {
+            // 用「发射顺序下标」作为 attempt 主键分量，而非 provider 的重试轮次计数：
+            // 一轮重试里 429 端点降级会先后发射「备用端点失败」+「主端点分类」两跳，
+            // 它们的轮次计数相同，若直接以 a.attempt 作主键，INSERT OR REPLACE 会让后
+            // 写入的主端点行覆盖先写入的备用端点行 —— 备用端点(runtime)失败因此在链路里
+            // 不可见。改用 enumerate 下标后每一跳都得到唯一、连续、有序的主键，所有跳
+            // （含 runtime 失败）都完整落库；正常单跳/轮次的 trace 编号不变。
+            for (seq, a) in rec.attempts.iter().enumerate() {
                 tx.execute(
                     "INSERT OR REPLACE INTO trace_attempts (trace_id, attempt, credential_id, \
                      endpoint, http_status, outcome, error_snippet, duration_ms) \
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     rusqlite::params![
                         rec.trace_id,
-                        a.attempt as i64,
+                        seq as i64,
                         a.credential_id as i64,
                         a.endpoint,
                         a.http_status.map(|v| v as i64),

@@ -673,6 +673,22 @@ impl KiroProvider {
             // - 备用端点也失败 → 落回下方按原始（主端点）响应体分类处理：账号级风控走
             //   冷却换号，普通 429 走退避重试；下一轮迭代再以主端点起手，形成 q↔runtime 来回。
             if status.as_u16() == 429 {
+                // 先对主端点 429 分类一次（账号风控 vs 普通限流），并**立即**发射主端点
+                // 这一跳的 trace——必须在备用端点降级之前发射，保证链路里主端点(q)行排在
+                // 备用端点(runtime)行之前，顺序与真实调用一致（先打 q、再降级 runtime）。
+                // 下方「账号级风控」「瞬态重试」两个分支因此不再重复发射本跳，仅保留控制流。
+                let account_throttled = self.token_manager.get_account_throttle_failover()
+                    && endpoint.is_account_throttled(&body);
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, endpoint_name, Some(429),
+                    if account_throttled {
+                        outcome::ACCOUNT_THROTTLED
+                    } else {
+                        outcome::TRANSIENT
+                    },
+                    Some(&body), attempt_start,
+                );
+
                 if let Some(fb_name) = endpoint.fallback_endpoint() {
                     if let Some(fb_endpoint) = self.endpoints.get(fb_name).cloned() {
                         tracing::info!(
@@ -754,10 +770,7 @@ impl KiroProvider {
                 );
 
                 let remaining = self.token_manager.report_account_throttled(ctx.id, cooldown);
-                Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(429),
-                    outcome::ACCOUNT_THROTTLED, Some(&body), attempt_start,
-                );
+                // 本跳 trace 已在上方 429 降级块统一发射（含 ACCOUNT_THROTTLED 分类），此处不再重发。
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败（账号级风控，凭据 #{} 已冷却 {} 分钟）: {} {}",
                     api_type,
@@ -834,10 +847,13 @@ impl KiroProvider {
                     status,
                     body
                 );
-                Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::TRANSIENT, Some(&body), attempt_start,
-                );
+                // 429 本跳 trace 已在上方降级块统一发射，此处仅对 408/5xx 发射，避免重复行。
+                if status.as_u16() != 429 {
+                    Self::emit_attempt(
+                        sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                        outcome::TRANSIENT, Some(&body), attempt_start,
+                    );
+                }
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
                     api_type,
