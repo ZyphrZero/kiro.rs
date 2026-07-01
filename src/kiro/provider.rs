@@ -284,16 +284,13 @@ impl KiroProvider {
 
     fn is_fallbackable_status(
         status: reqwest::StatusCode,
-        body: &str,
-        endpoint: &dyn KiroEndpoint,
+        _body: &str,
+        _endpoint: &dyn KiroEndpoint,
     ) -> bool {
-        if status.as_u16() == 524 || endpoint.is_gateway_timeout(body) {
-            return false;
-        }
-        if endpoint.is_client_validation_error(body) {
-            return false;
-        }
-        matches!(status.as_u16(), 408 | 429) || status.is_server_error()
+        // 对齐 Kiro-Go (proxy/kiro.go:401-419): 除账号级状态(401/402/403)外,
+        // 其余非 200 一律 fallback 到下一个端点(含 524 网关超时、400 客户端校验错误)。
+        // 401/403/402 由下方账号级状态处理分支负责,在同一账号上换端点无意义。
+        !matches!(status.as_u16(), 401 | 402 | 403)
     }
 
     fn is_fallbackable_network_error() -> bool {
