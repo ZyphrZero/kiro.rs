@@ -11,10 +11,12 @@ use reqwest::RequestBuilder;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
+pub mod amazonq;
 pub mod cli;
 pub mod codewhisperer;
 pub mod ide;
 
+pub use amazonq::AmazonqEndpoint;
 pub use cli::CliEndpoint;
 pub use codewhisperer::CodewhispererEndpoint;
 pub use ide::IdeEndpoint;

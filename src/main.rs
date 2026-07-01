@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use axum::serve::ListenerExt;
-use kiro::endpoint::{CliEndpoint, CodewhispererEndpoint, IdeEndpoint, KiroEndpoint};
+use kiro::endpoint::{AmazonqEndpoint, CliEndpoint, CodewhispererEndpoint, IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -126,6 +126,8 @@ async fn main() {
         endpoints.insert(cli.name().to_string(), Arc::new(cli));
         let codewhisperer = CodewhispererEndpoint::new();
         endpoints.insert(codewhisperer.name().to_string(), Arc::new(codewhisperer));
+        let amazonq = AmazonqEndpoint::new();
+        endpoints.insert(amazonq.name().to_string(), Arc::new(amazonq));
     }
 
     // 校验默认端点存在
