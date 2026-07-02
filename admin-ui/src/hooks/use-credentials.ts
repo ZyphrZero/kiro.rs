@@ -19,6 +19,14 @@ import {
   setAccountThrottleConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
+  getRuntimeGovernanceConfig,
+  setRuntimeGovernanceConfig,
+  getModelMappings,
+  setModelMappings,
+  getPromptFilterDefaults,
+  setPromptFilterDefaults,
+  getGlobalProxy,
+  setGlobalProxy,
   resetSuccessCount,
   resetAllSuccessCount,
 } from '@/api/credentials'
@@ -244,6 +252,82 @@ export function useSetLogGovernanceConfig() {
     mutationFn: setLogGovernanceConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['logGovernanceConfig'] })
+    },
+  })
+}
+
+// 获取运行时治理配置（配额阈值 + 全局响应缓存默认）
+export function useRuntimeGovernanceConfig() {
+  return useQuery({
+    queryKey: ['runtimeGovernanceConfig'],
+    queryFn: getRuntimeGovernanceConfig,
+  })
+}
+
+// 更新运行时治理配置
+export function useSetRuntimeGovernanceConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setRuntimeGovernanceConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['runtimeGovernanceConfig'] })
+    },
+  })
+}
+
+// 获取模型映射规则列表
+export function useModelMappings() {
+  return useQuery({
+    queryKey: ['modelMappings'],
+    queryFn: getModelMappings,
+  })
+}
+
+// 整表替换模型映射规则
+export function useSetModelMappings() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setModelMappings,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['modelMappings'] })
+    },
+  })
+}
+
+// 获取提示词过滤默认值
+export function usePromptFilterDefaults() {
+  return useQuery({
+    queryKey: ['promptFilterDefaults'],
+    queryFn: getPromptFilterDefaults,
+  })
+}
+
+// 更新提示词过滤默认值
+export function useSetPromptFilterDefaults() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setPromptFilterDefaults,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['promptFilterDefaults'] })
+    },
+  })
+}
+
+// 获取全局代理
+export function useGlobalProxy() {
+  return useQuery({
+    queryKey: ['globalProxy'],
+    queryFn: getGlobalProxy,
+  })
+}
+
+// 设置全局代理
+export function useSetGlobalProxy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setGlobalProxy,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['globalProxy'] })
     },
   })
 }

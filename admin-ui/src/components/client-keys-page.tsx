@@ -70,6 +70,12 @@ export function ClientKeysPage() {
   const [editSimplifyCc, setEditSimplifyCc] = useState(false)
   const [editStripBoundary, setEditStripBoundary] = useState(false)
   const [editStripEnvNoise, setEditStripEnvNoise] = useState(false)
+  // 响应缓存 per-key 覆盖：'global'=跟随全局 / 'on'=强制开 / 'off'=强制关
+  const [editRespCache, setEditRespCache] = useState<'global' | 'on' | 'off'>('global')
+  // 响应缓存 TTL 覆盖（秒）；空串=跟随全局
+  const [editRespCacheTtl, setEditRespCacheTtl] = useState('')
+  // 缓存命中率 R 覆盖：空串=跟随全局，否则 0~1
+  const [editCacheRatio, setEditCacheRatio] = useState('')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -176,12 +182,33 @@ export function ClientKeysPage() {
     setEditSimplifyCc(item.simplifyCcPrompt)
     setEditStripBoundary(item.stripBoundaryMarkers)
     setEditStripEnvNoise(item.stripEnvNoise)
+    setEditRespCache(
+      item.responseCacheEnabled == null ? 'global' : item.responseCacheEnabled ? 'on' : 'off',
+    )
+    setEditRespCacheTtl(item.responseCacheTtlSecs != null ? String(item.responseCacheTtlSecs) : '')
+    setEditCacheRatio(item.cacheReadRatio != null ? String(item.cacheReadRatio) : '')
     setEditOpen(true)
   }
 
   const handleEditSave = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!editTarget) return
+    // 响应缓存覆盖映射到三态线协议：'global'→null（复位跟随全局）/ 'on'→true / 'off'→false
+    const respCacheEnabled = editRespCache === 'global' ? null : editRespCache === 'on'
+    // TTL：空串→0（复位跟随全局）；否则解析为秒
+    const ttlRaw = editRespCacheTtl.trim()
+    const respCacheTtl = ttlRaw === '' ? 0 : parseInt(ttlRaw, 10)
+    if (ttlRaw !== '' && (isNaN(respCacheTtl) || respCacheTtl < 1 || respCacheTtl > 86400)) {
+      toast.error('缓存 TTL 需在 1..=86400 秒，或留空跟随全局')
+      return
+    }
+    // 命中率覆盖：空串→null（复位跟随全局）；否则 0~1
+    const ratioRaw = editCacheRatio.trim()
+    const cacheReadRatio = ratioRaw === '' ? null : parseFloat(ratioRaw)
+    if (ratioRaw !== '' && (isNaN(cacheReadRatio as number) || (cacheReadRatio as number) < 0 || (cacheReadRatio as number) > 1)) {
+      toast.error('缓存命中率需在 0..=1，或留空跟随全局')
+      return
+    }
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
@@ -193,6 +220,9 @@ export function ClientKeysPage() {
           simplifyCcPrompt: editSimplifyCc,
           stripBoundaryMarkers: editStripBoundary,
           stripEnvNoise: editStripEnvNoise,
+          responseCacheEnabled: respCacheEnabled,
+          responseCacheTtlSecs: respCacheTtl,
+          cacheReadRatio,
         },
       })
       toast.success('已更新')
@@ -422,9 +452,9 @@ export function ClientKeysPage() {
             </div>
             <div className="flex items-center justify-between gap-3 rounded-md border border-border/60 px-3 py-2">
               <div>
-                <div className="text-sm font-medium">Prompt cache</div>
+                <div className="text-sm font-medium">Prompt cache 计量</div>
                 <p className="text-[11px] text-muted-foreground">
-                  关闭后仅按标准 cache_control 计量，不使用中转层增强命中。
+                  合成 cache_creation/cache_read token 拆分上报给下游；关闭后这些计数归零，仅按标准 cache_control 计量。不缓存真实响应。
                 </p>
               </div>
               <Switch
@@ -503,7 +533,7 @@ export function ClientKeysPage() {
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>编辑 Key</DialogTitle>
-            <DialogDescription>修改名称与描述（不影响 Key 值与统计）</DialogDescription>
+            <DialogDescription>修改名称、描述、分组及缓存行为（不影响 Key 值与统计）</DialogDescription>
           </DialogHeader>
           <form onSubmit={handleEditSave} className="space-y-3 py-2">
             <div>
@@ -527,18 +557,42 @@ export function ClientKeysPage() {
                 绑定后仅调度该分组内账号（严格隔离）。选「不绑定」表示解除绑定。
               </p>
             </div>
-            <div className="flex items-center justify-between gap-3 rounded-md border border-border/60 px-3 py-2">
-              <div>
-                <div className="text-sm font-medium">Prompt cache</div>
-                <p className="text-[11px] text-muted-foreground">
-                  关闭后仅按标准 cache_control 计量，不使用中转层增强命中。
-                </p>
+            <div className="rounded-md border border-border/60 px-3 py-2">
+              <div className="mb-2 text-sm font-medium">Prompt cache 计量</div>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm">启用计量合成</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      合成 cache_creation/cache_read token 拆分上报给下游；关闭后这些计数归零，仅按标准 cache_control 计量。不缓存真实响应。
+                    </p>
+                  </div>
+                  <Switch
+                    checked={editCacheEnabled}
+                    onCheckedChange={setEditCacheEnabled}
+                    disabled={updateKey.isPending}
+                  />
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm">read 留存 R 覆盖</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      留空＝跟随全局；0~1。read 桶留存比例（其余推回 input，不触碰 creation）。仅在启用计量合成时生效。
+                    </p>
+                  </div>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    placeholder="跟随全局"
+                    value={editCacheRatio}
+                    onChange={(e) => setEditCacheRatio(e.target.value)}
+                    disabled={updateKey.isPending || !editCacheEnabled}
+                    className="h-8 w-28 text-xs"
+                  />
+                </div>
               </div>
-              <Switch
-                checked={editCacheEnabled}
-                onCheckedChange={setEditCacheEnabled}
-                disabled={updateKey.isPending}
-              />
             </div>
             <div className="rounded-md border border-border/60 px-3 py-2">
               <div className="mb-2 text-sm font-medium text-pink-600">提示词过滤</div>
@@ -580,6 +634,47 @@ export function ClientKeysPage() {
                     checked={editStripEnvNoise}
                     onCheckedChange={setEditStripEnvNoise}
                     disabled={updateKey.isPending}
+                  />
+                </div>
+              </div>
+            </div>
+            <div className="rounded-md border border-border/60 px-3 py-2">
+              <div className="mb-2 text-sm font-medium">响应缓存（per-key 覆盖）</div>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm">缓存策略</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      相同请求命中即回放、跳过上游。「跟随全局」沿用全局默认开关。
+                    </p>
+                  </div>
+                  <select
+                    value={editRespCache}
+                    onChange={(e) => setEditRespCache(e.target.value as 'global' | 'on' | 'off')}
+                    disabled={updateKey.isPending}
+                    className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                  >
+                    <option value="global">跟随全局</option>
+                    <option value="on">强制开启</option>
+                    <option value="off">强制关闭</option>
+                  </select>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm">TTL 覆盖（秒）</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      留空＝跟随全局默认 TTL；范围 1..=86400。
+                    </p>
+                  </div>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={86400}
+                    placeholder="跟随全局"
+                    value={editRespCacheTtl}
+                    onChange={(e) => setEditRespCacheTtl(e.target.value)}
+                    disabled={updateKey.isPending}
+                    className="h-8 w-28 text-xs"
                   />
                 </div>
               </div>

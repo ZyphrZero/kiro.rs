@@ -61,6 +61,17 @@ pub struct ClientKey {
     /// 提示词过滤（per-key，默认关）：去环境噪音（删 # Environment 段、gitStatus 等行）。
     #[serde(default, skip_serializing_if = "is_false")]
     pub strip_env_noise: bool,
+    /// 响应缓存 per-key 覆盖（None = 跟随全局 `responseCacheEnabled`；Some(true/false) = 强制开/关）。
+    /// 老数据无此字段时为 None（跟随全局，行为不变）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_cache_enabled: Option<bool>,
+    /// 响应缓存 TTL per-key 覆盖（秒；None 或 0 = 跟随全局 `responseCacheTtlSecs`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_cache_ttl_secs: Option<u32>,
+    /// 缓存计量 read 留存阻尼 R per-key 覆盖 ∈ [0,1]（None = 跟随全局 `cacheReadRatio`）。
+    /// 控制该 Key 的 read 桶留存比例（被砍部分推回 input，不触碰 creation）。老数据无此字段时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_ratio: Option<f64>,
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
@@ -171,33 +182,24 @@ impl ClientKeyManager {
         description: Option<String>,
         group: Option<String>,
         cache_enabled: bool,
+        prompt_filters: (bool, bool, bool),
     ) -> ClientKey {
         if cache_enabled {
-            self.create_with_key(name, description, group, generate_client_key())
+            self.create_with_key_full(name, description, group, generate_client_key(), true, prompt_filters)
         } else {
-            self.create_with_key_and_cache(name, description, group, generate_client_key(), false)
+            self.create_with_key_full(name, description, group, generate_client_key(), false, prompt_filters)
         }
     }
 
-    /// 用指定明文创建 Key（仅供首次启动 bootstrap 用，把 config.json apiKey 直接导入为第一条分发密钥）。
-    /// 若该明文已存在则跳过，返回已存在的条目。
-    pub fn create_with_key(
-        &self,
-        name: String,
-        description: Option<String>,
-        group: Option<String>,
-        plaintext: String,
-    ) -> ClientKey {
-        self.create_with_key_and_cache(name, description, group, plaintext, true)
-    }
-
-    fn create_with_key_and_cache(
+    /// 用指定明文创建 Key（带缓存与提示词过滤设置）。bootstrap 系统密钥走 `ensure_system_key`。
+    fn create_with_key_full(
         &self,
         name: String,
         description: Option<String>,
         group: Option<String>,
         plaintext: String,
         cache_enabled: bool,
+        prompt_filters: (bool, bool, bool),
     ) -> ClientKey {
         let mut inner = self.inner.write();
         // 防止 bootstrap 重复导入同一明文
@@ -224,9 +226,12 @@ impl ClientKeyManager {
             total_cache_creation_tokens: 0,
             total_cache_read_tokens: 0,
             cache_enabled,
-            simplify_cc_prompt: false,
-            strip_boundary_markers: false,
-            strip_env_noise: false,
+            simplify_cc_prompt: prompt_filters.0,
+            strip_boundary_markers: prompt_filters.1,
+            strip_env_noise: prompt_filters.2,
+            response_cache_enabled: None,
+            response_cache_ttl_secs: None,
+            cache_read_ratio: None,
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
@@ -304,6 +309,9 @@ impl ClientKeyManager {
                     simplify_cc_prompt: false,
                     strip_boundary_markers: false,
                     strip_env_noise: false,
+                    response_cache_enabled: None,
+                    response_cache_ttl_secs: None,
+                    cache_read_ratio: None,
                     total_credits: 0.0,
                     group: None,
                     is_system: true,
@@ -359,6 +367,9 @@ impl ClientKeyManager {
         simplify_cc_prompt: Option<bool>,
         strip_boundary_markers: Option<bool>,
         strip_env_noise: Option<bool>,
+        response_cache_enabled: Option<Option<bool>>,
+        response_cache_ttl_secs: Option<Option<u32>>,
+        cache_read_ratio: Option<Option<f64>>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -383,6 +394,17 @@ impl ClientKeyManager {
                 }
                 if let Some(v) = strip_env_noise {
                     e.strip_env_noise = v;
+                }
+                if let Some(v) = response_cache_enabled {
+                    e.response_cache_enabled = v;
+                }
+                if let Some(v) = response_cache_ttl_secs {
+                    // 0 视为"清除覆盖、跟随全局"
+                    e.response_cache_ttl_secs = v.filter(|t| *t > 0);
+                }
+                if let Some(v) = cache_read_ratio {
+                    // clamp 到 [0,1]；Some(None) 清除覆盖、跟随全局
+                    e.cache_read_ratio = v.map(|r| r.clamp(0.0, 1.0));
                 }
                 true
             }
@@ -411,6 +433,26 @@ impl ClientKeyManager {
             .get(&id)
             .map(|e| e.cache_enabled)
             .unwrap_or(false)
+    }
+
+    /// 返回指定 Key 的响应缓存覆盖 `(enabled_override, ttl_secs_override)`。
+    /// 两者均为 None 表示「跟随全局配置」。Key 不存在时返回 (None, None)。
+    pub fn response_cache_cfg_of(&self, id: u64) -> (Option<bool>, Option<u32>) {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .map(|e| (e.response_cache_enabled, e.response_cache_ttl_secs))
+            .unwrap_or((None, None))
+    }
+
+    /// 返回指定 Key 的缓存命中率 R 覆盖（None = 跟随全局；Key 不存在时也返回 None）。
+    pub fn cache_read_ratio_of(&self, id: u64) -> Option<f64> {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .and_then(|e| e.cache_read_ratio)
     }
 
     /// 返回指定 Key 的三个提示词过滤开关 (simplify_cc, strip_boundary, strip_env_noise)。
@@ -652,7 +694,7 @@ mod tests {
     #[test]
     fn create_and_verify() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None, true);
+        let entry = mgr.create("test".to_string(), None, None, true, (false, false, false));
         assert!(entry.key.starts_with(CLIENT_KEY_PREFIX));
         assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
         // 不带前缀的拒绝
@@ -662,7 +704,7 @@ mod tests {
     #[test]
     fn disabled_key_rejected() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None, true);
+        let entry = mgr.create("test".to_string(), None, None, true, (false, false, false));
         mgr.set_disabled(entry.id, true);
         assert_eq!(mgr.verify_and_touch(&entry.key), None);
         mgr.set_disabled(entry.id, false);
@@ -672,7 +714,7 @@ mod tests {
     #[test]
     fn record_usage_accumulates() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None, true);
+        let entry = mgr.create("test".to_string(), None, None, true, (false, false, false));
         mgr.record_usage(entry.id, 100, 50, 0, 0, 0.0);
         mgr.record_usage(entry.id, 200, 30, 5, 10, 1.5);
         let list = mgr.list();
@@ -686,15 +728,63 @@ mod tests {
     #[test]
     fn cache_enabled_can_be_updated() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None, false);
-        assert!(!mgr.cache_enabled_of(entry.id));
-        assert!(mgr.update_meta(entry.id, None, None, None, Some(true), None, None, None));
+        let entry = mgr.create("test".to_string(), None, None, false, (false, false, false));
+        assert!(mgr.update_meta(
+            entry.id,
+            None,
+            None,
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None
+        ));
         assert!(mgr.cache_enabled_of(entry.id));
     }
 
     #[test]
+    fn response_cache_override_can_be_updated() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("test".to_string(), None, None, false, (false, false, false));
+        // 默认无覆盖
+        assert_eq!(mgr.response_cache_cfg_of(entry.id), (None, None));
+        // 设置覆盖：开启 + ttl 60
+        assert!(mgr.update_meta(
+            entry.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(true)),
+            Some(Some(60)),
+            None,
+        ));
+        assert_eq!(mgr.response_cache_cfg_of(entry.id), (Some(true), Some(60)));
+        // ttl=0 → 清除 ttl 覆盖（跟随全局）
+        assert!(mgr.update_meta(
+            entry.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(0)),
+            None,
+        ));
+        assert_eq!(mgr.response_cache_cfg_of(entry.id), (Some(true), None));
+    }
+
+    #[test]
     fn mask_format() {
-        assert_eq!(mask_client_key("csk_abcdefghijklmnop"), "csk_abcd...mnop");
         assert_eq!(mask_client_key("short"), "short");
     }
 
@@ -706,6 +796,7 @@ mod tests {
             Some("desc".into()),
             Some("groupA".into()),
             true,
+            (false, false, false),
         );
         // 累计一些统计
         mgr.record_usage(entry.id, 100, 50, 5, 10, 1.5);
@@ -750,7 +841,7 @@ mod tests {
     fn ensure_system_key_migrates_misplaced_id_to_zero() {
         // 模拟旧版 bootstrap 把 apiKey 误建在 id=1 上的场景
         let mgr = ClientKeyManager::new();
-        mgr.create_with_key("默认密钥".into(), None, None, "sk-kiro-abc".into());
+        mgr.create_with_key_full("默认密钥".into(), None, None, "sk-kiro-abc".into(), true, (false, false, false));
         assert_eq!(mgr.list().first().map(|k| k.id), Some(1));
         // 修复后启动：应迁移到 id=0
         mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());

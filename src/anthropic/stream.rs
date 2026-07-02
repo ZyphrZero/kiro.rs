@@ -1111,7 +1111,7 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
-    /// 中转层 CacheMeter 的缓存覆盖情况（estimate 口径）。最终上报时按真实 total
+    /// 中转层结构化缓存计量的覆盖情况。最终上报时按真实 total
     /// 做互斥分摊：`input + cache_creation + cache_read == total`，避免把被缓存
     /// 覆盖的前缀重复计进 input_tokens。
     pub cache_usage: super::cache_metering::CacheUsage,
@@ -2238,7 +2238,7 @@ impl BufferedStreamContext {
         }
     }
 
-    /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），最终上报时分摊。
+    /// 注入结构化缓存计量的覆盖情况，最终上报时按真实 total 分摊。
     pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
         self.inner.cache_usage = cache_usage;
     }
@@ -2314,9 +2314,13 @@ impl BufferedStreamContext {
     pub fn context_input_tokens(&self) -> Option<i32> {
         self.inner.context_input_tokens
     }
-}
 
-/// usage-gated 流式上下文（A1：`/cc/v1` 首包优化）。
+    /// 当前响应的最终 stop_reason（`end_turn` / `tool_use` / `max_tokens` /
+    /// `model_context_window_exceeded` 等）。响应缓存据此判定是否可缓存（只缓存 `end_turn`）。
+    pub fn stop_reason(&self) -> String {
+        self.inner.state_manager.get_stop_reason()
+    }
+}
 ///
 /// 与 [`BufferedStreamContext`]（全缓冲，等整条上游流结束才一次性发）不同：本上下文只
 /// 缓冲到**能确定 `message_start.usage.input_tokens` 的那一刻**就放闸（"开门"），之后边收
@@ -2364,7 +2368,7 @@ impl GatedStreamContext {
         }
     }
 
-    /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），放闸时按真值分摊。
+    /// 注入结构化缓存计量的覆盖情况，放闸时按真实 total 分摊。
     pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
         self.inner.cache_usage = cache_usage;
     }
@@ -2472,10 +2476,15 @@ impl GatedStreamContext {
     pub fn context_input_tokens(&self) -> Option<i32> {
         self.inner.context_input_tokens
     }
+
+    /// 当前响应的最终 stop_reason。响应缓存据此判定是否可缓存（只缓存 `end_turn`）。
+    pub fn stop_reason(&self) -> String {
+        self.inner.state_manager.get_stop_reason()
+    }
 }
 
 ///
-/// 公开供 cache_meter 等模块复用同一估算口径。
+/// 公开供 cache_metering 等模块复用同一估算口径。
 pub fn estimate_tokens(text: &str) -> i32 {
     let chars: Vec<char> = text.chars().collect();
     let mut chinese_count = 0;

@@ -166,20 +166,20 @@ impl TraceUsage {
     }
 }
 
-struct RequestTraceOptions {
-    key_ctx: KeyContext,
-    model: String,
-    is_stream: bool,
-    request_bytes: u64,
-    local_input_tokens: u64,
+pub(crate) struct RequestTraceOptions {
+    pub key_ctx: KeyContext,
+    pub model: String,
+    pub is_stream: bool,
+    pub request_bytes: u64,
+    pub local_input_tokens: u64,
     /// Anthropic→Kiro 转换 + 序列化耗时（毫秒）
-    conversion_ms: Option<u64>,
+    pub conversion_ms: Option<u64>,
     /// 本地 count_all_tokens 耗时（毫秒）
-    token_count_ms: Option<u64>,
+    pub token_count_ms: Option<u64>,
 }
 
 impl RequestTracer {
-    fn new(state: &AppState, options: RequestTraceOptions) -> Self {
+    pub(crate) fn new(state: &AppState, options: RequestTraceOptions) -> Self {
         Self {
             store: state.trace_store.clone(),
             trace_id: Uuid::new_v4().to_string(),
@@ -296,7 +296,7 @@ impl TraceSink for RequestTracer {
 
 /// 取追踪器里最后一跳的 outcome（用于把 provider 的失败分类提升到 record.error_type）。
 /// 返回 'static str（outcome 常量），无 attempt 时返回 None。
-fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
+pub(crate) fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
     let last = tracer.attempts.lock().last()?.outcome.clone();
     Some(match last.as_str() {
         outcome::QUOTA_EXHAUSTED => outcome::QUOTA_EXHAUSTED,
@@ -361,7 +361,7 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
-pub(super) fn map_provider_error(err: Error) -> Response {
+pub(crate) fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -459,30 +459,242 @@ fn resolve_usage_input_tokens(
         .unwrap_or(fallback_total_input_tokens)
 }
 
-fn compute_cache_usage_for_key(
+/// 计算本次请求的结构化缓存覆盖。
+///
+/// `cache_enabled=false` 的 Key 直接返回默认（不模拟缓存，全量计入 input）。否则取该请求
+/// 生效的命中率 R——per-key `cache_read_ratio` 覆盖优先，否则全局 `MeterGovernance`——并按会话
+/// 热度取上轮消息条数（`observe_session`：首次出现或距上次超 TTL → cold=None，整段前缀按
+/// creation 重写计费；warm 返回上次条数以界定本轮新增的 creation 区间），交给
+/// `compute_structural_cache_usage` 拆分。
+pub(crate) fn compute_cache_usage_for_key(
     state: &AppState,
     payload: &MessagesRequest,
     key_ctx: &KeyContext,
 ) -> super::cache_metering::CacheUsage {
-    if key_ctx.cache_enabled {
+    if !key_ctx.cache_enabled {
+        return super::cache_metering::CacheUsage::default();
+    }
+    let read_ratio = key_ctx.cache_read_ratio.unwrap_or_else(|| {
         state
-            .cache_meter
+            .meter_governance
             .as_ref()
-            .map(|cache| super::cache_metering::compute_cache_usage(cache, payload, key_ctx.key_id))
-            .unwrap_or_else(|| {
-                super::cache_metering::compute_standard_cache_usage(None, payload, key_ctx.key_id)
-            })
+            .map(|g| g.read_ratio())
+            .unwrap_or(0.0)
+    });
+    // 会话热度：首次出现 / 超 TTL（缓存凉了）→ cold(None)，否则返回上次消息条数。无 governance
+    // 时退化为「无上轮记录」语义——传 Some(n-1) 等价旧的恒 warm + 倒数第二条 creation。
+    let prev_msg_count = match state.meter_governance.as_ref() {
+        Some(g) => {
+            let session = super::cache_metering::isolation_seed(payload, key_ctx.key_id);
+            g.observe_session(
+                &session,
+                super::cache_metering::now_unix_secs(),
+                payload.messages.len(),
+            )
+        }
+        None => Some(payload.messages.len().saturating_sub(1)),
+    };
+    super::cache_metering::compute_structural_cache_usage(payload, read_ratio, prev_msg_count)
+}
+
+/// `prepare_kiro_request` 的产物：已转换 + 序列化的上游请求体及其派生计量信息。
+///
+/// 这是 Anthropic `/v1/messages` 与 OpenAI `/v1/chat/completions` 两条入口的**唯一**
+/// 请求侧真相源——提示词过滤、payload 字节上限裁剪、Anthropic→Kiro 转换（含 tool 配对
+/// 清理）、本地 token 估算、cache 计量全部在此完成，避免两条路径各写一份导致走样。
+pub(crate) struct PreparedKiroRequest {
+    /// 序列化后的 Kiro wire body（直接交给 provider）
+    pub request_body: String,
+    /// 转换 + 序列化耗时（毫秒，落 trace）
+    pub conversion_ms: Option<u64>,
+    /// 本地 count_all_tokens 估算输入 token
+    pub total_input_tokens: i32,
+    /// 本地 count_all_tokens 估算耗时（毫秒，落 trace）
+    pub token_count_ms: Option<u64>,
+    /// 是否启用 thinking（用于出站是否提取 reasoning）
+    pub thinking_enabled: bool,
+    /// 工具名映射（短名 → 原始名），出站还原用
+    pub tool_name_map: std::collections::HashMap<String, String>,
+    /// 本次声明的所有工具名（原始 client 名），`<invoke>` 文本兜底用
+    pub known_tool_names: std::collections::HashSet<String>,
+    /// cache 计量覆盖量（estimate 口径，最终按 total 真值互斥分摊）
+    pub cache_usage: super::cache_metering::CacheUsage,
+}
+
+/// 把（已归一化的）Anthropic `MessagesRequest` 转换并序列化成 Kiro wire body。
+///
+/// 顺序与原 `post_messages` 主体一致：
+/// 1. per-key 提示词过滤（精简 CC / 去边界标记 / 去环境噪音）作用于客户端原始 system；
+/// 2. `convert_within_limit`：在转换前裁最旧历史使转换后 Kiro 体不超上游阈值，转换（含 tool
+///    配对清理）在裁剪后跑，保证输出永远配对合法；
+/// 3. 构造并序列化 `KiroRequest`；
+/// 4. 本地 token 估算 + per-key cache 计量。
+///
+/// `payload` 以 `&mut` 传入因为过滤 / 裁剪会就地改写；调用方在此之后仍可读 `payload.model`
+/// 等字段。返回 `Err` 时调用方应映射为 400（转换失败）或 500（序列化失败）。
+pub(crate) fn prepare_kiro_request(
+    state: &AppState,
+    payload: &mut MessagesRequest,
+    key_ctx: &KeyContext,
+) -> Result<PreparedKiroRequest, Response> {
+    let conversion_started = Instant::now();
+
+    // 1. per-key 提示词过滤（只作用于客户端原始 system，转换器自注入的 prefix 不受影响）
+    super::prompt_filter::apply(&mut payload.system, key_ctx);
+
+    // 2. 转换 + payload 字节上限裁剪
+    let conversion_result = match super::payload_truncate::convert_within_limit(
+        payload,
+        &super::payload_truncate::PayloadLimitConfig::from_env(),
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            let (error_type, message) = match &e {
+                ConversionError::UnsupportedModel(model) => {
+                    ("invalid_request_error", format!("模型不支持: {}", model))
+                }
+                ConversionError::EmptyMessages => {
+                    ("invalid_request_error", "消息列表为空".to_string())
+                }
+            };
+            tracing::warn!("请求转换失败: {}", e);
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(error_type, message)),
+            )
+                .into_response());
+        }
+    };
+
+    // 3. 构造并序列化 Kiro 请求。profile_arn 由 provider 层从真实凭据注入。
+    let kiro_request = KiroRequest {
+        conversation_state: conversion_result.conversation_state,
+        profile_arn: None,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
+    };
+    let request_body = match serde_json::to_string(&kiro_request) {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::error!("序列化请求失败: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "internal_error",
+                    format!("序列化请求失败: {}", e),
+                )),
+            )
+                .into_response());
+        }
+    };
+    let conversion_ms = Some(conversion_started.elapsed().as_millis() as u64);
+
+    // 4. 本地 token 估算 + per-key cache 计量
+    let token_count_started = Instant::now();
+    let total_input_tokens = token::count_all_tokens(
+        &payload.model,
+        &payload.system,
+        &payload.messages,
+        &payload.tools,
+    ) as i32;
+    let token_count_ms = Some(token_count_started.elapsed().as_millis() as u64);
+
+    let thinking_enabled = payload
+        .thinking
+        .as_ref()
+        .map(|t| t.is_enabled())
+        .unwrap_or(false);
+
+    let cache_usage = compute_cache_usage_for_key(state, payload, key_ctx);
+
+    Ok(PreparedKiroRequest {
+        request_body,
+        conversion_ms,
+        total_input_tokens,
+        token_count_ms,
+        thinking_enabled,
+        tool_name_map: conversion_result.tool_name_map,
+        known_tool_names: conversion_result.known_tool_names,
+        cache_usage,
+    })
+}
+
+/// 响应缓存的「写入句柄」：命中 miss 后传入流/非流 handler，待完整响应组装好再 `put`。
+///
+/// 只在「该请求响应缓存生效」时为 `Some(..)`，否则为 None（handler 内零开销跳过）。
+#[derive(Clone)]
+pub(crate) struct ResponseCacheStore {
+    cache: super::response_cache::SharedResponseCache,
+    key: String,
+    ttl_secs: u64,
+}
+
+impl ResponseCacheStore {
+    /// 写入一段干净响应体。`is_sse=true` 表示 body 是 SSE 事件流文本。
+    pub(crate) fn put(&self, body: Vec<u8>, is_sse: bool) {
+        self.cache
+            .put(self.key.clone(), body, is_sse, self.ttl_secs);
+    }
+}
+
+/// 解析「该请求是否启用响应缓存」并构造 lookup/store 所需上下文。
+///
+/// 返回 `None` 表示缓存未启用（无全局缓存实例，或该 Key 生效配置为关）。
+/// 返回 `Some((cache, key, ttl))` 表示启用：用 `cache.get(&key)` 查、miss 后用 `ttl` 写。
+/// key 在请求转换/裁剪**之前**用原始 payload 计算，使其反映客户端真正发送的内容。
+pub(crate) fn resolve_response_cache(
+    state: &AppState,
+    payload: &MessagesRequest,
+    key_ctx: &KeyContext,
+) -> Option<(super::response_cache::SharedResponseCache, String, u64)> {
+    let cache = state.response_cache.as_ref()?;
+    let (enabled, ttl) =
+        cache.effective_config(key_ctx.response_cache_enabled, key_ctx.response_cache_ttl_secs);
+    if !enabled {
+        return None;
+    }
+    let key = super::response_cache::ResponseCache::compute_key(payload, key_ctx.key_id);
+    Some((cache.clone(), key, ttl))
+}
+
+/// 命中时构造回放响应：按 `is_sse` 还原 content-type，body 原样写出。
+pub(crate) fn build_cached_response(cached: super::response_cache::CachedResponse) -> Response {
+    if cached.is_sse {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Body::from(cached.body))
+            .unwrap()
     } else {
-        super::cache_metering::compute_standard_cache_usage(
-            state.cache_meter.as_deref(),
-            payload,
-            key_ctx.key_id,
-        )
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(cached.body))
+            .unwrap()
     }
 }
 
 fn available_models() -> Vec<Model> {
     vec![
+        Model {
+            id: "claude-sonnet-5".to_string(),
+            object: "model".to_string(),
+            created: 1782576000, // Jun 28, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1782576000, // Jun 28, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
         Model {
             id: "claude-opus-4-8".to_string(),
             object: "model".to_string(),
@@ -732,63 +944,41 @@ pub async fn post_messages(
         .await;
     }
 
-    // 转换请求
-    let conversion_started = Instant::now();
-    // 提示词过滤（per-key，默认关）：精简 CC / 去边界标记 / 去环境噪音。只作用于客户端原始
-    // system，在转换前；kiro.rs 自注入的 SYSTEM_CHUNKED_POLICY/thinking_prefix 在转换器内部
-    // 追加，不受影响。
-    super::prompt_filter::apply(&mut payload.system, &key_ctx);
-    // 转换 + 整体 payload 字节上限：在转换前裁最旧历史使转换后 Kiro 体不超上游 CONTENT_LENGTH
-    // 阈值；转换(含 tool 配对清理)在裁剪后跑，保证输出永远配对合法。
-    let conversion_result = match super::payload_truncate::convert_within_limit(
-        &mut payload,
-        &super::payload_truncate::PayloadLimitConfig::from_env(),
-    ) {
-        Ok(result) => result,
-        Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-            };
-            tracing::warn!("请求转换失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
-        }
+    // 响应缓存：在转换/裁剪前用原始 payload 计算键并查表。命中即回放、跳过上游。
+    // 注：/v1 live 流式路径暂不写入缓存（见下文 handle_stream_request），但命中仍可回放
+    //（缓存可能由 /cc 路径写入；键只按会话+内容，不分端点）。
+    let response_cache_store =
+        resolve_response_cache(&state, &payload, &key_ctx).map(|(cache, key, ttl)| {
+            if let Some(cached) = cache.get(&key) {
+                tracing::debug!(key = %&key[..16.min(key.len())], "响应缓存命中 (/v1)");
+                hook.record(0, 0, 0, 0, 0, 0.0, "cache_hit");
+                return Err(build_cached_response(cached));
+            }
+            Ok(ResponseCacheStore {
+                cache,
+                key,
+                ttl_secs: ttl,
+            })
+        });
+    let response_cache_store = match response_cache_store {
+        Some(Err(resp)) => return resp,
+        Some(Ok(store)) => Some(store),
+        None => None,
     };
 
-    // Build the Kiro request. profile_arn is injected by the provider layer from the actual
-    // credentials; additional_model_request_fields is already filtered by converter model support.
-    let kiro_request = KiroRequest {
-        conversation_state: conversion_result.conversation_state,
-        profile_arn: None,
-        additional_model_request_fields: conversion_result.additional_model_request_fields,
-    };
-
-    let request_body = match serde_json::to_string(&kiro_request) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
+    // 转换请求（提示词过滤 + 裁剪 + 转换 + 序列化 + token 估算 + cache 计量）。
+    // 与 OpenAI `/v1/chat/completions` 共用同一份 `prepare_kiro_request` 真相源。
+    let prepared = match prepare_kiro_request(&state, &mut payload, &key_ctx) {
+        Ok(p) => p,
+        Err(resp) => {
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
+            return resp;
         }
     };
-    // 转换 + 序列化耗时（本地 CPU 开销，落 trace 便于区分"慢在转换 vs 上游"）。
-    let conversion_ms = Some(conversion_started.elapsed().as_millis() as u64);
+    let request_body = prepared.request_body;
+    let conversion_ms = prepared.conversion_ms;
+    let total_input_tokens = prepared.total_input_tokens;
+    let token_count_ms = prepared.token_count_ms;
 
     if tracing::enabled!(tracing::Level::DEBUG) {
         tracing::debug!(
@@ -796,16 +986,6 @@ pub async fn post_messages(
             crate::kiro::provider::truncate_for_log(&request_body)
         );
     }
-
-    // 估算输入 tokens
-    let token_count_started = Instant::now();
-    let total_input_tokens = token::count_all_tokens(
-        &payload.model,
-        &payload.system,
-        &payload.messages,
-        &payload.tools,
-    ) as i32;
-    let token_count_ms = Some(token_count_started.elapsed().as_millis() as u64);
 
     // 输入 token 分级(仅观测,不限流):small / medium / long。
     // long 请求单独打 info 日志,便于在高并发时段判断大上下文请求占比与分布。
@@ -819,18 +999,14 @@ pub async fn post_messages(
         );
     }
 
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
+    let thinking_enabled = prepared.thinking_enabled;
 
-    let tool_name_map = conversion_result.tool_name_map;
-    let known_tool_names = conversion_result.known_tool_names;
+    let tool_name_map = prepared.tool_name_map;
+    let known_tool_names = prepared.known_tool_names;
 
     // Key 开启时使用中转层增强缓存；关闭时回退到标准 cache_control 口径。
     // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
-    let cache_usage = compute_cache_usage_for_key(&state, &payload, &key_ctx);
+    let cache_usage = prepared.cache_usage;
 
     if payload.stream {
         // 流式响应
@@ -887,6 +1063,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            response_cache_store,
         )
         .await
     }
@@ -1131,6 +1308,7 @@ async fn handle_non_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    response_cache_store: Option<ResponseCacheStore>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
@@ -1367,6 +1545,18 @@ async fn handle_non_stream_request(
             context_input_tokens: context_input_tokens.map(|v| v.max(0) as u64),
         },
     );
+    // 响应缓存写入：只缓存「干净的终态文本响应」——无 tool_use、stop_reason 为 end_turn。
+    // tool_use 响应带 tool_use_id，跨会话回放会污染配对；非 end_turn（max_tokens /
+    // 上下文超限）是被截断的非自洽响应，均不缓存。
+    if let Some(store) = &response_cache_store {
+        if !has_tool_use && stop_reason == "end_turn" {
+            if let Ok(bytes) = serde_json::to_vec(&response_body) {
+                store.put(bytes, false);
+                tracing::debug!("响应缓存写入 (非流式)");
+            }
+        }
+    }
+
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
@@ -1573,6 +1763,27 @@ pub async fn post_messages_cc(
         .await;
     }
 
+    // 响应缓存：在转换/裁剪前用原始 payload 计算键并查表。命中即回放、跳过上游。
+    // /cc 路径（流式 + 非流式）既查也写。
+    let response_cache_store =
+        resolve_response_cache(&state, &payload, &key_ctx).map(|(cache, key, ttl)| {
+            if let Some(cached) = cache.get(&key) {
+                tracing::debug!(key = %&key[..16.min(key.len())], "响应缓存命中 (/cc)");
+                hook.record(0, 0, 0, 0, 0, 0.0, "cache_hit");
+                return Err(build_cached_response(cached));
+            }
+            Ok(ResponseCacheStore {
+                cache,
+                key,
+                ttl_secs: ttl,
+            })
+        });
+    let response_cache_store = match response_cache_store {
+        Some(Err(resp)) => return resp,
+        Some(Ok(store)) => Some(store),
+        None => None,
+    };
+
     // 转换请求
     let conversion_started = Instant::now();
     // 提示词过滤（per-key，默认关）：精简 CC / 去边界标记 / 去环境噪音。只作用于客户端原始
@@ -1700,6 +1911,7 @@ pub async fn post_messages_cc(
                 cache_usage,
                 tracer,
                 key_ctx.group.clone(),
+                response_cache_store,
             )
             .await
         } else {
@@ -1716,6 +1928,7 @@ pub async fn post_messages_cc(
                 cache_usage,
                 tracer,
                 key_ctx.group.clone(),
+                response_cache_store,
             )
             .await
         }
@@ -1746,6 +1959,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            response_cache_store,
         )
         .await
     }
@@ -1767,6 +1981,7 @@ async fn handle_stream_request_buffered(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    response_cache_store: Option<ResponseCacheStore>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
@@ -1800,7 +2015,14 @@ async fn handle_stream_request_buffered(
     ctx.set_cache_usage(cache_usage);
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
+    let stream = create_buffered_sse_stream(
+        response,
+        ctx,
+        hook,
+        credential_id,
+        tracer,
+        response_cache_store,
+    );
 
     // 返回 SSE 响应
     Response::builder()
@@ -1825,6 +2047,7 @@ fn create_buffered_sse_stream(
     hook: UsageRecordHook,
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
+    response_cache_store: Option<ResponseCacheStore>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -1839,8 +2062,9 @@ fn create_buffered_sse_stream(
             credential_id,
             tracer,
             0u64,
+            response_cache_store,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, response_cache_store)| async move {
             if finished {
                 return None;
             }
@@ -1855,7 +2079,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, response_cache_store)));
                     }
 
                     // 然后处理数据流
@@ -1909,7 +2133,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, response_cache_store)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
@@ -1934,10 +2158,22 @@ fn create_buffered_sse_stream(
                                     },
                                 );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
+                                    .iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
+                                // 响应缓存写入：只缓存干净的 end_turn 文本响应（无 tool_use、未截断）。
+                                // get_stop_reason() 在出现 tool_use 时返回 "tool_use"，故此判定已隐含排除工具调用。
+                                if let Some(store) = &response_cache_store {
+                                    if ctx.stop_reason() == "end_turn" {
+                                        let sse_text: Vec<u8> = all_events
+                                            .iter()
+                                            .flat_map(|e| e.to_sse_string().into_bytes())
+                                            .collect();
+                                        store.put(sse_text, true);
+                                        tracing::debug!("响应缓存写入 (缓冲流式)");
+                                    }
+                                }
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, response_cache_store)));
                             }
                         }
                     }
@@ -1967,6 +2203,7 @@ async fn handle_stream_request_gated(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    response_cache_store: Option<ResponseCacheStore>,
 ) -> Response {
     let call_result = match provider
         .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
@@ -1995,7 +2232,7 @@ async fn handle_stream_request_gated(
     );
     ctx.set_cache_usage(cache_usage);
 
-    let stream = create_gated_sse_stream(call_result, ctx, hook, tracer);
+    let stream = create_gated_sse_stream(call_result, ctx, hook, tracer, response_cache_store);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -2033,6 +2270,7 @@ fn create_gated_sse_stream(
     ctx: GatedStreamContext,
     hook: UsageRecordHook,
     tracer: std::sync::Arc<RequestTracer>,
+    response_cache_store: Option<ResponseCacheStore>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let credential_id = call_result.credential_id;
     let crate::kiro::provider::KiroCallResult {
@@ -2043,8 +2281,8 @@ fn create_gated_sse_stream(
     let body_stream = response.bytes_stream();
 
     stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64, account_guard),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, account_guard)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64, account_guard, response_cache_store, Vec::<u8>::new()),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, account_guard, response_cache_store, mut cache_accum)| async move {
             if finished {
                 return None;
             }
@@ -2074,21 +2312,27 @@ fn create_gated_sse_stream(
                                 }
                             }
 
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
+                            // 累积已下发的 SSE 字节（供响应缓存写入；ping 不计入）。
+                            let mut bytes: Vec<Result<Bytes, Infallible>> = Vec::with_capacity(events.len());
+                            for e in &events {
+                                let s = e.to_sse_string();
+                                if response_cache_store.is_some() {
+                                    cache_accum.extend_from_slice(s.as_bytes());
+                                }
+                                bytes.push(Ok(Bytes::from(s)));
+                            }
 
                             // 首个非空批次 = 放闸时刻 = 下游真正开始吐字（buffering_delay 由此算出）。
                             if !bytes.is_empty() {
                                 tracer.mark_downstream_first_event();
                             }
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard, response_cache_store, cache_accum)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             // 上游断流：finish 把剩余（含未放闸时的 message_start+缓冲）吐出，记 interrupted。
+                            // 断流是非自洽响应，不写入缓存。
                             let final_events = ctx.finish();
                             let (i, o, cc, cr, credits) = ctx.final_usage();
                             hook.record(credential_id, i, o, cc, cr, credits, "error");
@@ -2104,7 +2348,7 @@ fn create_gated_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard, response_cache_store, cache_accum)))
                         }
                         None => {
                             // 流正常结束：finish 生成 message_delta/message_stop（必要时先放闸）。
@@ -2113,18 +2357,29 @@ fn create_gated_sse_stream(
                             hook.record(credential_id, i, o, cc, cr, credits, "success");
                             tracer.mark_downstream_first_event();
                             tracer.finalize("success", None, None, None, gated_trace_usage(&ctx));
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard)))
+                            let mut bytes: Vec<Result<Bytes, Infallible>> = Vec::with_capacity(final_events.len());
+                            for e in &final_events {
+                                let s = e.to_sse_string();
+                                if response_cache_store.is_some() {
+                                    cache_accum.extend_from_slice(s.as_bytes());
+                                }
+                                bytes.push(Ok(Bytes::from(s)));
+                            }
+                            // 响应缓存写入：只缓存干净的 end_turn 文本响应（无 tool_use、未截断）。
+                            if let Some(store) = &response_cache_store {
+                                if ctx.stop_reason() == "end_turn" {
+                                    store.put(std::mem::take(&mut cache_accum), true);
+                                    tracing::debug!("响应缓存写入 (gated 流式)");
+                                }
+                            }
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard, response_cache_store, cache_accum)))
                         }
                     }
                 }
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件（gated 模式）");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, account_guard, response_cache_store, cache_accum)))
                 }
             }
         },
@@ -2298,6 +2553,15 @@ mod tests {
         assert!(ids.contains(&"claude-opus-4-8-thinking"));
         assert!(ids.contains(&"claude-sonnet-4-8"));
         assert!(ids.contains(&"claude-sonnet-4-8-thinking"));
+    }
+
+    #[test]
+    fn available_models_include_sonnet_5_variants() {
+        let models = available_models();
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+
+        assert!(ids.contains(&"claude-sonnet-5"));
+        assert!(ids.contains(&"claude-sonnet-5-thinking"));
     }
 
     /// resolve_usage_input_tokens 取 max(本地 fallback, 上游折算值)，

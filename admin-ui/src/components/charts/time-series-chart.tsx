@@ -47,9 +47,15 @@ function formatTs(ts: string, granularity: StatsGranularity): string {
   return `${d.getFullYear()}-${md} ${String(d.getHours()).padStart(2, '0')}:00`
 }
 
-/** 命中率 = cacheRead / (input + cacheRead)，无缓存读取时为 0 */
+/**
+ * 命中率 = cacheRead /(input + cacheCreation + cacheRead)，无可计量 token 时为 0。
+ *
+ * 「这次请求里有多大比例是便宜地从缓存读到的」。creation 是溢价写入（最贵的桶，
+ * 为将来命中而付费写入缓存），经济上算未命中——只进分母不进分子，所以首轮（全是写入、
+ * 零读取）如实显示 ≈0%，写入重的轮次命中率被正确拉低；长对话稳态读占绝对多数时趋近高位。
+ */
 function calcHitRate(p: TimeSeriesPoint): number {
-  const denom = p.inputTokens + p.cacheReadTokens
+  const denom = p.inputTokens + p.cacheCreationTokens + p.cacheReadTokens
   if (denom <= 0) return 0
   return (p.cacheReadTokens / denom) * 100
 }

@@ -199,14 +199,68 @@ pub struct Config {
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
 
-    /// 中转层 prompt cache（CacheMeter）的条目容量上限（默认 131072）。
+    /// 中转层 prompt cache 计量的**全局 read 留存阻尼 R** ∈ [0,1]（默认 1.0）。
     ///
-    /// 这是缓存命中率的关键旋钮：表满后按 LRU 淘汰，容量须 ≥ 写入速率 × TTL，
-    /// 否则历史前缀会在跨轮复用前被挤掉，长会话表现为 cache_read 恒为 0、
-    /// 每轮重建整段。高并发生产可按 `峰值 req/min × 每轮段数 × (300s/60)` 估算下限。
-    /// 运行时会被 clamp 到 `>= 256`。每条约 80B，131072 满载约 10MiB。
-    #[serde(default = "default_cache_meter_capacity")]
-    pub cache_meter_capacity: usize,
+    /// 上游不做真实缓存，cache_creation/cache_read 是中转层合成给下游看的数字（见
+    /// `crate::anthropic::cache_metering`）。计量按 delta-based 拆三桶：input=本轮新问题、
+    /// creation=本轮新写入缓存的一条 delta（有界）、read=已缓存的更早前缀。R 是 read 留存
+    /// 阻尼：保留 `read × R`，被砍部分推回 input（不给缓存折扣），**不触碰 creation**。
+    /// R=1（默认）给足真实缓存折扣;调低则更保守（少认缓存命中）;0 = 完全不给折扣。
+    /// 运行时可经 Admin API `/config/runtime-governance` 调整，并可被 per-key
+    /// `cacheReadRatio` 覆盖。clamp 到 [0,1]。
+    #[serde(default = "default_cache_read_ratio")]
+    pub cache_read_ratio: f64,
+
+    /// 中转层 prompt cache 计量的**缓存热度 TTL**（秒，默认 300 = 5min，对齐 Anthropic
+    /// ephemeral 缓存默认有效期）。
+    ///
+    /// 方案 2 的 cold/TTL 语义旋钮：按会话（isolation_seed）记 last_seen。某会话**首次出现**、
+    /// 或距上次请求**超过此 TTL**（缓存已凉）→ 本轮视为 cold，整段可缓存前缀按 **creation**
+    /// （贵桶 1.25~2.0×）计费、read=0，如同首轮重写缓存；TTL 内的连续请求才算 warm，走
+    /// delta 拆分（creation 只一条、其余 read 0.1× 便宜桶）。
+    ///
+    /// 这是真实、可解释的 margin 旋钮：TTL 短 → 更多请求判 cold → creation 多 / read 少 →
+    /// 下游折扣自然收紧；TTL 长 → 更易判 warm → 更多 0.1× 折扣。运行时可经 Admin API 调整。
+    #[serde(default = "default_cache_meter_ttl_secs")]
+    pub cache_meter_ttl_secs: u64,
+
+    /// 响应缓存全局开关（默认 false）。开启后，对同会话、同 model、同 messages、同 tools 的
+    /// 请求命中缓存时直接回放上次完整响应，跳过上游调用。可被 per-key 覆盖（见 ClientKey）。
+    /// 注意：这与 `cache_read_ratio`（只合成 token 计量数字）是两回事，本项缓存真实响应体。
+    #[serde(default)]
+    pub response_cache_enabled: bool,
+
+    /// 响应缓存默认 TTL（秒，默认 180）。可被 per-key 覆盖。
+    #[serde(default = "default_response_cache_ttl_secs")]
+    pub response_cache_ttl_secs: u64,
+
+    /// 响应缓存条目容量上限（默认 1024）。表满按 last_hit LRU 淘汰；运行时 clamp 到 `>= 16`。
+    /// 每条值是一段完整响应体（数十 KB 量级）。
+    #[serde(default = "default_response_cache_capacity")]
+    pub response_cache_capacity: usize,
+
+    /// OpenAI 端点的可配置模型映射规则（全局，运行时经 Admin API 热编辑）。
+    /// 客户端模型名按规则映射到目标 Claude 模型名，再交给下游解析。空表示不映射。
+    #[serde(default)]
+    pub model_mappings: Vec<crate::openai::model_mapping::ModelMappingRule>,
+
+    /// 新建客户端 Key 时提示词过滤三开关的默认值（运行时经 Admin API 可改 + 持久化）。
+    /// 仅作为「新建默认」：建 Key 时继承这些值；现有 Key 不受影响，per-key 仍可各自覆盖。
+    #[serde(default)]
+    pub default_simplify_cc_prompt: bool,
+    /// 新建 Key 默认是否去除边界标记。见 [`Self::default_simplify_cc_prompt`]。
+    #[serde(default)]
+    pub default_strip_boundary_markers: bool,
+    /// 新建 Key 默认是否去除环境噪声。见 [`Self::default_simplify_cc_prompt`]。
+    #[serde(default)]
+    pub default_strip_env_noise: bool,
+
+    /// 上游凭据配额自动禁用阈值（百分比，默认 90）。仿 kiro-account-manager：
+    /// 每次刷新余额后，若该凭据用量百分比 ≥ 此阈值则自动禁用（reason "配额已满"）；
+    /// 用量回落到阈值以下且此前正是因配额被自动禁用时，自动重新启用。
+    /// 设为 `>= 100` 即关闭自动禁用（仅 remaining≤0 的硬超额仍可手动一键禁用）。
+    #[serde(default = "default_quota_disable_threshold")]
+    pub quota_disable_threshold: f64,
 
     /// 账号并发槽获取是否阻塞等待。默认 false（非阻塞快速失败）。
     ///
@@ -362,8 +416,27 @@ fn default_usage_log_retention_days() -> u32 {
     31
 }
 
-fn default_cache_meter_capacity() -> usize {
-    131072
+fn default_cache_read_ratio() -> f64 {
+    1.0
+}
+
+fn default_cache_meter_ttl_secs() -> u64 {
+    300
+}
+
+fn default_response_cache_ttl_secs() -> u64 {
+    crate::anthropic::response_cache::DEFAULT_TTL_SECS
+}
+
+fn default_response_cache_capacity() -> usize {
+    crate::anthropic::response_cache::DEFAULT_CAPACITY
+}
+
+fn default_quota_disable_threshold() -> f64 {
+    // 默认 100 = 关闭"按百分比主动禁用":凭据用满 100% 乃至溢出(超额),
+    // 仅靠上游 402 请求错误(MONTHLY_REQUEST_COUNT / OVERAGE_REQUEST_LIMIT_EXCEEDED)判定不可用。
+    // 设为 <100 可重新开启主动禁用(在还剩 (100-阈值)% 额度时提前禁用)。
+    100.0
 }
 
 impl Default for Config {
@@ -406,7 +479,16 @@ impl Default for Config {
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
-            cache_meter_capacity: default_cache_meter_capacity(),
+            cache_read_ratio: default_cache_read_ratio(),
+            cache_meter_ttl_secs: default_cache_meter_ttl_secs(),
+            response_cache_enabled: false,
+            response_cache_ttl_secs: default_response_cache_ttl_secs(),
+            response_cache_capacity: default_response_cache_capacity(),
+            model_mappings: Vec::new(),
+            default_simplify_cc_prompt: false,
+            default_strip_boundary_markers: false,
+            default_strip_env_noise: false,
+            quota_disable_threshold: default_quota_disable_threshold(),
             account_acquire_blocking: false,
             usage_gated_streaming_enabled: default_usage_gated_streaming_enabled(),
             stream_conn_reuse_enabled: false,

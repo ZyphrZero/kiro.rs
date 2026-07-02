@@ -25,9 +25,9 @@ use super::{
         CreateClientKeyResponse, GlobalProxyResponse, SetAccountThrottleConfigRequest,
         SetConcurrencyRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
-        UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
-        UpdateRefreshTokenRequest,
+        SetRuntimeGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
+        StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest, UpdateClientKeyRequest,
+        UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -578,6 +578,73 @@ pub async fn set_log_governance_config(
     }
 }
 
+/// GET /api/admin/config/runtime-governance
+/// 获取运行时治理配置（配额自动禁用阈值 + 全局响应缓存默认开关/TTL）
+pub async fn get_runtime_governance_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_runtime_governance_config())
+}
+
+/// PUT /api/admin/config/runtime-governance
+/// 更新运行时治理配置（运行时生效 + 持久化 config.json）
+pub async fn set_runtime_governance_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetRuntimeGovernanceConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_runtime_governance_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/model-mappings
+/// 获取 OpenAI 端点模型映射规则列表
+pub async fn get_model_mappings(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_model_mappings())
+}
+
+/// PUT /api/admin/config/model-mappings
+/// 整表替换模型映射规则（运行时生效 + 持久化 config.json）
+pub async fn set_model_mappings(
+    State(state): State<AdminState>,
+    Json(payload): Json<Vec<crate::openai::model_mapping::ModelMappingRule>>,
+) -> impl IntoResponse {
+    match state.service.set_model_mappings(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/prompt-filter-defaults
+/// 获取新建 Key 的提示词过滤默认值
+pub async fn get_prompt_filter_defaults(State(state): State<AdminState>) -> impl IntoResponse {
+    let (simplify_cc_prompt, strip_boundary_markers, strip_env_noise) =
+        state.service.prompt_filter_defaults();
+    Json(super::types::PromptFilterDefaultsResponse {
+        simplify_cc_prompt,
+        strip_boundary_markers,
+        strip_env_noise,
+    })
+}
+
+/// PUT /api/admin/config/prompt-filter-defaults
+/// 部分更新新建 Key 的提示词过滤默认值（运行时生效 + 持久化 config.json）
+pub async fn set_prompt_filter_defaults(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::SetPromptFilterDefaultsRequest>,
+) -> impl IntoResponse {
+    let (simplify_cc_prompt, strip_boundary_markers, strip_env_noise) =
+        state.service.set_prompt_filter_defaults(
+            payload.simplify_cc_prompt,
+            payload.strip_boundary_markers,
+            payload.strip_env_noise,
+        );
+    Json(super::types::PromptFilterDefaultsResponse {
+        simplify_cc_prompt,
+        strip_boundary_markers,
+        strip_env_noise,
+    })
+}
+
 /// POST /api/admin/auth/idc/start
 /// 发起 IdC 设备授权登录
 pub async fn start_idc_login(
@@ -949,6 +1016,9 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         simplify_cc_prompt: k.simplify_cc_prompt,
         strip_boundary_markers: k.strip_boundary_markers,
         strip_env_noise: k.strip_env_noise,
+        response_cache_enabled: k.response_cache_enabled,
+        response_cache_ttl_secs: k.response_cache_ttl_secs,
+        cache_read_ratio: k.cache_read_ratio,
         group: k.group.clone(),
         is_system: k.is_system,
     }
@@ -991,6 +1061,7 @@ pub async fn create_client_key(
             .map(|g| g.trim().to_string())
             .filter(|g| !g.is_empty()),
         payload.cache_enabled,
+        state.service.prompt_filter_defaults(),
     );
     Json(CreateClientKeyResponse {
         id: entry.id,
@@ -1059,6 +1130,9 @@ pub async fn update_client_key(
             payload.simplify_cc_prompt,
             payload.strip_boundary_markers,
             payload.strip_env_noise,
+            payload.response_cache_enabled,
+            payload.response_cache_ttl_secs.map(Some),
+            payload.cache_read_ratio,
         )
     {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()

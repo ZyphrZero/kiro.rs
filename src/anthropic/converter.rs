@@ -180,6 +180,10 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-sonnet-4.6".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-sonnet-4.5".to_string())
+        } else if model_lower.contains("5") {
+            // Sonnet 5（1M 上下文，实验预览）。放在 4.x 分支之后，
+            // 避免与 4-5/4.5 冲突；上游 ListAvailableModels 的 modelId 即 "claude-sonnet-5"。
+            Some("claude-sonnet-5".to_string())
         } else {
             None
         }
@@ -212,6 +216,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
                 || mapped == "claude-sonnet-4.8"
+                || mapped == "claude-sonnet-5"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8" =>
@@ -1439,6 +1444,25 @@ mod tests {
             Some("claude-sonnet-4.8".to_string())
         );
         assert_eq!(get_context_window_size("claude-sonnet-4-8"), 1_000_000);
+    }
+
+    #[test]
+    fn test_map_model_sonnet_5() {
+        assert_eq!(
+            map_model("claude-sonnet-5"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5-thinking"),
+            Some("claude-sonnet-5".to_string())
+        );
+        // 1M 上下文
+        assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
+        // 不能与 4-5/4.5 混淆：显式版本号优先命中 4.x 分支
+        assert_eq!(
+            map_model("claude-sonnet-4-5-20250929"),
+            Some("claude-sonnet-4.5".to_string())
+        );
     }
 
     #[test]

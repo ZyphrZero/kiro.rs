@@ -474,6 +474,79 @@ export async function setLogGovernanceConfig(
   return data
 }
 
+// 运行时治理配置：配额自动禁用阈值 + 全局响应缓存默认（开关 / TTL）+ 缓存命中率
+export interface RuntimeGovernanceConfig {
+  quotaDisableThreshold: number
+  responseCacheEnabled: boolean
+  responseCacheTtlSecs: number
+  /** 缓存计量 read 留存阻尼 R ∈ [0,1]：read 桶保留 read×R，其余推回 input（不触碰 creation）。 */
+  cacheReadRatio: number
+  /** 缓存计量热度 TTL（秒）：会话首次出现 / 距上次超此值（缓存凉）→ 本轮判 cold，整段前缀按 creation 重写、read=0。 */
+  cacheMeterTtlSecs: number
+}
+
+// 获取运行时治理配置
+export async function getRuntimeGovernanceConfig(): Promise<RuntimeGovernanceConfig> {
+  const { data } = await api.get<RuntimeGovernanceConfig>('/config/runtime-governance')
+  return data
+}
+
+// 更新运行时治理配置
+export async function setRuntimeGovernanceConfig(
+  patch: Partial<RuntimeGovernanceConfig>,
+): Promise<RuntimeGovernanceConfig> {
+  const { data } = await api.put<RuntimeGovernanceConfig>('/config/runtime-governance', patch)
+  return data
+}
+
+// OpenAI 端点模型映射规则：客户端模型名 → 目标 Claude 模型名（全局、运行时热编辑）
+export interface ModelMappingRule {
+  id: string
+  name: string
+  enabled: boolean
+  /** 规则类型：'replace' | 'alias'（等价，取单一 targetModel） */
+  ruleType: string
+  /** 源模型名（客户端传入，精确匹配） */
+  sourceModel: string
+  /** 目标模型名（Claude 系，dashed，如 claude-opus-4-8） */
+  targetModel: string
+}
+
+// 获取模型映射规则列表
+export async function getModelMappings(): Promise<ModelMappingRule[]> {
+  const { data } = await api.get<ModelMappingRule[]>('/config/model-mappings')
+  return data
+}
+
+// 整表替换模型映射规则（运行时生效 + 持久化）
+export async function setModelMappings(
+  rules: ModelMappingRule[],
+): Promise<ModelMappingRule[]> {
+  const { data } = await api.put<ModelMappingRule[]>('/config/model-mappings', rules)
+  return data
+}
+
+// 新建客户端 Key 时提示词过滤三开关的默认值（全局、运行时可改）
+export interface PromptFilterDefaults {
+  simplifyCcPrompt: boolean
+  stripBoundaryMarkers: boolean
+  stripEnvNoise: boolean
+}
+
+// 获取提示词过滤默认值
+export async function getPromptFilterDefaults(): Promise<PromptFilterDefaults> {
+  const { data } = await api.get<PromptFilterDefaults>('/config/prompt-filter-defaults')
+  return data
+}
+
+// 更新提示词过滤默认值（部分字段，运行时生效 + 持久化）
+export async function setPromptFilterDefaults(
+  patch: Partial<PromptFilterDefaults>,
+): Promise<PromptFilterDefaults> {
+  const { data } = await api.put<PromptFilterDefaults>('/config/prompt-filter-defaults', patch)
+  return data
+}
+
 // 发起 IdC 设备授权登录
 export async function startIdcLogin(
   req: StartIdcLoginRequest

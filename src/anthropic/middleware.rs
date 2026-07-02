@@ -16,7 +16,7 @@ use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
-use super::cache_metering::SharedCacheMeter;
+use super::cache_metering::SharedMeterGovernance;
 use super::types::ErrorResponse;
 
 /// 命中的鉴权上下文（注入到请求扩展，供 handler 记录用量）
@@ -32,6 +32,11 @@ pub struct KeyContext {
     pub simplify_cc_prompt: bool,
     pub strip_boundary_markers: bool,
     pub strip_env_noise: bool,
+    /// 响应缓存 per-key 覆盖（None = 跟随全局配置）。
+    pub response_cache_enabled: Option<bool>,
+    pub response_cache_ttl_secs: Option<u32>,
+    /// 缓存计量 read 留存阻尼 R per-key 覆盖（None = 跟随全局 `MeterGovernance`）。
+    pub cache_read_ratio: Option<f64>,
     /// 命中的入口 Key 类型。
     pub key_source: TraceKeySource,
 }
@@ -50,8 +55,12 @@ pub struct AppState {
     pub usage_recorder: Option<SharedRecorder>,
     /// 用量聚合器
     pub usage_aggregator: Option<SharedAggregator>,
-    /// 中转层缓存计量（基于 cache_control 断点的内存缓存）
-    pub cache_meter: Option<SharedCacheMeter>,
+    /// 中转层缓存计量运行时治理（全局命中率 R 旋钮，per-key 可覆盖）
+    pub meter_governance: Option<SharedMeterGovernance>,
+    /// 响应体缓存（真实响应回放；全局开关 + TTL 作为运行时原子值存于缓存内部）
+    pub response_cache: Option<super::response_cache::SharedResponseCache>,
+    /// OpenAI 端点可配置模型映射表（全局，运行时热编辑）
+    pub model_mappings: Option<crate::openai::model_mapping::SharedModelMappings>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
     /// `/cc/v1` usage-gated streaming 开关（来自 config.usage_gated_streaming_enabled）。
@@ -69,7 +78,9 @@ impl AppState {
             client_keys: None,
             usage_recorder: None,
             usage_aggregator: None,
-            cache_meter: None,
+            meter_governance: None,
+            response_cache: None,
+            model_mappings: None,
             trace_store: None,
             usage_gated_streaming: true,
         }
@@ -100,15 +111,33 @@ impl AppState {
         self
     }
 
-    /// 注入缓存计量器
-    pub fn with_cache_meter(mut self, cache: Option<SharedCacheMeter>) -> Self {
-        self.cache_meter = cache;
+    /// 注入缓存计量运行时治理
+    pub fn with_meter_governance(mut self, governance: Option<SharedMeterGovernance>) -> Self {
+        self.meter_governance = governance;
+        self
+    }
+
+    /// 注入响应体缓存（全局默认开关 + TTL 已作为运行时原子值存于缓存内部）。
+    pub fn with_response_cache(
+        mut self,
+        cache: Option<super::response_cache::SharedResponseCache>,
+    ) -> Self {
+        self.response_cache = cache;
         self
     }
 
     /// 注入链路追踪存储
     pub fn with_trace_store(mut self, store: Option<SharedTraceStore>) -> Self {
         self.trace_store = store;
+        self
+    }
+
+    /// 注入 OpenAI 端点模型映射表（全局，运行时热编辑）。
+    pub fn with_model_mappings(
+        mut self,
+        mappings: Option<crate::openai::model_mapping::SharedModelMappings>,
+    ) -> Self {
+        self.model_mappings = mappings;
         self
     }
 }
@@ -137,6 +166,8 @@ pub async fn auth_middleware(
             let cache_enabled = mgr.cache_enabled_of(id);
             let (simplify_cc_prompt, strip_boundary_markers, strip_env_noise) =
                 mgr.prompt_filters_of(id);
+            let (response_cache_enabled, response_cache_ttl_secs) = mgr.response_cache_cfg_of(id);
+            let cache_read_ratio = mgr.cache_read_ratio_of(id);
             request.extensions_mut().insert(KeyContext {
                 key_id: id,
                 group,
@@ -144,6 +175,9 @@ pub async fn auth_middleware(
                 simplify_cc_prompt,
                 strip_boundary_markers,
                 strip_env_noise,
+                response_cache_enabled,
+                response_cache_ttl_secs,
+                cache_read_ratio,
                 key_source: TraceKeySource::ClientKey,
             });
             return next.run(request).await;

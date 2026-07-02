@@ -25,14 +25,71 @@ use super::types::{
     CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount,
     ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
     LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
-    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, SetAccountThrottleConfigRequest,
-    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetUpdateConfigRequest,
-    StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
-    UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, RuntimeGovernanceConfigResponse,
+    SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+    SetRuntimeGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
+    StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
+    UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+
+/// 平台超额积分上限（固定常量）：开启超额的账号最多可在基础额度之上再用 10000 积分。
+/// 余额查询里 `remaining = 基础额度 - 当前用量`，超额账号 `remaining` 为负即「已吃进超额池」，
+/// `remaining <= -OVERAGE_CREDIT_CAP` 表示超额池也耗尽（与上游 OVERAGE_REQUEST_LIMIT_EXCEEDED 对应）。
+const OVERAGE_CREDIT_CAP: f64 = 10000.0;
+
+/// 一次余额巡检对单个凭据应采取的配额动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuotaAction {
+    /// 不动
+    None,
+    /// 以 QuotaExceeded 原因自动禁用（用量达阈值）
+    Disable,
+    /// 自动重新启用（仅限此前因配额被禁用的）
+    Reenable,
+}
+
+/// 纯函数：根据一次余额结果决定配额动作。从 `refresh_all_balances` 的异步网络循环抽出，便于单测。
+///
+/// **主动禁用（Disable）与自动恢复（Reenable）解耦**：
+/// - `proactive_disable`（阈值 < 100）**只**控制"按百分比主动禁用";阈值 = 100 时关闭主动禁用,
+///   凭据可用满 100% 乃至溢出,仅靠上游请求错误(402 MONTHLY_REQUEST_COUNT /
+///   OVERAGE_REQUEST_LIMIT_EXCEEDED,由 `report_quota_exhausted` 处理)判定不可用。
+/// - **自动恢复始终生效**:无论主动禁用是否开启,此前因配额被禁用的账号在用量回落后都会被重新启用,
+///   否则 402 禁用的账号在月度重置/超额池回补后将永远停用。
+/// - **开启超额**的账号:绝不按百分比禁用;此前因配额被禁用且超额池仍有余量
+///   (`remaining > -OVERAGE_CREDIT_CAP`)时 Reenable;超额池真耗尽则保持禁用(防真实上限处 flapping)。
+/// - 未开超额:仅当 `proactive_disable` 且当前启用且 `pct >= threshold` → Disable;
+///   此前因配额禁用且 `pct < threshold`(阈值 100 时即 `remaining > 0`)→ Reenable。
+fn decide_quota_action(
+    proactive_disable: bool,
+    disabled: bool,
+    is_quota_disabled: bool,
+    overage_on: bool,
+    pct: f64,
+    remaining: f64,
+    threshold: f64,
+) -> QuotaAction {
+    if overage_on {
+        let overage_pool_exhausted = remaining <= -OVERAGE_CREDIT_CAP;
+        if is_quota_disabled && !overage_pool_exhausted {
+            return QuotaAction::Reenable;
+        }
+        return QuotaAction::None;
+    }
+    // 主动禁用仅在开启时、且当前启用、用量达阈值才触发。
+    if proactive_disable && !disabled && pct >= threshold {
+        return QuotaAction::Disable;
+    }
+    // 自动恢复与主动禁用解耦:只要此前因配额被禁用且用量回落到阈值以下就恢复。
+    // 阈值 100 时 `pct < 100` ⟺ `remaining > 0`,即月度重置后有额度可用即回池。
+    if is_quota_disabled && pct < threshold {
+        return QuotaAction::Reenable;
+    }
+    QuotaAction::None
+}
 
 /// 在线检查更新结果缓存时间（秒），30 分钟。
 /// 在线检查更新结果缓存时间（秒），30 分钟。
@@ -164,6 +221,18 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    /// 响应体缓存（与 anthropic 路由共享；运行时读写全局缓存开关 / TTL）
+    response_cache: Option<crate::anthropic::response_cache::SharedResponseCache>,
+    /// 缓存计量运行时治理（与 anthropic 路由共享；运行时调整全局命中率 R）
+    meter_governance: Option<crate::anthropic::cache_metering::SharedMeterGovernance>,
+    /// OpenAI 端点模型映射表（与 anthropic 路由共享；运行时热编辑规则）
+    model_mappings: Option<crate::openai::model_mapping::SharedModelMappings>,
+    /// 配额自动禁用阈值（用量百分比，运行时可改）。>= 100 表示关闭自动禁用/恢复。
+    /// 初始值取自 config.quota_disable_threshold，setter 同时持久化到 config.json。
+    quota_disable_threshold: Mutex<f64>,
+    /// 新建客户端 Key 时提示词过滤三开关默认值 (simplify_cc, strip_boundary, strip_env)。
+    /// 运行时可改 + 持久化；仅影响新建 Key，现有 Key 不受影响。
+    prompt_filter_defaults: Mutex<(bool, bool, bool)>,
 }
 
 /// Social 登录会话状态
@@ -489,6 +558,15 @@ impl AdminService {
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
+        let quota_threshold = token_manager.config().quota_disable_threshold;
+        let prompt_filter_defaults = {
+            let c = token_manager.config();
+            (
+                c.default_simplify_cc_prompt,
+                c.default_strip_boundary_markers,
+                c.default_strip_env_noise,
+            )
+        };
 
         let svc = Self {
             token_manager,
@@ -502,6 +580,11 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
+            response_cache: None,
+            meter_governance: None,
+            model_mappings: None,
+            quota_disable_threshold: Mutex::new(quota_threshold),
+            prompt_filter_defaults: Mutex::new(prompt_filter_defaults),
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -535,6 +618,33 @@ impl AdminService {
     ) -> Self {
         self.trace_store = trace_store;
         self.usage_recorder = usage_recorder;
+        self
+    }
+
+    /// 注入响应体缓存句柄（与 anthropic 路由共享），用于运行时读写全局缓存开关 / TTL。
+    pub fn with_response_cache(
+        mut self,
+        response_cache: Option<crate::anthropic::response_cache::SharedResponseCache>,
+    ) -> Self {
+        self.response_cache = response_cache;
+        self
+    }
+
+    /// 注入缓存计量运行时治理（与 anthropic 路由共享），用于运行时调整全局命中率 R。
+    pub fn with_meter_governance(
+        mut self,
+        meter_governance: Option<crate::anthropic::cache_metering::SharedMeterGovernance>,
+    ) -> Self {
+        self.meter_governance = meter_governance;
+        self
+    }
+
+    /// 注入模型映射表（与 anthropic 路由共享），用于运行时热编辑映射规则。
+    pub fn with_model_mappings(
+        mut self,
+        model_mappings: Option<crate::openai::model_mapping::SharedModelMappings>,
+    ) -> Self {
+        self.model_mappings = model_mappings;
         self
     }
 
@@ -842,15 +952,35 @@ impl AdminService {
     /// 与磁盘缓存。失败的条目不会清空旧缓存，调用方可在下次轮询时重试。
     pub async fn refresh_all_balances(&self) -> (usize, usize) {
         let snapshot = self.token_manager.snapshot();
+        let current_id = snapshot.current_id;
+        let threshold = *self.quota_disable_threshold.lock();
+        // 阈值 < 100 才开启"按百分比主动禁用";阈值 = 100(默认)关闭主动禁用,
+        // 凭据可用满 100% 乃至溢出,仅靠上游 402 请求错误判定不可用。
+        // 注意:自动恢复与主动禁用已解耦——无论此值真假,因配额被禁用的账号都会被重新轮询以探测恢复。
+        let proactive_disable = threshold < 100.0;
+
         let mut success = 0_usize;
         let mut failure = 0_usize;
+        let mut auto_disabled = 0_usize;
+        let mut auto_reenabled = 0_usize;
+        let mut switched_current = false;
 
         for entry in snapshot.entries.into_iter() {
-            if entry.disabled {
+            // 跳过禁用账号；但"因配额被禁用"(含 402 运行时禁用)的账号始终重新轮询,
+            // 以便月度重置/超额池回补后用量回落时自动恢复——这与主动禁用是否开启无关。
+            let is_quota_disabled =
+                entry.disabled && entry.disabled_reason.as_deref() == Some("QuotaExceeded");
+            if entry.disabled && !is_quota_disabled {
                 continue;
             }
+
             match self.fetch_balance(entry.id).await {
                 Ok(balance) => {
+                    let pct = balance.usage_percentage;
+                    // 在 balance 被移入缓存前，先取出配额判定所需字段：
+                    // 是否开启超额、基础额度剩余（负值=已吃进超额池多少）。
+                    let overage_on = balance.overage_enabled == Some(true);
+                    let remaining = balance.remaining;
                     {
                         let mut cache = self.balance_cache.lock();
                         cache.insert(
@@ -862,6 +992,63 @@ impl AdminService {
                         );
                     }
                     success += 1;
+
+                    match decide_quota_action(
+                        proactive_disable,
+                        entry.disabled,
+                        is_quota_disabled,
+                        overage_on,
+                        pct,
+                        remaining,
+                        threshold,
+                    ) {
+                        QuotaAction::Disable => {
+                            match self.token_manager.disable_quota_exceeded(entry.id) {
+                                Ok(()) => {
+                                    auto_disabled += 1;
+                                    if entry.id == current_id {
+                                        switched_current = true;
+                                    }
+                                    tracing::info!(
+                                        "配额自动禁用：凭据 #{} 用量 {:.1}% ≥ 阈值 {:.1}%",
+                                        entry.id,
+                                        pct,
+                                        threshold
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!("配额自动禁用凭据 #{} 失败: {}", entry.id, e)
+                                }
+                            }
+                        }
+                        QuotaAction::Reenable => {
+                            match self.token_manager.reenable_if_quota_recovered(entry.id) {
+                                Ok(true) => {
+                                    auto_reenabled += 1;
+                                    if overage_on {
+                                        tracing::info!(
+                                            "配额自动恢复：凭据 #{} 已开启超额且超额池仍有余量（剩余 {:.0}/{:.0}），已重新启用",
+                                            entry.id,
+                                            OVERAGE_CREDIT_CAP + remaining,
+                                            OVERAGE_CREDIT_CAP
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            "配额自动恢复：凭据 #{} 用量 {:.1}% < 阈值 {:.1}%，已重新启用",
+                                            entry.id,
+                                            pct,
+                                            threshold
+                                        );
+                                    }
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    tracing::warn!("配额自动恢复凭据 #{} 失败: {}", entry.id, e)
+                                }
+                            }
+                        }
+                        QuotaAction::None => {}
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("后台刷新凭据 #{} 余额失败: {}", entry.id, e);
@@ -872,8 +1059,21 @@ impl AdminService {
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         }
 
+        // 当前凭据被自动禁用时，切到下一个可用凭据
+        if switched_current {
+            let _ = self.token_manager.switch_to_next();
+        }
+
         if success > 0 {
             self.save_balance_cache();
+        }
+        if auto_disabled > 0 || auto_reenabled > 0 {
+            tracing::info!(
+                "配额阈值巡检（阈值 {:.1}%）：自动禁用 {}，自动恢复 {}",
+                threshold,
+                auto_disabled,
+                auto_reenabled
+            );
         }
         (success, failure)
     }
@@ -1066,6 +1266,7 @@ impl AdminService {
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
+            disabled_reason: None,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
             groups: req.groups,
@@ -1958,6 +2159,216 @@ impl AdminService {
         }
 
         Ok(self.get_log_governance_config())
+    }
+
+    /// 读取运行时治理配置：配额自动禁用阈值 + 全局响应缓存默认（开关 / TTL）。
+    pub fn get_runtime_governance_config(&self) -> RuntimeGovernanceConfigResponse {
+        let (rc_enabled, rc_ttl) = self
+            .response_cache
+            .as_ref()
+            .map(|c| (c.default_enabled(), c.default_ttl_secs()))
+            .unwrap_or((false, crate::anthropic::response_cache::DEFAULT_TTL_SECS));
+        RuntimeGovernanceConfigResponse {
+            quota_disable_threshold: *self.quota_disable_threshold.lock(),
+            response_cache_enabled: rc_enabled,
+            response_cache_ttl_secs: rc_ttl,
+            cache_read_ratio: self
+                .meter_governance
+                .as_ref()
+                .map(|g| g.read_ratio())
+                .unwrap_or(0.0),
+            cache_meter_ttl_secs: self
+                .meter_governance
+                .as_ref()
+                .map(|g| g.ttl_secs())
+                .unwrap_or(300),
+        }
+    }
+
+    /// 更新运行时治理配置：改运行时值（配额阈值 / 缓存开关 / 缓存 TTL / 命中率 R）+ 持久化 config.json。
+    /// 任一字段缺省表示不修改。
+    pub fn set_runtime_governance_config(
+        &self,
+        req: SetRuntimeGovernanceConfigRequest,
+    ) -> Result<RuntimeGovernanceConfigResponse, AdminServiceError> {
+        if req.quota_disable_threshold.is_none()
+            && req.response_cache_enabled.is_none()
+            && req.response_cache_ttl_secs.is_none()
+            && req.cache_read_ratio.is_none()
+            && req.cache_meter_ttl_secs.is_none()
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 quotaDisableThreshold / responseCacheEnabled / responseCacheTtlSecs / cacheReadRatio / cacheMeterTtlSecs 一个字段"
+                    .to_string(),
+            ));
+        }
+        // 校验范围
+        if let Some(t) = req.quota_disable_threshold {
+            if !(1.0..=100.0).contains(&t) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "quotaDisableThreshold 必须在 1..=100 内: {}",
+                    t
+                )));
+            }
+        }
+        if let Some(ttl) = req.response_cache_ttl_secs {
+            if !(1..=86400).contains(&ttl) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "responseCacheTtlSecs 必须在 1..=86400 内: {}",
+                    ttl
+                )));
+            }
+        }
+        if let Some(r) = req.cache_read_ratio {
+            if !(0.0..=1.0).contains(&r) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "cacheReadRatio 必须在 0..=1 内: {}",
+                    r
+                )));
+            }
+        }
+        if let Some(ttl) = req.cache_meter_ttl_secs {
+            if !(1..=86400).contains(&ttl) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "cacheMeterTtlSecs 必须在 1..=86400 内: {}",
+                    ttl
+                )));
+            }
+        }
+
+        // 先改运行时值
+        if let Some(t) = req.quota_disable_threshold {
+            *self.quota_disable_threshold.lock() = t;
+        }
+        if let Some(enabled) = req.response_cache_enabled {
+            if let Some(c) = &self.response_cache {
+                c.set_default_enabled(enabled);
+            }
+        }
+        if let Some(ttl) = req.response_cache_ttl_secs {
+            if let Some(c) = &self.response_cache {
+                c.set_default_ttl_secs(ttl);
+            }
+        }
+        if let Some(r) = req.cache_read_ratio {
+            if let Some(g) = &self.meter_governance {
+                g.set_read_ratio(r);
+            }
+        }
+        if let Some(ttl) = req.cache_meter_ttl_secs {
+            if let Some(g) = &self.meter_governance {
+                g.set_ttl_secs(ttl);
+            }
+        }
+
+        // 持久化到 config.json（从磁盘重载再写，避免覆盖并发修改）
+        self.update_config_file(|c| {
+            if let Some(t) = req.quota_disable_threshold {
+                c.quota_disable_threshold = t;
+            }
+            if let Some(enabled) = req.response_cache_enabled {
+                c.response_cache_enabled = enabled;
+            }
+            if let Some(ttl) = req.response_cache_ttl_secs {
+                c.response_cache_ttl_secs = ttl;
+            }
+            if let Some(r) = req.cache_read_ratio {
+                c.cache_read_ratio = r;
+            }
+            if let Some(ttl) = req.cache_meter_ttl_secs {
+                c.cache_meter_ttl_secs = ttl;
+            }
+        });
+
+        Ok(self.get_runtime_governance_config())
+    }
+
+    /// 获取当前模型映射规则列表（OpenAI 端点）。未注入映射表时返回空列表。
+    pub fn get_model_mappings(&self) -> Vec<crate::openai::model_mapping::ModelMappingRule> {
+        self.model_mappings
+            .as_ref()
+            .map(|m| m.get_all())
+            .unwrap_or_default()
+    }
+
+    /// 整表替换模型映射规则：校验 → 改运行时值 → 持久化 config.json。
+    pub fn set_model_mappings(
+        &self,
+        rules: Vec<crate::openai::model_mapping::ModelMappingRule>,
+    ) -> Result<Vec<crate::openai::model_mapping::ModelMappingRule>, AdminServiceError> {
+        use std::collections::HashSet;
+        // 校验：规则类型合法、源/目标非空、目标可被下游 map_model 解析、源模型不重复。
+        let mut seen_sources: HashSet<&str> = HashSet::new();
+        for r in &rules {
+            if !r.is_valid_rule_type() {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "规则类型仅支持 replace/alias: {}",
+                    r.rule_type
+                )));
+            }
+            if r.source_model.trim().is_empty() || r.target_model.trim().is_empty() {
+                return Err(AdminServiceError::InvalidCredential(
+                    "源模型名与目标模型名不能为空".to_string(),
+                ));
+            }
+            if crate::anthropic::map_model(&r.target_model).is_none() {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "目标模型无法解析（需为 Claude sonnet/opus/haiku 且带版本）: {}",
+                    r.target_model
+                )));
+            }
+            if !seen_sources.insert(r.source_model.as_str()) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "源模型名重复: {}",
+                    r.source_model
+                )));
+            }
+        }
+
+        // 改运行时值（立即对后续请求生效）
+        if let Some(m) = &self.model_mappings {
+            m.set_all(rules.clone());
+        }
+        // 持久化到 config.json
+        self.update_config_file(|c| {
+            c.model_mappings = rules.clone();
+        });
+
+        Ok(self.get_model_mappings())
+    }
+
+    /// 获取新建 Key 的提示词过滤默认值 (simplify_cc, strip_boundary, strip_env)。
+    pub fn prompt_filter_defaults(&self) -> (bool, bool, bool) {
+        *self.prompt_filter_defaults.lock()
+    }
+
+    /// 部分更新新建 Key 的提示词过滤默认值：改运行时值 + 持久化 config.json。
+    /// 各字段 None 表示不修改。返回更新后的三元组。
+    pub fn set_prompt_filter_defaults(
+        &self,
+        simplify_cc: Option<bool>,
+        strip_boundary: Option<bool>,
+        strip_env: Option<bool>,
+    ) -> (bool, bool, bool) {
+        {
+            let mut g = self.prompt_filter_defaults.lock();
+            if let Some(v) = simplify_cc {
+                g.0 = v;
+            }
+            if let Some(v) = strip_boundary {
+                g.1 = v;
+            }
+            if let Some(v) = strip_env {
+                g.2 = v;
+            }
+        }
+        let cur = *self.prompt_filter_defaults.lock();
+        self.update_config_file(|c| {
+            c.default_simplify_cc_prompt = cur.0;
+            c.default_strip_boundary_markers = cur.1;
+            c.default_strip_env_noise = cur.2;
+        });
+        cur
     }
 
     fn persist_log_governance_config(
@@ -3185,6 +3596,96 @@ impl AdminService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_action_no_proactive_disable_when_off() {
+        // 主动禁用关闭(阈值=100):当前启用、用量即便 500%(非超额)也不主动禁用。
+        assert_eq!(
+            decide_quota_action(false, false, false, false, 500.0, -9000.0, 100.0),
+            QuotaAction::None
+        );
+        // 主动禁用关闭、当前启用、用量刚好 100%:仍不禁用(等 402 兜底)。
+        assert_eq!(
+            decide_quota_action(false, false, false, false, 100.0, 0.0, 100.0),
+            QuotaAction::None
+        );
+    }
+
+    #[test]
+    fn quota_action_recovery_runs_even_when_proactive_off() {
+        // 关键回归:主动禁用关闭(阈值=100)时,此前因 402 被禁用的账号,
+        // 月度重置后用量回落(pct<100 ⟺ remaining>0)必须自动恢复,否则永远停用。
+        assert_eq!(
+            decide_quota_action(false, true, true, false, 12.0, 4400.0, 100.0),
+            QuotaAction::Reenable
+        );
+        // 用量仍为满(pct>=100, remaining<=0)→ 保持禁用,不 flapping。
+        assert_eq!(
+            decide_quota_action(false, true, true, false, 100.0, 0.0, 100.0),
+            QuotaAction::None
+        );
+        assert_eq!(
+            decide_quota_action(false, true, true, false, 130.0, -1500.0, 100.0),
+            QuotaAction::None
+        );
+    }
+
+    #[test]
+    fn quota_action_non_overage_disable_and_reenable() {
+        // 主动禁用开启、启用中、用量达阈值 → 禁用
+        assert_eq!(
+            decide_quota_action(true, false, false, false, 95.0, 50.0, 90.0),
+            QuotaAction::Disable
+        );
+        // 主动禁用开启、此前因配额禁用、用量回落 → 恢复
+        assert_eq!(
+            decide_quota_action(true, true, true, false, 80.0, 200.0, 90.0),
+            QuotaAction::Reenable
+        );
+        // 主动禁用开启、用量未达阈值、未禁用 → 不动
+        assert_eq!(
+            decide_quota_action(true, false, false, false, 80.0, 200.0, 90.0),
+            QuotaAction::None
+        );
+    }
+
+    #[test]
+    fn quota_action_overage_never_disabled_by_pct() {
+        // 生产 #54 形态：开超额、usage% 962%（对基础额度）、超额池只用了 8617/10000（remaining=-8617）
+        // → 绝不按百分比禁用。当前启用时不动。
+        assert_eq!(
+            decide_quota_action(true, false, false, true, 962.0, -8617.0, 90.0),
+            QuotaAction::None
+        );
+    }
+
+    #[test]
+    fn quota_action_overage_reenabled_when_pool_has_room() {
+        // 生产 #53/#54/#64-67 形态：开超额、此前被错误地按百分比禁用（is_quota_disabled）、
+        // 超额池仍有余量（remaining > -10000）→ 自动恢复
+        assert_eq!(
+            decide_quota_action(true, true, true, true, 487.0, -7737.0, 90.0),
+            QuotaAction::Reenable
+        );
+        // #64：remaining=-506，余量充足 → 恢复
+        assert_eq!(
+            decide_quota_action(true, true, true, true, 110.0, -506.0, 90.0),
+            QuotaAction::Reenable
+        );
+    }
+
+    #[test]
+    fn quota_action_overage_stays_disabled_when_pool_exhausted() {
+        // 超额池真耗尽（remaining <= -10000）→ 保持禁用，不恢复（防真实上限处 flapping）
+        assert_eq!(
+            decide_quota_action(true, true, true, true, 1100.0, -10000.0, 90.0),
+            QuotaAction::None
+        );
+        assert_eq!(
+            decide_quota_action(true, true, true, true, 1200.0, -10500.0, 90.0),
+            QuotaAction::None
+        );
+    }
 
     #[test]
     fn semver_compares_correctly() {

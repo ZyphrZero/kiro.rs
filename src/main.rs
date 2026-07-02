@@ -6,6 +6,7 @@ mod http_client;
 mod image_resize;
 mod kiro;
 mod model;
+mod openai;
 mod text_truncate;
 pub mod token;
 
@@ -263,15 +264,30 @@ async fn main() {
         );
     }
 
-    // CacheMeter：模拟 Anthropic 缓存、计量 cache_read/creation token 的进程内组件。
-    // 持久化到 cache_dir/cache_metering.json，启动时自动加载未过期条目。
-    // 容量上限可经 config.cacheMeterCapacity 配置：太小会在高并发下提前 LRU 淘汰
-    // 历史前缀，导致长会话跨轮 miss、每轮重建整段（cache_read 恒为 0）。
-    let cache_meter = std::sync::Arc::new(anthropic::cache_metering::CacheMeter::with_capacity(
-        Some(cache_dir.join("cache_metering.json")),
-        config.cache_meter_capacity,
+    // 缓存计量运行时治理：持有全局命中率 R + 缓存热度 TTL（按会话判 warm/cold）。
+    // 比旧的有状态 CacheMeter 轻：只存 session→last_seen，不存全前缀哈希链、不落盘。
+    let meter_governance = std::sync::Arc::new(
+        anthropic::cache_metering::MeterGovernance::new(
+            config.cache_read_ratio,
+            config.cache_meter_ttl_secs,
+        ),
+    );
+
+    // ResponseCache：真实响应体缓存（命中即回放、跳过上游）。始终构造（即使全局默认关闭），
+    // 这样可经 Admin API 运行时开启而无需重启；全局开关 + TTL 作为运行时原子值存于缓存内，
+    // 关闭时表为空、几乎零内存开销。
+    let response_cache = std::sync::Arc::new(anthropic::response_cache::ResponseCache::new(
+        config.response_cache_capacity,
+        config.response_cache_enabled,
+        config.response_cache_ttl_secs,
     ));
-    cache_meter.clone().spawn_background();
+    response_cache.clone().spawn_background();
+
+    // 模型映射表：OpenAI 端点客户端模型名 → 目标 Claude 模型名（全局，运行时热编辑）。
+    // 始终构造（即使空表），便于经 Admin API 运行时增删而无需重启。
+    let model_mappings = std::sync::Arc::new(
+        openai::model_mapping::ModelMappings::new(config.model_mappings.clone()),
+    );
 
     let anthropic_app = anthropic::create_router(
         Some(kiro_provider),
@@ -279,9 +295,11 @@ async fn main() {
         Some(client_key_manager.clone()),
         Some(usage_recorder.clone()),
         Some(usage_aggregator.clone()),
-        Some(cache_meter.clone()),
+        Some(meter_governance.clone()),
         trace_store.clone(),
         config.usage_gated_streaming_enabled,
+        Some(response_cache.clone()),
+        Some(model_mappings.clone()),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
@@ -302,7 +320,10 @@ async fn main() {
                     .with_log_governance(
                         Some(admin_trace_store.clone()),
                         Some(usage_recorder.clone()),
-                    );
+                    )
+                    .with_response_cache(Some(response_cache.clone()))
+                    .with_meter_governance(Some(meter_governance.clone()))
+                    .with_model_mappings(Some(model_mappings.clone()));
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,

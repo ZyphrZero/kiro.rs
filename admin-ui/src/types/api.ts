@@ -400,6 +400,12 @@ export interface ClientKeyItem {
   simplifyCcPrompt: boolean
   stripBoundaryMarkers: boolean
   stripEnvNoise: boolean
+  /** 响应缓存开关覆盖（undefined = 跟随全局默认） */
+  responseCacheEnabled?: boolean
+  /** 响应缓存 TTL 覆盖（秒；undefined = 跟随全局默认） */
+  responseCacheTtlSecs?: number
+  /** 缓存 read 留存阻尼 R 覆盖 ∈ [0,1]（undefined = 跟随全局 cacheReadRatio） */
+  cacheReadRatio?: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
   /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
@@ -435,6 +441,12 @@ export interface UpdateClientKeyRequest {
   simplifyCcPrompt?: boolean
   stripBoundaryMarkers?: boolean
   stripEnvNoise?: boolean
+  /** 响应缓存覆盖更新（省略=不变更；null=复位为跟随全局；true/false=强制开关） */
+  responseCacheEnabled?: boolean | null
+  /** 响应缓存 TTL 覆盖（秒；省略=不变更；0=复位为跟随全局） */
+  responseCacheTtlSecs?: number
+  /** 缓存 read 留存阻尼 R 覆盖更新 ∈ [0,1]（省略=不变更；null=复位为跟随全局；数值=强制） */
+  cacheReadRatio?: number | null
 }
 
 // ============ 用量统计 ============

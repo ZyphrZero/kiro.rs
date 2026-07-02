@@ -495,6 +495,67 @@ pub struct SetLogGovernanceConfigRequest {
     pub usage_log_retention_days: Option<u32>,
 }
 
+/// 运行时治理配置响应：配额自动禁用阈值 + 全局响应缓存默认（开关 / TTL）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeGovernanceConfigResponse {
+    /// 配额自动禁用阈值（用量百分比）。>= 100 表示关闭自动禁用/恢复。
+    pub quota_disable_threshold: f64,
+    /// 全局响应缓存默认开关。
+    pub response_cache_enabled: bool,
+    /// 全局响应缓存默认 TTL（秒）。
+    pub response_cache_ttl_secs: u64,
+    /// 缓存计量全局 read 留存阻尼 R ∈ [0,1]：read 桶保留 `read × R`，其余推回 input
+    /// （不给缓存折扣），不触碰 creation。delta-based 拆桶下 creation 每轮有界。
+    /// R=1=给足真实折扣；0=完全不给。可被 per-key `cacheReadRatio` 覆盖。
+    pub cache_read_ratio: f64,
+    /// 缓存计量热度 TTL（秒）：某会话首次出现 / 距上次超此值（缓存凉）→ 本轮判 cold，整段
+    /// 可缓存前缀按 creation 重写计费、read=0。TTL 越短越多请求判 cold（creation 多、折扣少）。
+    pub cache_meter_ttl_secs: u64,
+}
+
+/// 更新运行时治理配置（字段缺省表示不修改）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRuntimeGovernanceConfigRequest {
+    /// 配额自动禁用阈值（用量百分比），范围 1..=100；缺省不修改。100 表示关闭自动禁用/恢复。
+    #[serde(default)]
+    pub quota_disable_threshold: Option<f64>,
+    /// 全局响应缓存默认开关；缺省不修改。
+    #[serde(default)]
+    pub response_cache_enabled: Option<bool>,
+    /// 全局响应缓存默认 TTL（秒），范围 1..=86400；缺省不修改。
+    #[serde(default)]
+    pub response_cache_ttl_secs: Option<u64>,
+    /// 缓存计量全局 read 留存阻尼 R，范围 0..=1；缺省不修改。
+    #[serde(default)]
+    pub cache_read_ratio: Option<f64>,
+    /// 缓存计量热度 TTL（秒），范围 1..=86400；缺省不修改。
+    #[serde(default)]
+    pub cache_meter_ttl_secs: Option<u64>,
+}
+
+/// 新建 Key 提示词过滤默认值（响应）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptFilterDefaultsResponse {
+    pub simplify_cc_prompt: bool,
+    pub strip_boundary_markers: bool,
+    pub strip_env_noise: bool,
+}
+
+/// 更新新建 Key 提示词过滤默认值（字段缺省表示不修改）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPromptFilterDefaultsRequest {
+    #[serde(default)]
+    pub simplify_cc_prompt: Option<bool>,
+    #[serde(default)]
+    pub strip_boundary_markers: Option<bool>,
+    #[serde(default)]
+    pub strip_env_noise: Option<bool>,
+}
+
 // ============ 代理池 ============
 
 /// 代理池条目
@@ -774,6 +835,15 @@ pub struct ClientKeyItem {
     pub simplify_cc_prompt: bool,
     pub strip_boundary_markers: bool,
     pub strip_env_noise: bool,
+    /// 响应缓存开关覆盖（None = 跟随全局 `responseCacheEnabled`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_cache_enabled: Option<bool>,
+    /// 响应缓存 TTL 覆盖（秒；None = 跟随全局）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_cache_ttl_secs: Option<u32>,
+    /// 缓存命中率 R 覆盖 ∈ [0,1]（None = 跟随全局 `cacheReadRatio`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_ratio: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
@@ -829,6 +899,32 @@ pub struct UpdateClientKeyRequest {
     pub strip_boundary_markers: Option<bool>,
     #[serde(default)]
     pub strip_env_noise: Option<bool>,
+    /// 响应缓存开关覆盖更新。三态语义（借助 double-option 区分"字段缺省"与"显式 null"）：
+    /// - 字段缺省 → `None`：不变更
+    /// - `null` → `Some(None)`：清除覆盖、恢复为跟随全局默认
+    /// - `true`/`false` → `Some(Some(v))`：强制开/关该 Key 的响应缓存
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub response_cache_enabled: Option<Option<bool>>,
+    /// 响应缓存 TTL 覆盖更新（秒；字段缺省=不变更；0=清除覆盖、跟随全局）。
+    #[serde(default)]
+    pub response_cache_ttl_secs: Option<u32>,
+    /// 缓存命中率 R 覆盖更新 ∈ [0,1]。三态语义（double-option）：
+    /// - 字段缺省 → `None`：不变更
+    /// - `null` → `Some(None)`：清除覆盖、恢复为跟随全局默认
+    /// - 数值 → `Some(Some(v))`：强制该 Key 的命中率（clamp 到 [0,1]）
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub cache_read_ratio: Option<Option<f64>>,
+}
+
+/// double-option 反序列化：把 JSON 中"键不存在"与"键值为 null"区分开。
+/// 键不存在由 `#[serde(default)]` 给出外层 `None`；本函数处理键存在的情形，
+/// 值为 `null` → `Some(None)`，否则 → `Some(Some(v))`。
+fn deserialize_double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
 fn default_client_key_cache_enabled() -> bool {
@@ -1128,4 +1224,33 @@ pub struct DeleteGroupQuery {
     /// 强制删除：即使仍有引用也删；同时级联清理凭据 / Key 的引用
     #[serde(default)]
     pub force: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `responseCacheEnabled` 的三态线协议：缺省=None（不变更）、null=Some(None)（复位跟随全局）、
+    /// true/false=Some(Some(v))（强制开/关）。
+    #[test]
+    fn response_cache_enabled_three_state_wire() {
+        let absent: UpdateClientKeyRequest = serde_json::from_str(r#"{"name":"k"}"#).unwrap();
+        assert_eq!(absent.response_cache_enabled, None, "字段缺省应为 None（不变更）");
+
+        let null: UpdateClientKeyRequest =
+            serde_json::from_str(r#"{"responseCacheEnabled":null}"#).unwrap();
+        assert_eq!(
+            null.response_cache_enabled,
+            Some(None),
+            "null 应为 Some(None)（复位跟随全局）"
+        );
+
+        let on: UpdateClientKeyRequest =
+            serde_json::from_str(r#"{"responseCacheEnabled":true}"#).unwrap();
+        assert_eq!(on.response_cache_enabled, Some(Some(true)), "true 强制开");
+
+        let off: UpdateClientKeyRequest =
+            serde_json::from_str(r#"{"responseCacheEnabled":false}"#).unwrap();
+        assert_eq!(off.response_cache_enabled, Some(Some(false)), "false 强制关");
+    }
 }

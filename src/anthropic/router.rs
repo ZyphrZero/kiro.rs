@@ -13,9 +13,10 @@ use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::kiro::provider::KiroProvider;
 
 use super::{
-    cache_metering::SharedCacheMeter,
+    cache_metering::SharedMeterGovernance,
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
+    response_cache::SharedResponseCache,
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -38,6 +39,8 @@ pub fn create_router_with_provider(
         None,
         None,
         true,
+        None,
+        None,
     )
 }
 
@@ -49,24 +52,34 @@ pub fn create_router(
     client_keys: Option<SharedClientKeyManager>,
     usage_recorder: Option<SharedRecorder>,
     usage_aggregator: Option<SharedAggregator>,
-    cache_meter: Option<SharedCacheMeter>,
+    meter_governance: Option<SharedMeterGovernance>,
     trace_store: Option<SharedTraceStore>,
     usage_gated_streaming: bool,
+    response_cache: Option<SharedResponseCache>,
+    model_mappings: Option<crate::openai::model_mapping::SharedModelMappings>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
-    state = state.with_cache_meter(cache_meter);
+    state = state.with_meter_governance(meter_governance);
+    state = state.with_response_cache(response_cache);
     state = state.with_trace_store(trace_store);
     state = state.with_usage_gated_streaming(usage_gated_streaming);
+    state = state.with_model_mappings(model_mappings);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()
         .route("/models", get(get_models))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
+        // OpenAI 兼容端点：与 /v1/messages 共用同一 AppState 与 auth_middleware。
+        // 入站归一化成 Anthropic MessagesRequest 后复用全部既有管道（见 crate::openai）。
+        .route(
+            "/chat/completions",
+            post(crate::openai::post_chat_completions),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
