@@ -416,7 +416,10 @@ fn default_response_cache_capacity() -> usize {
 }
 
 fn default_quota_disable_threshold() -> f64 {
-    90.0
+    // 默认 100 = 关闭"按百分比主动禁用":凭据用满 100% 乃至溢出(超额),
+    // 仅靠上游 402 请求错误(MONTHLY_REQUEST_COUNT / OVERAGE_REQUEST_LIMIT_EXCEEDED)判定不可用。
+    // 设为 <100 可重新开启主动禁用(在还剩 (100-阈值)% 额度时提前禁用)。
+    100.0
 }
 
 impl Default for Config {

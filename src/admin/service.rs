@@ -53,13 +53,18 @@ enum QuotaAction {
 
 /// 纯函数：根据一次余额结果决定配额动作。从 `refresh_all_balances` 的异步网络循环抽出，便于单测。
 ///
-/// - `auto_quota` 关闭（阈值 ≥ 100）：一律 None。
-/// - **开启超额**的账号：不按百分比禁用（超额本就要跑过基础额度）；仅当此前因配额被禁用、
-///   且超额池仍有余量（`remaining > -OVERAGE_CREDIT_CAP`）时 Reenable；超额池耗尽则 None
-///   （保持禁用，真实耗尽靠上游 OVERAGE_REQUEST_LIMIT_EXCEEDED 兜底，避免在真实上限处 flapping）。
-/// - 未开超额：当前启用且 `pct >= threshold` → Disable；此前因配额禁用且 `pct < threshold` → Reenable。
+/// **主动禁用（Disable）与自动恢复（Reenable）解耦**：
+/// - `proactive_disable`（阈值 < 100）**只**控制"按百分比主动禁用";阈值 = 100 时关闭主动禁用,
+///   凭据可用满 100% 乃至溢出,仅靠上游请求错误(402 MONTHLY_REQUEST_COUNT /
+///   OVERAGE_REQUEST_LIMIT_EXCEEDED,由 `report_quota_exhausted` 处理)判定不可用。
+/// - **自动恢复始终生效**:无论主动禁用是否开启,此前因配额被禁用的账号在用量回落后都会被重新启用,
+///   否则 402 禁用的账号在月度重置/超额池回补后将永远停用。
+/// - **开启超额**的账号:绝不按百分比禁用;此前因配额被禁用且超额池仍有余量
+///   (`remaining > -OVERAGE_CREDIT_CAP`)时 Reenable;超额池真耗尽则保持禁用(防真实上限处 flapping)。
+/// - 未开超额:仅当 `proactive_disable` 且当前启用且 `pct >= threshold` → Disable;
+///   此前因配额禁用且 `pct < threshold`(阈值 100 时即 `remaining > 0`)→ Reenable。
 fn decide_quota_action(
-    auto_quota: bool,
+    proactive_disable: bool,
     disabled: bool,
     is_quota_disabled: bool,
     overage_on: bool,
@@ -67,9 +72,6 @@ fn decide_quota_action(
     remaining: f64,
     threshold: f64,
 ) -> QuotaAction {
-    if !auto_quota {
-        return QuotaAction::None;
-    }
     if overage_on {
         let overage_pool_exhausted = remaining <= -OVERAGE_CREDIT_CAP;
         if is_quota_disabled && !overage_pool_exhausted {
@@ -77,13 +79,16 @@ fn decide_quota_action(
         }
         return QuotaAction::None;
     }
-    if !disabled && pct >= threshold {
-        QuotaAction::Disable
-    } else if is_quota_disabled && pct < threshold {
-        QuotaAction::Reenable
-    } else {
-        QuotaAction::None
+    // 主动禁用仅在开启时、且当前启用、用量达阈值才触发。
+    if proactive_disable && !disabled && pct >= threshold {
+        return QuotaAction::Disable;
     }
+    // 自动恢复与主动禁用解耦:只要此前因配额被禁用且用量回落到阈值以下就恢复。
+    // 阈值 100 时 `pct < 100` ⟺ `remaining > 0`,即月度重置后有额度可用即回池。
+    if is_quota_disabled && pct < threshold {
+        return QuotaAction::Reenable;
+    }
+    QuotaAction::None
 }
 
 /// 在线检查更新结果缓存时间（秒），30 分钟。
@@ -949,8 +954,10 @@ impl AdminService {
         let snapshot = self.token_manager.snapshot();
         let current_id = snapshot.current_id;
         let threshold = *self.quota_disable_threshold.lock();
-        // 阈值 >= 100 视为关闭自动配额禁用：行为与旧版一致（只刷新启用账号、不自动增减禁用状态）。
-        let auto_quota = threshold < 100.0;
+        // 阈值 < 100 才开启"按百分比主动禁用";阈值 = 100(默认)关闭主动禁用,
+        // 凭据可用满 100% 乃至溢出,仅靠上游 402 请求错误判定不可用。
+        // 注意:自动恢复与主动禁用已解耦——无论此值真假,因配额被禁用的账号都会被重新轮询以探测恢复。
+        let proactive_disable = threshold < 100.0;
 
         let mut success = 0_usize;
         let mut failure = 0_usize;
@@ -959,10 +966,11 @@ impl AdminService {
         let mut switched_current = false;
 
         for entry in snapshot.entries.into_iter() {
-            // 默认跳过禁用账号；但开启自动配额时，仍轮询"因配额被自动禁用"的账号以探测用量回落恢复。
+            // 跳过禁用账号；但"因配额被禁用"(含 402 运行时禁用)的账号始终重新轮询,
+            // 以便月度重置/超额池回补后用量回落时自动恢复——这与主动禁用是否开启无关。
             let is_quota_disabled =
                 entry.disabled && entry.disabled_reason.as_deref() == Some("QuotaExceeded");
-            if entry.disabled && !(auto_quota && is_quota_disabled) {
+            if entry.disabled && !is_quota_disabled {
                 continue;
             }
 
@@ -986,7 +994,7 @@ impl AdminService {
                     success += 1;
 
                     match decide_quota_action(
-                        auto_quota,
+                        proactive_disable,
                         entry.disabled,
                         is_quota_disabled,
                         overage_on,
@@ -3590,27 +3598,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quota_action_off_when_auto_quota_disabled() {
-        // 阈值 >= 100 → auto_quota=false：任何情况都不动
+    fn quota_action_no_proactive_disable_when_off() {
+        // 主动禁用关闭(阈值=100):当前启用、用量即便 500%(非超额)也不主动禁用。
         assert_eq!(
             decide_quota_action(false, false, false, false, 500.0, -9000.0, 100.0),
+            QuotaAction::None
+        );
+        // 主动禁用关闭、当前启用、用量刚好 100%:仍不禁用(等 402 兜底)。
+        assert_eq!(
+            decide_quota_action(false, false, false, false, 100.0, 0.0, 100.0),
+            QuotaAction::None
+        );
+    }
+
+    #[test]
+    fn quota_action_recovery_runs_even_when_proactive_off() {
+        // 关键回归:主动禁用关闭(阈值=100)时,此前因 402 被禁用的账号,
+        // 月度重置后用量回落(pct<100 ⟺ remaining>0)必须自动恢复,否则永远停用。
+        assert_eq!(
+            decide_quota_action(false, true, true, false, 12.0, 4400.0, 100.0),
+            QuotaAction::Reenable
+        );
+        // 用量仍为满(pct>=100, remaining<=0)→ 保持禁用,不 flapping。
+        assert_eq!(
+            decide_quota_action(false, true, true, false, 100.0, 0.0, 100.0),
+            QuotaAction::None
+        );
+        assert_eq!(
+            decide_quota_action(false, true, true, false, 130.0, -1500.0, 100.0),
             QuotaAction::None
         );
     }
 
     #[test]
     fn quota_action_non_overage_disable_and_reenable() {
-        // 未开超额、启用中、用量达阈值 → 禁用
+        // 主动禁用开启、启用中、用量达阈值 → 禁用
         assert_eq!(
             decide_quota_action(true, false, false, false, 95.0, 50.0, 90.0),
             QuotaAction::Disable
         );
-        // 未开超额、此前因配额禁用、用量回落 → 恢复
+        // 主动禁用开启、此前因配额禁用、用量回落 → 恢复
         assert_eq!(
             decide_quota_action(true, true, true, false, 80.0, 200.0, 90.0),
             QuotaAction::Reenable
         );
-        // 未开超额、用量未达阈值、未禁用 → 不动
+        // 主动禁用开启、用量未达阈值、未禁用 → 不动
         assert_eq!(
             decide_quota_action(true, false, false, false, 80.0, 200.0, 90.0),
             QuotaAction::None
