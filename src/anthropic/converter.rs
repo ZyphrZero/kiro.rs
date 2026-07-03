@@ -148,6 +148,9 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-sonnet-4.6".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-sonnet-4.5".to_string())
+        } else if model_lower.contains("5") {
+            // Next-gen "Sonnet 5" family (no "4-" prefix), e.g. "claude-sonnet-5".
+            Some("claude-sonnet-5".to_string())
         } else {
             None
         }
@@ -160,6 +163,9 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-opus-4.5".to_string())
         } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-opus-4.6".to_string())
+        } else if model_lower.contains("5") {
+            // Next-gen "Opus 5" family (no "4-" prefix), e.g. "claude-opus-5".
+            Some("claude-opus-5".to_string())
         } else {
             None
         }
@@ -182,7 +188,9 @@ pub fn get_context_window_size(model: &str) -> i32 {
                 || mapped == "claude-sonnet-4.8"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8" =>
+                || mapped == "claude-opus-4.8"
+                || mapped == "claude-sonnet-5"
+                || mapped == "claude-opus-5" =>
         {
             1_000_000
         }
@@ -1215,6 +1223,22 @@ mod tests {
             map_model("claude-sonnet-4-6")
                 .unwrap()
                 .contains("sonnet")
+        );
+    }
+
+    #[test]
+    fn test_map_model_sonnet_5() {
+        assert_eq!(
+            map_model("claude-sonnet-5"),
+            Some("claude-sonnet-5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_opus_5() {
+        assert_eq!(
+            map_model("claude-opus-5"),
+            Some("claude-opus-5".to_string())
         );
     }
 
