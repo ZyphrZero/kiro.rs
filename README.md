@@ -1,5 +1,6 @@
 # kiro-rs
 
+**🍒 该项目基于 [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs) 进行的二次开发**
 `kiro-rs` 是一个用 Rust 编写的 Anthropic Messages API 兼容代理。它把
 `/v1/messages`、`/v1/models`、`/v1/messages/count_tokens` 等 Anthropic 风格请求转换为 Kiro / Amazon Q 后端请求，并提供一个可选的 Web Admin 面板来管理凭据、客户端 Key、用量、代理池、请求日志和在线更新。
 
