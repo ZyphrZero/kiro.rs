@@ -351,6 +351,10 @@ export function CredentialCard({
       if (provider === "builderid") return "Builder ID";
       return "IdC";
     }
+    if (credential.authMethod === "external_idp") {
+      if (provider === "azuread") return "Entra ID";
+      return "企业 SSO";
+    }
     return credential.authMethod;
   })();
 

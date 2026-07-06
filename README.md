@@ -39,7 +39,7 @@
 - **Anthropic Messages API 兼容**：`/v1/messages`、`/v1/models`、`/v1/messages/count_tokens`。
 - **Claude Code 兼容端点**：`/cc/v1/messages`、`/cc/v1/messages/count_tokens`。
 - 流式和非流式响应：支持 Anthropic SSE 事件格式。
-- **多凭据管理**：OAuth、Builder ID、Social、Enterprise / IdC、Kiro API Key。
+- **多凭据管理**：OAuth、Builder ID、Social、Enterprise / IdC、企业 SSO（Microsoft Entra ID / Azure AD）、Kiro API Key。
 - 自动 token 刷新：支持刷新后回写 `credentials.json`。
 - **多凭据调度**：`priority` 固定优先级和 `balanced` 均衡分配。
 - **故障转移**：凭据失败、额度用尽、账号级 429 风控冷却、token 失效强制刷新。
@@ -371,6 +371,28 @@ Enterprise / IdC 账号在流式调用前会按需调用 `ListAvailableProfiles`
 
 `provider` 可为 `Github` 或 `Google`。Social 登录会使用固定 Social profile ARN。
 
+#### 企业 SSO（Microsoft Entra ID / Azure AD）
+
+```json
+{
+  "refreshToken": "xxx",
+  "accessToken": "xxx",
+  "expiresAt": "2026-12-31T00:00:00Z",
+  "authMethod": "external_idp",
+  "provider": "AzureAD",
+  "clientId": "11111111-2222-3333-4444-555555555555",
+  "tokenEndpoint": "https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token",
+  "issuerUrl": "https://login.microsoftonline.com/<tenant>/v2.0",
+  "scopes": "openid profile offline_access <resource-scope>"
+}
+```
+
+适用于 Microsoft 365 / Entra ID / Azure AD 企业租户账号（既不是 AWS Builder ID 也不是 IAM Identity Center）。Token 刷新走 IdP 的 OAuth2 `refresh_token` grant（公共客户端，表单编码，无 `clientSecret`）：`clientId` 与 `tokenEndpoint` 必填，`scopes` 需含 `offline_access` 才能拿到 refresh token。数据面与 Profile 请求会自动携带 `TokenType: EXTERNAL_IDP` 头，真实 `profileArn` 由 `ListAvailableProfiles` 懒解析回填。
+
+`authMethod` 除 `external_idp` 外也接受 `azuread` / `azure` / `entra` / `microsoft` / `m365` 等别名（统一归一化）；未写 `authMethod` 但带 `tokenEndpoint` 时会自动判定为 `external_idp`。出于防 SSRF / refresh token 外泄考虑，`tokenEndpoint`（及 `issuerUrl`）必须为 `https` 且 host 命中允许列表（`*.microsoftonline.com` / `.us` / `.cn`），否则拒绝导入。
+
+> 核心逻辑参考 [Quorinex/Kiro-Go#131](https://github.com/Quorinex/Kiro-Go/pull/131)。本版仅支持以 JSON 导入（不含浏览器门户登录），按需手动获取 Azure 凭据后导入即可。
+
 #### Kiro API Key
 
 ```json
@@ -394,10 +416,11 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 | `id` | 凭据 ID，Admin 管理时自动分配 |
 | `refreshToken` / `accessToken` | OAuth token |
 | `expiresAt` | RFC3339 过期时间 |
-| `authMethod` | `idc`、`social`、`api_key`。旧值 `builder-id`、`iam` 会规范化为 `idc` |
-| `provider` | `BuilderId`、`Enterprise`、`Github`、`Google`、`IAM_SSO` 等 |
-| `clientId` / `clientSecret` | IdC 刷新 token 所需 OIDC client |
+| `authMethod` | `idc`、`social`、`external_idp`、`api_key`。旧值 `builder-id`、`iam` 会规范化为 `idc`；`azuread` / `entra` 等别名归一化为 `external_idp` |
+| `provider` | `BuilderId`、`Enterprise`、`Github`、`Google`、`IAM_SSO`、`AzureAD` 等 |
+| `clientId` / `clientSecret` | IdC 刷新 token 所需 OIDC client；`external_idp` 仅需 `clientId`（公共客户端，无 `clientSecret`） |
 | `startUrl` | Enterprise IAM Identity Center Start URL |
+| `tokenEndpoint` / `issuerUrl` / `scopes` | 企业 SSO（Entra ID / Azure AD）专用：IdP 刷新端点 / OIDC issuer（备注）/ 已授权 scope（需含 `offline_access`） |
 | `profileArn` | 真实 profile ARN 或已知固定 ARN；通常由程序维护 |
 | `priority` | 数字越小优先级越高 |
 | `region` | 凭据级 Region，兼容旧配置 |
@@ -418,6 +441,8 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 
 当前静态列表包含：
 
+- `claude-fable-5` / `claude-fable-5-thinking`
+- `claude-sonnet-5` / `claude-sonnet-5-thinking`
 - `claude-opus-4-8` / `claude-opus-4-8-thinking`
 - `claude-sonnet-4-8` / `claude-sonnet-4-8-thinking`
 - `claude-opus-4-7` / `claude-opus-4-7-thinking`
@@ -431,6 +456,8 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 
 | 请求模型关键词 | 上游模型 |
 |---|---|
+| `fable`（任意） | `claude-fable-5` |
+| `sonnet` + `5`（`sonnet-5` / `sonnet5` / `sonnet.5`） | `claude-sonnet-5` |
 | `sonnet` + `4-8` / `4.8` | `claude-sonnet-4.8` |
 | `sonnet` + `4-6` / `4.6` | `claude-sonnet-4.6` |
 | `sonnet` + `4-5` / `4.5` | `claude-sonnet-4.5` |
@@ -444,7 +471,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 
 上下文窗口估算：
 
-- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`：`1_000_000`
+- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-fable-5`：`1_000_000`
 - 其它模型：`200_000`
 
 <a id="thinking-tools-websearch"></a>

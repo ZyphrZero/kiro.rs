@@ -155,6 +155,53 @@ export function formatCredits(value: number | null | undefined): string {
 /**
  * 脱敏代理 URL：将 user:pass@host 中的认证信息替换为 xxx****xxx
  */
+/** 企业 SSO (external_idp) 的 authMethod 别名，与后端 canonicalize_auth_method_value 保持一致 */
+export const EXTERNAL_IDP_ALIASES = [
+  'external_idp',
+  'azuread',
+  'azure',
+  'entra',
+  'entra-id',
+  'microsoft',
+  'm365',
+  'office365',
+  'external',
+]
+
+/**
+ * 导入路径的 authMethod 归一化，与后端 `normalize_import_auth_method` 对齐：
+ * - 命中企业 SSO 别名，或携带 `tokenEndpoint`（social/idc 均无此字段）→ `external_idp`
+ * - `clientId` + `clientSecret` → `idc`
+ * - 否则 → `social`
+ *
+ * 同时做最小必填校验：external_idp 需 `clientId` + `tokenEndpoint`；idc 需成对的
+ * clientId/clientSecret。缺失时通过 `error` 返回原因，由调用方标记该行失败并跳过。
+ */
+export function normalizeImportAuthMethod(
+  raw: string | undefined,
+  opts: { tokenEndpoint?: string; clientId?: string; clientSecret?: string },
+): { authMethod: 'social' | 'idc' | 'external_idp'; error?: string } {
+  const am = (raw || '').trim().toLowerCase()
+  const clientId = opts.clientId?.trim()
+  const clientSecret = opts.clientSecret?.trim()
+  const tokenEndpoint = opts.tokenEndpoint?.trim()
+
+  if (EXTERNAL_IDP_ALIASES.includes(am) || tokenEndpoint) {
+    if (!clientId || !tokenEndpoint) {
+      return {
+        authMethod: 'external_idp',
+        error: '企业 SSO (external_idp) 需要 clientId 和 tokenEndpoint',
+      }
+    }
+    return { authMethod: 'external_idp' }
+  }
+  if (clientId && clientSecret) return { authMethod: 'idc' }
+  if (clientId || clientSecret) {
+    return { authMethod: 'social', error: 'idc 模式需要同时提供 clientId 和 clientSecret' }
+  }
+  return { authMethod: 'social' }
+}
+
 export function maskProxyUrl(url: string): string {
   const match = url.match(/^(\w+:\/\/)([^:@]+):([^@]+)@(.+)$/)
   if (!match) return url

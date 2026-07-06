@@ -4,6 +4,32 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.8] - 2026-07-06
+
+主题：**新增 Claude Sonnet 5 / Claude Fable 5 模型映射 + 企业 SSO（Microsoft Entra ID / Azure AD）`external_idp` 认证**。这一版把请求模型关键词映射扩展到 5 代 Sonnet / Fable，并让 `/v1/models` 能列出它们；同时新增第四种认证方式 `external_idp`，支持以 JSON 导入 Microsoft Entra ID / Azure AD 企业租户账号（既不是 AWS Builder ID 也不是 IAM Identity Center，原先无法接入），Token 走 IdP 的 OAuth2 `refresh_token` grant 刷新，并在导入与刷新两处对 IdP 端点做 allow-list 校验，防止 refresh token 外泄。
+
+### ✨ 新功能 — 新增模型映射：Claude Sonnet 5 / Claude Fable 5
+
+- **`claude-sonnet-5`**：`map_model` 的 sonnet 分支新增主版本 5，精确匹配 `sonnet-5` / `sonnet5` / `sonnet.5`（含 `-5-20xxx`、`-5-thinking` 等后缀），排在 4.x 判断之前/相邻并精确到 `sonnet-5`，避免把 `4-5` / `4.5` 误判为 5，也不会命中 legacy 的 `claude-3-5-sonnet`。
+- **`claude-fable-5`**：新增独立 `fable` 分支，映射到上游 `claude-fable-5`（Fable 5 与 Mythos 5 同底座，目前仅 5 代），放在最前以免干扰其它关键词。
+- **上下文窗口**：`claude-sonnet-5` 与 `claude-fable-5` 均按 `1_000_000` 上下文处理。
+- **`/v1/models` 静态列表**：新增 `claude-sonnet-5` / `claude-sonnet-5-thinking`、`claude-fable-5` / `claude-fable-5-thinking` 四个条目，客户端可直接发现。
+- **effort 分级**：两者默认支持 `xhigh`（`fable-5` 显式在允许列表，`sonnet-5` 不在旧模型黑名单），无需额外配置。
+
+### ✨ 新功能 — 企业 SSO（Microsoft Entra ID / Azure AD）`external_idp` 认证
+
+> 核心逻辑参考 [Quorinex/Kiro-Go#131](https://github.com/Quorinex/Kiro-Go/pull/131) 移植。本版仅实现凭据导入与刷新，**不含**浏览器门户登录 / 回调监听 / 两段式状态机——按需手动获取 Azure 凭据后以 JSON 导入即可。
+
+- **新增第四种认证方式 `external_idp`**：适用于 Microsoft 365 / Entra ID / Azure AD 企业租户账号。凭据新增三个字段：`tokenEndpoint`（IdP 的 OAuth2 token 端点）、`issuerUrl`（OIDC issuer，纯备注）、`scopes`（空格分隔的已授权 scope，需含 `offline_access` 才能拿到 refresh token）。`authMethod` 可写 `external_idp`，也接受 `azuread` / `azure` / `entra` / `entra-id` / `microsoft` / `m365` / `office365` / `external` 等别名统一归一化；未声明 `authMethod` 但带 `tokenEndpoint` 时自动推断为 `external_idp`。
+- **IdP token 端点刷新**：`external_idp` 账号的刷新走 IdP OAuth2 `refresh_token` grant（公共客户端，`application/x-www-form-urlencoded` 表单，无 `clientSecret`），区别于 Social / IdC 的刷新路径。IdP 未下发新 refresh token 时保留原值（Azure AD 有时不轮换）；`invalid_grant` 复用既有的永久失效检测，自动禁用凭据。IdP 不返回 `profileArn`，真实 ARN 仍由 `ListAvailableProfiles` 懒解析回填（与 IdC 一致）。
+- **`TokenType: EXTERNAL_IDP` 头**：数据面（`generateAssistantResponse` / MCP）与 `getUsageLimits` / `ListAvailableProfiles` / `setUserPreference` 等 REST 请求，对 `external_idp` 账号自动携带该头——否则 CodeWhisperer 静默返回空 profile 列表并拒绝数据面调用。
+- **Admin 导入 / 导出**：`AddCredentialRequest` 与账号导出结构均新增 `tokenEndpoint` / `issuerUrl` / `scopes`；「添加凭据」对话框新增「企业 SSO (Microsoft Entra / Azure AD)」选项与对应输入（Client ID / Token Endpoint / Issuer URL / Scopes），批量导入与嵌套账号（KAM 格式）导入均支持 `external_idp`；凭据卡片展示 `Entra ID` / `企业 SSO` 标签。导出会无损保留新字段与 `external_idp` 认证方式。
+
+### 🔐 安全 — 外部 IdP 端点 allow-list 校验
+
+- **防 SSRF / refresh token 外泄**：`tokenEndpoint` 是外发 refresh token 的目标，属新的信任边界。导入 `external_idp` 凭据时，以及**每次刷新外发前**，都会校验 `tokenEndpoint`（及 `issuerUrl`，若提供）：必须为 `https`、host 非 IP 字面量、且命中允许列表后缀（`*.microsoftonline.com` / `.us` / `.cn`，前导点锚定到真实子域边界）。校验不通过的凭据直接拒绝导入，不会把 refresh token 发往非法主机。新增 IdP 时可扩展该允许列表。
+- **必填校验**：导入 `external_idp` 时若缺少 `clientId` 或 `tokenEndpoint`（刷新的前提），提前返回明确错误而非等到刷新失败。
+
 ## [0.6.7] - 2026-06-17
 
 主题：**远程部署 Social 登录零配置化（OAuth 回调地址自动派生）+ 凭据列表卡片 / 列表双视图与分页增强 + 来源渠道模糊搜索与移动端体验优化 + output_config.effort 分级归一化**。这一版解决了远程部署（Render / Docker / VPS）下 Social 登录回调指向 `127.0.0.1` 无法使用的痛点——前端按当前访问地址自动派生公网回调地址，远程部署零配置即可完成 Google / GitHub 登录；凭据列表新增 iOS 风格的卡片 / 列表双视图切换、可配置每页数量与跨页全选；同时归一化 `output_config.effort` 分级，避免较老模型收到不支持的 `xhigh` 报错，并在删除凭据时清理其历史失败记录。凭据管理页面还新增按来源渠道（备注）/ 邮箱的模糊搜索、批量导入 / 验活 / 刷新余额的 8 路并发化，以及一轮移动端工具栏布局与下拉菜单渲染异常的修复。

@@ -137,6 +137,18 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub start_url: Option<String>,
 
+    /// 企业 SSO (external_idp) 的 OAuth2 Token 端点（刷新用，external_idp 必填）
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+
+    /// 企业 SSO 的 OIDC Issuer URL（可选，纯记录）
+    #[serde(default)]
+    pub issuer_url: Option<String>,
+
+    /// 企业 SSO 授予的 scopes（空格分隔，可选）
+    #[serde(default)]
+    pub scopes: Option<String>,
+
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
@@ -903,6 +915,12 @@ pub struct ExportedCredentials {
     pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
     pub expires_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,

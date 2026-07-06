@@ -141,13 +141,22 @@ Complete all chunked operations without commentary.";
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
-    if model_lower.contains("sonnet") {
+    if model_lower.contains("fable") {
+        // Fable 5：与 Mythos 5 同底座；目前仅 5 代
+        Some("claude-fable-5".to_string())
+    } else if model_lower.contains("sonnet") {
         if model_lower.contains("4-8") || model_lower.contains("4.8") {
             Some("claude-sonnet-4.8".to_string())
         } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-sonnet-4.5".to_string())
+        } else if model_lower.contains("sonnet-5")
+            || model_lower.contains("sonnet5")
+            || model_lower.contains("sonnet.5")
+        {
+            // 精确匹配 5 代，避免命中 legacy claude-3-5-sonnet
+            Some("claude-sonnet-5".to_string())
         } else {
             None
         }
@@ -180,9 +189,11 @@ pub fn get_context_window_size(model: &str) -> i32 {
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
                 || mapped == "claude-sonnet-4.8"
+                || mapped == "claude-sonnet-5"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8" =>
+                || mapped == "claude-opus-4.8"
+                || mapped == "claude-fable-5" =>
         {
             1_000_000
         }
@@ -1264,6 +1275,39 @@ mod tests {
             Some("claude-sonnet-4.8".to_string())
         );
         assert_eq!(get_context_window_size("claude-sonnet-4-8"), 1_000_000);
+    }
+
+    #[test]
+    fn test_map_model_sonnet_5() {
+        assert_eq!(
+            map_model("claude-sonnet-5"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5-20260101-thinking"),
+            Some("claude-sonnet-5".to_string())
+        );
+        // 点号形式 sonnet.5 也应命中
+        assert_eq!(
+            map_model("claude-sonnet.5"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
+        // 不应误判 legacy claude-3-5-sonnet
+        assert_eq!(map_model("claude-3-5-sonnet-20241022"), None);
+    }
+
+    #[test]
+    fn test_map_model_fable_5() {
+        assert_eq!(
+            map_model("claude-fable-5"),
+            Some("claude-fable-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-fable-5-thinking"),
+            Some("claude-fable-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-fable-5"), 1_000_000);
     }
 
     #[test]

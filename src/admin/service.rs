@@ -13,6 +13,7 @@ use crate::http_client::ProxyConfig;
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{normalize_import_auth_method, validate_external_idp_endpoint};
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::Config;
 
@@ -359,23 +360,34 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
     }
 
     // authMethod 规范化："idc" → "IdC"，其余按 social 处理
+    // authMethod 规范化："idc" → "IdC"，"external_idp" 保留，其余按 social 处理
     let auth_method = non_empty(cred.auth_method.clone()).map(|m| {
         if m.eq_ignore_ascii_case("idc")
             || m.eq_ignore_ascii_case("builder-id")
             || m.eq_ignore_ascii_case("iam")
         {
             "IdC".to_string()
+        } else if cred.is_external_idp_credential() {
+            "external_idp".to_string()
         } else {
             "social".to_string()
         }
     });
     let is_idc = auth_method.as_deref() == Some("IdC");
+    let is_external_idp = auth_method.as_deref() == Some("external_idp");
 
     let provider = non_empty(cred.provider.clone());
     // idp 与 provider 同义；缺失时按认证方式回退到合法的身份提供商
-    let idp = provider
-        .clone()
-        .unwrap_or_else(|| if is_idc { "BuilderId" } else { "Google" }.to_string());
+    let idp = provider.clone().unwrap_or_else(|| {
+        if is_external_idp {
+            "AzureAD"
+        } else if is_idc {
+            "BuilderId"
+        } else {
+            "Google"
+        }
+        .to_string()
+    });
 
     let status = if cred.disabled {
         "unknown".to_string()
@@ -417,6 +429,9 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
             .or_else(|| non_empty(cred.auth_region.clone()))
             .or_else(|| non_empty(cred.api_region.clone())),
         start_url: non_empty(cred.start_url.clone()),
+        token_endpoint: non_empty(cred.token_endpoint.clone()),
+        issuer_url: non_empty(cred.issuer_url.clone()),
+        scopes: non_empty(cred.scopes.clone()),
         expires_at: expires_at_ms,
         auth_method,
         provider: provider.clone(),
@@ -1010,6 +1025,49 @@ impl AdminService {
             }
         }
 
+        // 规范化 auth_method：识别企业 SSO 别名；带 tokenEndpoint 但未声明时推断为 external_idp。
+        let auth_method =
+            normalize_import_auth_method(&req.auth_method, req.token_endpoint.as_deref());
+
+        // 企业 SSO 导入校验（安全边界）：
+        // - 必须同时具备 clientId 与 tokenEndpoint（refresh_external_idp_token 的前提）；
+        // - tokenEndpoint / issuerUrl 必须过 Microsoft allow-list，防止把 refreshToken
+        //   外发到内网 / 攻击者控制的主机（SSRF / 凭据外泄）。
+        if auth_method == "external_idp" {
+            let client_id_ok = req
+                .client_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+            let token_endpoint = req
+                .token_endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let Some(token_endpoint) = token_endpoint else {
+                return Err(AdminServiceError::InvalidCredential(
+                    "企业 SSO (external_idp) 需要 clientId 和 tokenEndpoint".to_string(),
+                ));
+            };
+            if !client_id_ok {
+                return Err(AdminServiceError::InvalidCredential(
+                    "企业 SSO (external_idp) 需要 clientId 和 tokenEndpoint".to_string(),
+                ));
+            }
+            validate_external_idp_endpoint(token_endpoint).map_err(|e| {
+                AdminServiceError::InvalidCredential(format!("tokenEndpoint 被拒绝: {}", e))
+            })?;
+            if let Some(issuer) = req
+                .issuer_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                validate_external_idp_endpoint(issuer).map_err(|e| {
+                    AdminServiceError::InvalidCredential(format!("issuerUrl 被拒绝: {}", e))
+                })?;
+            }
+        }
+
         // 构建凭据对象
         let email = req.email.clone();
         let new_cred = KiroCredentials {
@@ -1018,11 +1076,14 @@ impl AdminService {
             refresh_token: req.refresh_token,
             profile_arn: req.profile_arn,
             expires_at: req.expires_at,
-            auth_method: Some(req.auth_method),
+            auth_method: Some(auth_method),
             provider: req.provider,
             client_id: req.client_id,
             client_secret: req.client_secret,
             start_url: req.start_url,
+            token_endpoint: req.token_endpoint,
+            issuer_url: req.issuer_url,
+            scopes: req.scopes,
             priority: req.priority,
             region: req.region,
             auth_region: req.auth_region,

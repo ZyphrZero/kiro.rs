@@ -102,11 +102,17 @@ export interface AddCredentialRequest {
   accessToken?: string
   profileArn?: string
   expiresAt?: string
-  authMethod?: 'social' | 'idc' | 'api_key'
+  authMethod?: 'social' | 'idc' | 'api_key' | 'external_idp'
   provider?: string
   clientId?: string
   clientSecret?: string
   startUrl?: string
+  /** 企业 SSO (external_idp) 的 OAuth2 Token 端点（external_idp 必填） */
+  tokenEndpoint?: string
+  /** 企业 SSO 的 OIDC Issuer URL（可选） */
+  issuerUrl?: string
+  /** 企业 SSO 授予的 scopes（空格分隔，可选） */
+  scopes?: string
   priority?: number
   authRegion?: string
   apiRegion?: string

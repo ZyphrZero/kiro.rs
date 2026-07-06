@@ -23,7 +23,8 @@ use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
-    IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
+    ExternalIdpTokenResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
+    RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
@@ -120,6 +121,13 @@ pub(crate) async fn refresh_token(
     }
 
     validate_refresh_token(credentials)?;
+
+    // 企业 SSO (external_idp) 走 IdP token 端点刷新（refresh_token grant，public client），
+    // 而非 AWS SSO OIDC / Social 端点。必须在下面的 idc/social 自动判断之前分流：
+    // external_idp 有 clientId 但无 clientSecret，落到自动判断会被误判为 social。
+    if credentials.is_external_idp_credential() {
+        return refresh_external_idp_token(credentials, config, proxy).await;
+    }
 
     // 根据 auth_method 选择刷新方式
     // 如果未指定 auth_method，根据是否有 clientId/clientSecret 自动判断
@@ -322,6 +330,103 @@ async fn refresh_idc_token(
     Ok(new_credentials)
 }
 
+/// 刷新企业 SSO (external_idp, 如 Azure AD) Token
+///
+/// 通过 IdP 的 OAuth2 token 端点以 refresh_token grant 刷新（public client，无
+/// client_secret）。IdP 不返回 profileArn（由 `list_available_profiles` 用
+/// EXTERNAL_IDP token type 另行解析并回填）。
+async fn refresh_external_idp_token(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<KiroCredentials> {
+    tracing::info!("正在刷新 External IdP (企业 SSO) Token...");
+
+    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let client_id = credentials
+        .client_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 clientId"))?;
+    let token_endpoint = credentials
+        .token_endpoint
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 tokenEndpoint"))?;
+
+    // 纵深防御：外发 refreshToken 前再次校验端点在允许列表内，避免持久化的
+    // tokenEndpoint 被带外写入（备份还原 / 外部改文件）后把 refreshToken 送到非法主机。
+    crate::kiro::model::credentials::validate_external_idp_endpoint(token_endpoint)
+        .map_err(|e| anyhow::anyhow!("External IdP tokenEndpoint 被拒绝: {}", e))?;
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+
+    // 表单编码 refresh_token grant；scope 中的 offline_access 是拿到（轮换后）
+    // refresh_token 的前提。reqwest 的 .form() 会自动设 Content-Type。
+    let mut form: Vec<(&str, &str)> = vec![
+        ("client_id", client_id),
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+    ];
+    if let Some(scopes) = credentials.scopes.as_deref().filter(|s| !s.is_empty()) {
+        form.push(("scope", scopes));
+    }
+
+    let response = client
+        .post(token_endpoint)
+        .header("Accept", "application/json")
+        .form(&form)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+
+        // invalid_grant → refreshToken 永久失效（Azure 返回
+        // {"error":"invalid_grant","error_description":"..."}）
+        if status.as_u16() == 400 && body_text.contains("invalid_grant") {
+            return Err(RefreshTokenInvalidError {
+                message: format!(
+                    "External IdP refreshToken 已失效 (invalid_grant): {}",
+                    body_text
+                ),
+            }
+            .into());
+        }
+
+        let error_msg = match status.as_u16() {
+            401 => "企业 SSO 凭证已过期或无效，需要重新认证",
+            403 => "权限不足，无法刷新 Token",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "服务器错误，IdP token 端点暂时不可用",
+            _ => "External IdP Token 刷新失败",
+        };
+        bail!("{}: {} {}", error_msg, status, body_text);
+    }
+
+    let data: ExternalIdpTokenResponse = response.json().await?;
+    if data.access_token.is_empty() {
+        bail!("External IdP Token 刷新失败: 响应缺少 access_token");
+    }
+
+    let mut new_credentials = credentials.clone();
+    new_credentials.access_token = Some(data.access_token);
+
+    // 部分 IdP（Azure AD）轮换 refresh_token，部分刷新时不下发；未下发时保留旧的。
+    if let Some(new_refresh_token) = data.refresh_token.filter(|t| !t.is_empty()) {
+        new_credentials.refresh_token = Some(new_refresh_token);
+    }
+
+    if let Some(expires_in) = data.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    }
+
+    // 不改动 profile_arn：external_idp 不返回，由 resolve_profile_arn_for 解析回填。
+    Ok(new_credentials)
+}
+
 /// 官方 Kiro 用量 / 模型 REST 接口（getUsageLimits / ListAvailableModels /
 /// setUserPreference）仅在 `us-east-1` 与 `eu-central-1` 两个端点提供服务。
 ///
@@ -393,8 +498,8 @@ pub(crate) async fn get_usage_limits(
             .header("Authorization", format!("Bearer {}", token))
             .header("Connection", "close");
 
-        if credentials.is_api_key_credential() {
-            request = request.header("tokentype", "API_KEY");
+        if let Some(token_type) = credentials.token_type_header() {
+            request = request.header("tokentype", token_type);
         }
 
         let response = request.send().await?;
@@ -490,8 +595,8 @@ pub(crate) async fn get_available_models(
             .header("Authorization", format!("Bearer {}", token))
             .header("Connection", "close");
 
-        if credentials.is_api_key_credential() {
-            request = request.header("tokentype", "API_KEY");
+        if let Some(token_type) = credentials.token_type_header() {
+            request = request.header("tokentype", token_type);
         }
 
         let response = request.send().await?;
@@ -589,8 +694,8 @@ pub(crate) async fn list_available_profiles(
             .header("Connection", "close")
             .body(r#"{"maxResults":10}"#);
 
-        if credentials.is_api_key_credential() {
-            request = request.header("tokentype", "API_KEY");
+        if let Some(token_type) = credentials.token_type_header() {
+            request = request.header("tokentype", token_type);
         }
 
         let response = request.send().await?;
@@ -682,8 +787,8 @@ pub(crate) async fn set_user_preference(
             .header("Connection", "close")
             .json(&body);
 
-        if credentials.is_api_key_credential() {
-            request = request.header("tokentype", "API_KEY");
+        if let Some(token_type) = credentials.token_type_header() {
+            request = request.header("tokentype", token_type);
         }
 
         let response = request.send().await?;
@@ -2739,12 +2844,8 @@ impl MultiTokenManager {
         // 5. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
         validated_cred.priority = new_cred.priority;
-        validated_cred.auth_method = new_cred.auth_method.map(|m| {
-            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
-                "idc".to_string()
-            } else {
-                m
-            }
+        validated_cred.auth_method = new_cred.auth_method.as_deref().map(|m| {
+            crate::kiro::model::credentials::canonicalize_auth_method_value(m).to_string()
         });
         if new_cred.profile_arn.is_some() {
             validated_cred.profile_arn = new_cred.profile_arn;
@@ -2753,6 +2854,9 @@ impl MultiTokenManager {
         validated_cred.fill_default_profile_arn();
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
+        validated_cred.token_endpoint = new_cred.token_endpoint;
+        validated_cred.issuer_url = new_cred.issuer_url;
+        validated_cred.scopes = new_cred.scopes;
         validated_cred.region = new_cred.region;
         validated_cred.auth_region = new_cred.auth_region;
         validated_cred.api_region = new_cred.api_region;

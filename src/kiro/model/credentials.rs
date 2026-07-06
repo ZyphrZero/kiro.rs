@@ -62,6 +62,22 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_url: Option<String>,
 
+    /// 企业 SSO (external_idp, 如 Microsoft 365 / Entra ID / Azure AD) 的 OAuth2 Token 端点。
+    ///
+    /// 当 `auth_method == "external_idp"` 时，Token 通过 refresh_token grant 打到该端点刷新
+    /// （public client，无 client_secret），而非 AWS SSO OIDC 端点。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+
+    /// 企业 SSO 的 OIDC Issuer URL（端点的发现来源，纯记录用途）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+
+    /// 企业 SSO 授予的 scopes（空格分隔）。刷新时作为 `scope` 参数回传，
+    /// 其中的 `offline_access` 是拿到 refresh_token 的前提。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
+
     /// 凭据优先级（数字越小优先级越高，默认为 0）
     #[serde(default)]
     #[serde(skip_serializing_if = "is_zero")]
@@ -170,6 +186,9 @@ impl std::fmt::Debug for KiroCredentials {
             .field("client_id", &fmt_redacted(&self.client_id))
             .field("client_secret", &fmt_redacted(&self.client_secret))
             .field("start_url", &self.start_url)
+            .field("token_endpoint", &self.token_endpoint)
+            .field("issuer_url", &self.issuer_url)
+            .field("scopes", &self.scopes)
             .field("priority", &self.priority)
             .field("region", &self.region)
             .field("auth_region", &self.auth_region)
@@ -189,13 +208,92 @@ impl std::fmt::Debug for KiroCredentials {
     }
 }
 
-fn canonicalize_auth_method_value(value: &str) -> &str {
+/// 企业 SSO (external_idp) 的 auth_method 别名。凭据来源多样（Kiro 导出、Azure 门户、
+/// 手工），统一归一到规范值 `external_idp`。
+const EXTERNAL_IDP_ALIASES: &[&str] = &[
+    "external_idp",
+    "azuread",
+    "azure",
+    "entra",
+    "entra-id",
+    "microsoft",
+    "m365",
+    "office365",
+    "external",
+];
+
+pub(crate) fn canonicalize_auth_method_value(value: &str) -> &str {
     if value.eq_ignore_ascii_case("builder-id") || value.eq_ignore_ascii_case("iam") {
         "idc"
     } else if value.eq_ignore_ascii_case("api_key") || value.eq_ignore_ascii_case("apikey") {
         "api_key"
+    } else if EXTERNAL_IDP_ALIASES
+        .iter()
+        .any(|a| value.eq_ignore_ascii_case(a))
+    {
+        "external_idp"
     } else {
         value
+    }
+}
+
+/// 导入路径的 auth_method 归一化。
+///
+/// 在别名规范化之外，额外做一步推断：若显式声明的方式不是企业 SSO，但携带了
+/// `tokenEndpoint`（social/idc 均无此字段），则判定为 `external_idp`。这样即便粘贴的
+/// JSON 未写 authMethod，只要带 tokenEndpoint 就能被正确识别。
+pub(crate) fn normalize_import_auth_method(raw: &str, token_endpoint: Option<&str>) -> String {
+    let canonical = canonicalize_auth_method_value(raw.trim());
+    if canonical.eq_ignore_ascii_case("external_idp") {
+        return "external_idp".to_string();
+    }
+    if token_endpoint.is_some_and(|e| !e.trim().is_empty()) {
+        return "external_idp".to_string();
+    }
+    canonical.to_string()
+}
+
+/// 企业 SSO IdP 端点允许列表（后缀锚定）。
+///
+/// `tokenEndpoint` 是外发 refreshToken 的目标，属新的信任边界；导入的凭据可能来自不可信
+/// 来源（如共享账号包），若指向内网/攻击者控制的主机会导致 refreshToken 泄露。故限制到
+/// 已知企业 IdP 主机（Microsoft Entra / Azure AD）。前导点锚定到真实子域边界，
+/// `evil-microsoftonline.com` 无法命中。新增其它 IdP 时扩展此列表。
+pub const ALLOWED_EXTERNAL_IDP_SUFFIXES: &[&str] = &[
+    ".microsoftonline.com",
+    ".microsoftonline.us",
+    ".microsoftonline.cn",
+];
+
+/// 校验企业 SSO IdP 端点 URL 是否可安全外发。
+///
+/// 要求：可解析、必须 https、host 非 IP 字面量、host 命中 [`ALLOWED_EXTERNAL_IDP_SUFFIXES`]。
+/// 用于 Token 刷新（外发 refreshToken 前）与导入校验两处，防 SSRF / 凭据外泄。
+pub fn validate_external_idp_endpoint(raw_url: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(raw_url.trim())
+        .map_err(|e| format!("IdP 端点 URL 无法解析: {}", e))?;
+
+    if !url.scheme().eq_ignore_ascii_case("https") {
+        return Err("IdP 端点 URL 必须为 https".to_string());
+    }
+
+    let host = match url.host_str() {
+        Some(h) if !h.is_empty() => h.to_ascii_lowercase(),
+        _ => return Err("IdP 端点 URL 缺少 host".to_string()),
+    };
+
+    // 拒绝 IP 字面量（含 IPv6，url 的 host_str 对 IPv6 返回不带方括号的形式）
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Err("IdP 端点 host 不能是 IP 字面量".to_string());
+    }
+
+    if ALLOWED_EXTERNAL_IDP_SUFFIXES
+        .iter()
+        .any(|suffix| host.ends_with(suffix))
+    {
+        Ok(())
+    } else {
+        Err(format!("IdP 端点 host {:?} 不在允许列表内", host))
     }
 }
 
@@ -378,6 +476,31 @@ impl KiroCredentials {
                 .unwrap_or(false)
     }
 
+    /// 是否为企业 SSO (external_idp) 凭据。
+    ///
+    /// 容忍未规范化的别名（azuread/entra/... ），统一按规范值判断。
+    pub fn is_external_idp_credential(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .map(|m| canonicalize_auth_method_value(m).eq_ignore_ascii_case("external_idp"))
+            .unwrap_or(false)
+    }
+
+    /// 返回该凭据在 CodeWhisperer 调用上应携带的 `tokentype` 头值（无则 None）。
+    ///
+    /// - API Key 凭据 → `"API_KEY"`
+    /// - 企业 SSO 凭据 → `"EXTERNAL_IDP"`（缺此头上游会静默返回空 profile 列表并拒绝数据面调用）
+    /// - social / idc → None
+    pub fn token_type_header(&self) -> Option<&'static str> {
+        if self.is_api_key_credential() {
+            Some("API_KEY")
+        } else if self.is_external_idp_credential() {
+            Some("EXTERNAL_IDP")
+        } else {
+            None
+        }
+    }
+
     /// 返回「可发送给上游」的真实 profileArn（跳过 BuilderID 占位符）。
     ///
     /// - 真实 ARN（含 Social 共享 ARN）→ 原样返回；
@@ -476,6 +599,9 @@ mod tests {
             client_id: None,
             client_secret: None,
             start_url: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -667,6 +793,9 @@ mod tests {
             client_id: None,
             client_secret: None,
             start_url: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 0,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
@@ -702,6 +831,9 @@ mod tests {
             client_id: None,
             client_secret: None,
             start_url: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 0,
             region: None,
             auth_region: None,
@@ -820,6 +952,9 @@ mod tests {
             client_id: None,
             client_secret: None,
             start_url: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             priority: 3,
             region: Some("us-west-2".to_string()),
             auth_region: None,
@@ -1098,5 +1233,123 @@ mod tests {
         let creds = KiroCredentials::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
+    }
+
+    // ============ 企业 SSO (external_idp) 测试 ============
+
+    #[test]
+    fn test_canonicalize_external_idp_aliases() {
+        for alias in [
+            "external_idp",
+            "AzureAD",
+            "azure",
+            "Entra",
+            "entra-id",
+            "microsoft",
+            "M365",
+            "office365",
+            "external",
+        ] {
+            assert_eq!(
+                canonicalize_auth_method_value(alias),
+                "external_idp",
+                "别名 {:?} 应规范化为 external_idp",
+                alias
+            );
+        }
+        // 不误伤其它方式
+        assert_eq!(canonicalize_auth_method_value("social"), "social");
+        assert_eq!(canonicalize_auth_method_value("builder-id"), "idc");
+        assert_eq!(canonicalize_auth_method_value("apikey"), "api_key");
+    }
+
+    #[test]
+    fn test_normalize_import_auth_method_inference() {
+        // 显式别名 → external_idp
+        assert_eq!(normalize_import_auth_method("azuread", None), "external_idp");
+        // 带 tokenEndpoint 但未声明（默认 social）→ 推断 external_idp
+        assert_eq!(
+            normalize_import_auth_method(
+                "social",
+                Some("https://login.microsoftonline.com/t/oauth2/v2.0/token")
+            ),
+            "external_idp"
+        );
+        // 空 tokenEndpoint 不触发推断
+        assert_eq!(normalize_import_auth_method("social", Some("   ")), "social");
+        assert_eq!(normalize_import_auth_method("social", None), "social");
+        // idc 保持
+        assert_eq!(normalize_import_auth_method("idc", None), "idc");
+    }
+
+    #[test]
+    fn test_validate_external_idp_endpoint() {
+        // 合法 Microsoft 主机
+        assert!(
+            validate_external_idp_endpoint(
+                "https://login.microsoftonline.com/tenant/oauth2/v2.0/token"
+            )
+            .is_ok()
+        );
+        assert!(validate_external_idp_endpoint("https://login.microsoftonline.us/t/token").is_ok());
+        // 非 https 拒绝
+        assert!(validate_external_idp_endpoint("http://login.microsoftonline.com/t").is_err());
+        // IP 字面量拒绝
+        assert!(validate_external_idp_endpoint("https://127.0.0.1/token").is_err());
+        assert!(validate_external_idp_endpoint("https://[::1]/token").is_err());
+        // 允许列表外拒绝
+        assert!(validate_external_idp_endpoint("https://evil.example.com/token").is_err());
+        // 前导点锚定：evil-microsoftonline.com 不应命中
+        assert!(validate_external_idp_endpoint("https://evil-microsoftonline.com/token").is_err());
+        // 裸域（无子域）不应命中 .microsoftonline.com 后缀
+        assert!(validate_external_idp_endpoint("https://microsoftonline.com/token").is_err());
+    }
+
+    #[test]
+    fn test_is_external_idp_and_token_type_header() {
+        let mut cred = KiroCredentials {
+            auth_method: Some("azuread".to_string()), // 别名也应识别
+            ..Default::default()
+        };
+        assert!(cred.is_external_idp_credential());
+        assert_eq!(cred.token_type_header(), Some("EXTERNAL_IDP"));
+
+        cred.auth_method = Some("social".to_string());
+        assert!(!cred.is_external_idp_credential());
+        assert_eq!(cred.token_type_header(), None);
+
+        cred.auth_method = Some("api_key".to_string());
+        assert_eq!(cred.token_type_header(), Some("API_KEY"));
+    }
+
+    #[test]
+    fn test_external_idp_credentials_serde_roundtrip() {
+        let json = r#"{
+            "authMethod": "external_idp",
+            "refreshToken": "rt",
+            "clientId": "fa6d79bf-xxxx",
+            "tokenEndpoint": "https://login.microsoftonline.com/t/oauth2/v2.0/token",
+            "issuerUrl": "https://login.microsoftonline.com/t/v2.0",
+            "scopes": "openid profile offline_access",
+            "region": "eu-central-1"
+        }"#;
+        let cred = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(cred.auth_method.as_deref(), Some("external_idp"));
+        assert_eq!(
+            cred.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token")
+        );
+        assert_eq!(cred.scopes.as_deref(), Some("openid profile offline_access"));
+
+        // 序列化后应保留新字段（camelCase）
+        let serialized = cred.to_pretty_json().unwrap();
+        assert!(serialized.contains("\"tokenEndpoint\""));
+        assert!(serialized.contains("\"issuerUrl\""));
+        assert!(serialized.contains("\"scopes\""));
+
+        // 空字段不应出现在序列化结果中
+        let empty = KiroCredentials::default();
+        let empty_json = empty.to_pretty_json().unwrap();
+        assert!(!empty_json.contains("tokenEndpoint"));
     }
 }
