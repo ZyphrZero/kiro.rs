@@ -2,6 +2,7 @@
 
 use axum::{
     Router, middleware,
+    extract::DefaultBodyLimit,
     routing::{delete, get, post, put},
 };
 
@@ -30,6 +31,13 @@ use super::{
     },
     middleware::{AdminState, admin_auth_middleware},
 };
+
+/// 请求体最大大小限制 (50MB)
+///
+/// 批量导入凭据（`POST /credentials/batch-import`）会一次性提交所有待导入条目，
+/// 每条含 refreshToken / clientSecret 等长字段，条数多时 JSON body 很容易超过
+/// axum 默认的 2MB 上限而被拒绝（HTTP 413）。这里与 Anthropic 路由保持一致放宽到 50MB。
+const MAX_ADMIN_BODY_SIZE: usize = 50 * 1024 * 1024;
 
 /// 创建 Admin API 路由
 ///
@@ -168,5 +176,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
             admin_auth_middleware,
         ));
 
-    Router::new().merge(authenticated).with_state(state)
+    Router::new()
+        .merge(authenticated)
+        .layer(DefaultBodyLimit::max(MAX_ADMIN_BODY_SIZE))
+        .with_state(state)
 }
