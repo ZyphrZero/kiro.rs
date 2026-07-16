@@ -291,6 +291,17 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
     }
 }
 
+fn reasoning_enabled(payload: &MessagesRequest) -> bool {
+    payload
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.is_enabled())
+        || payload
+            .output_config
+            .as_ref()
+            .is_some_and(|config| !config.effort.trim().is_empty())
+}
+
 /// 将 KiroProvider 错误映射为 HTTP 响应
 pub(super) fn map_provider_error(err: Error) -> Response {
     if let Some(rate_limit) = err.downcast_ref::<crate::kiro::error::UpstreamRateLimitError>() {
@@ -750,11 +761,7 @@ pub async fn post_messages(
     ) as i32;
 
     // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
+    let thinking_enabled = reasoning_enabled(&payload);
 
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
@@ -1541,11 +1548,7 @@ pub async fn post_messages_cc(
     ) as i32;
 
     // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
+    let thinking_enabled = reasoning_enabled(&payload);
 
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
@@ -1927,6 +1930,19 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "native thinking fallback");
+    }
+
+    #[test]
+    fn explicit_effort_enables_reasoning_extraction() {
+        let req: MessagesRequest = serde_json::from_str(r#"{
+            "model": "gpt-5.6-sol",
+            "max_tokens": 100,
+            "messages": [],
+            "output_config": {"effort": "high"}
+        }"#)
+        .unwrap();
+
+        assert!(reasoning_enabled(&req));
     }
 
     #[test]

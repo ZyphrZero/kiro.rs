@@ -267,7 +267,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
 
 /// 是否为已确认接受 `additionalModelRequestFields.output_config` 的模型。
 ///
-/// Kiro `ListAvailableModels`（2026-06）确认：Opus 4.6/4.7/4.8、Sonnet 4.6 接受
+/// Kiro `ListAvailableModels`（2026-06）确认：Opus 4.6/4.7/4.8、Sonnet 4.6、GPT 5.6 接受
 /// `output_config`。Claude 5 系（fable-5 / mythos-5 / sonnet-5 / opus-5 / claude-5）
 /// 与 xhigh 能力一致，一并视为支持。其余（4.5 系、haiku、sonnet-4.8 等）保守视为
 /// 不支持——向它们下发会触发上游 400（`additionalModelRequestFields is not supported`）。
@@ -282,6 +282,7 @@ fn model_supports_native_reasoning(model_id: &str) -> bool {
         || m.contains("sonnet-5")
         || m.contains("opus-5")
         || m.contains("claude-5")
+        || m.starts_with("gpt-5.6-")
 }
 
 /// 本次请求是否请求了原生 reasoning。
@@ -2237,6 +2238,18 @@ mod tests {
             .expect("fable-5 显式 effort 应下发");
         // fable-5 支持 xhigh（model_supports_xhigh_effort），不降级。
         assert_eq!(fields.output_config.unwrap().effort, "xhigh");
+    }
+
+    #[test]
+    fn explicit_effort_emits_for_gpt_5_6_family() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let req = minimal_request_with_effort(model, "high");
+            let result = convert_request(&req).unwrap();
+            let fields = result.additional_model_request_fields.unwrap_or_else(|| {
+                panic!("{model} should forward explicit reasoning effort")
+            });
+            assert_eq!(fields.output_config.unwrap().effort, "high");
+        }
     }
 
     // ---- normalize_json_schema: 顶层 type / 组合关键字（PR#6）----
