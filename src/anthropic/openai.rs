@@ -405,6 +405,12 @@ pub(super) struct ParsedResponse {
     /// 内部代答的 web_search 展示（server_tool_use 块）：(id, query)。
     /// Responses 路径渲染为 web_search_call item。
     pub(super) web_searches: Vec<(String, String)>,
+    /// 上游 meteringEvent 透传的 credit_usage，未下发时为 None。
+    /// 与 kiro-rs /v1/chat/completions 行为对齐：仅在拿到 meteringEvent 时
+    /// 才把 credit_usage / credit_unit / credit_unit_plural 写入响应 usage。
+    pub(super) credit_usage: Option<f64>,
+    pub(super) credit_unit: Option<String>,
+    pub(super) credit_unit_plural: Option<String>,
 }
 
 pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedResponse {
@@ -494,6 +500,18 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
 
+    let credit_usage = usage
+        .and_then(|u| u.get("credit_usage"))
+        .and_then(|v| v.as_f64());
+    let credit_unit = usage
+        .and_then(|u| u.get("credit_unit"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let credit_unit_plural = usage
+        .and_then(|u| u.get("credit_unit_plural"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     ParsedResponse {
         model: model.to_string(),
         text,
@@ -503,6 +521,9 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
         completion_tokens,
         thinking,
         web_searches,
+        credit_usage,
+        credit_unit,
+        credit_unit_plural,
     }
 }
 
@@ -545,11 +566,7 @@ fn build_completion_json(p: &ParsedResponse) -> Value {
             "message": message,
             "finish_reason": p.finish_reason,
         }],
-        "usage": {
-            "prompt_tokens": p.prompt_tokens,
-            "completion_tokens": p.completion_tokens,
-            "total_tokens": p.prompt_tokens + p.completion_tokens,
-        }
+        "usage": build_usage_json(p),
     })
 }
 
@@ -608,11 +625,7 @@ fn build_stream_sse(p: &ParsedResponse) -> String {
             "delta": {},
             "finish_reason": p.finish_reason,
         }],
-        "usage": {
-            "prompt_tokens": p.prompt_tokens,
-            "completion_tokens": p.completion_tokens,
-            "total_tokens": p.prompt_tokens + p.completion_tokens,
-        }
+        "usage": build_usage_json(p),
     });
     out.push_str("data: ");
     out.push_str(&final_chunk.to_string());
@@ -620,6 +633,26 @@ fn build_stream_sse(p: &ParsedResponse) -> String {
     out.push_str("data: [DONE]\n\n");
 
     out
+}
+
+/// 构造 OpenAI usage 对象，并按需透传 upstream meteringEvent 写入的
+/// credit_usage / credit_unit / credit_unit_plural 字段。
+fn build_usage_json(p: &ParsedResponse) -> Value {
+    let mut usage = json!({
+        "prompt_tokens": p.prompt_tokens,
+        "completion_tokens": p.completion_tokens,
+        "total_tokens": p.prompt_tokens + p.completion_tokens,
+    });
+    if let Some(credit_usage) = p.credit_usage {
+        usage["credit_usage"] = json!(credit_usage);
+    }
+    if let Some(credit_unit) = &p.credit_unit {
+        usage["credit_unit"] = json!(credit_unit);
+    }
+    if let Some(credit_unit_plural) = &p.credit_unit_plural {
+        usage["credit_unit_plural"] = json!(credit_unit_plural);
+    }
+    usage
 }
 
 fn openai_error(status: StatusCode, err_type: &str, message: &str) -> Response {
@@ -630,4 +663,126 @@ fn openai_error(status: StatusCode, err_type: &str, message: &str) -> Response {
         }
     });
     (status, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_parsed() -> ParsedResponse {
+        ParsedResponse {
+            model: "gpt-5.6-sol".to_string(),
+            text: "hi".to_string(),
+            tool_calls: Vec::new(),
+            finish_reason: "stop".to_string(),
+            prompt_tokens: 7,
+            completion_tokens: 11,
+            thinking: String::new(),
+            web_searches: Vec::new(),
+            credit_usage: None,
+            credit_unit: None,
+            credit_unit_plural: None,
+        }
+    }
+
+    #[test]
+    fn build_completion_omits_credit_fields_without_metering() {
+        let p = base_parsed();
+        let out = build_completion_json(&p);
+        let usage = &out["usage"];
+        assert!(usage.get("credit_usage").is_none());
+        assert!(usage.get("credit_unit").is_none());
+        assert!(usage.get("credit_unit_plural").is_none());
+        // 原有字段保持原样
+        assert_eq!(usage["prompt_tokens"], json!(7));
+        assert_eq!(usage["completion_tokens"], json!(11));
+        assert_eq!(usage["total_tokens"], json!(18));
+    }
+
+    #[test]
+    fn build_completion_carries_credit_fields_when_metering_present() {
+        let mut p = base_parsed();
+        p.credit_usage = Some(0.5);
+        p.credit_unit = Some("credit".to_string());
+        p.credit_unit_plural = Some("credits".to_string());
+        let out = build_completion_json(&p);
+        let usage = &out["usage"];
+        assert_eq!(usage["credit_usage"], json!(0.5));
+        assert_eq!(usage["credit_unit"], json!("credit"));
+        assert_eq!(usage["credit_unit_plural"], json!("credits"));
+    }
+
+    #[test]
+    fn build_stream_sse_carries_credit_fields_in_final_chunk() {
+        let mut p = base_parsed();
+        p.credit_usage = Some(0.33);
+        p.credit_unit = Some("credit".to_string());
+        p.credit_unit_plural = Some("credits".to_string());
+        let sse = build_stream_sse(&p);
+        assert!(sse.contains("\"credit_usage\":0.33"));
+        assert!(sse.contains("\"credit_unit\":\"credit\""));
+        assert!(sse.contains("\"credit_unit_plural\":\"credits\""));
+        // 结束帧的 usage 必须出现在最后一个 data 块里
+        assert!(sse.contains("\"usage\""));
+    }
+
+    #[test]
+    fn build_stream_sse_omits_credit_fields_without_metering() {
+        let p = base_parsed();
+        let sse = build_stream_sse(&p);
+        assert!(!sse.contains("credit_usage"));
+        assert!(!sse.contains("credit_unit"));
+        assert!(!sse.contains("credit_unit_plural"));
+    }
+
+    #[test]
+    fn parse_anthropic_message_extracts_credit_fields() {
+        let anthropic = json!({
+            "id": "msg_x",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "model": "claude-opus-4-7",
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "credit_usage": 0.6,
+                "credit_unit": "credit",
+                "credit_unit_plural": "credits",
+            }
+        });
+        let p = parse_anthropic_message(&anthropic, "claude-opus-4-7");
+        assert_eq!(p.prompt_tokens, 3);
+        assert_eq!(p.completion_tokens, 5);
+        assert_eq!(p.credit_usage, Some(0.6));
+        assert_eq!(p.credit_unit.as_deref(), Some("credit"));
+        assert_eq!(p.credit_unit_plural.as_deref(), Some("credits"));
+    }
+
+    #[test]
+    fn parse_anthropic_message_without_credit_fields_leaves_them_none() {
+        let anthropic = json!({
+            "id": "msg_x",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "model": "claude-opus-4-7",
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 5,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            }
+        });
+        let p = parse_anthropic_message(&anthropic, "claude-opus-4-7");
+        assert!(p.credit_usage.is_none());
+        assert!(p.credit_unit.is_none());
+        assert!(p.credit_unit_plural.is_none());
+    }
 }

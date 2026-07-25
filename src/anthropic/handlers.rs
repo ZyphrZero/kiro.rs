@@ -1106,6 +1106,10 @@ async fn handle_non_stream_request(
     // meteringEvent 上报的 credit 计费量（上游真实下发）；
     // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
     let mut credits: f64 = 0.0;
+    // 最近一次 meteringEvent 的完整 payload，用于在响应体 usage 中透传
+    // credit_usage / credit_unit / credit_unit_plural 字段，与 /v1/messages
+    // 流式（message_delta）行为一致；如果上游多次下发则取最后一次。
+    let mut metering: Option<crate::kiro::model::events::MeteringEvent> = None;
 
     // 工具调用参数 JSON 累积器：按 tool_use_id 缓冲分片，stop 时整体解析。
     // 半截 / 非法 JSON 显式暴露为错误（返回 502），不再静默回退 {} 或丢弃。
@@ -1167,10 +1171,16 @@ async fn handle_non_stream_request(
                                 actual_input_tokens
                             );
                         }
-                        Event::Metering(metering) => {
+                        Event::Metering(event_metering) => {
                             // 上游只下发 credit；token / cache 字段不存在
-                            credits += metering.usage;
-                            tracing::debug!("metering credits +{:.6}", metering.usage);
+                            credits += event_metering.usage;
+                            tracing::debug!(
+                                usage = event_metering.usage,
+                                unit = %event_metering.unit,
+                                unit_plural = %event_metering.unit_plural,
+                                "metering credits +{:.6}", event_metering.usage
+                            );
+                            metering = Some(event_metering);
                         }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
@@ -1243,6 +1253,19 @@ async fn handle_non_stream_request(
         cache_usage.split_against_total(total_input_tokens);
 
     // 构建 Anthropic 响应
+    let mut usage_json = json!({
+        "input_tokens": final_input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": cache_creation_tokens,
+        "cache_read_input_tokens": cache_read_tokens
+    });
+    // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro
+    // 后端口径一致的计费元数据；只在收到过 meteringEvent 时才追加。
+    if let Some(m) = &metering {
+        usage_json["credit_usage"] = json!(m.usage);
+        usage_json["credit_unit"] = json!(m.unit);
+        usage_json["credit_unit_plural"] = json!(m.unit_plural);
+    }
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
         "type": "message",
@@ -1251,12 +1274,7 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens,
-            "cache_creation_input_tokens": cache_creation_tokens,
-            "cache_read_input_tokens": cache_read_tokens
-        }
+        "usage": usage_json
     });
 
     hook.record(

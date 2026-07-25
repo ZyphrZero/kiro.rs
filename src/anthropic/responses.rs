@@ -858,13 +858,23 @@ fn build_view(p: &ParsedResponse, kinds: &ToolKindMap) -> ResponsesView {
         }
     }
 
-    let usage = json!({
+    let mut usage = json!({
         "input_tokens": p.prompt_tokens,
         "input_tokens_details": { "cached_tokens": 0 },
         "output_tokens": p.completion_tokens,
         "output_tokens_details": { "reasoning_tokens": 0 },
         "total_tokens": p.prompt_tokens + p.completion_tokens,
     });
+    // 透传上游 meteringEvent 写入的 credit_* 字段（仅在拿到 meteringEvent 时）。
+    if let Some(credit_usage) = p.credit_usage {
+        usage["credit_usage"] = json!(credit_usage);
+    }
+    if let Some(credit_unit) = &p.credit_unit {
+        usage["credit_unit"] = json!(credit_unit);
+    }
+    if let Some(credit_unit_plural) = &p.credit_unit_plural {
+        usage["credit_unit_plural"] = json!(credit_unit_plural);
+    }
 
     ResponsesView {
         status,
@@ -1176,6 +1186,9 @@ mod tests {
             completion_tokens: 5,
             thinking: String::new(),
             web_searches: Vec::new(),
+            credit_usage: None,
+            credit_unit: None,
+            credit_unit_plural: None,
         }
     }
 
@@ -1684,5 +1697,48 @@ mod tests {
         assert!(sse.contains("event: response.reasoning_summary_text.delta"));
         assert!(sse.contains("deep thought"));
         assert!(sse.contains("\"reasoning\""));
+    }
+
+    // ---- credit_usage 透传 ----
+
+    #[test]
+    fn response_object_omits_credit_fields_without_metering() {
+        let kinds = ToolKindMap::new();
+        let p = parsed_with_tool_calls(vec![]);
+        let obj = build_responses_object(&p, &kinds);
+        let usage = &obj["usage"];
+        assert!(usage.get("credit_usage").is_none());
+        assert!(usage.get("credit_unit").is_none());
+        assert!(usage.get("credit_unit_plural").is_none());
+    }
+
+    #[test]
+    fn response_object_carries_credit_fields_when_metering_present() {
+        let kinds = ToolKindMap::new();
+        let mut p = parsed_with_tool_calls(vec![]);
+        p.credit_usage = Some(0.25);
+        p.credit_unit = Some("credit".to_string());
+        p.credit_unit_plural = Some("credits".to_string());
+        let obj = build_responses_object(&p, &kinds);
+        let usage = &obj["usage"];
+        assert_eq!(usage["credit_usage"], json!(0.25));
+        assert_eq!(usage["credit_unit"], json!("credit"));
+        assert_eq!(usage["credit_unit_plural"], json!("credits"));
+        // 原有字段保持原样
+        assert_eq!(usage["input_tokens"], json!(10));
+        assert_eq!(usage["output_tokens"], json!(5));
+    }
+
+    #[test]
+    fn response_completed_sse_event_contains_credit_fields() {
+        let kinds = ToolKindMap::new();
+        let mut p = parsed_with_tool_calls(vec![]);
+        p.credit_usage = Some(0.99);
+        p.credit_unit = Some("credit".to_string());
+        p.credit_unit_plural = Some("credits".to_string());
+        let sse = build_responses_sse(&p, &kinds);
+        assert!(sse.contains("\"credit_usage\":0.99"));
+        assert!(sse.contains("\"credit_unit\":\"credit\""));
+        assert!(sse.contains("\"credit_unit_plural\":\"credits\""));
     }
 }
