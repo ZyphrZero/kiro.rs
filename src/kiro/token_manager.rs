@@ -3897,6 +3897,11 @@ impl MultiTokenManager {
             });
         }
 
+        // 新凭据可能比当前凭据优先级更高，入库后立即重选，确保 priority 模式
+        // 不会继续粘滞在旧的低优先级凭据上。即使后续持久化失败，内存中的
+        // entries 与 current_id 也应保持一致。
+        self.select_highest_priority();
+
         // 6. 升级为多凭据格式（确保后续 token rotation 能写盘）并持久化
         self.is_multiple_format.store(true, Ordering::Relaxed);
         self.persist_credentials()?;
@@ -4917,6 +4922,53 @@ mod tests {
         assert!(id > 0);
         assert_eq!(manager.snapshot().total, 1);
         assert_eq!(manager.available_count(), 1);
+        assert_eq!(manager.snapshot().current_id, id);
+    }
+
+    #[tokio::test]
+    async fn test_add_higher_priority_credential_becomes_current() {
+        let config = Config::default();
+
+        let mut existing = KiroCredentials::default();
+        existing.kiro_api_key = Some("ksk_existing_lower_priority".to_string());
+        existing.auth_method = Some("api_key".to_string());
+        existing.priority = 1000;
+
+        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+        let original_id = manager.snapshot().current_id;
+
+        let mut higher_priority = KiroCredentials::default();
+        higher_priority.kiro_api_key = Some("ksk_new_higher_priority".to_string());
+        higher_priority.auth_method = Some("api_key".to_string());
+        higher_priority.priority = 0;
+
+        let new_id = manager.add_credential(higher_priority).await.unwrap();
+
+        assert_ne!(new_id, original_id);
+        assert_eq!(manager.snapshot().current_id, new_id);
+    }
+
+    #[tokio::test]
+    async fn test_add_lower_priority_credential_keeps_current() {
+        let config = Config::default();
+
+        let mut existing = KiroCredentials::default();
+        existing.kiro_api_key = Some("ksk_existing_higher_priority".to_string());
+        existing.auth_method = Some("api_key".to_string());
+        existing.priority = 0;
+
+        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+        let original_id = manager.snapshot().current_id;
+
+        let mut lower_priority = KiroCredentials::default();
+        lower_priority.kiro_api_key = Some("ksk_new_lower_priority".to_string());
+        lower_priority.auth_method = Some("api_key".to_string());
+        lower_priority.priority = 1000;
+
+        let new_id = manager.add_credential(lower_priority).await.unwrap();
+
+        assert_ne!(new_id, original_id);
+        assert_eq!(manager.snapshot().current_id, original_id);
     }
 
     /// add_credential 应在入库时为新凭据写入 created_at（RFC3339），
