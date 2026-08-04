@@ -270,6 +270,23 @@ fn find_real_thinking_end_tag_at_buffer_end(buffer: &str) -> Option<usize> {
     None
 }
 
+/// 缓冲区末尾可能是 `<thinking>` 半截前缀的长度（0 表示末尾不可能是部分标签）。
+///
+/// 用于跨 chunk 的开始标签探测：只保留「确实是 `<thinking>` 前缀」的尾巴，
+/// 其余内容可以立即下发，避免普通文本被盲目扣住 10 字节。
+fn partial_thinking_start_tag_len(buffer: &str) -> usize {
+    const TAG: &str = "<thinking>";
+    let max = (TAG.len() - 1).min(buffer.len());
+    for keep in (1..=max).rev() {
+        if buffer.is_char_boundary(buffer.len() - keep)
+            && buffer.ends_with(&TAG[..keep])
+        {
+            return keep;
+        }
+    }
+    0
+}
+
 /// 查找真正的 thinking 开始标签（不被引用字符包裹）
 ///
 /// 与 `find_real_thinking_end_tag` 类似，跳过被引用字符包裹的开始标签。
@@ -1408,8 +1425,6 @@ pub struct StreamContext {
     pub invoke_sniff_buffer: String,
     /// 是否在 thinking 块内
     pub in_thinking_block: bool,
-    /// thinking 块是否已提取完成
-    pub thinking_extracted: bool,
     /// thinking 块索引
     pub thinking_block_index: Option<i32>,
     /// 上游原生 reasoningContentEvent 下发的 thinking 签名
@@ -1505,7 +1520,6 @@ impl StreamContext {
             thinking_buffer: String::new(),
             invoke_sniff_buffer: String::new(),
             in_thinking_block: false,
-            thinking_extracted: false,
             thinking_block_index: None,
             pending_thinking_signature: None,
             text_block_index: None,
@@ -1698,7 +1712,7 @@ impl StreamContext {
         self.thinking_buffer.push_str(content);
 
         loop {
-            if !self.in_thinking_block && !self.thinking_extracted {
+            if !self.in_thinking_block {
                 // 查找 <thinking> 开始标签（跳过被反引号包裹的）
                 if let Some(start_pos) = find_real_thinking_start_tag(&self.thinking_buffer) {
                     // 发送 <thinking> 之前的内容作为 text_delta
@@ -1732,12 +1746,10 @@ impl StreamContext {
                     );
                     events.extend(start_events);
                 } else {
-                    // 没有找到 <thinking>，检查是否可能是部分标签
-                    // 保留可能是部分标签的内容
-                    let target_len = self
-                        .thinking_buffer
-                        .len()
-                        .saturating_sub("<thinking>".len());
+                    // 没有找到 <thinking>，只保留末尾确实可能是半截 `<thinking>` 的部分，
+                    // 其余内容立即下发（普通文本不应被盲目扣住等待跨 chunk 匹配）。
+                    let holdback = partial_thinking_start_tag_len(&self.thinking_buffer);
+                    let target_len = self.thinking_buffer.len() - holdback;
                     let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
@@ -1778,9 +1790,8 @@ impl StreamContext {
                         }
                     }
 
-                    // 结束 thinking 块
+                    // 结束 thinking 块（后续若再出现 <thinking> 标签会另开新块）
                     self.in_thinking_block = false;
-                    self.thinking_extracted = true;
 
                     // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
                     if let Some(thinking_index) = self.thinking_block_index {
@@ -1824,14 +1835,6 @@ impl StreamContext {
                     }
                     break;
                 }
-            } else {
-                // thinking 已提取完成，剩余内容作为 text_delta
-                if !self.thinking_buffer.is_empty() {
-                    let remaining = self.thinking_buffer.clone();
-                    self.thinking_buffer.clear();
-                    events.extend(self.create_text_delta_events(&remaining));
-                }
-                break;
             }
         }
 
@@ -2151,7 +2154,6 @@ impl StreamContext {
 
         let idx = self.state_manager.next_block_index();
         self.thinking_block_index = Some(idx);
-        self.thinking_extracted = true;
         events.extend(self.state_manager.handle_content_block_start(
             idx,
             "thinking",
@@ -2379,9 +2381,8 @@ impl StreamContext {
                     }
                 }
 
-                // 结束 thinking 块
+                // 结束 thinking 块（后续若再出现 <thinking> 标签会另开新块）
                 self.in_thinking_block = false;
-                self.thinking_extracted = true;
 
                 if let Some(thinking_index) = self.thinking_block_index {
                     // 先发送空的 thinking_delta
@@ -2411,12 +2412,15 @@ impl StreamContext {
         // 约束：只在尚未进入 thinking block、且 thinking 尚未被提取时，将缓冲区当作普通文本 flush。
         if self.thinking_enabled
             && !self.in_thinking_block
-            && !self.thinking_extracted
             && !self.thinking_buffer.is_empty()
         {
             let buffered = std::mem::take(&mut self.thinking_buffer);
             events.extend(self.create_text_delta_events(&buffered));
         }
+        // tool_use 是明确的段落边界：invoke 嗅探缓冲里可能还压着半截 `<...` 标签，
+        // 它不可能跨过结构化 tool_use 续接成完整块，在此 flush 掉，
+        // 避免这段文本被挪到工具块之后（乱序）。
+        events.extend(self.drain_invoke_sniff_buffer(true));
 
         // 通过累积器缓冲工具参数 JSON 分片：只有收到 stop=true 且解析成功时才
         // 发出完整的工具调用；半截 / 非法 JSON 记为错误，交由收尾（generate_final_events）
@@ -2492,7 +2496,6 @@ impl StreamContext {
                     let remaining = self.thinking_buffer[after_pos..].trim_start().to_string();
                     self.thinking_buffer.clear();
                     self.in_thinking_block = false;
-                    self.thinking_extracted = true;
                     if !remaining.is_empty() {
                         events.extend(self.create_text_delta_events(&remaining));
                     }
@@ -3255,6 +3258,103 @@ mod tests {
     }
 
     #[test]
+    fn test_second_thinking_segment_becomes_own_thinking_block() {
+        // 一次响应里模型可能吐出多段 <thinking>（原生 reasoning 或标签混排）。
+        // 第二段及以后必须同样识别为 thinking 块，而不是连同字面标签漏进 text_delta。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model", 1, true, HashMap::new(), test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "<thinking>first</thinking>\n\nvisible\n\n<thinking>second</thinking>\n\ntail",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        let thinking_starts: Vec<_> = all
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "thinking"
+            })
+            .collect();
+        assert_eq!(
+            thinking_starts.len(),
+            2,
+            "两段 <thinking> 应各开一个 thinking 块"
+        );
+
+        let text_all: String = all
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
+            })
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+        assert!(
+            !text_all.contains("<thinking>") && !text_all.contains("</thinking>"),
+            "字面 thinking 标签不应出现在 text_delta 中，实际：{text_all:?}"
+        );
+        assert!(
+            !text_all.contains("second"),
+            "第二段思考内容不应漏进正文，实际：{text_all:?}"
+        );
+
+        let thinking_all: String = all
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "thinking_delta"
+            })
+            .filter_map(|e| e.data["delta"]["thinking"].as_str())
+            .collect();
+        assert!(
+            thinking_all.contains("second"),
+            "第二段思考内容应作为 thinking_delta 下发，实际：{thinking_all:?}"
+        );
+    }
+
+    #[test]
+    fn test_tool_use_flushes_buffered_tail_after_thinking_extracted() {
+        // 第一段 thinking 提取完成后，后续文本的半截 `<thinking>` 尾巴同样会暂存；
+        // 此时来 tool_use，暂存文本必须先于工具块 flush，而不是被吞或挪后。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model", 1, true, HashMap::new(), test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("<thinking>abc</thinking>\n\n结论：<think"));
+        all.extend(ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Write".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: "{}".to_string(),
+            stop: true,
+        }));
+
+        let text_all_before_tool: String = {
+            let pos_tool_start = all
+                .iter()
+                .position(|e| {
+                    e.event == "content_block_start"
+                        && e.data["content_block"]["type"] == "tool_use"
+                })
+                .expect("should start tool_use block");
+            all[..pos_tool_start]
+                .iter()
+                .filter(|e| {
+                    e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
+                })
+                .filter_map(|e| e.data["delta"]["text"].as_str())
+                .collect()
+        };
+        assert_eq!(
+            text_all_before_tool, "结论：<think",
+            "thinking 提取后暂存的尾部文本应在工具块之前完整 flush"
+        );
+    }
+
+    #[test]
     fn test_tool_use_flushes_pending_thinking_buffer_text_before_tool_block() {
         // thinking 模式下，短文本可能被暂存在 thinking_buffer 以等待 `<thinking>` 的跨 chunk 匹配。
         // 当紧接着出现 tool_use 时，应先 flush 这段文本，再开始 tool_use block。
@@ -3267,18 +3367,18 @@ mod tests {
         );
         let _initial_events = ctx.generate_initial_events();
 
-        // 两段短文本（各 2 个中文字符），总长度仍可能不足以满足 safe_len>0 的输出条件，
-        // 因而会留在 thinking_buffer 中等待后续 chunk。
-        let ev1 = ctx.process_assistant_response("有修");
-        assert!(
-            ev1.iter().all(|e| e.event != "content_block_delta"),
-            "short prefix should be buffered under thinking mode"
-        );
-        let ev2 = ctx.process_assistant_response("改：");
-        assert!(
-            ev2.iter().all(|e| e.event != "content_block_delta"),
-            "short prefix should still be buffered under thinking mode"
-        );
+        // 末尾是半截 `<thinking>` 前缀的文本：`<think` 会留在 thinking_buffer
+        // 等待跨 chunk 匹配，其余部分立即下发。
+        let ev1 = ctx.process_assistant_response("有修改：<think");
+        let ev1_text: String = ev1
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
+            })
+            .filter_map(|e| e.data["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(ev1_text, "有修改：", "非标签前缀应立即下发");
+        assert_eq!(ctx.thinking_buffer, "<think", "半截标签应留在缓冲区");
 
         let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
             name: "Write".to_string(),
@@ -3287,55 +3387,23 @@ mod tests {
             stop: true, // 累积器仅在 stop=true 时整体发出工具调用（含关闭前一个块）
         });
 
-        let text_start_index = events.iter().find_map(|e| {
-            if e.event == "content_block_start" && e.data["content_block"]["type"] == "text" {
-                e.data["index"].as_i64()
-            } else {
-                None
-            }
-        });
         let pos_text_delta = events.iter().position(|e| {
-            e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-        });
-        let pos_text_stop = text_start_index.and_then(|idx| {
-            events.iter().position(|e| {
-                e.event == "content_block_stop" && e.data["index"].as_i64() == Some(idx)
-            })
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "text_delta"
+                && e.data["delta"]["text"] == "<think"
         });
         let pos_tool_start = events.iter().position(|e| {
             e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
         });
 
         assert!(
-            text_start_index.is_some(),
-            "should start a text block to flush buffered text"
-        );
-        assert!(
             pos_text_delta.is_some(),
-            "should flush buffered text as text_delta"
-        );
-        assert!(
-            pos_text_stop.is_some(),
-            "should stop text block before tool_use block starts"
+            "buffered partial tag should be flushed as text_delta, not swallowed by tool_use"
         );
         assert!(pos_tool_start.is_some(), "should start tool_use block");
-
-        let pos_text_delta = pos_text_delta.unwrap();
-        let pos_text_stop = pos_text_stop.unwrap();
-        let pos_tool_start = pos_tool_start.unwrap();
-
         assert!(
-            pos_text_delta < pos_text_stop && pos_text_stop < pos_tool_start,
-            "ordering should be: text_delta -> text_stop -> tool_use_start"
-        );
-
-        assert!(
-            events.iter().any(|e| {
-                e.event == "content_block_delta"
-                    && e.data["delta"]["type"] == "text_delta"
-                    && e.data["delta"]["text"] == "有修改："
-            }),
-            "flushed text should equal the buffered prefix"
+            pos_text_delta.unwrap() < pos_tool_start.unwrap(),
+            "ordering should be: flushed text_delta -> tool_use_start"
         );
     }
 
