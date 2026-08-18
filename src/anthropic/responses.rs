@@ -18,20 +18,21 @@
 //!   → 应答 `custom_tool_call`（原始字符串 `input`）。
 //!   Anthropic 侧没有自由文本工具，进方向包一层
 //!   `{"input": <string>}` 单字段 schema，出方向再解包。
+//!
 //! 每个请求维护一张 name → 声明类型 的 [`ToolKindMap`]，请求翻译时生成、
 //! 响应构造时消费，保证出方向 item 类型永远与声明一致。
 //!
-//! web_search 始终由 kiro-rs 内部代答（codex 自带的搜索插件在自定义
-//! provider 下 401）：注入原生 `web_search_20250305`，请求因此必然进入
-//! handlers 的 web_search agentic loop——该 loop 会内部消化 web_search、
-//! 把其它 client 工具的 tool_use 原样透传（见 websearch_loop.rs）。
+//! 客户端显式声明 `type:"web_search"` 时由 kiro-rs 内部代答：注入原生
+//! `web_search_20250305` 并进入 handlers 的 web_search agentic loop。普通
+//! 文本和本地工具请求不注入搜索工具，以便沿用 Anthropic 的实时流。
 //!
-//! 说明：内部调用始终以非流式方式执行，`stream: true` 的请求在拿到完整结果后
-//! 合成为 Responses 的 SSE 事件序列（response.created / output_item /
-//! output_text.delta / function_call_arguments / response.completed）。
-//! codex 只从 `response.output_item.done` 构建回合内容，缓冲式合成足够。
+//! `stream:true` 时内部同样使用流式 Messages 请求，并逐事件把 Anthropic SSE
+//! 翻译成 Responses SSE；显式 WebSearch 仍由现有 agentic loop 整轮缓冲。
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    convert::Infallible,
+};
 
 use axum::{
     Json,
@@ -40,6 +41,8 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
+use futures::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -50,7 +53,9 @@ use super::openai::{
     ParsedResponse, collect_text_strings, now_ts, parse_anthropic_message, push_merged,
     resolve_session_metadata,
 };
-use super::types::{Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Tool};
+use super::types::{
+    Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Thinking, Tool,
+};
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
 const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
@@ -125,16 +130,59 @@ pub struct ResponsesRequest {
     pub tools: Option<Vec<Value>>,
     #[serde(default)]
     pub tool_choice: Option<Value>,
+    #[serde(default = "default_parallel_tool_calls")]
+    pub parallel_tool_calls: bool,
     #[serde(default)]
     pub reasoning: Option<ReasoningConfig>,
     #[serde(default)]
     pub prompt_cache_key: Option<String>,
 }
 
+fn default_parallel_tool_calls() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ReasoningConfig {
     #[serde(default)]
     pub effort: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResponsesResponseConfig {
+    parallel_tool_calls: bool,
+    tool_choice: Value,
+    tools: Vec<Value>,
+}
+
+impl Default for ResponsesResponseConfig {
+    fn default() -> Self {
+        Self {
+            parallel_tool_calls: true,
+            tool_choice: json!("auto"),
+            tools: Vec::new(),
+        }
+    }
+}
+
+impl ResponsesResponseConfig {
+    fn from_request(req: &ResponsesRequest) -> Self {
+        let mut tools = req.tools.clone().unwrap_or_default();
+        if let Value::Array(items) = &req.input {
+            for item in items {
+                if item.get("type").and_then(Value::as_str) == Some("additional_tools")
+                    && let Some(extra) = item.get("tools").and_then(Value::as_array)
+                {
+                    tools.extend(extra.iter().cloned());
+                }
+            }
+        }
+        Self {
+            parallel_tool_calls: req.parallel_tool_calls,
+            tool_choice: req.tool_choice.clone().unwrap_or_else(|| json!("auto")),
+            tools,
+        }
+    }
 }
 
 // ============================ Handler ============================
@@ -148,6 +196,7 @@ pub async fn post_responses(
 ) -> Response {
     let want_stream = req.stream;
     let model = req.model.clone();
+    let response_config = ResponsesResponseConfig::from_request(&req);
     let metadata = resolve_session_metadata(req.prompt_cache_key.as_deref(), &headers);
 
     tracing::info!(
@@ -164,10 +213,32 @@ pub async fn post_responses(
         }
     };
 
-    // 2. 复用 Anthropic 全链路（内部强制非流式）
+    // 2. 复用 Anthropic 全链路。流式请求会得到标准 Anthropic SSE。
     let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
 
     let status = inner.status();
+    if !status.is_success() {
+        let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {
+            Ok(b) => b,
+            Err(e) => {
+                return responses_error(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    &format!("failed to read upstream response: {e}"),
+                );
+            }
+        };
+        return Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body_bytes))
+            .unwrap();
+    }
+
+    if want_stream {
+        return responses_streaming_response(inner.into_body(), model, tool_kinds, response_config);
+    }
+
     let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {
         Ok(b) => b,
         Err(e) => {
@@ -178,15 +249,6 @@ pub async fn post_responses(
             );
         }
     };
-
-    // 上游非 2xx：原样透传
-    if !status.is_success() {
-        return Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body_bytes))
-            .unwrap();
-    }
 
     let anthropic: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
@@ -202,18 +264,8 @@ pub async fn post_responses(
     // 3. Anthropic -> Responses 响应翻译
     let parsed = parse_anthropic_message(&anthropic, &model);
 
-    if want_stream {
-        let sse = build_responses_sse(&parsed, &tool_kinds);
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(Body::from(sse))
-            .unwrap()
-    } else {
-        let body = build_responses_object(&parsed, &tool_kinds);
-        (StatusCode::OK, Json(body)).into_response()
-    }
+    let body = build_responses_object_with_config(&parsed, &tool_kinds, &response_config);
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 // ============================ 请求翻译 ============================
@@ -228,13 +280,13 @@ fn responses_to_anthropic(
         .unwrap_or(DEFAULT_MAX_TOKENS);
 
     let mut system: Vec<SystemMessage> = Vec::new();
-    if let Some(instr) = req.instructions.as_ref() {
-        if !instr.trim().is_empty() {
-            system.push(SystemMessage {
-                text: instr.clone(),
-                cache_control: None,
-            });
-        }
+    if let Some(instr) = req.instructions.as_ref()
+        && !instr.trim().is_empty()
+    {
+        system.push(SystemMessage {
+            text: instr.clone(),
+            cache_control: None,
+        });
     }
 
     let mut merged: Vec<(String, Vec<Value>)> = Vec::new();
@@ -244,10 +296,8 @@ fn responses_to_anthropic(
 
     match &req.input {
         // input 直接是字符串 → 单条 user 文本
-        Value::String(s) => {
-            if !s.is_empty() {
-                push_merged(&mut merged, "user", vec![json!({"type":"text","text":s})]);
-            }
+        Value::String(s) if !s.is_empty() => {
+            push_merged(&mut merged, "user", vec![json!({"type":"text","text":s})]);
         }
         Value::Array(items) => {
             for item in items {
@@ -263,7 +313,7 @@ fn responses_to_anthropic(
                     continue;
                 }
 
-                translate_input_item(item, &mut system, &mut merged);
+                translate_input_item(item, &mut system, &mut merged)?;
             }
         }
         _ => {}
@@ -282,41 +332,53 @@ fn responses_to_anthropic(
         return Err("input must contain at least one user/assistant message".to_string());
     }
 
-    // 翻译 codex 声明的工具，并记录每个工具的声明类型（出方向要用）。
+    let hosted_web_search_declared = declared_entries
+        .iter()
+        .any(|entry| entry.get("type").and_then(Value::as_str) == Some("web_search"));
+
+    let tool_choice = req
+        .tool_choice
+        .as_ref()
+        .map(convert_tool_choice)
+        .transpose()?;
+    let tool_choice_none = tool_choice
+        .as_ref()
+        .is_some_and(|choice| choice.get("type").and_then(Value::as_str) == Some("none"));
+
+    // 翻译 codex 声明的本地工具，并记录每个工具的声明类型（出方向要用）。
     let mut tool_kinds: ToolKindMap = HashMap::new();
     let mut tool_list = convert_responses_tools(&declared_entries, &mut tool_kinds, None);
 
-    if tool_list.is_empty() {
-        // 无 codex 工具（纯聊天流）：保持既有已验证行为——noop 占位 +
-        // 原生 web_search（占位保证 tool_count > 1，走 agentic loop 而非
-        // 单工具 fast-path）+ 严格提示。
-        tool_list = vec![
-            Tool {
+    // `tool_choice: none` 是显式禁止工具调用，不能让 hosted web_search
+    // 注入工具，也不能把声明的工具继续转发给上游。
+    if !tool_choice_none
+        // 只有 hosted web_search 声明才进入内部搜索循环。若客户端声明了同名
+        // function，则客户端工具优先，避免破坏工具类型及名称还原。
+        && hosted_web_search_declared
+        && !tool_list.iter().any(|t| t.name == "web_search")
+    {
+        if tool_list.is_empty() {
+            // noop 保证不触发单 WebSearch fast-path，继续使用已验证的 agentic loop。
+            tool_list.push(Tool {
                 tool_type: None,
                 name: "noop".to_string(),
                 description: "Placeholder tool; never call this.".to_string(),
                 input_schema: Default::default(),
                 max_uses: None,
                 cache_control: None,
-            },
-            native_web_search_tool(),
-        ];
-        system.push(SystemMessage {
-            text: NUDGE_STRICT.to_string(),
-            cache_control: None,
-        });
-    } else {
-        // 有 codex 工具：追加原生 web_search（除非客户端已声明同名工具，
-        // 避免名字冲突破坏 tool_name 还原逻辑），并使用软化提示。
-        // 注入后 has_web_search_among_tools 命中 → 走 agentic loop，
-        // loop 会把非 web_search 的 client 工具 tool_use 原样透传。
-        if !tool_list.iter().any(|t| t.name == "web_search") {
+            });
             tool_list.push(native_web_search_tool());
+            system.push(SystemMessage {
+                text: NUDGE_STRICT.to_string(),
+                cache_control: None,
+            });
+        } else {
+            tool_list.push(native_web_search_tool());
+            system.push(SystemMessage {
+                text: NUDGE_SOFT.to_string(),
+                cache_control: None,
+            });
         }
-        system.push(SystemMessage {
-            text: NUDGE_SOFT.to_string(),
-            cache_control: None,
-        });
     }
 
     let custom_count = tool_kinds
@@ -329,20 +391,33 @@ fn responses_to_anthropic(
         "responses: forwarding tools to upstream"
     );
 
-    let tools = Some(tool_list);
-    let tool_choice = req.tool_choice.as_ref().and_then(convert_tool_choice);
+    let tools = if tool_choice_none || tool_list.is_empty() {
+        None
+    } else {
+        Some(tool_list)
+    };
     let output_config = req
         .reasoning
-        .and_then(|r| r.effort)
+        .as_ref()
+        .and_then(|r| r.effort.clone())
         .filter(|e| !e.trim().is_empty())
         .map(|effort| OutputConfig { effort });
+    let thinking = req.reasoning.and_then(|reasoning| {
+        reasoning
+            .effort
+            .filter(|effort| !effort.trim().is_empty())
+            .map(|_| Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 20_000,
+            })
+    });
 
     Ok((
         MessagesRequest {
             model: req.model,
             max_tokens,
             messages,
-            stream: false,
+            stream: req.stream,
             system: if system.is_empty() {
                 None
             } else {
@@ -350,7 +425,7 @@ fn responses_to_anthropic(
             },
             tools,
             tool_choice,
-            thinking: None,
+            thinking,
             output_config,
             metadata,
         },
@@ -529,7 +604,7 @@ fn translate_input_item(
     item: &Value,
     system: &mut Vec<SystemMessage>,
     merged: &mut Vec<(String, Vec<Value>)>,
-) {
+) -> Result<(), String> {
     let ty = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match ty {
@@ -552,7 +627,9 @@ fn translate_input_item(
                 .get("arguments")
                 .and_then(|v| v.as_str())
                 .unwrap_or("{}");
-            let input: Value = serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
+            let input: Value = serde_json::from_str(args_str).map_err(|error| {
+                format!("input function_call {call_id} has invalid JSON arguments: {error}")
+            })?;
             let block = json!({
                 "type": "tool_use",
                 "id": call_id,
@@ -607,7 +684,7 @@ fn translate_input_item(
         _ => {
             let role = item.get("role").and_then(|v| v.as_str());
             let Some(role) = role else {
-                return;
+                return Ok(());
             };
             match role {
                 "system" | "developer" => {
@@ -626,26 +703,25 @@ fn translate_input_item(
             }
         }
     }
+    Ok(())
 }
 
 /// 把 Responses message.content（字符串或数组）转成 Anthropic content blocks
 fn content_blocks(content: Option<&Value>) -> Vec<Value> {
     let mut out = Vec::new();
     match content {
-        Some(Value::String(s)) => {
-            if !s.is_empty() {
-                out.push(json!({"type":"text","text":s}));
-            }
+        Some(Value::String(s)) if !s.is_empty() => {
+            out.push(json!({"type":"text","text":s}));
         }
         Some(Value::Array(parts)) => {
             for part in parts {
                 let ty = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 match ty {
                     "input_text" | "output_text" | "text" => {
-                        if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                            if !t.is_empty() {
-                                out.push(json!({"type":"text","text":t}));
-                            }
+                        if let Some(t) = part.get("text").and_then(|v| v.as_str())
+                            && !t.is_empty()
+                        {
+                            out.push(json!({"type":"text","text":t}));
                         }
                     }
                     "input_image" => {
@@ -697,23 +773,36 @@ fn stringify_output(output: Option<&Value>) -> String {
     }
 }
 
-fn convert_tool_choice(tc: &Value) -> Option<Value> {
+fn convert_tool_choice(tc: &Value) -> Result<Value, String> {
     match tc {
         Value::String(s) => match s.as_str() {
-            "auto" => Some(json!({"type":"auto"})),
-            "required" => Some(json!({"type":"any"})),
-            "none" => None,
-            _ => Some(json!({"type":"auto"})),
+            "auto" => Ok(json!({"type":"auto"})),
+            "required" => Ok(json!({"type":"any"})),
+            "none" => Ok(json!({"type":"none"})),
+            other => Err(format!("unsupported tool_choice value: {other}")),
         },
-        Value::Object(_) => {
-            // Responses: {"type":"function","name":"..."}
-            let name = tc
-                .get("name")
-                .or_else(|| tc.get("function").and_then(|f| f.get("name")))
-                .and_then(|v| v.as_str());
-            name.map(|n| json!({"type":"tool","name":n}))
+        Value::Object(object) => {
+            let choice_type = object
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("function");
+            match choice_type {
+                "function" => {
+                    let name = object
+                        .get("name")
+                        .or_else(|| object.get("function").and_then(|f| f.get("name")))
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "tool_choice function is missing name".to_string())?;
+                    let namespace = object.get("namespace").and_then(Value::as_str);
+                    Ok(json!({"type":"tool","name":flat_tool_name(namespace, name)}))
+                }
+                "auto" => Ok(json!({"type":"auto"})),
+                "required" => Ok(json!({"type":"any"})),
+                "none" => Ok(json!({"type":"none"})),
+                other => Err(format!("unsupported tool_choice type: {other}")),
+            }
         }
-        _ => None,
+        _ => Err("tool_choice must be a string or object".to_string()),
     }
 }
 
@@ -749,10 +838,10 @@ fn custom_input_text(arguments_json: &str) -> String {
             if let Some(Value::String(s)) = map.get("input") {
                 return s.clone();
             }
-            if map.len() == 1 {
-                if let Some(Value::String(s)) = map.values().next() {
-                    return s.clone();
-                }
+            if map.len() == 1
+                && let Some(Value::String(s)) = map.values().next()
+            {
+                return s.clone();
             }
             arguments_json.to_string()
         }
@@ -893,7 +982,12 @@ fn build_view(p: &ParsedResponse, kinds: &ToolKindMap) -> ResponsesView {
     }
 }
 
-fn build_response_object_from(p: &ParsedResponse, view: &ResponsesView, id: &str) -> Value {
+fn build_response_object_from(
+    p: &ParsedResponse,
+    view: &ResponsesView,
+    id: &str,
+    config: &ResponsesResponseConfig,
+) -> Value {
     let mut obj = json!({
         "id": id,
         "object": "response",
@@ -902,9 +996,9 @@ fn build_response_object_from(p: &ParsedResponse, view: &ResponsesView, id: &str
         "model": p.model,
         "output": view.output,
         "usage": view.usage,
-        "parallel_tool_calls": true,
-        "tool_choice": "auto",
-        "tools": [],
+        "parallel_tool_calls": config.parallel_tool_calls,
+        "tool_choice": config.tool_choice,
+        "tools": config.tools,
     });
     if view.status == "incomplete" {
         obj["incomplete_details"] = json!({ "reason": "max_output_tokens" });
@@ -912,10 +1006,850 @@ fn build_response_object_from(p: &ParsedResponse, view: &ResponsesView, id: &str
     obj
 }
 
-fn build_responses_object(p: &ParsedResponse, kinds: &ToolKindMap) -> Value {
+fn build_responses_object_with_config(
+    p: &ParsedResponse,
+    kinds: &ToolKindMap,
+    config: &ResponsesResponseConfig,
+) -> Value {
     let view = build_view(p, kinds);
     let id = new_resp_id();
-    build_response_object_from(p, &view, &id)
+    build_response_object_from(p, &view, &id, config)
+}
+
+#[cfg(test)]
+fn build_responses_object(p: &ParsedResponse, kinds: &ToolKindMap) -> Value {
+    build_responses_object_with_config(p, kinds, &ResponsesResponseConfig::default())
+}
+
+// ============================ 流式响应翻译 ============================
+
+#[derive(Debug)]
+enum StreamingBlock {
+    Text {
+        item_id: String,
+        output_index: Option<i64>,
+        text: String,
+    },
+    Reasoning {
+        item_id: String,
+        output_index: Option<i64>,
+        text: String,
+    },
+    Tool {
+        call_id: String,
+        flat_name: String,
+        arguments: String,
+    },
+    WebSearch {
+        item_id: String,
+        query: String,
+        output_index: i64,
+    },
+    Ignored,
+}
+
+struct ResponsesStreamContext {
+    response_id: String,
+    created_at: i64,
+    model: String,
+    tool_kinds: ToolKindMap,
+    response_config: ResponsesResponseConfig,
+    sequence_number: i64,
+    next_output_index: i64,
+    blocks: HashMap<i64, StreamingBlock>,
+    output: Vec<Value>,
+    input_tokens: i64,
+    cache_creation_tokens: i64,
+    cached_tokens: i64,
+    output_tokens: i64,
+    reasoning_tokens: i64,
+    credit_usage: Option<f64>,
+    credit_unit: Option<String>,
+    credit_unit_plural: Option<String>,
+    stop_reason: Option<String>,
+    saw_message_stop: bool,
+    terminal: bool,
+}
+
+impl ResponsesStreamContext {
+    fn new(
+        model: String,
+        tool_kinds: ToolKindMap,
+        response_config: ResponsesResponseConfig,
+    ) -> Self {
+        Self {
+            response_id: new_resp_id(),
+            created_at: now_ts(),
+            model,
+            tool_kinds,
+            response_config,
+            sequence_number: 0,
+            next_output_index: 0,
+            blocks: HashMap::new(),
+            output: Vec::new(),
+            input_tokens: 0,
+            cache_creation_tokens: 0,
+            cached_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            credit_usage: None,
+            credit_unit: None,
+            credit_unit_plural: None,
+            stop_reason: None,
+            saw_message_stop: false,
+            terminal: false,
+        }
+    }
+
+    fn initial_events(&mut self) -> Vec<Bytes> {
+        let response = json!({
+            "id": self.response_id,
+            "object": "response",
+            "created_at": self.created_at,
+            "status": "in_progress",
+            "model": self.model,
+            "output": [],
+        });
+        vec![
+            self.emit("response.created", json!({ "response": response.clone() })),
+            self.emit("response.in_progress", json!({ "response": response })),
+        ]
+    }
+
+    fn emit(&mut self, event_type: &str, mut payload: Value) -> Bytes {
+        payload["type"] = json!(event_type);
+        payload["sequence_number"] = json!(self.sequence_number);
+        self.sequence_number += 1;
+        Bytes::from(format!("event: {event_type}\ndata: {}\n\n", payload))
+    }
+
+    fn allocate_output_index(&mut self) -> i64 {
+        let index = self.next_output_index;
+        self.next_output_index += 1;
+        index
+    }
+
+    fn handle_anthropic_event(&mut self, event: &str, data: Value) -> Vec<Bytes> {
+        if self.terminal {
+            return Vec::new();
+        }
+        // The hosted web-search loop carries unsigned provider reasoning as an
+        // out-of-band field on the next standard event. Consume it first so the
+        // Responses reasoning item precedes the visible answer/tool item.
+        let mut events = data
+            .get("kiro_thinking")
+            .and_then(Value::as_str)
+            .filter(|thinking| !thinking.is_empty())
+            .map(|thinking| self.emit_reasoning_summary(thinking))
+            .unwrap_or_default();
+        let translated = match event {
+            "message_start" => {
+                if let Some(usage) = data.pointer("/message/usage") {
+                    self.update_usage(usage);
+                }
+                Vec::new()
+            }
+            "content_block_start" => self.handle_block_start(&data),
+            "content_block_delta" => self.handle_block_delta(&data),
+            "content_block_stop" => self.handle_block_stop(&data),
+            "message_delta" => {
+                if let Some(usage) = data.get("usage") {
+                    self.update_usage(usage);
+                }
+                self.stop_reason = data
+                    .pointer("/delta/stop_reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                Vec::new()
+            }
+            "message_stop" => {
+                self.saw_message_stop = true;
+                self.finish()
+            }
+            "error" => {
+                let error_type = data
+                    .pointer("/error/type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("server_error");
+                let message = data
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("upstream stream failed");
+                vec![self.fail(error_type, message)]
+            }
+            "ping" => vec![Bytes::from(": ping\n\n")],
+            _ => Vec::new(),
+        };
+        events.extend(translated);
+        events
+    }
+
+    fn handle_block_start(&mut self, data: &Value) -> Vec<Bytes> {
+        let Some(index) = data.get("index").and_then(Value::as_i64) else {
+            return Vec::new();
+        };
+        let block = data.get("content_block").unwrap_or(&Value::Null);
+        let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
+        let state = match block_type {
+            "text" => StreamingBlock::Text {
+                item_id: new_msg_id(),
+                output_index: None,
+                text: String::new(),
+            },
+            "thinking" => StreamingBlock::Reasoning {
+                item_id: new_rs_id(),
+                output_index: None,
+                text: String::new(),
+            },
+            "tool_use" => StreamingBlock::Tool {
+                call_id: block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                flat_name: block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                arguments: String::new(),
+            },
+            "server_tool_use"
+                if block.get("name").and_then(Value::as_str) == Some("web_search") =>
+            {
+                let item_id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(new_fc_id);
+                let query = block
+                    .pointer("/input/query")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let output_index = self.allocate_output_index();
+                let added = json!({
+                    "type": "web_search_call",
+                    "id": item_id,
+                    "status": "in_progress",
+                    "action": { "type": "search", "query": query },
+                });
+                self.blocks.insert(
+                    index,
+                    StreamingBlock::WebSearch {
+                        item_id,
+                        query,
+                        output_index,
+                    },
+                );
+                return vec![self.emit(
+                    "response.output_item.added",
+                    json!({ "output_index": output_index, "item": added }),
+                )];
+            }
+            _ => StreamingBlock::Ignored,
+        };
+        self.blocks.insert(index, state);
+        Vec::new()
+    }
+
+    fn handle_block_delta(&mut self, data: &Value) -> Vec<Bytes> {
+        let Some(index) = data.get("index").and_then(Value::as_i64) else {
+            return Vec::new();
+        };
+        let delta = data.get("delta").unwrap_or(&Value::Null);
+        match delta.get("type").and_then(Value::as_str).unwrap_or("") {
+            "text_delta" => {
+                let text = delta.get("text").and_then(Value::as_str).unwrap_or("");
+                self.handle_text_delta(index, text)
+            }
+            "thinking_delta" => {
+                let text = delta.get("thinking").and_then(Value::as_str).unwrap_or("");
+                self.handle_reasoning_delta(index, text)
+            }
+            "input_json_delta" => {
+                if let Some(StreamingBlock::Tool { arguments, .. }) = self.blocks.get_mut(&index) {
+                    arguments.push_str(
+                        delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                    );
+                }
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn handle_text_delta(&mut self, index: i64, delta: &str) -> Vec<Bytes> {
+        if delta.is_empty() {
+            return Vec::new();
+        }
+        let needs_start = matches!(
+            self.blocks.get(&index),
+            Some(StreamingBlock::Text {
+                output_index: None,
+                ..
+            })
+        );
+        if needs_start {
+            let output_index = self.allocate_output_index();
+            if let Some(StreamingBlock::Text {
+                output_index: block_index,
+                ..
+            }) = self.blocks.get_mut(&index)
+            {
+                *block_index = Some(output_index);
+            }
+        }
+        let Some(StreamingBlock::Text {
+            item_id,
+            output_index: Some(output_index),
+            text,
+        }) = self.blocks.get_mut(&index)
+        else {
+            return Vec::new();
+        };
+        let first = text.is_empty();
+        text.push_str(delta);
+        let item_id = item_id.clone();
+        let output_index = *output_index;
+        let mut events = Vec::new();
+        if first {
+            events.push(self.emit(
+                "response.output_item.added",
+                json!({ "output_index": output_index, "item": {
+                    "type": "message", "id": item_id, "status": "in_progress",
+                    "role": "assistant", "content": [],
+                }}),
+            ));
+            events.push(self.emit(
+                "response.content_part.added",
+                json!({
+                    "item_id": item_id, "output_index": output_index, "content_index": 0,
+                    "part": { "type": "output_text", "text": "", "annotations": [] },
+                }),
+            ));
+        }
+        events.push(self.emit(
+            "response.output_text.delta",
+            json!({
+                "item_id": item_id, "output_index": output_index,
+                "content_index": 0, "delta": delta,
+            }),
+        ));
+        events
+    }
+
+    fn handle_reasoning_delta(&mut self, index: i64, delta: &str) -> Vec<Bytes> {
+        if delta.is_empty() {
+            return Vec::new();
+        }
+        let needs_start = matches!(
+            self.blocks.get(&index),
+            Some(StreamingBlock::Reasoning {
+                output_index: None,
+                ..
+            })
+        );
+        if needs_start {
+            let output_index = self.allocate_output_index();
+            if let Some(StreamingBlock::Reasoning {
+                output_index: block_index,
+                ..
+            }) = self.blocks.get_mut(&index)
+            {
+                *block_index = Some(output_index);
+            }
+        }
+        let Some(StreamingBlock::Reasoning {
+            item_id,
+            output_index: Some(output_index),
+            text,
+        }) = self.blocks.get_mut(&index)
+        else {
+            return Vec::new();
+        };
+        let first = text.is_empty();
+        text.push_str(delta);
+        let item_id = item_id.clone();
+        let output_index = *output_index;
+        let mut events = Vec::new();
+        if first {
+            events.push(self.emit(
+                "response.output_item.added",
+                json!({ "output_index": output_index, "item": {
+                    "type": "reasoning", "id": item_id, "summary": [],
+                }}),
+            ));
+        }
+        events.push(self.emit(
+            "response.reasoning_summary_text.delta",
+            json!({
+                "item_id": item_id, "output_index": output_index,
+                "summary_index": 0, "delta": delta,
+            }),
+        ));
+        events
+    }
+
+    fn handle_block_stop(&mut self, data: &Value) -> Vec<Bytes> {
+        let Some(index) = data.get("index").and_then(Value::as_i64) else {
+            return Vec::new();
+        };
+        match self.blocks.remove(&index) {
+            Some(StreamingBlock::Text {
+                item_id,
+                output_index: Some(output_index),
+                text,
+            }) => self.finish_text(item_id, output_index, text),
+            Some(StreamingBlock::Reasoning {
+                item_id,
+                output_index: Some(output_index),
+                text,
+            }) => self.finish_reasoning(item_id, output_index, text),
+            Some(StreamingBlock::Tool {
+                call_id,
+                flat_name,
+                arguments,
+            }) => self.finish_tool(call_id, flat_name, arguments),
+            Some(StreamingBlock::WebSearch {
+                item_id,
+                query,
+                output_index,
+            }) => self.finish_web_search(item_id, query, output_index),
+            _ => Vec::new(),
+        }
+    }
+
+    fn finish_text(&mut self, item_id: String, output_index: i64, text: String) -> Vec<Bytes> {
+        let item = json!({
+            "type": "message", "id": item_id, "status": "completed",
+            "role": "assistant", "content": [{
+                "type": "output_text", "text": text, "annotations": [],
+            }],
+        });
+        self.output.push(item.clone());
+        vec![
+            self.emit(
+                "response.output_text.done",
+                json!({
+                    "item_id": item_id, "output_index": output_index,
+                    "content_index": 0, "text": text,
+                }),
+            ),
+            self.emit(
+                "response.content_part.done",
+                json!({
+                    "item_id": item_id, "output_index": output_index, "content_index": 0,
+                    "part": { "type": "output_text", "text": text, "annotations": [] },
+                }),
+            ),
+            self.emit(
+                "response.output_item.done",
+                json!({ "output_index": output_index, "item": item }),
+            ),
+        ]
+    }
+
+    fn finish_reasoning(&mut self, item_id: String, output_index: i64, text: String) -> Vec<Bytes> {
+        let item = json!({
+            "type": "reasoning", "id": item_id,
+            "summary": [{ "type": "summary_text", "text": text }],
+        });
+        self.output.push(item.clone());
+        vec![
+            self.emit(
+                "response.reasoning_summary_text.done",
+                json!({
+                    "item_id": item_id, "output_index": output_index,
+                    "summary_index": 0, "text": text,
+                }),
+            ),
+            self.emit(
+                "response.output_item.done",
+                json!({ "output_index": output_index, "item": item }),
+            ),
+        ]
+    }
+
+    /// Translate the hosted web-search loop's out-of-band reasoning extension.
+    /// It deliberately does not use an Anthropic `thinking` block because those
+    /// require a provider signature when replayed by Anthropic clients.
+    fn emit_reasoning_summary(&mut self, text: &str) -> Vec<Bytes> {
+        let item_id = new_rs_id();
+        let output_index = self.allocate_output_index();
+        let item = json!({
+            "type": "reasoning", "id": item_id,
+            "summary": [{ "type": "summary_text", "text": text }],
+        });
+        self.output.push(item.clone());
+        vec![
+            self.emit(
+                "response.output_item.added",
+                json!({ "output_index": output_index, "item": {
+                    "type": "reasoning", "id": item_id, "summary": [],
+                }}),
+            ),
+            self.emit(
+                "response.reasoning_summary_text.delta",
+                json!({
+                    "item_id": item_id, "output_index": output_index,
+                    "summary_index": 0, "delta": text,
+                }),
+            ),
+            self.emit(
+                "response.reasoning_summary_text.done",
+                json!({
+                    "item_id": item_id, "output_index": output_index,
+                    "summary_index": 0, "text": text,
+                }),
+            ),
+            self.emit(
+                "response.output_item.done",
+                json!({ "output_index": output_index, "item": item }),
+            ),
+        ]
+    }
+
+    fn finish_tool(
+        &mut self,
+        call_id: String,
+        flat_name: String,
+        mut arguments: String,
+    ) -> Vec<Bytes> {
+        if arguments.trim().is_empty() {
+            arguments = "{}".to_string();
+        }
+        let output_index = self.allocate_output_index();
+        let decl = self.tool_kinds.get(&flat_name);
+        let (name, namespace, kind) = match decl {
+            Some(d) => (d.name.clone(), d.namespace.clone(), d.kind),
+            None => (flat_name, None, DeclaredToolKind::Function),
+        };
+        let (item, added, delta_event, done_event, done_key, value) = match kind {
+            DeclaredToolKind::Custom => {
+                let input = custom_input_text(&arguments);
+                let mut item = json!({
+                    "type": "custom_tool_call", "id": new_ctc_id(),
+                    "call_id": call_id, "name": name, "input": input,
+                    "status": "completed",
+                });
+                if let Some(ns) = namespace {
+                    item["namespace"] = json!(ns);
+                }
+                let mut added = item.clone();
+                added["status"] = json!("in_progress");
+                (
+                    item,
+                    added,
+                    "response.custom_tool_call_input.delta",
+                    "response.custom_tool_call_input.done",
+                    "input",
+                    input,
+                )
+            }
+            DeclaredToolKind::Function => {
+                let mut item = json!({
+                    "type": "function_call", "id": new_fc_id(),
+                    "call_id": call_id, "name": name, "arguments": arguments,
+                    "status": "completed",
+                });
+                if let Some(ns) = namespace {
+                    item["namespace"] = json!(ns);
+                }
+                let mut added = item.clone();
+                added["status"] = json!("in_progress");
+                added["arguments"] = json!("");
+                (
+                    item,
+                    added,
+                    "response.function_call_arguments.delta",
+                    "response.function_call_arguments.done",
+                    "arguments",
+                    arguments,
+                )
+            }
+        };
+        let item_id = item["id"].as_str().unwrap_or("").to_string();
+        self.output.push(item.clone());
+        let mut delta_payload = json!({
+            "item_id": item_id,
+            "output_index": output_index,
+        });
+        delta_payload["delta"] = json!(value);
+        let mut done_payload = json!({
+            "item_id": item_id,
+            "output_index": output_index,
+        });
+        done_payload[done_key] = json!(value);
+        vec![
+            self.emit(
+                "response.output_item.added",
+                json!({ "output_index": output_index, "item": added }),
+            ),
+            self.emit(delta_event, delta_payload),
+            self.emit(done_event, done_payload),
+            self.emit(
+                "response.output_item.done",
+                json!({ "output_index": output_index, "item": item }),
+            ),
+        ]
+    }
+
+    fn finish_web_search(
+        &mut self,
+        item_id: String,
+        query: String,
+        output_index: i64,
+    ) -> Vec<Bytes> {
+        let item = json!({
+            "type": "web_search_call", "id": item_id, "status": "completed",
+            "action": { "type": "search", "query": query },
+        });
+        self.output.push(item.clone());
+        vec![self.emit(
+            "response.output_item.done",
+            json!({ "output_index": output_index, "item": item }),
+        )]
+    }
+
+    fn update_usage(&mut self, usage: &Value) {
+        if let Some(value) = usage.get("input_tokens").and_then(Value::as_i64) {
+            self.input_tokens = value.max(0);
+        }
+        if let Some(value) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_i64)
+        {
+            self.cache_creation_tokens = value.max(0);
+        }
+        if let Some(value) = usage.get("output_tokens").and_then(Value::as_i64) {
+            self.output_tokens = value.max(0);
+        }
+        if let Some(value) = usage.get("cache_read_input_tokens").and_then(Value::as_i64) {
+            self.cached_tokens = value.max(0);
+        }
+        if let Some(value) = usage.get("reasoning_tokens").and_then(Value::as_i64) {
+            self.reasoning_tokens = value.max(0);
+        }
+        if let Some(value) = usage.get("credit_usage").and_then(Value::as_f64) {
+            self.credit_usage = Some(value);
+        }
+        if let Some(value) = usage.get("credit_unit").and_then(Value::as_str) {
+            self.credit_unit = Some(value.to_string());
+        }
+        if let Some(value) = usage.get("credit_unit_plural").and_then(Value::as_str) {
+            self.credit_unit_plural = Some(value.to_string());
+        }
+    }
+
+    fn usage(&self) -> Value {
+        let total_input_tokens = self
+            .input_tokens
+            .saturating_add(self.cache_creation_tokens)
+            .saturating_add(self.cached_tokens);
+        let mut usage = json!({
+            "input_tokens": total_input_tokens,
+            "input_tokens_details": { "cached_tokens": self.cached_tokens },
+            "output_tokens": self.output_tokens,
+            "output_tokens_details": { "reasoning_tokens": self.reasoning_tokens },
+            "total_tokens": total_input_tokens.saturating_add(self.output_tokens),
+        });
+        if let Some(value) = self.credit_usage {
+            usage["credit_usage"] = json!(value);
+        }
+        if let Some(value) = &self.credit_unit {
+            usage["credit_unit"] = json!(value);
+        }
+        if let Some(value) = &self.credit_unit_plural {
+            usage["credit_unit_plural"] = json!(value);
+        }
+        usage
+    }
+
+    fn response_object(&self, status: &str) -> Value {
+        let mut response = json!({
+            "id": self.response_id,
+            "object": "response",
+            "created_at": self.created_at,
+            "status": status,
+            "model": self.model,
+            "output": self.output,
+            "usage": self.usage(),
+            "parallel_tool_calls": self.response_config.parallel_tool_calls,
+            "tool_choice": self.response_config.tool_choice,
+            "tools": self.response_config.tools,
+        });
+        if status == "incomplete" {
+            response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+        }
+        response
+    }
+
+    fn finish(&mut self) -> Vec<Bytes> {
+        if self.terminal {
+            return Vec::new();
+        }
+        if !self.saw_message_stop {
+            return vec![self.fail("server_error", "upstream stream ended before message_stop")];
+        }
+        let incomplete = matches!(
+            self.stop_reason.as_deref(),
+            Some("max_tokens" | "model_context_window_exceeded")
+        );
+        let status = if incomplete {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        let event = if incomplete {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
+        self.terminal = true;
+        vec![self.emit(event, json!({ "response": self.response_object(status) }))]
+    }
+
+    fn fail(&mut self, error_type: &str, message: &str) -> Bytes {
+        self.terminal = true;
+        let mut response = self.response_object("failed");
+        response["error"] = json!({
+            "code": error_type,
+            "message": message,
+        });
+        self.emit("response.failed", json!({ "response": response }))
+    }
+}
+
+fn responses_streaming_response(
+    body: Body,
+    model: String,
+    tool_kinds: ToolKindMap,
+    response_config: ResponsesResponseConfig,
+) -> Response {
+    let mut context = ResponsesStreamContext::new(model, tool_kinds, response_config);
+    let pending = VecDeque::from(context.initial_events());
+    let stream = stream::unfold(
+        (
+            body.into_data_stream(),
+            Vec::<u8>::new(),
+            context,
+            pending,
+            false,
+        ),
+        |(mut body, mut buffer, mut context, mut pending, mut finished)| async move {
+            loop {
+                if let Some(bytes) = pending.pop_front() {
+                    return Some((
+                        Ok::<Bytes, Infallible>(bytes),
+                        (body, buffer, context, pending, finished),
+                    ));
+                }
+                if finished || context.terminal {
+                    return None;
+                }
+                match body.next().await {
+                    Some(Ok(chunk)) => {
+                        buffer.extend_from_slice(&chunk);
+                        for frame in take_sse_frames(&mut buffer) {
+                            if context.terminal {
+                                break;
+                            }
+                            match parse_sse_frame(&frame) {
+                                Ok(Some((event, data))) => {
+                                    pending.extend(context.handle_anthropic_event(&event, data))
+                                }
+                                Ok(None) => {}
+                                Err(message) => {
+                                    pending.push_back(context.fail("server_error", &message))
+                                }
+                            }
+                        }
+                    }
+                    Some(Err(error)) => {
+                        pending.push_back(context.fail(
+                            "upstream_error",
+                            &format!("failed to read upstream stream: {error}"),
+                        ));
+                        finished = true;
+                    }
+                    None => {
+                        if buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                            pending.push_back(
+                                context
+                                    .fail("server_error", "upstream sent an incomplete SSE frame"),
+                            );
+                        } else {
+                            pending.extend(context.finish());
+                        }
+                        finished = true;
+                    }
+                }
+            }
+        },
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+fn take_sse_frames(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    loop {
+        let lf = buffer.windows(2).position(|window| window == b"\n\n");
+        let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+        let delimiter = match (lf, crlf) {
+            (Some(a), Some(b)) if a <= b => Some((a, 2)),
+            (Some(_), Some(b)) => Some((b, 4)),
+            (Some(a), None) => Some((a, 2)),
+            (None, Some(b)) => Some((b, 4)),
+            (None, None) => None,
+        };
+        let Some((position, length)) = delimiter else {
+            break;
+        };
+        let frame = buffer.drain(..position).collect::<Vec<_>>();
+        buffer.drain(..length);
+        if frame.iter().any(|byte| !byte.is_ascii_whitespace()) {
+            frames.push(frame);
+        }
+    }
+    frames
+}
+
+fn parse_sse_frame(frame: &[u8]) -> Result<Option<(String, Value)>, String> {
+    let text = std::str::from_utf8(frame)
+        .map_err(|error| format!("upstream sent invalid UTF-8 SSE: {error}"))?;
+    let mut event = None;
+    let mut data_lines = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with(':') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("event:") {
+            event = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data_lines.push(value.trim_start());
+        }
+    }
+    let Some(event) = event else {
+        return Ok(None);
+    };
+    if event == "ping" {
+        return Ok(Some((event, json!({ "type": "ping" }))));
+    }
+    let data = serde_json::from_str::<Value>(&data_lines.join("\n"))
+        .map_err(|error| format!("failed to parse upstream SSE event {event}: {error}"))?;
+    Ok(Some((event, data)))
 }
 
 /// 把完整结果合成为 Responses SSE 事件序列
@@ -923,6 +1857,7 @@ fn build_responses_object(p: &ParsedResponse, kinds: &ToolKindMap) -> Value {
 /// codex 只从 `response.output_item.done` 构建回合内容（`.added` 用于进度
 /// 展示，`response.completed` 只取 id/usage），所以每个 item 只要保证
 /// added/done 成对且 done 携带完整内容即可。delta 事件是锦上添花。
+#[cfg(test)]
 fn build_responses_sse(p: &ParsedResponse, kinds: &ToolKindMap) -> String {
     let view = build_view(p, kinds);
     let resp_id = new_resp_id();
@@ -1146,7 +2081,8 @@ fn build_responses_sse(p: &ParsedResponse, kinds: &ToolKindMap) -> String {
     }
 
     // response.completed（完整对象含 usage）
-    let final_obj = build_response_object_from(p, &view, &resp_id);
+    let final_obj =
+        build_response_object_from(p, &view, &resp_id, &ResponsesResponseConfig::default());
     let completed_event = if view.status == "incomplete" {
         "response.incomplete"
     } else {
@@ -1274,6 +2210,28 @@ mod tests {
             .unwrap_or_default()
     }
 
+    fn event_text(events: Vec<Bytes>) -> String {
+        events
+            .into_iter()
+            .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap())
+            .collect()
+    }
+
+    fn feed_event(context: &mut ResponsesStreamContext, event: &str, data: Value) -> String {
+        event_text(context.handle_anthropic_event(event, data))
+    }
+
+    fn sequence_numbers(sse: &str) -> Vec<i64> {
+        sse.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| {
+                serde_json::from_str::<Value>(data).unwrap()["sequence_number"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect()
+    }
+
     // ---- 请求方向：工具声明转换 ----
 
     #[test]
@@ -1301,7 +2259,7 @@ mod tests {
         let tools = anth.tools.as_ref().unwrap();
         assert!(tools.iter().any(|t| t.name == "exec"));
         assert!(tools.iter().any(|t| t.name == "wait"));
-        assert!(tools.iter().any(|t| t.name == "web_search"));
+        assert!(!tools.iter().any(|t| t.name == "web_search"));
         assert!(!tools.iter().any(|t| t.name == "noop"));
         // additional_tools item 本身不进消息
         assert_eq!(anth.messages.len(), 1);
@@ -1372,6 +2330,85 @@ mod tests {
     }
 
     #[test]
+    fn tool_choice_none_disables_forwarded_tools() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "input": simple_input(),
+            "tools": [{ "type": "function", "name": "shell", "parameters": {} }],
+            "tool_choice": "none",
+        }))
+        .unwrap();
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
+        assert!(anth.tools.is_none());
+        assert_eq!(anth.tool_choice, Some(json!({"type": "none"})));
+    }
+
+    #[test]
+    fn namespaced_tool_choice_is_flattened() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "input": simple_input(),
+            "tools": [{
+                "type": "namespace",
+                "name": "collaboration",
+                "tools": [{ "type": "function", "name": "spawn_agent", "parameters": {} }]
+            }],
+            "tool_choice": {
+                "type": "function",
+                "name": "spawn_agent",
+                "namespace": "collaboration"
+            },
+        }))
+        .unwrap();
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
+        assert_eq!(
+            anth.tool_choice,
+            Some(json!({"type": "tool", "name": "collaboration__spawn_agent"}))
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_enables_non_stream_reasoning_extraction() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "input": simple_input(),
+            "reasoning": { "effort": "medium" },
+        }))
+        .unwrap();
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
+        assert!(anth.thinking.as_ref().is_some_and(Thinking::is_enabled));
+        assert_eq!(anth.output_config.as_ref().unwrap().effort, "medium");
+    }
+
+    #[test]
+    fn malformed_historical_function_arguments_are_rejected() {
+        let req = req_with(
+            json!([]),
+            json!([
+                { "type": "message", "role": "user", "content": "go" },
+                { "type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{" },
+            ]),
+        );
+        let error = responses_to_anthropic(req, None).unwrap_err();
+        assert!(error.contains("invalid JSON arguments"));
+    }
+
+    #[test]
+    fn response_metadata_preserves_request_controls() {
+        let config = ResponsesResponseConfig {
+            parallel_tool_calls: false,
+            tool_choice: json!("required"),
+            tools: vec![json!({ "type": "function", "name": "shell" })],
+        };
+        let mut p = parsed_with_tool_calls(vec![]);
+        p.text = "done".to_string();
+        let response = build_responses_object_with_config(&p, &ToolKindMap::new(), &config);
+        assert_eq!(response["parallel_tool_calls"], json!(false));
+        assert_eq!(response["tool_choice"], json!("required"));
+        assert_eq!(response["tools"][0]["name"], json!("shell"));
+    }
+
+    #[test]
     fn custom_tool_declared_maps_to_wrapper_and_kind() {
         let req = req_with(
             json!([{
@@ -1388,7 +2425,7 @@ mod tests {
             Some(DeclaredToolKind::Custom)
         );
 
-        let tools = anth.tools.unwrap();
+        let tools = anth.tools.as_ref().unwrap();
         let ap = tools.iter().find(|t| t.name == "apply_patch").unwrap();
         // 包装 schema：单个 input 字符串字段
         let props = ap.input_schema.get("properties").unwrap();
@@ -1398,10 +2435,8 @@ mod tests {
         assert!(ap.description.contains("Apply a patch."));
         assert!(ap.description.contains("lark grammar"));
         assert!(ap.description.contains("start: PATCH"));
-        // 原生 web_search 注入，noop 不再存在
-        assert!(tools.iter().any(
-            |t| t.name == "web_search" && t.tool_type.as_deref() == Some("web_search_20250305")
-        ));
+        // 普通本地工具不应触发缓冲式 WebSearch loop。
+        assert!(!tools.iter().any(|t| t.name == "web_search"));
         assert!(!tools.iter().any(|t| t.name == "noop"));
     }
 
@@ -1425,7 +2460,7 @@ mod tests {
             kinds.get("shell").map(|d| d.kind),
             Some(DeclaredToolKind::Function)
         );
-        let tools = anth.tools.unwrap();
+        let tools = anth.tools.as_ref().unwrap();
         let shell = tools.iter().find(|t| t.name == "shell").unwrap();
         assert_eq!(shell.input_schema.get("type").unwrap(), &json!("object"));
         assert!(
@@ -1439,38 +2474,25 @@ mod tests {
     }
 
     #[test]
-    fn noop_fallback_when_no_codex_tools() {
+    fn no_tools_remains_toolless() {
         let req = req_with(json!([]), simple_input());
         let (anth, kinds) = responses_to_anthropic(req, None).unwrap();
         assert!(kinds.is_empty());
-        let tools = anth.tools.as_ref().unwrap();
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["noop", "web_search"]);
-        // 严格提示保留
-        let sys = system_texts(&anth);
-        assert!(
-            sys.iter().any(|t| t.contains("Do not call any other tool")),
-            "strict nudge must be kept for tool-less flows"
-        );
+        assert!(anth.tools.is_none());
+        assert!(system_texts(&anth).is_empty());
     }
 
     #[test]
-    fn nudge_softened_when_codex_tools_present() {
+    fn local_tools_do_not_add_web_search_nudge() {
         let req = req_with(
             json!([{ "type": "function", "name": "shell", "parameters": {} }]),
             simple_input(),
         );
         let (anth, _) = responses_to_anthropic(req, None).unwrap();
-        let sys = system_texts(&anth);
-        assert!(
-            !sys.iter().any(|t| t.contains("Do not call any other tool")),
-            "strict nudge must be removed when codex tools are forwarded"
-        );
-        assert!(
-            sys.iter()
-                .any(|t| t.contains("Use your other tools normally")),
-            "soft nudge must be present"
-        );
+        let tools = anth.tools.as_ref().unwrap();
+        assert!(tools.iter().any(|tool| tool.name == "shell"));
+        assert!(!tools.iter().any(|tool| tool.name == "web_search"));
+        assert!(system_texts(&anth).is_empty());
     }
 
     #[test]
@@ -1503,10 +2525,41 @@ mod tests {
             simple_input(),
         );
         let (anth, _) = responses_to_anthropic(req, None).unwrap();
-        let tools = anth.tools.unwrap();
+        let tools = anth.tools.as_ref().unwrap();
         let ws: Vec<&Tool> = tools.iter().filter(|t| t.name == "web_search").collect();
         assert_eq!(ws.len(), 1);
         assert_eq!(ws[0].tool_type.as_deref(), Some("web_search_20250305"));
+        assert!(
+            system_texts(&anth)
+                .iter()
+                .any(|text| text.contains("Use your other tools normally"))
+        );
+    }
+
+    #[test]
+    fn hosted_web_search_without_local_tools_uses_agentic_loop_pair() {
+        let req = req_with(json!([{ "type": "web_search" }]), simple_input());
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
+        let tools = anth.tools.as_ref().unwrap();
+        let names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(names, vec!["noop", "web_search"]);
+        assert!(
+            system_texts(&anth)
+                .iter()
+                .any(|text| text.contains("Do not call any other tool"))
+        );
+    }
+
+    #[test]
+    fn stream_flag_is_forwarded_to_messages_request() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "input": simple_input(),
+            "stream": true,
+        }))
+        .unwrap();
+        let (anth, _) = responses_to_anthropic(req, None).unwrap();
+        assert!(anth.stream);
     }
 
     // ---- 请求方向：input item 回放 ----
@@ -1699,6 +2752,337 @@ mod tests {
     }
 
     // ---- 响应方向：SSE ----
+
+    #[test]
+    fn streaming_text_preserves_each_delta_and_completes_with_usage() {
+        let mut context = ResponsesStreamContext::new(
+            "gpt-5.6-sol".into(),
+            ToolKindMap::new(),
+            ResponsesResponseConfig::default(),
+        );
+        let mut sse = event_text(context.initial_events());
+        sse.push_str(&feed_event(
+            &mut context,
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": { "usage": { "input_tokens": 7 } },
+            }),
+        ));
+        sse.push_str(&feed_event(
+            &mut context,
+            "content_block_start",
+            json!({
+                "type": "content_block_start", "index": 0,
+                "content_block": { "type": "text", "text": "" },
+            }),
+        ));
+        let first = feed_event(
+            &mut context,
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": { "type": "text_delta", "text": "hel" },
+            }),
+        );
+        assert!(first.contains("response.output_text.delta"));
+        assert!(first.contains("\"delta\":\"hel\""));
+        assert!(!first.contains("response.output_text.done"));
+        sse.push_str(&first);
+
+        let second = feed_event(
+            &mut context,
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": { "type": "text_delta", "text": "lo" },
+            }),
+        );
+        assert_eq!(
+            second.matches("event: response.output_text.delta").count(),
+            1
+        );
+        assert!(second.contains("\"delta\":\"lo\""));
+        sse.push_str(&second);
+        sse.push_str(&feed_event(
+            &mut context,
+            "content_block_stop",
+            json!({ "type": "content_block_stop", "index": 0 }),
+        ));
+        sse.push_str(&feed_event(
+            &mut context,
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn" },
+                "usage": {
+                    "output_tokens": 3,
+                    "cache_read_input_tokens": 2,
+                    "credit_usage": 0.25,
+                    "credit_unit": "credit",
+                    "credit_unit_plural": "credits"
+                },
+            }),
+        ));
+        sse.push_str(&feed_event(
+            &mut context,
+            "message_stop",
+            json!({ "type": "message_stop" }),
+        ));
+
+        assert_eq!(sse.matches("event: response.output_text.delta").count(), 2);
+        assert!(sse.contains("\"text\":\"hello\""));
+        assert!(sse.contains("event: response.completed"));
+        assert!(sse.contains("\"input_tokens\":9"));
+        assert!(sse.contains("\"output_tokens\":3"));
+        assert!(sse.contains("\"cached_tokens\":2"));
+        assert!(sse.contains("\"credit_usage\":0.25"));
+        let sequences = sequence_numbers(&sse);
+        assert_eq!(sequences, (0..sequences.len() as i64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn streaming_tool_waits_for_complete_json_and_restores_custom_namespace() {
+        let mut kinds = ToolKindMap::new();
+        kinds.insert(
+            "collaboration__apply_patch".into(),
+            DeclaredTool {
+                kind: DeclaredToolKind::Custom,
+                name: "apply_patch".into(),
+                namespace: Some("collaboration".into()),
+            },
+        );
+        let mut context = ResponsesStreamContext::new(
+            "gpt-5.6-sol".into(),
+            kinds,
+            ResponsesResponseConfig::default(),
+        );
+        context.initial_events();
+        assert!(
+            feed_event(
+                &mut context,
+                "content_block_start",
+                json!({
+                    "type": "content_block_start", "index": 1,
+                    "content_block": {
+                        "type": "tool_use", "id": "toolu_1",
+                        "name": "collaboration__apply_patch", "input": {}
+                    },
+                }),
+            )
+            .is_empty()
+        );
+        assert!(
+            feed_event(
+                &mut context,
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta", "index": 1,
+                    "delta": { "type": "input_json_delta", "partial_json": "{\"input\":\"PATCH" },
+                }),
+            )
+            .is_empty()
+        );
+        assert!(
+            feed_event(
+                &mut context,
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta", "index": 1,
+                    "delta": { "type": "input_json_delta", "partial_json": " BODY\"}" },
+                }),
+            )
+            .is_empty()
+        );
+        let completed = feed_event(
+            &mut context,
+            "content_block_stop",
+            json!({ "type": "content_block_stop", "index": 1 }),
+        );
+        assert!(completed.contains("response.custom_tool_call_input.delta"));
+        assert!(completed.contains("response.custom_tool_call_input.done"));
+        assert!(completed.contains("\"input\":\"PATCH BODY\""));
+        assert!(completed.contains("\"name\":\"apply_patch\""));
+        assert!(completed.contains("\"namespace\":\"collaboration\""));
+        assert!(completed.contains("\"call_id\":\"toolu_1\""));
+        assert!(!completed.contains("\"done_key\""));
+    }
+
+    #[test]
+    fn streaming_error_maps_to_failed_without_completed() {
+        let mut context = ResponsesStreamContext::new(
+            "gpt-5.6-sol".into(),
+            ToolKindMap::new(),
+            ResponsesResponseConfig::default(),
+        );
+        let mut sse = event_text(context.initial_events());
+        sse.push_str(&feed_event(
+            &mut context,
+            "error",
+            json!({
+                "type": "error",
+                "error": { "type": "api_error", "message": "broken upstream" },
+            }),
+        ));
+        sse.push_str(&event_text(context.finish()));
+        assert!(sse.contains("event: response.failed"));
+        assert!(sse.contains("broken upstream"));
+        assert!(sse.contains("\"code\":\"api_error\""));
+        assert!(!sse.contains("event: response.completed"));
+    }
+
+    #[test]
+    fn streaming_usage_includes_uncached_created_and_read_cache_tokens() {
+        let mut context = ResponsesStreamContext::new(
+            "gpt-5.6-sol".into(),
+            ToolKindMap::new(),
+            ResponsesResponseConfig::default(),
+        );
+        context.update_usage(&json!({
+            "input_tokens": 3,
+            "cache_creation_input_tokens": 4,
+            "cache_read_input_tokens": 7,
+            "output_tokens": 5
+        }));
+
+        let usage = context.usage();
+        assert_eq!(usage["input_tokens"], json!(14));
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], json!(7));
+        assert_eq!(usage["output_tokens"], json!(5));
+        assert_eq!(usage["total_tokens"], json!(19));
+    }
+
+    #[test]
+    fn hosted_web_search_thinking_becomes_a_responses_reasoning_item() {
+        let mut context = ResponsesStreamContext::new(
+            "gpt-5.6-sol".into(),
+            ToolKindMap::new(),
+            ResponsesResponseConfig::default(),
+        );
+        let sse = feed_event(
+            &mut context,
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 2},
+                "kiro_thinking": "search reasoning"
+            }),
+        );
+
+        assert!(sse.contains("event: response.reasoning_summary_text.delta"));
+        assert!(sse.contains("event: response.reasoning_summary_text.done"));
+        assert!(sse.contains("search reasoning"));
+        assert_eq!(context.output.len(), 1);
+        assert_eq!(context.output[0]["type"], json!("reasoning"));
+    }
+
+    #[test]
+    fn hosted_web_search_reasoning_precedes_final_answer_item() {
+        let mut context = ResponsesStreamContext::new(
+            "gpt-5.6-sol".into(),
+            ToolKindMap::new(),
+            ResponsesResponseConfig::default(),
+        );
+        context.initial_events();
+        let started = feed_event(
+            &mut context,
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": 2,
+                "content_block": {"type": "text", "text": ""},
+                "kiro_thinking": "search reasoning"
+            }),
+        );
+        let answer = feed_event(
+            &mut context,
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": 2,
+                "delta": {"type": "text_delta", "text": "final answer"}
+            }),
+        );
+
+        assert!(started.contains("response.reasoning_summary_text.done"));
+        assert!(answer.contains("response.output_text.delta"));
+        assert_eq!(context.next_output_index, 2);
+        assert!(started.contains("\"output_index\":0"));
+        assert!(answer.contains("\"output_index\":1"));
+    }
+
+    #[tokio::test]
+    async fn message_stop_completes_without_waiting_for_upstream_eof() {
+        let upstream = stream::iter([Ok::<Bytes, Infallible>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ))])
+        .chain(stream::pending());
+        let response = responses_streaming_response(
+            Body::from_stream(upstream),
+            "gpt-5.6-sol".into(),
+            ToolKindMap::new(),
+            ResponsesResponseConfig::default(),
+        );
+        let mut body = response.into_body().into_data_stream();
+
+        let mut output = String::new();
+        while !output.contains("event: response.completed") {
+            let chunk = tokio::time::timeout(std::time::Duration::from_millis(100), body.next())
+                .await
+                .expect("response.completed must not wait for upstream EOF")
+                .expect("stream must emit response.completed")
+                .unwrap();
+            output.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        let end = tokio::time::timeout(std::time::Duration::from_millis(100), body.next())
+            .await
+            .expect("translated stream must terminate after message_stop");
+        assert!(end.is_none());
+    }
+
+    #[test]
+    fn streaming_max_tokens_maps_to_incomplete() {
+        let mut context = ResponsesStreamContext::new(
+            "gpt-5.6-sol".into(),
+            ToolKindMap::new(),
+            ResponsesResponseConfig::default(),
+        );
+        context.initial_events();
+        feed_event(
+            &mut context,
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "max_tokens" },
+                "usage": { "output_tokens": 12 },
+            }),
+        );
+        let sse = feed_event(
+            &mut context,
+            "message_stop",
+            json!({ "type": "message_stop" }),
+        );
+        assert!(sse.contains("event: response.incomplete"));
+        assert!(sse.contains("\"reason\":\"max_output_tokens\""));
+    }
+
+    #[test]
+    fn sse_parser_handles_chunk_boundaries_and_crlf() {
+        let mut buffer = b"event: ping\r\ndata: {}\r\n\r".to_vec();
+        assert!(take_sse_frames(&mut buffer).is_empty());
+        buffer.extend_from_slice(b"\nevent: message_stop\n");
+        let first = take_sse_frames(&mut buffer);
+        assert_eq!(first.len(), 1);
+        assert_eq!(parse_sse_frame(&first[0]).unwrap().unwrap().0, "ping");
+        buffer.extend_from_slice(b"data: {\"type\":\"message_stop\"}\n\n");
+        let second = take_sse_frames(&mut buffer);
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            parse_sse_frame(&second[0]).unwrap().unwrap().0,
+            "message_stop"
+        );
+    }
 
     #[test]
     fn sse_contains_custom_item_events_with_full_input() {

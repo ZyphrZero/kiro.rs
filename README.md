@@ -282,7 +282,7 @@ export KIRO_RS_API_KEY='sk-kiro-rs-...'
 codex
 ```
 
-两个 OpenAI 端点都会复用现有的模型映射、凭据故障转移和用量计量链路。当前实现会先取得完整的内部非流式响应，再为 `stream: true` 合成 SSE，因此不是逐 token 的上游实时流。Responses 端点不会把 Codex 的 `exec`、`shell`、`apply_patch` 等本地执行工具声明转发给 Kiro；时效性查询由服务端的 Kiro MCP WebSearch 处理。
+两个 OpenAI 端点都会复用现有的模型映射、凭据故障转移和用量计量链路。`/v1/responses` 在 `stream: true` 时会复用 Anthropic 流式链路，将上游 SSE 事件增量转换为 Responses SSE，而不是等待完整响应后再合成；WebSearch 多轮调用期间也会持续发送搜索进度和保活事件。Responses 端点会将 Codex 声明的 function、custom 和 namespace 工具（包括 `additional_tools`）转换后转发给 Kiro，并将工具调用还原为对应的 Responses 事件；hosted `web_search` 则由服务端的 Kiro MCP WebSearch 处理。
 
 <a id="api-routes"></a>
 ## API 路由

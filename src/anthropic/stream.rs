@@ -1331,6 +1331,41 @@ impl SseStateManager {
 
         events
     }
+
+    /// 生成异常终止事件序列。
+    ///
+    /// 流已经开始后无法再修改 HTTP 状态码，因此先关闭仍处于打开状态的内容块，
+    /// 再发送 Anthropic `error` 事件。异常路径不能发送 `message_delta` 或
+    /// `message_stop`，否则下游会把中断的响应误判为正常完成。
+    pub fn generate_error_events(&mut self, error_type: &str, message: &str) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+
+        for (index, block) in self.active_blocks.iter_mut() {
+            if block.started && !block.stopped {
+                events.push(SseEvent::new(
+                    "content_block_stop",
+                    json!({
+                        "type": "content_block_stop",
+                        "index": index
+                    }),
+                ));
+                block.stopped = true;
+            }
+        }
+
+        self.message_ended = true;
+        events.push(SseEvent::new(
+            "error",
+            json!({
+                "type": "error",
+                "error": {
+                    "type": error_type,
+                    "message": message
+                }
+            }),
+        ));
+        events
+    }
 }
 
 use super::converter::get_context_window_size;
@@ -2517,6 +2552,15 @@ impl StreamContext {
             self.state_manager.set_stop_reason("error");
         }
 
+        // 工具调用 JSON 错误必须直接以异常终态结束，不能先发送正常的
+        // message_delta/message_stop，否则 Responses 等下游会把请求标记为 completed。
+        if let Some(err) = &self.tool_json_error {
+            let error_type = err.error_type();
+            let message = err.message();
+            events.extend(self.generate_error_events(error_type, &message));
+            return events;
+        }
+
         // 精确 metadata 真值优先；缺失时才使用 contextUsage/估算回退。
         let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
         let final_output_tokens = self.resolved_output_tokens();
@@ -2530,21 +2574,19 @@ impl StreamContext {
             self.metering.as_ref(),
         ));
 
-        // 工具调用 JSON 错误：在最终事件之后补一个 Anthropic `error` 事件，明确告知
-        // 客户端本次工具调用因上游半截 / 非法 JSON 未被转发（实时流已返回 200，无法再改状态码）。
-        if let Some(err) = &self.tool_json_error {
-            events.push(SseEvent::new(
-                "error",
-                json!({
-                    "type": "error",
-                    "error": {
-                        "type": err.error_type(),
-                        "message": err.message()
-                    }
-                }),
-            ));
-        }
+        events
+    }
 
+    /// 上游响应体读取失败时生成异常终态，不 flush 可能已被截断的缓冲内容。
+    pub fn generate_error_events(&mut self, error_type: &str, message: &str) -> Vec<SseEvent> {
+        // Anthropic requires a signature_delta before a thinking block closes,
+        // including abnormal termination. Close it through the thinking-aware
+        // path first; the generic state manager then closes any other blocks.
+        let mut events = self.close_open_thinking_block();
+        events.extend(
+            self.state_manager
+                .generate_error_events(error_type, message),
+        );
         events
     }
 }
@@ -2779,6 +2821,37 @@ mod tests {
         ));
         // 已取出残留后再 finish() 应成功。
         assert!(acc.finish().is_ok());
+    }
+
+    #[test]
+    fn incomplete_tool_json_ends_stream_with_error_only() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let emitted = ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+            "t1",
+            "read_file",
+            "{\"path\":\"/a",
+            false,
+        )));
+        assert!(emitted.is_empty(), "partial tool JSON must remain buffered");
+
+        let final_events = ctx.generate_final_events();
+        assert_eq!(final_events.last().unwrap().event, "error");
+        assert_eq!(
+            final_events.last().unwrap().data["error"]["type"],
+            json!("upstream_tool_json_error")
+        );
+        assert!(
+            final_events
+                .iter()
+                .all(|event| event.event != "message_delta" && event.event != "message_stop")
+        );
     }
 
     #[test]
@@ -3485,6 +3558,47 @@ mod tests {
             pos_sig.unwrap() < pos_stop.unwrap(),
             "signature_delta must precede content_block_stop"
         );
+    }
+
+    #[test]
+    fn error_termination_signs_thinking_before_stop() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let mut events =
+            ctx.process_reasoning_content(&crate::kiro::model::events::ReasoningContentEvent {
+                text: Some("unfinished reasoning".to_string()),
+                signature: None,
+                redacted_content: None,
+            });
+        events.extend(ctx.generate_error_events("upstream_error", "stream interrupted"));
+
+        let thinking_index = ctx.thinking_block_index.unwrap();
+        let signature = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_delta"
+                    && event.data["index"] == thinking_index
+                    && event.data["delta"]["type"] == "signature_delta"
+            })
+            .expect("thinking error close must include a signature");
+        let stop = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_stop" && event.data["index"] == thinking_index
+            })
+            .expect("thinking block must close");
+        let error = events
+            .iter()
+            .position(|event| event.event == "error")
+            .expect("stream must end with error");
+        assert!(signature < stop && stop < error);
+        assert!(events.iter().all(|event| event.event != "message_stop"));
     }
 
     #[test]
@@ -5197,6 +5311,35 @@ mod tests {
         // 既有字段保持原样
         assert_eq!(usage["input_tokens"], json!(10));
         assert_eq!(usage["output_tokens"], json!(5));
+    }
+
+    #[test]
+    fn error_events_close_open_blocks_without_normal_message_terminal() {
+        let mut manager = SseStateManager::new();
+        let _ = manager.handle_content_block_start(
+            0,
+            "text",
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }),
+        );
+
+        let events = manager.generate_error_events("upstream_error", "stream interrupted");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["content_block_stop", "error"]
+        );
+        assert_eq!(events[1].data["error"]["type"], json!("upstream_error"));
+        assert!(
+            events
+                .iter()
+                .all(|event| { event.event != "message_delta" && event.event != "message_stop" })
+        );
     }
 
     #[test]
