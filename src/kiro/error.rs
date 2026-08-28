@@ -7,6 +7,13 @@ pub struct UpstreamRateLimitError {
     retry_after: Option<String>,
 }
 
+/// Kiro rejected the serialized conversation because it exceeded the model's
+/// context limit. Keeping this typed at the provider boundary lets compact
+/// retry once without reverse-engineering an HTTP error response.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("upstream context window exceeded")]
+pub struct UpstreamContextOverflowError;
+
 impl UpstreamRateLimitError {
     pub(crate) fn new(retry_after: Option<String>) -> Self {
         Self {
