@@ -31,7 +31,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request_with_mode};
+use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
@@ -467,6 +467,14 @@ fn infer_model_owner(model_id: &str) -> &'static str {
     }
 }
 
+fn context_window_from_upstream(model_id: &str, token_limits: Option<&TokenLimits>) -> i32 {
+    token_limits
+        .and_then(|limits| limits.max_input_tokens)
+        .and_then(|limit| i32::try_from(limit).ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or_else(|| get_context_window_size(model_id))
+}
+
 fn model_from_upstream(upstream: UpstreamModel) -> Model {
     let max_tokens = upstream
         .token_limits
@@ -475,6 +483,8 @@ fn model_from_upstream(upstream: UpstreamModel) -> Model {
         .and_then(|limit| i32::try_from(limit).ok())
         .filter(|limit| *limit > 0)
         .unwrap_or(64_000);
+    let context_window =
+        context_window_from_upstream(&upstream.model_id, upstream.token_limits.as_ref());
     Model {
         display_name: upstream
             .model_name
@@ -485,6 +495,7 @@ fn model_from_upstream(upstream: UpstreamModel) -> Model {
         object: "model".to_string(),
         created: 0,
         model_type: "chat".to_string(),
+        context_window,
         max_tokens,
     }
 }
@@ -532,6 +543,9 @@ fn aggregate_available_models_with_custom(
                 .clone()
                 .unwrap_or_else(|| custom.id.clone()),
             model_type: "chat".to_string(),
+            context_window: custom
+                .context_window
+                .unwrap_or_else(|| get_context_window_size(&custom.id)),
             max_tokens: custom.max_tokens.unwrap_or(64_000),
         };
         models.insert(model.id.clone(), model);
@@ -1144,8 +1158,6 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
         },
     }
 }
-
-use super::converter::get_context_window_size;
 
 /// 处理非流式请求
 async fn handle_non_stream_request(
@@ -2449,6 +2461,7 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].display_name, "GLM 5");
         assert_eq!(models[0].owned_by, "kiro");
+        assert_eq!(models[0].context_window, 1_000_000);
         assert_eq!(models[0].max_tokens, 32_000);
     }
 
@@ -2479,6 +2492,7 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].display_name, "Configured GPT");
         assert_eq!(models[0].owned_by, "configured-owner");
+        assert_eq!(models[0].context_window, 500_000);
         assert_eq!(models[0].max_tokens, 12_345);
     }
 
