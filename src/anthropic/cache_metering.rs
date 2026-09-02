@@ -159,20 +159,23 @@ impl CacheMeter {
     pub fn lookup_and_renew(&self, hash: u64) -> Option<u32> {
         let now = now_secs();
         let mut inner = self.inner.lock();
-        let hit = match inner.entries.get_mut(&hash) {
-            Some(entry) if entry.expires_at > now => {
+        let tokens = if let Some(entry) = inner.entries.get_mut(&hash) {
+            if entry.expires_at > now {
                 let ttl = entry.ttl_secs.clamp(60, MAX_TTL_SECS);
                 entry.ttl_secs = ttl;
                 entry.last_hit_at = now;
                 entry.expires_at = now + ttl;
                 Some(entry.tokens)
+            } else {
+                None
             }
-            _ => None,
+        } else {
+            None
         };
-        if hit.is_some() {
+        if tokens.is_some() {
             inner.dirty = true;
         }
-        hit
+        tokens
     }
 
     /// 写入单个断点条目，按指定的 ttl_secs 设置过期时间
@@ -285,14 +288,7 @@ pub type SharedCacheMeter = Arc<CacheMeter>;
 // ============================================================================
 
 use super::stream::estimate_tokens;
-use super::types::{CacheControl, MessagesRequest, Tool};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PromptSection {
-    Tool,
-    System,
-    Message,
-}
+use super::types::{CacheControl, MessagesRequest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LookbackGroup {
@@ -303,7 +299,6 @@ enum LookbackGroup {
 /// 协议层打平后的一个 Prompt Block
 #[derive(Debug, Clone)]
 struct PromptBlock {
-    section: PromptSection,
     signature: Vec<u8>,
     tokens: u32,
     cache_control: Option<CacheControl>,
@@ -328,10 +323,10 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
         for t in tools {
             let value = serde_json::to_value(t).unwrap_or(serde_json::Value::Null);
             let content = without_cache_control(&value);
+            let serialized = serde_json::to_string(&content).unwrap_or_default();
             blocks.push(PromptBlock {
-                section: PromptSection::Tool,
                 signature: prompt_block_signature("tool", None, &content),
-                tokens: estimate_tokens(&tool_token_text(t)).max(0) as u32,
+                tokens: estimate_tokens(&serialized).max(0) as u32,
                 cache_control: t.cache_control.clone(),
                 invalid_cache_control: false,
                 cacheable: true,
@@ -346,7 +341,6 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
             let value = serde_json::to_value(sys).unwrap_or(serde_json::Value::Null);
             let content = without_cache_control(&value);
             blocks.push(PromptBlock {
-                section: PromptSection::System,
                 signature: prompt_block_signature("system", None, &content),
                 tokens: estimate_tokens(&sys.text).max(0) as u32,
                 cache_control: sys.cache_control.clone(),
@@ -363,7 +357,6 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
             serde_json::Value::String(s) => {
                 let content = serde_json::Value::String(s.clone());
                 blocks.push(PromptBlock {
-                    section: PromptSection::Message,
                     signature: prompt_block_signature("message", Some(&msg.role), &content),
                     tokens: estimate_tokens(s).max(0) as u32,
                     cache_control: None,
@@ -389,7 +382,6 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                         _ => None,
                     };
                     blocks.push(PromptBlock {
-                        section: PromptSection::Message,
                         signature: prompt_block_signature("message", Some(&msg.role), &content),
                         tokens: block_tokens(&content),
                         cache_control,
@@ -521,12 +513,7 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
     let mut cum_hashes = Vec::with_capacity(blocks.len());
     let mut current_cum: u32 = 0;
 
-    let mut message_context_hashed = false;
     for b in &blocks {
-        if b.section == PromptSection::Message && !message_context_hashed {
-            hash_frame(&mut hasher, &request_message_cache_context(req));
-            message_context_hashed = true;
-        }
         hash_frame(&mut hasher, &b.signature);
         current_cum = current_cum.saturating_add(b.tokens);
         cum_tokens.push(current_cum);
@@ -609,11 +596,6 @@ fn extract_session_id(user_id: &str) -> Option<String> {
         .split_once("_session_")
         .map(|(_, sid)| sid.trim().to_string())
         .filter(|s| !s.is_empty())
-}
-
-fn tool_token_text(t: &Tool) -> String {
-    let schema = serde_json::to_string(&t.input_schema).unwrap_or_default();
-    format!("{} {} {}", t.name, t.description, schema)
 }
 
 fn validated_ttl(cache_control: &CacheControl) -> Option<i64> {
@@ -699,23 +681,9 @@ fn request_global_cache_context(req: &MessagesRequest) -> Vec<u8> {
     });
     serde_json::to_vec(&serde_json::json!({
         "model": req.model,
+        "tool_choice": req.tool_choice,
         "thinking": thinking,
         "output_config": output_config,
-    }))
-    .unwrap_or_default()
-}
-
-fn request_message_cache_context(req: &MessagesRequest) -> Vec<u8> {
-    let has_image = req.messages.iter().any(|message| {
-        message.content.as_array().is_some_and(|blocks| {
-            blocks
-                .iter()
-                .any(|block| block.get("type").and_then(|value| value.as_str()) == Some("image"))
-        })
-    });
-    serde_json::to_vec(&serde_json::json!({
-        "tool_choice": req.tool_choice,
-        "has_image": has_image,
     }))
     .unwrap_or_default()
 }
@@ -1482,75 +1450,146 @@ mod tests {
     fn structured_tool_fields_are_part_of_prefix_key() {
         use super::super::types::{CacheControl, Message, MessagesRequest};
 
-        let make = |path: &str, result: &str| MessagesRequest {
-            model: "claude-sonnet-4-5-20250929".to_string(),
-            max_tokens: 32,
-            messages: vec![
-                Message {
-                    role: "user".to_string(),
-                    content: serde_json::json!([{"type":"text","text":"inspect a file"}]),
-                },
-                Message {
-                    role: "assistant".to_string(),
-                    content: serde_json::json!([{
-                        "type": "tool_use",
-                        "id": "toolu_1",
-                        "name": "Read",
-                        "input": {"file_path": path}
-                    }]),
-                },
-                Message {
-                    role: "user".to_string(),
-                    content: serde_json::json!([{
-                        "type": "tool_result",
-                        "tool_use_id": "toolu_1",
-                        "content": result,
-                        "is_error": false
-                    }]),
-                },
-            ],
-            stream: false,
-            system: None,
-            tools: None,
-            tool_choice: None,
-            thinking: None,
-            output_config: None,
-            metadata: None,
-            cache_control: Some(CacheControl {
-                cache_type: "ephemeral".to_string(),
-                ttl: None,
-            }),
-        };
+        let make =
+            |name: &str, id: &str, path: &str, result: &str, is_error: bool| MessagesRequest {
+                model: "claude-sonnet-4-5-20250929".to_string(),
+                max_tokens: 32,
+                messages: vec![
+                    Message {
+                        role: "user".to_string(),
+                        content: serde_json::json!([{"type":"text","text":"inspect a file"}]),
+                    },
+                    Message {
+                        role: "assistant".to_string(),
+                        content: serde_json::json!([{
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": {"file_path": path}
+                        }]),
+                    },
+                    Message {
+                        role: "user".to_string(),
+                        content: serde_json::json!([{
+                            "type": "tool_result",
+                            "tool_use_id": id,
+                            "content": result,
+                            "is_error": is_error
+                        }]),
+                    },
+                ],
+                stream: false,
+                system: None,
+                tools: None,
+                tool_choice: None,
+                thinking: None,
+                output_config: None,
+                metadata: None,
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            };
 
         let identical_cache = CacheMeter::new(None);
-        let cold = compute_cache_usage(&identical_cache, &make("/a.rs", "alpha"), 1);
-        let warm = compute_cache_usage(&identical_cache, &make("/a.rs", "alpha"), 1);
+        let cold = compute_cache_usage(
+            &identical_cache,
+            &make("Read", "toolu_1", "/a.rs", "alpha", false),
+            1,
+        );
+        let warm = compute_cache_usage(
+            &identical_cache,
+            &make("Read", "toolu_1", "/a.rs", "alpha", false),
+            1,
+        );
         assert_eq!(warm.cache_read, cold.cache_covered_est);
 
         let changed_input_cache = CacheMeter::new(None);
-        compute_cache_usage(&changed_input_cache, &make("/a.rs", "alpha"), 1);
-        let changed_input = compute_cache_usage(&changed_input_cache, &make("/b.rs", "alpha"), 1);
+        compute_cache_usage(
+            &changed_input_cache,
+            &make("Read", "toolu_1", "/a.rs", "alpha", false),
+            1,
+        );
+        let changed_input = compute_cache_usage(
+            &changed_input_cache,
+            &make("Read", "toolu_1", "/b.rs", "alpha", false),
+            1,
+        );
         assert_eq!(
             changed_input.cache_read, 0,
             "tool_use.input 变化必须使前缀失效"
         );
 
         let changed_result_cache = CacheMeter::new(None);
-        compute_cache_usage(&changed_result_cache, &make("/a.rs", "alpha"), 1);
-        let changed_result = compute_cache_usage(&changed_result_cache, &make("/a.rs", "beta"), 1);
+        compute_cache_usage(
+            &changed_result_cache,
+            &make("Read", "toolu_1", "/a.rs", "alpha", false),
+            1,
+        );
+        let changed_result = compute_cache_usage(
+            &changed_result_cache,
+            &make("Read", "toolu_1", "/a.rs", "beta", false),
+            1,
+        );
         assert_eq!(
             changed_result.cache_read, 0,
             "tool_result.content 变化不得与旧断点产生虚假命中"
+        );
+
+        let changed_name_cache = CacheMeter::new(None);
+        compute_cache_usage(
+            &changed_name_cache,
+            &make("Read", "toolu_1", "/a.rs", "alpha", false),
+            1,
+        );
+        let changed_name = compute_cache_usage(
+            &changed_name_cache,
+            &make("Write", "toolu_1", "/a.rs", "alpha", false),
+            1,
+        );
+        assert_eq!(
+            changed_name.cache_read, 0,
+            "tool_use.name 变化必须使前缀失效"
+        );
+
+        let changed_id_cache = CacheMeter::new(None);
+        compute_cache_usage(
+            &changed_id_cache,
+            &make("Read", "toolu_1", "/a.rs", "alpha", false),
+            1,
+        );
+        let changed_id = compute_cache_usage(
+            &changed_id_cache,
+            &make("Read", "toolu_2", "/a.rs", "alpha", false),
+            1,
+        );
+        assert_eq!(changed_id.cache_read, 0, "tool_use.id 变化必须使前缀失效");
+
+        let changed_err_cache = CacheMeter::new(None);
+        compute_cache_usage(
+            &changed_err_cache,
+            &make("Read", "toolu_1", "/a.rs", "alpha", false),
+            1,
+        );
+        let changed_err = compute_cache_usage(
+            &changed_err_cache,
+            &make("Read", "toolu_1", "/a.rs", "alpha", true),
+            1,
+        );
+        assert_eq!(
+            changed_err.cache_read, 0,
+            "tool_result.is_error 变化必须使前缀失效"
         );
     }
 
     #[test]
     fn request_configuration_changes_invalidate_prefix() {
-        use super::super::types::{CacheControl, Message, MessagesRequest, Thinking};
+        use super::super::types::{CacheControl, Message, MessagesRequest, OutputConfig, Thinking};
 
         let make = |model: &str,
                     tool_choice: Option<serde_json::Value>,
-                    budget_tokens: Option<i32>| MessagesRequest {
+                    budget_tokens: Option<i32>,
+                    effort: Option<&str>| MessagesRequest {
             model: model.to_string(),
             max_tokens: 32,
             messages: vec![Message {
@@ -1565,7 +1604,9 @@ mod tests {
                 thinking_type: "enabled".to_string(),
                 budget_tokens,
             }),
-            output_config: None,
+            output_config: effort.map(|effort| OutputConfig {
+                effort: effort.to_string(),
+            }),
             metadata: None,
             cache_control: Some(CacheControl {
                 cache_type: "ephemeral".to_string(),
@@ -1574,116 +1615,55 @@ mod tests {
         };
 
         let model_cache = CacheMeter::new(None);
-        compute_cache_usage(&model_cache, &make("model-a", None, None), 1);
+        compute_cache_usage(&model_cache, &make("model-a", None, None, None), 1);
         assert_eq!(
-            compute_cache_usage(&model_cache, &make("model-b", None, None), 1).cache_read,
-            0
+            compute_cache_usage(&model_cache, &make("model-b", None, None, None), 1).cache_read,
+            0,
+            "model 变化必须 miss"
         );
 
         let tool_choice_cache = CacheMeter::new(None);
-        compute_cache_usage(&tool_choice_cache, &make("model-a", None, None), 1);
+        compute_cache_usage(&tool_choice_cache, &make("model-a", None, None, None), 1);
         assert_eq!(
             compute_cache_usage(
                 &tool_choice_cache,
-                &make("model-a", Some(serde_json::json!({"type":"auto"})), None),
+                &make(
+                    "model-a",
+                    Some(serde_json::json!({"type":"auto"})),
+                    None,
+                    None
+                ),
                 1,
             )
             .cache_read,
-            0
+            0,
+            "tool_choice 变化必须 miss"
         );
 
         let thinking_cache = CacheMeter::new(None);
-        compute_cache_usage(&thinking_cache, &make("model-a", None, Some(1024)), 1);
+        compute_cache_usage(&thinking_cache, &make("model-a", None, Some(1024), None), 1);
         assert_eq!(
-            compute_cache_usage(&thinking_cache, &make("model-a", None, Some(2048)), 1).cache_read,
-            0
+            compute_cache_usage(&thinking_cache, &make("model-a", None, Some(2048), None), 1)
+                .cache_read,
+            0,
+            "thinking 变化必须 miss"
         );
-    }
 
-    #[test]
-    fn tool_choice_change_preserves_system_cache() {
-        use super::super::types::{CacheControl, Message, MessagesRequest, SystemMessage};
-
-        let make = |tool_choice: Option<serde_json::Value>| MessagesRequest {
-            model: "model-a".to_string(),
-            max_tokens: 32,
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: serde_json::json!("new request"),
-            }],
-            stream: false,
-            system: Some(vec![SystemMessage {
-                text: "stable system prompt ".repeat(50),
-                cache_control: Some(CacheControl {
-                    cache_type: "ephemeral".to_string(),
-                    ttl: None,
-                }),
-            }]),
-            tools: None,
-            tool_choice,
-            thinking: None,
-            output_config: None,
-            metadata: None,
-            cache_control: None,
-        };
-
-        let cache = CacheMeter::new(None);
-        let cold = compute_cache_usage(&cache, &make(None), 1);
-        let warm = compute_cache_usage(&cache, &make(Some(serde_json::json!({"type": "auto"}))), 1);
-        assert_eq!(
-            warm.cache_read, cold.cache_covered_est,
-            "tool_choice 变化只应使 message 缓存失效"
-        );
-    }
-
-    #[test]
-    fn image_presence_invalidates_message_cache() {
-        use super::super::types::{Message, MessagesRequest};
-
-        let make = |tail: serde_json::Value| MessagesRequest {
-            model: "model-a".to_string(),
-            max_tokens: 32,
-            messages: vec![
-                Message {
-                    role: "user".to_string(),
-                    content: serde_json::json!([{
-                        "type": "text",
-                        "text": "stable message prefix",
-                        "cache_control": {"type": "ephemeral"}
-                    }]),
-                },
-                Message {
-                    role: "user".to_string(),
-                    content: tail,
-                },
-            ],
-            stream: false,
-            system: None,
-            tools: None,
-            tool_choice: None,
-            thinking: None,
-            output_config: None,
-            metadata: None,
-            cache_control: None,
-        };
-
-        let cache = CacheMeter::new(None);
+        let output_config_cache = CacheMeter::new(None);
         compute_cache_usage(
-            &cache,
-            &make(serde_json::json!([{"type": "text", "text": "tail"}])),
-            1,
-        );
-        let with_image = compute_cache_usage(
-            &cache,
-            &make(serde_json::json!([{
-                "type": "image",
-                "source": {"type": "base64", "media_type": "image/png", "data": ""}
-            }])),
+            &output_config_cache,
+            &make("model-a", None, None, Some("high")),
             1,
         );
         assert_eq!(
-            with_image.cache_read, 0,
-            "图片存在性变化必须使 message 缓存失效"
+            compute_cache_usage(
+                &output_config_cache,
+                &make("model-a", None, None, Some("low")),
+                1
+            )
+            .cache_read,
+            0,
+            "output_config 变化必须 miss"
         );
     }
 
@@ -1698,7 +1678,9 @@ mod tests {
                 role: "assistant".to_string(),
                 content: serde_json::json!([
                     {"type":"text","text":"stable visible content"},
-                    {"type":"thinking","thinking":"not a direct breakpoint"}
+                    {"type":"thinking","thinking":"not a direct breakpoint"},
+                    {"type":"redacted_thinking","data":"redacted"},
+                    {"type":"text","text":""}
                 ]),
             }],
             stream: false,
@@ -1724,6 +1706,38 @@ mod tests {
         assert!(cold.prompt_total_est > cold.cache_covered_est);
         let warm = compute_cache_usage(&cache, &make(), 1);
         assert_eq!(warm.cache_read, cold.cache_covered_est);
+
+        // 全部 block 都不合格时，不模拟缓存
+        let all_ineligible = MessagesRequest {
+            model: "model-a".to_string(),
+            max_tokens: 32,
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type":"thinking","thinking":"cannot cache"},
+                    {"type":"redacted_thinking","data":"redacted"},
+                    {"type":"text","text":"   "}
+                ]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: Some(CacheControl {
+                cache_type: "ephemeral".to_string(),
+                ttl: None,
+            }),
+        };
+
+        let empty_cache = CacheMeter::new(None);
+        let res = compute_cache_usage(&empty_cache, &all_ineligible, 1);
+        assert_eq!(res.cache_covered_est, 0);
+        assert_eq!(res.cache_read, 0);
+        assert_eq!(empty_cache.len(), 0);
+        assert!(res.prompt_total_est > 0);
     }
 
     #[test]
@@ -1748,6 +1762,7 @@ mod tests {
                 cache_control: top_cache_control,
             };
 
+        // 1. 非 ephemeral 类型
         let invalid_type_cache = CacheMeter::new(None);
         let invalid_type = compute_cache_usage(
             &invalid_type_cache,
@@ -1763,6 +1778,7 @@ mod tests {
         assert_eq!(invalid_type.cache_covered_est, 0);
         assert_eq!(invalid_type_cache.len(), 0);
 
+        // 2. 显式 cache_control 在 thinking 上
         let thinking_cache = CacheMeter::new(None);
         let explicit_thinking = compute_cache_usage(
             &thinking_cache,
@@ -1779,6 +1795,41 @@ mod tests {
         assert_eq!(explicit_thinking.cache_covered_est, 0);
         assert_eq!(thinking_cache.len(), 0);
 
+        // 3. 显式 cache_control 在 redacted_thinking 上
+        let redacted_cache = CacheMeter::new(None);
+        let explicit_redacted = compute_cache_usage(
+            &redacted_cache,
+            &request(
+                serde_json::json!([{
+                    "type":"redacted_thinking",
+                    "data":"secret",
+                    "cache_control":{"type":"ephemeral"}
+                }]),
+                None,
+            ),
+            1,
+        );
+        assert_eq!(explicit_redacted.cache_covered_est, 0);
+        assert_eq!(redacted_cache.len(), 0);
+
+        // 4. 显式 cache_control 在空 text 上
+        let empty_text_cache = CacheMeter::new(None);
+        let explicit_empty = compute_cache_usage(
+            &empty_text_cache,
+            &request(
+                serde_json::json!([{
+                    "type":"text",
+                    "text":"",
+                    "cache_control":{"type":"ephemeral"}
+                }]),
+                None,
+            ),
+            1,
+        );
+        assert_eq!(explicit_empty.cache_covered_est, 0);
+        assert_eq!(empty_text_cache.len(), 0);
+
+        // 5. 顶层自动与显式 TTL 冲突 (5m vs 1h)
         let conflict_cache = CacheMeter::new(None);
         let conflict = compute_cache_usage(
             &conflict_cache,
@@ -1797,6 +1848,26 @@ mod tests {
         );
         assert_eq!(conflict.cache_covered_est, 0);
         assert_eq!(conflict_cache.len(), 0);
+
+        // 6. 顶层自动与显式同位置同 TTL (5m + 5m) 是 no-op，成功模拟
+        let noop_cache = CacheMeter::new(None);
+        let noop = compute_cache_usage(
+            &noop_cache,
+            &request(
+                serde_json::json!([{
+                    "type":"text",
+                    "text":"hello world",
+                    "cache_control":{"type":"ephemeral","ttl":"5m"}
+                }]),
+                Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: Some("5m".to_string()),
+                }),
+            ),
+            1,
+        );
+        assert!(noop.cache_covered_est > 0);
+        assert_eq!(noop_cache.len(), 1);
     }
 
     /// 代表性多轮会话 fixture：热缓存后自然产生 75%～90% 的 cache_read 占比目标
@@ -2180,6 +2251,7 @@ mod tests {
 
     #[test]
     fn tool_signature_stable_across_insert_order() {
+        use super::super::types::Tool;
         let build_tool = |insert_required_first: bool| {
             let mut schema = std::collections::BTreeMap::new();
             if insert_required_first {
