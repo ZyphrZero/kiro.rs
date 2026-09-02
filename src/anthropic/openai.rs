@@ -282,6 +282,7 @@ fn openai_to_anthropic(
         thinking: None,
         output_config,
         metadata,
+        cache_control: None,
     })
 }
 

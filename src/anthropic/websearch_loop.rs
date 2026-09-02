@@ -2248,6 +2248,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         }
     }
 

@@ -755,6 +755,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
 
         assert!(has_web_search_tool(&req));
@@ -795,6 +796,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
 
         // 多个工具时不应该被识别为纯 websearch 请求
@@ -837,6 +839,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
 
         // A regular client-defined tool can be named web_search, but only
@@ -866,6 +869,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
 
         let query = extract_search_query(&req);
@@ -891,6 +895,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
 
         let query = extract_search_query(&req);

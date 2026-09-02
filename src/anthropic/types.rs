@@ -129,6 +129,9 @@ pub struct MessagesRequest {
     pub output_config: Option<OutputConfig>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
+    /// 顶层 cache_control（开启自动提示词缓存）
+    #[serde(default)]
+    pub cache_control: Option<CacheControl>,
 }
 
 fn default_max_tokens() -> i32 {
@@ -335,5 +338,19 @@ mod tests {
     fn messages_request_preserves_explicit_max_tokens() {
         let request: MessagesRequest = serde_json::from_value(request_json(Some(4096))).unwrap();
         assert_eq!(request.max_tokens, 4096);
+    }
+
+    #[test]
+    fn messages_request_deserializes_top_level_cache_control() {
+        let json = serde_json::json!({
+            "model": "claude-sonnet-4.6",
+            "messages": [{"role": "user", "content": "hello"}],
+            "cache_control": {"type": "ephemeral", "ttl": "1h"}
+        });
+        let request: MessagesRequest = serde_json::from_value(json).unwrap();
+        assert!(request.cache_control.is_some());
+        let cc = request.cache_control.unwrap();
+        assert_eq!(cc.cache_type, "ephemeral");
+        assert_eq!(cc.ttl.as_deref(), Some("1h"));
     }
 }
