@@ -315,6 +315,21 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 pub(super) fn map_provider_error(err: Error) -> Response {
+    if err
+        .downcast_ref::<crate::kiro::error::UpstreamContextOverflowError>()
+        .is_some()
+    {
+        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Context window is full. Reduce conversation history, system prompt, or tools.",
+            )),
+        )
+            .into_response();
+    }
+
     if let Some(rate_limit) = err.downcast_ref::<crate::kiro::error::UpstreamRateLimitError>() {
         tracing::warn!(error = %err, "上游限流（映射为 429）");
         let mut response = (
@@ -721,6 +736,10 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
+                ConversionError::InvalidMessageSequence(reason) => (
+                    "invalid_request_error",
+                    format!("消息序列无效: {}", reason),
+                ),
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
@@ -1147,6 +1166,26 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
 
 use super::converter::get_context_window_size;
 
+pub(crate) enum NonStreamExecutionError {
+    Provider(Error),
+    Response(Response),
+}
+
+pub(crate) fn new_non_stream_request_tracer(
+    state: &AppState,
+    key_ctx: KeyContext,
+    model: String,
+) -> std::sync::Arc<RequestTracer> {
+    std::sync::Arc::new(RequestTracer::new(
+        state,
+        RequestTraceOptions {
+            key_ctx,
+            model,
+            is_stream: false,
+        },
+    ))
+}
+
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -1163,6 +1202,38 @@ async fn handle_non_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
+    match execute_non_stream_request(
+        provider,
+        request_body,
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        hook,
+        cache_usage,
+        tracer,
+        group,
+    )
+    .await
+    {
+        Ok(response_body) => (StatusCode::OK, Json(response_body)).into_response(),
+        Err(NonStreamExecutionError::Provider(error)) => map_provider_error(error),
+        Err(NonStreamExecutionError::Response(response)) => response,
+    }
+}
+
+pub(crate) async fn execute_non_stream_request(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: &str,
+    model: &str,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    hook: UsageRecordHook,
+    cache_usage: super::cache_metering::CacheUsage,
+    tracer: std::sync::Arc<RequestTracer>,
+    group: Option<String>,
+) -> Result<serde_json::Value, NonStreamExecutionError> {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
         .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
@@ -1178,7 +1249,7 @@ async fn handle_non_stream_request(
                 None,
                 TraceUsage::zero(),
             );
-            return map_provider_error(e);
+            return Err(NonStreamExecutionError::Provider(e));
         }
     };
     let response = call_result.response;
@@ -1197,14 +1268,16 @@ async fn handle_non_stream_request(
                 None,
                 TraceUsage::zero(),
             );
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    format!("读取响应失败: {}", e),
-                )),
-            )
-                .into_response();
+            return Err(NonStreamExecutionError::Response(
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse::new(
+                        "api_error",
+                        format!("读取响应失败: {}", e),
+                    )),
+                )
+                    .into_response(),
+            ));
         }
     };
 
@@ -1386,11 +1459,13 @@ async fn handle_non_stream_request(
                 TraceUsage::zero(),
             );
         }
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new("upstream_tool_json_error", message)),
-        )
-            .into_response();
+        return Err(NonStreamExecutionError::Response(
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new("upstream_tool_json_error", message)),
+            )
+                .into_response(),
+        ));
     }
 
     // 确定 stop_reason
@@ -1473,7 +1548,7 @@ async fn handle_non_stream_request(
             },
         },
     );
-    (StatusCode::OK, Json(response_body)).into_response()
+    Ok(response_body)
 }
 
 fn build_non_stream_content(
@@ -1710,6 +1785,10 @@ pub async fn post_messages_cc(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
+                ConversionError::InvalidMessageSequence(reason) => (
+                    "invalid_request_error",
+                    format!("消息序列无效: {}", reason),
+                ),
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
@@ -2281,6 +2360,21 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(resp.headers().get(header::RETRY_AFTER).is_none());
+    }
+
+    #[tokio::test]
+    async fn typed_context_overflow_maps_to_stable_400() {
+        let resp = map_provider_error(crate::kiro::error::UpstreamContextOverflowError.into());
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Context window is full"));
     }
 
     #[tokio::test]

@@ -57,6 +57,9 @@ use super::types::{
     Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Thinking, Tool,
 };
 
+#[path = "responses_compaction.rs"]
+mod compaction;
+
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
 const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
 
@@ -112,7 +115,7 @@ fn flat_tool_name(namespace: Option<&str>, name: &str) -> String {
 
 // ============================ 请求类型 ============================
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ResponsesRequest {
     pub model: String,
     #[serde(default)]
@@ -142,7 +145,7 @@ fn default_parallel_tool_calls() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ReasoningConfig {
     #[serde(default)]
     pub effort: Option<String>,
@@ -194,6 +197,16 @@ pub async fn post_responses(
     headers: HeaderMap,
     Json(req): Json<ResponsesRequest>,
 ) -> Response {
+    let operation = match compaction::classify(&req.input) {
+        Ok(operation) => operation,
+        Err(message) => {
+            return responses_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
+        }
+    };
+    if operation == compaction::Operation::RemoteCompact {
+        return compaction::handle(state, key_ctx, headers, req).await;
+    }
+
     let want_stream = req.stream;
     let model = req.model.clone();
     let response_config = ResponsesResponseConfig::from_request(&req);
@@ -678,8 +691,21 @@ fn translate_input_item(
             });
             push_merged(merged, "user", vec![block]);
         }
-        // 推理项 / 已完成的搜索展示项 / 压缩项：对 Anthropic 请求无意义，忽略
-        "reasoning" | "web_search_call" | "compaction" => {}
+        // 本代理生成的 compaction 项可还原为上一窗口的摘要；其它服务生成的
+        // opaque payload 无法解释，保持忽略。compaction_trigger 已由 handler 消费。
+        "compaction" => {
+            if let Some(summary) = item
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .and_then(compaction::decode_payload)
+            {
+                system.push(SystemMessage {
+                    text: compaction::restored_context(&summary),
+                    cache_control: None,
+                });
+            }
+        }
+        "reasoning" | "web_search_call" | "compaction_trigger" => {}
         // "message" 或未标注 type 但带 role 的项
         _ => {
             let role = item.get("role").and_then(|v| v.as_str());
@@ -823,7 +849,6 @@ fn new_ctc_id() -> String {
 fn new_rs_id() -> String {
     format!("rs_{}", Uuid::new_v4().to_string().replace('-', ""))
 }
-
 /// 从自由文本工具的 arguments JSON 里解出原始 input 字符串。
 ///
 /// 回退链：`{"input": <string>}` → 单字段字符串对象 → 原样返回 arguments。
@@ -2123,6 +2148,26 @@ mod tests {
     }
 
     #[test]
+    fn compaction_payload_round_trips_into_system_context() {
+        let summary = "implemented parser; next run integration tests";
+        let payload = compaction::encode_payload(summary);
+        let req = req_with(
+            json!([]),
+            json!([
+                {
+                    "id": "cmp_1",
+                    "type": "compaction",
+                    "encrypted_content": payload
+                },
+                { "type": "message", "role": "user", "content": "continue" }
+            ]),
+        );
+        let (anthropic, _) = responses_to_anthropic(req, None).unwrap();
+        let system = anthropic.system.unwrap();
+        assert!(system.iter().any(|part| part.text.contains(summary)));
+    }
+
+    #[test]
     fn responses_body_session_metadata_is_forwarded() {
         let req: ResponsesRequest = serde_json::from_value(json!({
             "model": "gpt-5.6-sol",
@@ -2175,6 +2220,7 @@ mod tests {
             model: "gpt-5.6-sol".to_string(),
             text: String::new(),
             tool_calls,
+            upstream_stop_reason: "tool_use".to_string(),
             finish_reason: "tool_calls".to_string(),
             prompt_tokens: 10,
             cached_tokens: 0,

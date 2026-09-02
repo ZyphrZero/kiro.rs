@@ -433,6 +433,9 @@ pub(super) struct ParsedResponse {
     pub(super) model: String,
     pub(super) text: String,
     pub(super) tool_calls: Vec<Value>, // OpenAI tool_calls
+    /// Anthropic/Kiro 的原始停止原因。`finish_reason` 是面向 OpenAI
+    /// completion 兼容层的归一化值，不能用于区分输出耗尽和上下文溢出。
+    pub(super) upstream_stop_reason: String,
     pub(super) finish_reason: String,
     pub(super) prompt_tokens: i64,
     pub(super) cached_tokens: i64,
@@ -570,6 +573,7 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
         model: model.to_string(),
         text,
         tool_calls,
+        upstream_stop_reason: stop_reason.to_string(),
         finish_reason,
         prompt_tokens,
         cached_tokens,
@@ -846,6 +850,7 @@ mod tests {
             model: "gpt-5.6-sol".to_string(),
             text: "hi".to_string(),
             tool_calls: Vec::new(),
+            upstream_stop_reason: "end_turn".to_string(),
             finish_reason: "stop".to_string(),
             prompt_tokens: 7,
             cached_tokens: 0,
@@ -952,6 +957,20 @@ mod tests {
         assert_eq!(p.prompt_tokens, 14);
         assert_eq!(p.cached_tokens, 7);
         assert_eq!(p.completion_tokens, 5);
+    }
+
+    #[test]
+    fn parse_anthropic_message_preserves_upstream_stop_reason() {
+        for reason in ["max_tokens", "model_context_window_exceeded"] {
+            let anthropic = json!({
+                "content": [{"type": "text", "text": "partial"}],
+                "stop_reason": reason,
+                "usage": {"input_tokens": 3, "output_tokens": 5}
+            });
+            let parsed = parse_anthropic_message(&anthropic, "gpt-5.6-sol");
+            assert_eq!(parsed.upstream_stop_reason, reason);
+            assert_eq!(parsed.finish_reason, "length");
+        }
     }
 
     #[test]
