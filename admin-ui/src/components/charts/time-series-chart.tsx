@@ -250,9 +250,7 @@ function chartLines() {
       dot={false}
       strokeWidth={s.kind === 'percent' ? 1.8 : 2}
       strokeDasharray={s.kind === 'percent' ? '4 4' : undefined}
-      isAnimationActive
-      animationDuration={550}
-      animationEasing="ease-out"
+      isAnimationActive={false}
     />
   ))
 }

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useDeferredValue, useCallback, useMemo } from "react";
 import {
   RefreshCw,
   LogOut,
@@ -352,6 +352,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [tierFilter, setTierFilter] = useState<Set<Tier>>(new Set());
   // 模糊搜索：按来源渠道（备注）/ 邮箱做大小写不敏感的子串匹配；空串 = 不限
   const [searchQuery, setSearchQuery] = useState("");
+  const deferredSearchQuery = useDeferredValue(searchQuery);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   // 快捷键支持：按下 '/' 或 'Cmd/Ctrl+K' 聚焦搜索框；'Esc' 快速清空并失焦
@@ -426,7 +427,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   };
 
   // 应用分组 + 分级筛选后的凭据全集（分页前先过滤，确保翻页粒度正确）
-  const filteredCredentials = (() => {
+  const filteredCredentials = useMemo(() => {
     const all = allCredentials;
     let out = all;
     if (groupFilter) {
@@ -440,7 +441,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         tierFilter.has(detectTier(c.balance?.subscriptionTitle)),
       );
     }
-    const q = searchQuery.trim().toLowerCase();
+    const q = deferredSearchQuery.trim().toLowerCase();
     if (q) {
       out = out.filter(
         (c) =>
@@ -449,9 +450,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       );
     }
     // 状态筛选：点状态账条某一段时只留该状态的凭据
-    //
-    // 合并说明：PR #56 曾用一个多选下拉「按状态隐藏」（hiddenStatuses）做同一件事。
-    // 状态账条把计数和筛选合到一处，交互更直接，故以账条取代该下拉；字段排序保留。
     if (stateFilter) {
       out = out.filter((c) =>
         matchesStateFilter(c, balanceMap.get(c.id) ?? c.balance, stateFilter),
@@ -491,7 +489,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       });
     }
     return out;
-  })();
+  }, [allCredentials, groupFilter, tierFilter, deferredSearchQuery, stateFilter, balanceMap, sortField, sortDir]);
 
   // 各状态计数（状态账条用）。基于全量凭据而非当前筛选结果 ——
   // 账条是导航器，点进某一段之后其余段的数字不该跟着变。
@@ -503,7 +501,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   // 切换分组 / 分级筛选 / 搜索 / 状态 / 排序时复位到第 1 页，避免空页
   useEffect(() => {
     setCurrentPage(1);
-  }, [groupFilter, tierFilter, searchQuery, stateFilter, sortField, sortDir]);
+  }, [groupFilter, tierFilter, deferredSearchQuery, stateFilter, sortField, sortDir]);
 
   // pageSize === 0 表示“全部”：单页容纳全部已筛选凭据
   const effectivePageSize =
@@ -624,7 +622,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   };
 
   const gridRef = useRef<HTMLElement | null>(null);
-  const rectSelection = useRectSelect({
+  useRectSelect({
     containerRef: gridRef,
     itemSelector: "[data-credential-id]",
     idAttribute: "credential-id",
@@ -728,12 +726,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
   }, [error]);
 
-  const toggleSelect = (id: number) => {
-    const next = new Set(selectedIds);
-    if (next.has(id)) next.delete(id);
-    else next.add(id);
-    setSelectedIds(next);
-  };
+  const toggleSelect = useCallback((id: number) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
   const deselectAll = () => setSelectedIds(new Set());
 
   /** 全选 / 取消全选当前页凭据。已选中其他页的不会被清除。 */
@@ -980,7 +980,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     else toast.warning(`查询完成：成功 ${s} 个，失败 ${f} 个`);
   };
 
-  const handleRefreshBalance = async (id: number) => {
+  const handleRefreshBalance = useCallback(async (id: number) => {
     setLoadingBalanceIds((prev) => {
       const n = new Set(prev);
       n.add(id);
@@ -1003,7 +1003,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         return n;
       });
     }
-  };
+  }, []);
 
   const handleBatchVerify = async () => {
     if (selectedIds.size === 0) {
@@ -2117,16 +2117,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       credential={credential}
                       view={viewMode}
                       selected={selectedIds.has(credential.id)}
-                      onToggleSelect={() => toggleSelect(credential.id)}
+                      onToggleSelect={toggleSelect}
                       balance={
                         balanceMap.get(credential.id) ||
                         credential.balance ||
                         null
                       }
                       loadingBalance={loadingBalanceIds.has(credential.id)}
-                      onRefreshBalance={() =>
-                        handleRefreshBalance(credential.id)
-                      }
+                      onRefreshBalance={handleRefreshBalance}
                       failureStats={failureStatsMap?.[String(credential.id)]}
                       dragDisabled={dragDisabled || credential.id === DEV_PREVIEW_CREDENTIAL.id}
                       preview={credential.id === DEV_PREVIEW_CREDENTIAL.id}
@@ -2437,17 +2435,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         </DialogContent>
       </Dialog>
 
-      {rectSelection.active && rectSelection.rect && (
-        <div
-          className="pointer-events-none fixed z-50 rounded-sm border border-primary/70 bg-primary/15"
-          style={{
-            left: rectSelection.rect.left,
-            top: rectSelection.rect.top,
-            width: rectSelection.rect.width,
-            height: rectSelection.rect.height,
-          }}
-        />
-      )}
       <BatchVerifyDialog
         open={verifyDialogOpen}
         onOpenChange={setVerifyDialogOpen}

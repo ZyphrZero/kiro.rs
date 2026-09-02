@@ -6,6 +6,7 @@ import { ConfirmProvider } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
 import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, SlidersHorizontal } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { tabFromHash } from "@/hooks/use-url-state";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -207,17 +208,19 @@ function LoggedInApp({
   tab,
 }: AppHeaderProps) {
   return (
-    <ConfirmProvider>
-      <AppHeader
-        darkMode={darkMode}
-        tab={tab}
-        onLogout={onLogout}
-        onSwitchTab={onSwitchTab}
-        onToggleDarkMode={onToggleDarkMode}
-      />
-      <AppMain tab={tab} onLogout={onLogout} />
-      <Toaster position="top-center" />
-    </ConfirmProvider>
+    <TooltipProvider delayDuration={150}>
+      <ConfirmProvider>
+        <AppHeader
+          darkMode={darkMode}
+          tab={tab}
+          onLogout={onLogout}
+          onSwitchTab={onSwitchTab}
+          onToggleDarkMode={onToggleDarkMode}
+        />
+        <AppMain tab={tab} onLogout={onLogout} />
+        <Toaster position="top-center" />
+      </ConfirmProvider>
+    </TooltipProvider>
   );
 }
 

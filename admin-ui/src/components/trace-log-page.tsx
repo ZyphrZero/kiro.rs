@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { toast } from 'sonner'
 import {
   ScrollText,
   RefreshCw,
@@ -9,13 +10,13 @@ import {
   Unplug,
   Search,
   X,
+  Copy,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
   Tooltip,
   TooltipContent,
-  TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import {
@@ -33,6 +34,7 @@ import {
   ConsoleTable,
   type ConsoleColumn,
 } from '@/components/console/data-table'
+import { BulkBar } from '@/components/console/bulk-bar'
 import {
   DetailDrawer,
   DrawerField,
@@ -214,39 +216,37 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
   if (cacheCreation > 0) rows.push(['缓存创建 Token', cacheCreation])
   if (cacheRead > 0) rows.push(['缓存读取 Token', cacheRead])
   return (
-    <TooltipProvider delayDuration={150}>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <span className="inline-flex items-center gap-1 font-mono tabular-nums cursor-default border-b border-dotted border-muted-foreground/40">
-            <span className="text-emerald-600 dark:text-emerald-400">
-              ↓{formatTokens(input + cacheCreation + cacheRead)}
-            </span>
-            <span className="text-violet-600 dark:text-violet-400">
-              ↑{formatTokens(output)}
-            </span>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="inline-flex items-center gap-1 font-mono tabular-nums cursor-default border-b border-dotted border-muted-foreground/40">
+          <span className="text-emerald-600 dark:text-emerald-400">
+            ↓{formatTokens(input + cacheCreation + cacheRead)}
           </span>
-        </TooltipTrigger>
-        <TooltipContent className="p-0">
-          <div className="min-w-[180px] px-3 py-2">
-            <div className="mb-1.5 text-[13px] font-semibold">Token 明细</div>
-            <div className="space-y-1 text-[12px]">
-              {rows.map(([label, val]) => (
-                <div key={label} className="flex items-center justify-between gap-6">
-                  <span className="text-muted-foreground">{label}</span>
-                  <span className="font-mono tabular-nums">{formatTokenFull(val)}</span>
-                </div>
-              ))}
-              <div className="mt-1 flex items-center justify-between gap-6 border-t border-border/50 pt-1">
-                <span className="font-medium">总 Token</span>
-                <span className="font-mono font-semibold tabular-nums">
-                  {formatTokenFull(total)}
-                </span>
+          <span className="text-violet-600 dark:text-violet-400">
+            ↑{formatTokens(output)}
+          </span>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent className="p-0">
+        <div className="min-w-[180px] px-3 py-2">
+          <div className="mb-1.5 text-[13px] font-semibold">Token 明细</div>
+          <div className="space-y-1 text-[12px]">
+            {rows.map(([label, val]) => (
+              <div key={label} className="flex items-center justify-between gap-6">
+                <span className="text-muted-foreground">{label}</span>
+                <span className="font-mono tabular-nums">{formatTokenFull(val)}</span>
               </div>
+            ))}
+            <div className="mt-1 flex items-center justify-between gap-6 border-t border-border/50 pt-1">
+              <span className="font-medium">总 Token</span>
+              <span className="font-mono font-semibold tabular-nums">
+                {formatTokenFull(total)}
+              </span>
             </div>
           </div>
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
+        </div>
+      </TooltipContent>
+    </Tooltip>
   )
 }
 
@@ -266,28 +266,26 @@ function AttemptChain({ rec }: { rec: TraceRecord }) {
     )
   }
   return (
-    <TooltipProvider delayDuration={150}>
-      <span className="inline-flex items-center gap-1">
-        {attempts.map((a, i) => (
-          <span key={a.attempt} className="inline-flex items-center gap-1">
-            {i > 0 && <span className="text-muted-foreground/40">→</span>}
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span className="inline-flex cursor-default items-center gap-1 rounded border border-border/60 bg-secondary/40 px-1.5 py-0.5 font-mono text-[11px] tabular-nums">
-                  <span className={`h-1.5 w-1.5 rounded-full ${outcomeDot(a.outcome)}`} />
-                  {a.credentialId > 0 ? `#${a.credentialId}` : '—'}
-                </span>
-              </TooltipTrigger>
-              <TooltipContent className="font-mono text-[11px]">
-                第 {a.attempt + 1} 跳 · {outcomeStyle(a.outcome).label}
-                {a.httpStatus != null ? ` · HTTP ${a.httpStatus}` : ''}
-                {a.endpoint ? ` · ${a.endpoint}` : ''} · {formatDuration(a.durationMs)}
-              </TooltipContent>
-            </Tooltip>
-          </span>
-        ))}
-      </span>
-    </TooltipProvider>
+    <span className="inline-flex items-center gap-1">
+      {attempts.map((a, i) => (
+        <span key={a.attempt} className="inline-flex items-center gap-1">
+          {i > 0 && <span className="text-muted-foreground/40">→</span>}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="inline-flex cursor-default items-center gap-1 rounded border border-border/60 bg-secondary/40 px-1.5 py-0.5 font-mono text-[11px] tabular-nums">
+                <span className={`h-1.5 w-1.5 rounded-full ${outcomeDot(a.outcome)}`} />
+                {a.credentialId > 0 ? `#${a.credentialId}` : '—'}
+              </span>
+            </TooltipTrigger>
+            <TooltipContent className="font-mono text-[11px]">
+              第 {a.attempt + 1} 跳 · {outcomeStyle(a.outcome).label}
+              {a.httpStatus != null ? ` · HTTP ${a.httpStatus}` : ''}
+              {a.endpoint ? ` · ${a.endpoint}` : ''} · {formatDuration(a.durationMs)}
+            </TooltipContent>
+          </Tooltip>
+        </span>
+      ))}
+    </span>
   )
 }
 
@@ -602,6 +600,7 @@ export function TraceLogPage() {
   const debouncedSearch = useDebounced(searchDraft)
   const searchRef = useRef<HTMLInputElement>(null)
   const [detail, setDetail] = useState<TraceRecord | null>(null)
+  const [selectedTraceIds, setSelectedTraceIds] = useState<Set<number | string>>(new Set())
   const [now, setNow] = useState(() => Date.now())
   useSlashFocus(searchRef)
 
@@ -763,6 +762,9 @@ export function TraceLogPage() {
         columns={columns}
         rowKey={(r) => r.traceId}
         tone={traceTone}
+        selectable
+        selected={selectedTraceIds}
+        onSelectedChange={setSelectedTraceIds}
         onRowActivate={setDetail}
         columnsStorageKey="kiro.traces.columns"
         loading={isLoading}
@@ -772,6 +774,27 @@ export function TraceLogPage() {
             : '暂无记录。发起几次 /v1/messages 请求后即可看到链路。'
         }
       />
+
+      {/* 吸底批量操作栏 */}
+      <BulkBar
+        count={selectedTraceIds.size}
+        onClear={() => setSelectedTraceIds(new Set())}
+        noun="条日志"
+      >
+        <Button
+          onClick={() => {
+            const list = Array.from(selectedTraceIds).join('\n')
+            navigator.clipboard.writeText(list)
+            toast.success(`已复制 ${selectedTraceIds.size} 个 Trace ID`)
+          }}
+          size="sm"
+          variant="ghost"
+          className="h-8 px-3 text-xs gap-1.5 rounded-full hover:bg-accent"
+        >
+          <Copy className="h-3.5 w-3.5" />
+          复制 Trace ID
+        </Button>
+      </BulkBar>
 
       {total > PAGE_SIZE && (
         <div className="flex items-center justify-center gap-2">

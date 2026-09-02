@@ -129,11 +129,11 @@
 @layer components {
   /* Frosted glass surface — like macOS toolbar */
   .glass {
-    @apply bg-background/70 backdrop-blur-xl backdrop-saturate-150;
+    @apply bg-background/85 backdrop-blur-md;
     box-shadow: inset 0 -1px 0 0 hsl(var(--border) / 0.6);
   }
   .glass-card {
-    @apply bg-card/80 backdrop-blur-2xl backdrop-saturate-150 border border-border/60;
+    @apply bg-card/90 backdrop-blur-md border border-border/60;
   }
   /* Soft, layered Apple-style elevation */
   .shadow-apple-sm {
