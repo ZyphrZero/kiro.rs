@@ -496,6 +496,27 @@ fn usage_api_attempts<'a>(
     attempts
 }
 
+/// 判断带真实 profileArn 的用量请求是否应回退到旧版无 ARN 形态。
+///
+/// 上游对不同租户的灰度行为不一致：有的租户缺 ARN 返回 403，有的租户
+/// 在携带已缓存 ARN 时返回 400 `Improperly formed request.` 或
+/// `Invalid profileArn.`。只有当前请求确实携带了 ARN 时才允许该回退，
+/// 避免把无 ARN 请求本身的客户端错误重复发送到其他候选端点。
+fn should_retry_usage_api_without_profile_arn(
+    status: u16,
+    body: &str,
+    profile_arn: Option<&str>,
+) -> bool {
+    if profile_arn.is_none() {
+        return false;
+    }
+
+    status == 403
+        || (status == 400
+            && (body.contains("Improperly formed request")
+                || body.contains("Invalid profileArn")))
+}
+
 fn usage_limits_url(host: &str, profile_arn: Option<&str>) -> String {
     format!(
         "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true{}",
@@ -593,11 +614,19 @@ pub(crate) async fn get_usage_limits(
             return Err(error.into());
         }
 
-        // 403 时依次回退：带 profileArn → 不带 → 备用区域端点
-        if status.as_u16() == 403 && idx + 1 < attempts.len() {
+        // 带 ARN 遇到租户兼容性错误时回退：带 profileArn → 不带 → 备用区域端点。
+        // 无 ARN 请求的 403 仍需保留原有的跨区域回退行为。
+        let should_try_next = status.as_u16() == 403
+            || should_retry_usage_api_without_profile_arn(
+                status.as_u16(),
+                &body_text,
+                *profile_arn,
+            );
+        if should_try_next && idx + 1 < attempts.len() {
             tracing::debug!(
-                "getUsageLimits 在 {} 返回 403（profileArn={}），尝试下一候选",
+                "getUsageLimits 在 {} 返回 {}（profileArn={}），尝试下一候选",
                 region,
+                status,
                 profile_arn.is_some()
             );
             last_error = Some(format!("{} {}", status, body_text));
@@ -688,11 +717,19 @@ pub(crate) async fn get_available_models(
             return Err(error.into());
         }
 
-        // 403 时依次回退：带 profileArn → 不带 → 备用区域端点
-        if status.as_u16() == 403 && idx + 1 < attempts.len() {
+        // 带 ARN 遇到租户兼容性错误时回退：带 profileArn → 不带 → 备用区域端点。
+        // 无 ARN 请求的 403 仍需保留原有的跨区域回退行为。
+        let should_try_next = status.as_u16() == 403
+            || should_retry_usage_api_without_profile_arn(
+                status.as_u16(),
+                &body_text,
+                *profile_arn,
+            );
+        if should_try_next && idx + 1 < attempts.len() {
             tracing::debug!(
-                "ListAvailableModels 在 {} 返回 403（profileArn={}），尝试下一候选",
+                "ListAvailableModels 在 {} 返回 {}（profileArn={}），尝试下一候选",
                 region,
+                status,
                 profile_arn.is_some()
             );
             last_error = Some(format!("{} {}", status, body_text));
@@ -6163,7 +6200,7 @@ mod tests {
             )
         );
 
-        // 每个区域端点先试带 ARN，403 时回退到不带
+        // 每个区域端点先试带 ARN，遇到兼容性错误时回退到不带
         assert_eq!(
             usage_api_attempts(&credentials, &["us-east-1", "eu-central-1"]),
             vec![
@@ -6173,6 +6210,35 @@ mod tests {
                 ("eu-central-1", None),
             ]
         );
+    }
+
+    #[test]
+    fn test_usage_api_profile_arn_error_fallback_only_for_arn_attempt() {
+        assert!(should_retry_usage_api_without_profile_arn(
+            403,
+            "User is not authorized to make this call.",
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL"),
+        ));
+        assert!(should_retry_usage_api_without_profile_arn(
+            400,
+            "{\"message\":\"Improperly formed request.\"}",
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL"),
+        ));
+        assert!(should_retry_usage_api_without_profile_arn(
+            400,
+            "{\"message\":\"Invalid profileArn.\"}",
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL"),
+        ));
+        assert!(!should_retry_usage_api_without_profile_arn(
+            400,
+            "{\"message\":\"Improperly formed request.\"}",
+            None,
+        ));
+        assert!(!should_retry_usage_api_without_profile_arn(
+            500,
+            "server error",
+            Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL"),
+        ));
     }
 
     #[test]
