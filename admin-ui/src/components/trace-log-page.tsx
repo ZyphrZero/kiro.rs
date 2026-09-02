@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { toast } from 'sonner'
 import {
   ScrollText,
+  RefreshCw,
   ChevronRight,
   ChevronLeft,
   AlertTriangle,
@@ -8,13 +10,13 @@ import {
   Unplug,
   Search,
   X,
+  Copy,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
   Tooltip,
   TooltipContent,
-  TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import {
@@ -25,8 +27,6 @@ import {
   SelectItem as UiSelectItem,
 } from '@/components/ui/select'
 import { useTraces } from '@/hooks/use-traces'
-import { AutoRefreshControl } from '@/components/console/auto-refresh-control'
-import { PageHeader } from '@/components/console/page-header'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { useUrlState } from '@/hooks/use-url-state'
@@ -34,6 +34,7 @@ import {
   ConsoleTable,
   type ConsoleColumn,
 } from '@/components/console/data-table'
+import { BulkBar } from '@/components/console/bulk-bar'
 import {
   DetailDrawer,
   DrawerField,
@@ -215,39 +216,37 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
   if (cacheCreation > 0) rows.push(['缓存创建 Token', cacheCreation])
   if (cacheRead > 0) rows.push(['缓存读取 Token', cacheRead])
   return (
-    <TooltipProvider delayDuration={150}>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <span className="inline-flex items-center gap-1 font-mono tabular-nums cursor-default border-b border-dotted border-muted-foreground/40">
-            <span className="text-emerald-600 dark:text-emerald-400">
-              ↓{formatTokens(input + cacheCreation + cacheRead)}
-            </span>
-            <span className="text-violet-600 dark:text-violet-400">
-              ↑{formatTokens(output)}
-            </span>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="inline-flex items-center gap-1 font-mono tabular-nums cursor-default border-b border-dotted border-muted-foreground/40">
+          <span className="text-emerald-600 dark:text-emerald-400">
+            ↓{formatTokens(input + cacheCreation + cacheRead)}
           </span>
-        </TooltipTrigger>
-        <TooltipContent className="p-0">
-          <div className="min-w-[180px] px-3 py-2">
-            <div className="mb-1.5 text-[13px] font-semibold">Token 明细</div>
-            <div className="space-y-1 text-[12px]">
-              {rows.map(([label, val]) => (
-                <div key={label} className="flex items-center justify-between gap-6">
-                  <span className="text-muted-foreground">{label}</span>
-                  <span className="font-mono tabular-nums">{formatTokenFull(val)}</span>
-                </div>
-              ))}
-              <div className="mt-1 flex items-center justify-between gap-6 border-t border-border/50 pt-1">
-                <span className="font-medium">总 Token</span>
-                <span className="font-mono font-semibold tabular-nums">
-                  {formatTokenFull(total)}
-                </span>
+          <span className="text-violet-600 dark:text-violet-400">
+            ↑{formatTokens(output)}
+          </span>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent className="p-0">
+        <div className="min-w-[180px] px-3 py-2">
+          <div className="mb-1.5 text-[13px] font-semibold">Token 明细</div>
+          <div className="space-y-1 text-[12px]">
+            {rows.map(([label, val]) => (
+              <div key={label} className="flex items-center justify-between gap-6">
+                <span className="text-muted-foreground">{label}</span>
+                <span className="font-mono tabular-nums">{formatTokenFull(val)}</span>
               </div>
+            ))}
+            <div className="mt-1 flex items-center justify-between gap-6 border-t border-border/50 pt-1">
+              <span className="font-medium">总 Token</span>
+              <span className="font-mono font-semibold tabular-nums">
+                {formatTokenFull(total)}
+              </span>
             </div>
           </div>
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
+        </div>
+      </TooltipContent>
+    </Tooltip>
   )
 }
 
@@ -267,28 +266,26 @@ function AttemptChain({ rec }: { rec: TraceRecord }) {
     )
   }
   return (
-    <TooltipProvider delayDuration={150}>
-      <span className="inline-flex items-center gap-1">
-        {attempts.map((a, i) => (
-          <span key={a.attempt} className="inline-flex items-center gap-1">
-            {i > 0 && <span className="text-muted-foreground/40">→</span>}
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span className="inline-flex cursor-default items-center gap-1 rounded border border-border/60 bg-secondary/40 px-1.5 py-0.5 font-mono text-[11px] tabular-nums">
-                  <span className={`h-1.5 w-1.5 rounded-full ${outcomeDot(a.outcome)}`} />
-                  {a.credentialId > 0 ? `#${a.credentialId}` : '—'}
-                </span>
-              </TooltipTrigger>
-              <TooltipContent className="font-mono text-[11px]">
-                第 {a.attempt + 1} 跳 · {outcomeStyle(a.outcome).label}
-                {a.httpStatus != null ? ` · HTTP ${a.httpStatus}` : ''}
-                {a.endpoint ? ` · ${a.endpoint}` : ''} · {formatDuration(a.durationMs)}
-              </TooltipContent>
-            </Tooltip>
-          </span>
-        ))}
-      </span>
-    </TooltipProvider>
+    <span className="inline-flex items-center gap-1">
+      {attempts.map((a, i) => (
+        <span key={a.attempt} className="inline-flex items-center gap-1">
+          {i > 0 && <span className="text-muted-foreground/40">→</span>}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="inline-flex cursor-default items-center gap-1 rounded border border-border/60 bg-secondary/40 px-1.5 py-0.5 font-mono text-[11px] tabular-nums">
+                <span className={`h-1.5 w-1.5 rounded-full ${outcomeDot(a.outcome)}`} />
+                {a.credentialId > 0 ? `#${a.credentialId}` : '—'}
+              </span>
+            </TooltipTrigger>
+            <TooltipContent className="font-mono text-[11px]">
+              第 {a.attempt + 1} 跳 · {outcomeStyle(a.outcome).label}
+              {a.httpStatus != null ? ` · HTTP ${a.httpStatus}` : ''}
+              {a.endpoint ? ` · ${a.endpoint}` : ''} · {formatDuration(a.durationMs)}
+            </TooltipContent>
+          </Tooltip>
+        </span>
+      ))}
+    </span>
   )
 }
 
@@ -453,6 +450,29 @@ function useDebounced<T>(value: T, delay = 300): T {
   return debounced
 }
 
+/** `/` 聚焦搜索框 —— 手不离键盘就能开始筛 */
+function useSlashFocus(ref: React.RefObject<HTMLInputElement | null>) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return
+      const t = e.target as HTMLElement | null
+      if (
+        t &&
+        (t.tagName === 'INPUT' ||
+          t.tagName === 'TEXTAREA' ||
+          t.isContentEditable)
+      ) {
+        return
+      }
+      e.preventDefault()
+      ref.current?.focus()
+      ref.current?.select()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [ref])
+}
+
 /** 表格列定义。默认 8 列，其余进列控制菜单 —— 12 列全摆开必然横向滚动。 */
 function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
   return useMemo(
@@ -578,8 +598,16 @@ export function TraceLogPage() {
   const [url, patchUrl, resetUrl] = useUrlState('traces', URL_DEFAULTS)
   const [searchDraft, setSearchDraft] = useState(url.q)
   const debouncedSearch = useDebounced(searchDraft)
+  const searchRef = useRef<HTMLInputElement>(null)
   const [detail, setDetail] = useState<TraceRecord | null>(null)
+  const [selectedTraceIds, setSelectedTraceIds] = useState<Set<number | string>>(new Set())
   const [now, setNow] = useState(() => Date.now())
+  useSlashFocus(searchRef)
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   // 搜索词稳定后才写进 URL / 触发查询
   useEffect(() => {
@@ -631,50 +659,49 @@ export function TraceLogPage() {
   ).length
 
   return (
-    <div className="console-scope space-y-4">
-      <PageHeader
-        icon={<ScrollText className="h-4 w-4" />}
-        title="请求日志"
-        meta={
-          <>
-            <span className="console-num text-[13px] text-muted-foreground">
-              {total} 条
-            </span>
-            {filterCount > 0 && (
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => {
-                  resetUrl()
-                  setSearchDraft('')
-                }}
-                className="h-7 px-2 text-xs"
-              >
-                清除 {filterCount} 个筛选
-              </Button>
-            )}
-          </>
-        }
-        actions={
-          <AutoRefreshControl
-            onRefresh={() => {
-              // 相对时间窗口需要在每次刷新时重新取“现在”；即使同一秒内点击，也直接 refetch。
-              if (range.minutes != null) {
-                setNow(Date.now())
-              }
-              return refetch()
-            }}
-            isRefreshing={isFetching}
-            resourceLabel="请求日志"
-          />
-        }
-      />
-
-      {/* 筛选栏：文本与分类条件优先，时间范围收在末尾。 */}
+    <div className="console-scope space-y-3">
       <div className="flex flex-wrap items-center gap-2">
+        <ScrollText className="h-4 w-4 text-muted-foreground" />
+        <h2 className="text-lg font-semibold tracking-tight">请求日志</h2>
+        <span className="console-num text-[13px] text-muted-foreground">
+          {total} 条
+        </span>
+        {filterCount > 0 && (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => {
+              resetUrl()
+              setSearchDraft('')
+            }}
+            className="h-7 px-2 text-xs"
+          >
+            清除 {filterCount} 个筛选
+          </Button>
+        )}
+        <span className="ml-auto text-[11px] text-muted-foreground">
+          <kbd className="rounded border border-border/70 px-1">/</kbd> 搜索 ·{' '}
+          <kbd className="rounded border border-border/70 px-1">j</kbd>
+          <kbd className="ml-0.5 rounded border border-border/70 px-1">k</kbd> 移动 ·{' '}
+          <kbd className="rounded border border-border/70 px-1">Enter</kbd> 详情
+        </span>
+      </div>
+
+      {/* 筛选栏：时间范围在最前，因为排查的第一句话通常是"刚才那几分钟" */}
+      <div className="flex flex-wrap items-center gap-2">
+        <TimeRangePicker
+          value={range}
+          onChange={(next) =>
+            patchUrl({
+              range: next.minutes == null ? '' : String(next.minutes),
+              page: '0',
+            })
+          }
+        />
         <div className="relative">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <input
+            ref={searchRef}
             type="text"
             value={searchDraft}
             onChange={(e) => setSearchDraft(e.target.value)}
@@ -719,15 +746,15 @@ export function TraceLogPage() {
           onChange={(v) => patchUrl({ group: v, page: '0' })}
           options={groupSelectOptions}
         />
-        <TimeRangePicker
-          value={range}
-          onChange={(next) =>
-            patchUrl({
-              range: next.minutes == null ? '' : String(next.minutes),
-              page: '0',
-            })
-          }
-        />
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => refetch()}
+          disabled={isFetching}
+          title="立即刷新（每 30 秒自动刷新）"
+        >
+          <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
+        </Button>
       </div>
 
       <ConsoleTable
@@ -735,6 +762,9 @@ export function TraceLogPage() {
         columns={columns}
         rowKey={(r) => r.traceId}
         tone={traceTone}
+        selectable
+        selected={selectedTraceIds}
+        onSelectedChange={setSelectedTraceIds}
         onRowActivate={setDetail}
         columnsStorageKey="kiro.traces.columns"
         loading={isLoading}
@@ -744,6 +774,27 @@ export function TraceLogPage() {
             : '暂无记录。发起几次 /v1/messages 请求后即可看到链路。'
         }
       />
+
+      {/* 吸底批量操作栏 */}
+      <BulkBar
+        count={selectedTraceIds.size}
+        onClear={() => setSelectedTraceIds(new Set())}
+        noun="条日志"
+      >
+        <Button
+          onClick={() => {
+            const list = Array.from(selectedTraceIds).join('\n')
+            navigator.clipboard.writeText(list)
+            toast.success(`已复制 ${selectedTraceIds.size} 个 Trace ID`)
+          }}
+          size="sm"
+          variant="ghost"
+          className="h-8 px-3 text-xs gap-1.5 rounded-full hover:bg-accent"
+        >
+          <Copy className="h-3.5 w-3.5" />
+          复制 Trace ID
+        </Button>
+      </BulkBar>
 
       {total > PAGE_SIZE && (
         <div className="flex items-center justify-center gap-2">
@@ -783,7 +834,8 @@ export function TraceLogPage() {
  * 详情抽屉，替掉原先的行展开。
  *
  * 行展开会把 34px 的行顶到几百 px，下方所有行位置突变、滚动位置跟着跳 —— 想对比
- * 相邻两条记录时格外难受。抽屉让表格布局始终稳定，左边列表和右边详情能同时看。
+ * 相邻两条记录时格外难受。抽屉让表格布局始终稳定，左边列表和右边详情能同时看，
+ * j/k 还能继续在列表里走。
  */
 function TraceDetailDrawer({
   rec,

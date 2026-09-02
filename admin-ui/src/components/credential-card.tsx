@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, memo } from "react";
 import { toast } from "sonner";
 import {
   RefreshCw,
@@ -84,10 +84,10 @@ import { CredentialLabel } from "@/components/console/credential-label";
 interface CredentialCardProps {
   credential: CredentialStatusItem;
   selected: boolean;
-  onToggleSelect: () => void;
+  onToggleSelect: (id: number) => void;
   balance: BalanceResponse | null;
   loadingBalance: boolean;
-  onRefreshBalance: () => void;
+  onRefreshBalance: (id: number) => void | Promise<void>;
   /** 该凭据的失败分类计数（来自 trace 聚合）；无数据时回退 totalFailureCount */
   failureStats?: { auth: number; throttle: number; other: number };
   /** 展示形态：卡片（默认）或紧凑列表行 */
@@ -345,22 +345,15 @@ function getDisabledReasonStyle(reason?: string | null): {
 
 function MetadataSummary({
   credential,
-  scrollable = false,
 }: {
   credential: CredentialStatusItem;
-  scrollable?: boolean;
 }) {
   const entries = metadataEntries(credential);
   if (entries.length === 0) return null;
 
   return (
     <div
-      className={cn(
-        "mt-1 flex min-w-0 items-center gap-1",
-        scrollable
-          ? "select-none overflow-x-auto overflow-y-hidden overscroll-x-contain touch-pan-x [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-          : "overflow-hidden",
-      )}
+      className="mt-1 flex min-w-0 items-center gap-1 overflow-hidden"
       aria-label="凭据 Metadata"
     >
       {entries.map((entry) => (
@@ -382,7 +375,7 @@ function MetadataSummary({
   );
 }
 
-export function CredentialCard({
+function CredentialCardImpl({
   credential,
   selected,
   onToggleSelect,
@@ -417,11 +410,12 @@ export function CredentialCard({
   const clearThrottle = useClearThrottle();
   const queryClient = useQueryClient();
 
-  // 代理池健康数据，用于标记凭据专属代理是否异常
+  // 代理池健康数据，用于标记凭据专属代理是否异常（仅在凭据配置了代理时按需查询）
   const { data: proxyPool } = useQuery({
     queryKey: ['proxy-pool'],
     queryFn: getProxyPool,
     staleTime: 30_000,
+    enabled: Boolean(credential.hasProxy && credential.proxyUrl),
   });
 
   /** 凭据专属代理在代理池中的健康信息（仅当 proxyUrl 匹配到池内条目时有效） */
@@ -489,6 +483,14 @@ export function CredentialCard({
     }
   };
 
+  const handleToggleSelect = useCallback(() => {
+    onToggleSelect(credential.id);
+  }, [onToggleSelect, credential.id]);
+
+  const handleRefreshBalanceClick = useCallback(() => {
+    onRefreshBalance(credential.id);
+  }, [onRefreshBalance, credential.id]);
+
   const handleToggleDisabled = () => {
     const willEnable = credential.disabled;
     setDisabled.mutate(
@@ -496,7 +498,7 @@ export function CredentialCard({
       {
         onSuccess: (res) => {
           toast.success(res.message);
-          if (willEnable) onRefreshBalance();
+          if (willEnable) onRefreshBalance(credential.id);
         },
         onError: (err) => toast.error("操作失败: " + (err as Error).message),
       },
@@ -842,7 +844,7 @@ export function CredentialCard({
         <Checkbox
           className="h-4 w-4 [&_svg]:h-3 [&_svg]:w-3"
           checked={selected}
-          onCheckedChange={onToggleSelect}
+          onCheckedChange={handleToggleSelect}
         />
       </label>
 
@@ -870,7 +872,7 @@ export function CredentialCard({
             </span>
           )}
         </div>
-        <MetadataSummary credential={credential} scrollable />
+        <MetadataSummary credential={credential} />
       </div>
 
       <div className="hidden shrink-0 items-center gap-6 lg:flex">
@@ -1072,7 +1074,7 @@ export function CredentialCard({
           size="icon"
           variant="ghost"
           className={`h-8 w-8 ${dispositionButton ? "hidden" : "hidden sm:inline-flex"}`}
-          onClick={onRefreshBalance}
+          onClick={handleRefreshBalanceClick}
           disabled={loadingBalance || credential.disabled}
           title={credential.disabled ? "已禁用" : "刷新余额"}
         >
@@ -1130,7 +1132,7 @@ export function CredentialCard({
                   <Checkbox
                     className="h-4 w-4 [&_svg]:h-3 [&_svg]:w-3"
                     checked={selected}
-                    onCheckedChange={onToggleSelect}
+                    onCheckedChange={handleToggleSelect}
                     disabled={preview}
                   />
                 </label>
@@ -1362,7 +1364,7 @@ export function CredentialCard({
                     size="sm"
                     variant="outline"
                     className="h-7 px-2.5 text-xs font-medium"
-                    onClick={onRefreshBalance}
+                    onClick={handleRefreshBalanceClick}
                   >
                     <Wallet className="mr-1.5 h-3.5 w-3.5" />
                     查询余额
@@ -1487,7 +1489,7 @@ export function CredentialCard({
                   size="icon"
                   variant="ghost"
                   className="h-8 w-8 shrink-0 hover:bg-accent"
-                  onClick={onRefreshBalance}
+                  onClick={handleRefreshBalanceClick}
                   disabled={loadingBalance || credential.disabled}
                   title={credential.disabled ? "已禁用" : "刷新余额"}
                 >
@@ -1513,66 +1515,82 @@ export function CredentialCard({
         </Card>
       )}
 
-      {/* 弹窗 Dialog 组件保持完全相同的功能 */}
-      <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
-        <DialogContent className="sm:max-w-sm">
-          <DialogHeader>
-            <DialogTitle>确认删除凭据</DialogTitle>
-            <DialogDescription>
-              您确定要删除凭据 #{credential.id} 吗？此操作无法撤销。
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setShowDeleteDialog(false)}
-              disabled={deleteCredential.isPending}
-            >
-              取消
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={handleDelete}
-              disabled={deleteCredential.isPending}
-            >
-              确认删除
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {/* 弹窗 Dialog 组件按需惰性挂载，避免关闭时无谓实例化 */}
+      {showDeleteDialog && (
+        <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
+          <DialogContent className="sm:max-w-sm">
+            <DialogHeader>
+              <DialogTitle>确认删除凭据</DialogTitle>
+              <DialogDescription>
+                您确定要删除凭据 #{credential.id} 吗？此操作无法撤销。
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => setShowDeleteDialog(false)}
+                disabled={deleteCredential.isPending}
+              >
+                取消
+              </Button>
+              <Button
+                variant="destructive"
+                onClick={handleDelete}
+                disabled={deleteCredential.isPending}
+              >
+                确认删除
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
 
-      <EditCredentialDialog
-        open={showEditDialog}
-        onOpenChange={setShowEditDialog}
-        credential={credential}
-        metadataSchema={metadataSchema}
-      />
-      <UpdateTokenDialog
-        open={showUpdateTokenDialog}
-        onOpenChange={setShowUpdateTokenDialog}
-        credential={credential}
-      />
-      <ReloginDialog
-        open={showReloginDialog}
-        onOpenChange={setShowReloginDialog}
-        credential={credential}
-      />
-      <CredentialFailuresDialog
-        open={showFailuresDialog}
-        onOpenChange={setShowFailuresDialog}
-        credentialId={credential.id}
-        email={credential.email}
-      />
-      <AvailableModelsDialog
-        open={showModelsDialog}
-        onOpenChange={setShowModelsDialog}
-        credentialId={credential.id}
-      />
-      <BalanceDialog
-        open={showBalanceDialog}
-        onOpenChange={setShowBalanceDialog}
-        credentialId={showBalanceDialog ? credential.id : null}
-      />
+      {showEditDialog && (
+        <EditCredentialDialog
+          open={showEditDialog}
+          onOpenChange={setShowEditDialog}
+          credential={credential}
+          metadataSchema={metadataSchema}
+        />
+      )}
+      {showUpdateTokenDialog && (
+        <UpdateTokenDialog
+          open={showUpdateTokenDialog}
+          onOpenChange={setShowUpdateTokenDialog}
+          credential={credential}
+        />
+      )}
+      {showReloginDialog && (
+        <ReloginDialog
+          open={showReloginDialog}
+          onOpenChange={setShowReloginDialog}
+          credential={credential}
+        />
+      )}
+      {showFailuresDialog && (
+        <CredentialFailuresDialog
+          open={showFailuresDialog}
+          onOpenChange={setShowFailuresDialog}
+          credentialId={credential.id}
+          email={credential.email}
+        />
+      )}
+      {showModelsDialog && (
+        <AvailableModelsDialog
+          open={showModelsDialog}
+          onOpenChange={setShowModelsDialog}
+          credentialId={credential.id}
+        />
+      )}
+      {showBalanceDialog && (
+        <BalanceDialog
+          open={showBalanceDialog}
+          onOpenChange={setShowBalanceDialog}
+          credentialId={showBalanceDialog ? credential.id : null}
+        />
+      )}
     </>
   );
 }
+
+export const CredentialCard = memo(CredentialCardImpl);

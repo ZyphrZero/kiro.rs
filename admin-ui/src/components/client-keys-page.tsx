@@ -1,9 +1,8 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { toast } from 'sonner'
 import {
   Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw,
 } from 'lucide-react'
-import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -23,7 +22,8 @@ import { GroupSingleSelect } from '@/components/group-select'
 import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
 import { extractErrorMessage, formatCredits } from '@/lib/utils'
 import { useConfirm } from '@/components/ui/confirm-dialog'
-import { PageHeader } from '@/components/console/page-header'
+import { ConsoleTable, type ConsoleColumn } from '@/components/console/data-table'
+import { BulkBar } from '@/components/console/bulk-bar'
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
@@ -246,168 +246,306 @@ export function ClientKeysPage() {
     }
   }
 
-  return (
-    <div>
-      <PageHeader
-        className="mb-4"
-        icon={<KeyRound className="h-4 w-4" />}
-        title="客户端 Key"
-        description="分发给下游用户/项目的访问密钥。每把 Key 独立计数与禁用，泄露后只需替换一把。"
-        actions={
-          <Button onClick={() => setCreateOpen(true)} size="sm">
-            <Plus className="h-3.5 w-3.5" />新建 Key
-          </Button>
+  const [selectedIds, setSelectedIds] = useState<Set<number | string>>(new Set())
+  const [batchActionPending, setBatchActionPending] = useState(false)
+
+  const keys: ClientKeyItem[] = useMemo(() => data?.keys ?? [], [data?.keys])
+
+  const handleBatchDelete = async () => {
+    if (selectedIds.size === 0) return
+    const selectedItems = keys.filter((k) => selectedIds.has(k.id))
+    const deletableItems = selectedItems.filter((k) => !k.isSystem)
+    const systemCount = selectedItems.length - deletableItems.length
+
+    if (deletableItems.length === 0) {
+      toast.error('所选项均为系统密钥，不可删除')
+      return
+    }
+
+    const systemHint = systemCount > 0 ? `（已自动跳过 ${systemCount} 个系统密钥）` : ''
+    const ok = await confirm({
+      title: `批量删除 ${deletableItems.length} 把 Key？`,
+      description: `确定要删除选中的 ${deletableItems.length} 把客户端 Key 吗？${systemHint}此操作无法撤销。`,
+      confirmText: '确认删除',
+      destructive: true,
+    })
+    if (!ok) return
+
+    setBatchActionPending(true)
+    let s = 0
+    let f = 0
+    try {
+      for (const item of deletableItems) {
+        try {
+          await deleteKey.mutateAsync(item.id)
+          s++
+        } catch {
+          f++
         }
+      }
+      if (f === 0) {
+        toast.success(`已批量删除 ${s} 把 Key`)
+      } else {
+        toast.warning(`批量删除完成：成功 ${s} 个，失败 ${f} 个`)
+      }
+      setSelectedIds(new Set())
+    } finally {
+      setBatchActionPending(false)
+    }
+  }
+
+  const handleBatchSetDisabled = async (disabled: boolean) => {
+    if (selectedIds.size === 0) return
+    const ids = Array.from(selectedIds).map(Number)
+    setBatchActionPending(true)
+    let s = 0
+    let f = 0
+    try {
+      for (const id of ids) {
+        try {
+          await setDisabled.mutateAsync({ id, disabled })
+          s++
+        } catch {
+          f++
+        }
+      }
+      toast.success(`已批量${disabled ? '禁用' : '启用'} ${s} 把 Key${f > 0 ? `，失败 ${f} 个` : ''}`)
+      setSelectedIds(new Set())
+    } finally {
+      setBatchActionPending(false)
+    }
+  }
+
+  const columns: ConsoleColumn<ClientKeyItem>[] = useMemo(
+    () => [
+      {
+        id: 'id',
+        header: 'ID',
+        cell: (k) => (
+          <span className="console-num text-[12px] text-muted-foreground">
+            #{k.id}
+          </span>
+        ),
+      },
+      {
+        id: 'name',
+        header: '名称',
+        cell: (k) => (
+          <div className="min-w-0 max-w-[240px]">
+            <div className="flex items-center gap-1.5">
+              <span className="truncate font-medium text-foreground">{k.name}</span>
+              {k.isSystem && (
+                <Badge variant="secondary" title="由 config.json apiKey 同步，不可删除、可轮换">
+                  系统
+                </Badge>
+              )}
+            </div>
+            {k.description && (
+              <div className="truncate text-[11px] text-muted-foreground">
+                {k.description}
+              </div>
+            )}
+          </div>
+        ),
+      },
+      {
+        id: 'key',
+        header: 'Key',
+        cell: (k) => (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                className="rounded px-1 py-0.5 font-mono text-[12px] text-muted-foreground hover:bg-accent/60 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                title="点击展开 Key 操作"
+              >
+                {k.maskedKey}
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start">
+              <DropdownMenuItem onSelect={() => handleRotate(k)}>
+                <RefreshCw className="h-3.5 w-3.5" />
+                重新生成 Key（旧 Key 立即失效）
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        ),
+      },
+      {
+        id: 'group',
+        header: '分组',
+        cell: (k) =>
+          k.group ? (
+            <Badge variant="outline">{k.group}</Badge>
+          ) : (
+            <span className="text-[12px] text-muted-foreground">全部账号</span>
+          ),
+      },
+      {
+        id: 'status',
+        header: '状态',
+        cell: (k) =>
+          k.disabled ? (
+            <Badge variant="destructive">已禁用</Badge>
+          ) : (
+            <Badge variant="success">启用</Badge>
+          ),
+      },
+      {
+        id: 'totalCalls',
+        header: '总调用',
+        align: 'right',
+        cell: (k) => <span className="console-num">{k.totalCalls}</span>,
+      },
+      {
+        id: 'inputTokens',
+        header: '输入',
+        align: 'right',
+        cell: (k) => <span className="console-num">{formatTokens(k.totalInputTokens)}</span>,
+      },
+      {
+        id: 'outputTokens',
+        header: '输出',
+        align: 'right',
+        cell: (k) => <span className="console-num">{formatTokens(k.totalOutputTokens)}</span>,
+      },
+      {
+        id: 'credits',
+        header: '积分 / 上限',
+        align: 'right',
+        cell: (k) => <CreditsUsage used={k.totalCredits} max={k.maxCredits} />,
+      },
+      {
+        id: 'lastUsed',
+        header: '最后使用',
+        cell: (k) => (
+          <span className="text-[12px] text-muted-foreground">
+            {formatRelative(k.lastUsedAt)}
+          </span>
+        ),
+      },
+    ],
+    [],
+  )
+
+  const rowActions = (k: ClientKeyItem) => (
+    <div className="flex items-center justify-end gap-1">
+      <Button
+        size="icon"
+        variant="ghost"
+        className="h-7 w-7"
+        onClick={(e) => {
+          e.stopPropagation()
+          startEdit(k)
+        }}
+        title="编辑"
+      >
+        <Pencil className="h-3.5 w-3.5" />
+      </Button>
+      <Button
+        size="icon"
+        variant="ghost"
+        className="h-7 w-7"
+        onClick={(e) => {
+          e.stopPropagation()
+          handleToggleDisabled(k)
+        }}
+        title={k.disabled ? '启用' : '禁用'}
+      >
+        <Power className={`h-3.5 w-3.5 ${k.disabled ? 'text-emerald-500' : 'text-amber-500'}`} />
+      </Button>
+      <Button
+        size="icon"
+        variant="ghost"
+        className="h-7 w-7"
+        onClick={(e) => {
+          e.stopPropagation()
+          handleReset(k)
+        }}
+        title="重置统计"
+      >
+        <RotateCcw className="h-3.5 w-3.5" />
+      </Button>
+      {!k.isSystem && (
+        <Button
+          size="icon"
+          variant="ghost"
+          className="h-7 w-7 text-destructive hover:text-destructive"
+          onClick={(e) => {
+            e.stopPropagation()
+            handleDelete(k)
+          }}
+          title="删除"
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </Button>
+      )}
+    </div>
+  )
+
+  return (
+    <div className="console-scope space-y-4">
+      <div className="flex items-end justify-between gap-4">
+        <div>
+          <h1 className="text-[28px] font-semibold tracking-tight leading-tight">客户端 Key</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            分发给下游用户/项目的访问密钥。每把 Key 独立计数与禁用，泄露后只需替换一把。
+          </p>
+        </div>
+        <Button onClick={() => setCreateOpen(true)} size="sm">
+          <Plus className="h-3.5 w-3.5" />新建 Key
+        </Button>
+      </div>
+
+      <ConsoleTable
+        rows={keys}
+        columns={columns}
+        rowKey={(k) => k.id}
+        selectable
+        selected={selectedIds}
+        onSelectedChange={setSelectedIds}
+        rowActions={rowActions}
+        loading={isLoading}
+        empty="还没有客户端 Key，点击右上角「新建 Key」开始。"
       />
 
-      {isLoading ? (
-        <Card>
-          <CardContent className="py-16 text-center text-sm text-muted-foreground">
-            加载中…
-          </CardContent>
-        </Card>
-      ) : !data || data.keys.length === 0 ? (
-        <Card>
-          <CardContent className="py-16 text-center">
-            <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-secondary text-muted-foreground">
-              <KeyRound className="h-5 w-5" />
-            </div>
-            <p className="text-sm text-muted-foreground">还没有客户端 Key，点击右上角"新建 Key"开始</p>
-          </CardContent>
-        </Card>
-      ) : (
-        <Card className="overflow-hidden">
-          <CardContent className="overflow-x-auto p-0">
-            <table className="w-full min-w-[1040px] text-sm">
-              <thead className="text-[12px] text-muted-foreground border-b border-border/60">
-                <tr className="whitespace-nowrap">
-                  <th className="text-left font-medium px-4 py-3">ID</th>
-                  <th className="text-left font-medium px-4 py-3">名称</th>
-                  <th className="text-left font-medium px-4 py-3">Key</th>
-                  <th className="text-left font-medium px-4 py-3">分组</th>
-                  <th className="text-left font-medium px-4 py-3">状态</th>
-                  <th className="text-right font-medium px-4 py-3">总调用</th>
-                  <th className="text-right font-medium px-4 py-3">输入</th>
-                  <th className="text-right font-medium px-4 py-3">输出</th>
-                  <th className="text-right font-medium px-4 py-3">积分 / 上限</th>
-                  <th className="text-left font-medium px-4 py-3">最后使用</th>
-                  <th className="sticky right-0 z-20 min-w-[9.75rem] border-l border-border/60 bg-card px-4 py-3 text-right font-medium">
-                    操作
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.keys.map((k) => (
-                  <tr key={k.id} className="border-t border-border/40 whitespace-nowrap">
-                    <td className="px-4 py-3 font-mono text-[12px] text-muted-foreground tabular-nums">
-                      #{k.id}
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-1.5">
-                        <span className="max-w-[220px] truncate font-medium">{k.name}</span>
-                        {k.isSystem && (
-                          <Badge variant="secondary" title="由 config.json apiKey 同步，不可删除、可轮换">
-                            系统
-                          </Badge>
-                        )}
-                      </div>
-                      {k.description && (
-                        <div className="max-w-[220px] truncate text-[11px] text-muted-foreground">
-                          {k.description}
-                        </div>
-                      )}
-                    </td>
-                    <td className="px-4 py-3">
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <button
-                            type="button"
-                            className="rounded px-1 py-0.5 font-mono text-[12px] text-muted-foreground hover:bg-accent/60 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                            title="点击展开 Key 操作"
-                          >
-                            {k.maskedKey}
-                          </button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="start">
-                          <DropdownMenuItem onSelect={() => handleRotate(k)}>
-                            <RefreshCw className="h-3.5 w-3.5" />
-                            重新生成 Key（旧 Key 立即失效）
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    </td>
-                    <td className="px-4 py-3">
-                      {k.group ? (
-                        <Badge variant="outline">{k.group}</Badge>
-                      ) : (
-                        <span className="text-[12px] text-muted-foreground">全部账号</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3">
-                      {k.disabled ? (
-                        <Badge variant="destructive">已禁用</Badge>
-                      ) : (
-                        <Badge variant="success">启用</Badge>
-                      )}
-                    </td>
-                    <td className="px-4 py-3 text-right tabular-nums">{k.totalCalls}</td>
-                    <td className="px-4 py-3 text-right tabular-nums">{formatTokens(k.totalInputTokens)}</td>
-                    <td className="px-4 py-3 text-right tabular-nums">{formatTokens(k.totalOutputTokens)}</td>
-                    <td className="px-4 py-3 text-right">
-                      <CreditsUsage used={k.totalCredits} max={k.maxCredits} />
-                    </td>
-                    <td className="px-4 py-3 text-[12px] text-muted-foreground">
-                      {formatRelative(k.lastUsedAt)}
-                    </td>
-                    <td className="sticky right-0 z-10 min-w-[9.75rem] border-l border-border/60 bg-card px-4 py-3">
-                      <div className="flex items-center justify-end gap-1">
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          className="h-7 w-7"
-                          onClick={() => startEdit(k)}
-                          title="改名"
-                        >
-                          <Pencil className="h-3.5 w-3.5" />
-                        </Button>
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          className="h-7 w-7"
-                          onClick={() => handleToggleDisabled(k)}
-                          title={k.disabled ? '启用' : '禁用'}
-                        >
-                          <Power className={`h-3.5 w-3.5 ${k.disabled ? 'text-emerald-500' : 'text-amber-500'}`} />
-                        </Button>
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          className="h-7 w-7"
-                          onClick={() => handleReset(k)}
-                          title="重置统计"
-                        >
-                          <RotateCcw className="h-3.5 w-3.5" />
-                        </Button>
-                        {!k.isSystem && (
-                          <Button
-                            size="icon"
-                            variant="ghost"
-                            className="h-7 w-7"
-                            onClick={() => handleDelete(k)}
-                            title="删除"
-                          >
-                            <Trash2 className="h-3.5 w-3.5 text-destructive" />
-                          </Button>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </CardContent>
-        </Card>
-      )}
+      {/* 吸底批量操作栏 */}
+      <BulkBar
+        count={selectedIds.size}
+        onClear={() => setSelectedIds(new Set())}
+        noun="把 Key"
+      >
+        <Button
+          onClick={() => handleBatchSetDisabled(false)}
+          size="sm"
+          variant="ghost"
+          className="h-8 px-3 text-xs gap-1.5 rounded-full hover:bg-accent"
+          disabled={batchActionPending}
+        >
+          <Power className="h-3.5 w-3.5 text-emerald-500" />
+          批量启用
+        </Button>
+        <Button
+          onClick={() => handleBatchSetDisabled(true)}
+          size="sm"
+          variant="ghost"
+          className="h-8 px-3 text-xs gap-1.5 rounded-full hover:bg-accent"
+          disabled={batchActionPending}
+        >
+          <Power className="h-3.5 w-3.5 text-amber-500" />
+          批量禁用
+        </Button>
+        <Button
+          onClick={handleBatchDelete}
+          size="sm"
+          variant="destructive"
+          className="h-8 px-3 text-xs gap-1.5 rounded-full"
+          disabled={batchActionPending}
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+          {batchActionPending ? '删除中…' : '批量删除'}
+        </Button>
+      </BulkBar>
 
       {/* 新建对话框 */}
       <Dialog open={createOpen} onOpenChange={(o) => !createKey.isPending && setCreateOpen(o)}>
