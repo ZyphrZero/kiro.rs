@@ -30,7 +30,7 @@
 //! 翻译成 Responses SSE；显式 WebSearch 仍由现有 agentic loop 整轮缓冲。
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     convert::Infallible,
 };
 
@@ -63,6 +63,12 @@ const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
 /// 未显式给出 max_output_tokens 时的默认输出上限
 const DEFAULT_MAX_TOKENS: i32 = 32000;
 
+/// OpenAI freeform 工具在 Kiro JSON 工具通道上的适配说明。
+///
+/// Codex 的原始描述明确要求传裸文本，但 Kiro 只能接收 JSON Schema 工具；
+/// 若不显式说明替身形态，模型会按原描述直接输出裸文本，导致参数解析失败。
+const FREEFORM_ADAPTATION_NOTE: &str = "\n\n---\n[Gateway adaptation] This freeform tool is exposed as a JSON tool. Put the raw tool text (unquoted, no code fences) into the `input` string field.";
+
 /// 无 codex 工具时的严格提示（保持既有已验证的纯聊天/搜索行为）
 const NUDGE_STRICT: &str = "You have a web_search tool that returns live results. For anything \
 time-sensitive — current events, news, recent sports results, prices, releases, or facts \
@@ -87,28 +93,15 @@ enum DeclaredToolKind {
     Custom,
 }
 
-/// 一个已声明工具的完整身份。codex 0.144 的工具可能挂在 `namespace`
-/// 分组下（如 collaboration 子代理工具）：对 Anthropic 模型展平为
-/// `ns__name`，应答时还原为 `name` + `namespace` 字段。
+/// 一个已声明工具的完整身份。
 #[derive(Clone, Debug)]
 struct DeclaredTool {
     kind: DeclaredToolKind,
-    /// 原始工具名（不含 namespace 前缀）
     name: String,
-    /// 所属 namespace（codex 的 ToolName::new(namespace, name) 需要）
-    namespace: Option<String>,
 }
 
 /// 展平名（模型看到的名字）→ 声明信息（每请求独立，无全局状态）
 type ToolKindMap = HashMap<String, DeclaredTool>;
-
-/// 模型侧的展平工具名：namespace 用 `__` 连接（Anthropic 工具名不允许 `.`）
-fn flat_tool_name(namespace: Option<&str>, name: &str) -> String {
-    match namespace {
-        Some(ns) if !ns.is_empty() => format!("{ns}__{name}"),
-        _ => name.to_string(),
-    }
-}
 
 // ============================ 请求类型 ============================
 
@@ -167,22 +160,65 @@ impl Default for ResponsesResponseConfig {
 
 impl ResponsesResponseConfig {
     fn from_request(req: &ResponsesRequest) -> Self {
-        let mut tools = req.tools.clone().unwrap_or_default();
-        if let Value::Array(items) = &req.input {
-            for item in items {
-                if item.get("type").and_then(Value::as_str) == Some("additional_tools")
-                    && let Some(extra) = item.get("tools").and_then(Value::as_array)
-                {
-                    tools.extend(extra.iter().cloned());
-                }
-            }
-        }
         Self {
             parallel_tool_calls: req.parallel_tool_calls,
             tool_choice: req.tool_choice.clone().unwrap_or_else(|| json!("auto")),
-            tools,
+            tools: collect_responses_tools(req),
         }
     }
+}
+
+/// 汇总标准 `tools` 与 code-mode `additional_tools`，并展开 Codex 的默认
+/// `functions` namespace。真实 wire 中该容器的子工具仍以裸名回调；其它
+/// namespace 没有可执行的 Responses 表达，保留后由转换器明确跳过。
+///
+/// 只展开一层，避免畸形自嵌套结构造成无界递归。同名工具按来源顺序
+/// “先到先得”（顶层优先），与 kiro2claude 的已验证行为一致。
+/// 本适配的整体实现思路借鉴自 yupanzi/kiro2claude：
+/// https://github.com/yupanzi/kiro2claude
+fn collect_responses_tools(req: &ResponsesRequest) -> Vec<Value> {
+    fn take(list: &[Value], merged: &mut Vec<Value>, seen: &mut HashSet<String>) {
+        for entry in list {
+            let expanded: Vec<&Value> = if entry.get("type").and_then(Value::as_str)
+                == Some("namespace")
+                && entry.get("name").and_then(Value::as_str) == Some("functions")
+            {
+                entry
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .map(|tools| tools.iter().collect())
+                    .unwrap_or_default()
+            } else {
+                vec![entry]
+            };
+
+            for tool in expanded {
+                if let Some(name) = tool.get("name").and_then(Value::as_str)
+                    && !name.is_empty()
+                    && !seen.insert(name.to_string())
+                {
+                    continue;
+                }
+                merged.push(tool.clone());
+            }
+        }
+    }
+
+    let mut merged = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(tools) = req.tools.as_deref() {
+        take(tools, &mut merged, &mut seen);
+    }
+    if let Value::Array(items) = &req.input {
+        for item in items {
+            if item.get("type").and_then(Value::as_str) == Some("additional_tools")
+                && let Some(tools) = item.get("tools").and_then(Value::as_array)
+            {
+                take(tools, &mut merged, &mut seen);
+            }
+        }
+    }
+    merged
 }
 
 // ============================ Handler ============================
@@ -292,7 +328,7 @@ fn responses_to_anthropic(
     let mut merged: Vec<(String, Vec<Value>)> = Vec::new();
     // codex 0.144 把工具声明放进 input 里的 `additional_tools` item
     //（顶层 `tools` 通常为空）；两处都收集，合并转换。
-    let mut declared_entries: Vec<Value> = req.tools.clone().unwrap_or_default();
+    let declared_entries = collect_responses_tools(&req);
 
     match &req.input {
         // input 直接是字符串 → 单条 user 文本
@@ -307,9 +343,6 @@ fn responses_to_anthropic(
                 // developer 角色的 message item（AGENTS.md / user_instructions /
                 // environment_context）会在 translate_input_item 里归入 system。
                 if item_type == Some("additional_tools") {
-                    if let Some(list) = item.get("tools").and_then(|v| v.as_array()) {
-                        declared_entries.extend(list.iter().cloned());
-                    }
                     continue;
                 }
 
@@ -347,7 +380,11 @@ fn responses_to_anthropic(
 
     // 翻译 codex 声明的本地工具，并记录每个工具的声明类型（出方向要用）。
     let mut tool_kinds: ToolKindMap = HashMap::new();
-    let mut tool_list = convert_responses_tools(&declared_entries, &mut tool_kinds, None);
+    let mut tool_list = if tool_choice_none {
+        Vec::new()
+    } else {
+        convert_responses_tools(&declared_entries, &mut tool_kinds)
+    };
 
     // `tool_choice: none` 是显式禁止工具调用，不能让 hosted web_search
     // 注入工具，也不能把声明的工具继续转发给上游。
@@ -451,17 +488,11 @@ fn native_web_search_tool() -> Tool {
 /// - `function`：JSON schema 原样映射（converter 内部处理 >63 字符的
 ///   名字缩短与还原，这里保持展平名）。
 /// - `custom`（自由文本，如 code-mode 的 exec）：包一层
-///   `{"input": <string>}` 单字段 schema，grammar/format 追加到
-///   description 里提示模型输入格式。
-/// - `namespace`：分组容器（如 collaboration 子代理工具），递归展开，
-///   模型侧展平为 `ns__name`，应答时还原 namespace 字段。
+///   `{"input": <string>}` 单字段 schema，并追加替身协议说明。
+/// - `namespace`：默认 `functions` 已由收集阶段展开；其它容器跳过。
 /// - `web_search`：跳过（原生注入统一代答）。
 /// - 其它类型（local_shell / tool_search ...）：警告并跳过。
-fn convert_responses_tools(
-    entries: &[Value],
-    kinds: &mut ToolKindMap,
-    namespace: Option<&str>,
-) -> Vec<Tool> {
+fn convert_responses_tools(entries: &[Value], kinds: &mut ToolKindMap) -> Vec<Tool> {
     let mut out = Vec::new();
     for entry in entries {
         let ty = entry
@@ -492,18 +523,16 @@ fn convert_responses_tools(
                         input_schema.insert(k.clone(), v.clone());
                     }
                 }
-                let flat = flat_tool_name(namespace, &name);
                 kinds.insert(
-                    flat.clone(),
+                    name.clone(),
                     DeclaredTool {
                         kind: DeclaredToolKind::Function,
-                        name,
-                        namespace: namespace.map(str::to_string),
+                        name: name.clone(),
                     },
                 );
                 out.push(Tool {
                     tool_type: None,
-                    name: flat,
+                    name,
                     description,
                     input_schema,
                     max_uses: None,
@@ -524,43 +553,25 @@ fn convert_responses_tools(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                // 自由文本工具的语法（如 apply_patch 的 lark grammar）
-                // 附到描述里，让模型知道 input 字符串该长什么样。
-                if let Some(format) = entry.get("format") {
-                    let syntax = format
-                        .get("syntax")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("grammar");
-                    if let Some(def) = format.get("definition").and_then(|v| v.as_str()) {
-                        description
-                            .push_str(&format!("\n\nInput format ({syntax} grammar):\n{def}"));
-                    }
-                }
+                description.push_str(FREEFORM_ADAPTATION_NOTE);
                 let mut input_schema: BTreeMap<String, Value> = BTreeMap::new();
                 input_schema.insert("type".to_string(), json!("object"));
                 input_schema.insert(
                     "properties".to_string(),
-                    json!({
-                        "input": {
-                            "type": "string",
-                            "description": "The complete raw tool input text. Do NOT wrap it in JSON or escape it.",
-                        }
-                    }),
+                    json!({ "input": { "type": "string" } }),
                 );
                 input_schema.insert("required".to_string(), json!(["input"]));
                 input_schema.insert("additionalProperties".to_string(), json!(false));
-                let flat = flat_tool_name(namespace, &name);
                 kinds.insert(
-                    flat.clone(),
+                    name.clone(),
                     DeclaredTool {
                         kind: DeclaredToolKind::Custom,
-                        name,
-                        namespace: namespace.map(str::to_string),
+                        name: name.clone(),
                     },
                 );
                 out.push(Tool {
                     tool_type: None,
-                    name: flat,
+                    name,
                     description,
                     input_schema,
                     max_uses: None,
@@ -568,26 +579,13 @@ fn convert_responses_tools(
                 });
             }
             "namespace" => {
-                let ns = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                if ns.is_empty() || namespace.is_some() {
-                    // 嵌套 namespace 未见于协议，保守跳过
-                    tracing::warn!("responses: skipping empty/nested namespace tool group");
-                    continue;
-                }
-                if let Some(nested) = entry.get("tools").and_then(|v| v.as_array()) {
-                    let ns_desc = entry
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let mut converted = convert_responses_tools(nested, kinds, Some(ns));
-                    // 分组描述附到每个成员前，保留上下文
-                    if !ns_desc.is_empty() {
-                        for t in &mut converted {
-                            t.description = format!("[{ns}] {ns_desc}\n{}", t.description);
-                        }
-                    }
-                    out.extend(converted);
-                }
+                tracing::warn!(
+                    namespace = entry
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(""),
+                    "responses: skipping unsupported namespace tool group"
+                );
             }
             // 托管 web_search 声明：原生注入统一代答，无需单独转发。
             "web_search" => {}
@@ -608,8 +606,8 @@ fn translate_input_item(
     let ty = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match ty {
-        // 助手发起的工具调用（function 类型）。namespace 工具还原为展平名，
-        // 与进方向声明及模型产出保持一致。
+        // 助手发起的工具调用（function 类型）。默认 functions namespace 在
+        // wire 上仍按裸名回放。
         "function_call" => {
             let call_id = item
                 .get("call_id")
@@ -622,7 +620,6 @@ fn translate_input_item(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let namespace = item.get("namespace").and_then(|v| v.as_str());
             let args_str = item
                 .get("arguments")
                 .and_then(|v| v.as_str())
@@ -633,7 +630,7 @@ fn translate_input_item(
             let block = json!({
                 "type": "tool_use",
                 "id": call_id,
-                "name": flat_tool_name(namespace, &name),
+                "name": name,
                 "input": input,
             });
             push_merged(merged, "assistant", vec![block]);
@@ -653,12 +650,11 @@ fn translate_input_item(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let namespace = item.get("namespace").and_then(|v| v.as_str());
             let input_str = item.get("input").and_then(|v| v.as_str()).unwrap_or("");
             let block = json!({
                 "type": "tool_use",
                 "id": call_id,
-                "name": flat_tool_name(namespace, &name),
+                "name": name,
                 "input": { "input": input_str },
             });
             push_merged(merged, "assistant", vec![block]);
@@ -793,8 +789,7 @@ fn convert_tool_choice(tc: &Value) -> Result<Value, String> {
                         .or_else(|| object.get("function").and_then(|f| f.get("name")))
                         .and_then(Value::as_str)
                         .ok_or_else(|| "tool_choice function is missing name".to_string())?;
-                    let namespace = object.get("namespace").and_then(Value::as_str);
-                    Ok(json!({"type":"tool","name":flat_tool_name(namespace, name)}))
+                    Ok(json!({"type":"tool","name":name}))
                 }
                 "auto" => Ok(json!({"type":"auto"})),
                 "required" => Ok(json!({"type":"any"})),
@@ -917,16 +912,15 @@ fn build_view(p: &ParsedResponse, kinds: &ToolKindMap) -> ResponsesView {
             .unwrap_or("{}")
             .to_string();
         let decl = kinds.get(flat_name.as_str());
-        // 展平名还原：namespace 工具应答时用原名 + namespace 字段
-        let (name, namespace) = match decl {
-            Some(d) => (d.name.clone(), d.namespace.clone()),
-            None => (flat_name.clone(), None),
+        let name = match decl {
+            Some(d) => d.name.clone(),
+            None => flat_name.clone(),
         };
         match decl.map(|d| d.kind) {
             // custom 声明 → custom_tool_call（原始字符串 input），
             // 否则 codex 校验 payload 种类失败（"incompatible payload"）。
             Some(DeclaredToolKind::Custom) => {
-                let mut item = json!({
+                let item = json!({
                     "type": "custom_tool_call",
                     "id": new_ctc_id(),
                     "call_id": call_id,
@@ -934,14 +928,11 @@ fn build_view(p: &ParsedResponse, kinds: &ToolKindMap) -> ResponsesView {
                     "input": custom_input_text(&arguments),
                     "status": "completed",
                 });
-                if let Some(ns) = namespace {
-                    item["namespace"] = json!(ns);
-                }
                 output.push(item);
             }
             // function 声明或未声明（模型幻觉出的名字走最兼容的 function_call）
             _ => {
-                let mut item = json!({
+                let item = json!({
                     "type": "function_call",
                     "id": new_fc_id(),
                     "call_id": call_id,
@@ -949,9 +940,6 @@ fn build_view(p: &ParsedResponse, kinds: &ToolKindMap) -> ResponsesView {
                     "arguments": arguments,
                     "status": "completed",
                 });
-                if let Some(ns) = namespace {
-                    item["namespace"] = json!(ns);
-                }
                 output.push(item);
             }
         }
@@ -1519,26 +1507,20 @@ impl ResponsesStreamContext {
         flat_name: String,
         mut arguments: String,
     ) -> Vec<Bytes> {
-        if arguments.trim().is_empty() {
-            arguments = "{}".to_string();
-        }
         let output_index = self.allocate_output_index();
         let decl = self.tool_kinds.get(&flat_name);
-        let (name, namespace, kind) = match decl {
-            Some(d) => (d.name.clone(), d.namespace.clone(), d.kind),
-            None => (flat_name, None, DeclaredToolKind::Function),
+        let (name, kind) = match decl {
+            Some(d) => (d.name.clone(), d.kind),
+            None => (flat_name, DeclaredToolKind::Function),
         };
         let (item, added, delta_event, done_event, done_key, value) = match kind {
             DeclaredToolKind::Custom => {
                 let input = custom_input_text(&arguments);
-                let mut item = json!({
+                let item = json!({
                     "type": "custom_tool_call", "id": new_ctc_id(),
                     "call_id": call_id, "name": name, "input": input,
                     "status": "completed",
                 });
-                if let Some(ns) = namespace {
-                    item["namespace"] = json!(ns);
-                }
                 let mut added = item.clone();
                 added["status"] = json!("in_progress");
                 (
@@ -1551,14 +1533,14 @@ impl ResponsesStreamContext {
                 )
             }
             DeclaredToolKind::Function => {
-                let mut item = json!({
+                if arguments.trim().is_empty() {
+                    arguments = "{}".to_string();
+                }
+                let item = json!({
                     "type": "function_call", "id": new_fc_id(),
                     "call_id": call_id, "name": name, "arguments": arguments,
                     "status": "completed",
                 });
-                if let Some(ns) = namespace {
-                    item["namespace"] = json!(ns);
-                }
                 let mut added = item.clone();
                 added["status"] = json!("in_progress");
                 added["arguments"] = json!("");
@@ -2196,7 +2178,6 @@ mod tests {
                     DeclaredTool {
                         kind: *k,
                         name: n.to_string(),
-                        namespace: None,
                     },
                 )
             })
@@ -2266,67 +2247,51 @@ mod tests {
     }
 
     #[test]
-    fn namespace_tools_flattened_and_restored() {
+    fn functions_namespace_is_expanded_once_with_bare_names() {
         let req = req_with(
             json!([]),
             json!([
                 { "type": "additional_tools", "role": "developer", "tools": [
-                    { "type": "namespace", "name": "collaboration", "description": "Sub-agents.",
+                    { "type": "namespace", "name": "functions",
                       "tools": [
-                          { "type": "function", "name": "spawn_agent", "parameters": { "type": "object" } },
+                          { "type": "custom", "name": "exec", "description": "Run JS" },
+                          { "type": "function", "name": "wait", "parameters": { "type": "object" } },
                       ]},
                 ]},
                 { "type": "message", "role": "user", "content": "hi" },
             ]),
         );
         let (anth, kinds) = responses_to_anthropic(req, None).unwrap();
-        let decl = kinds
-            .get("collaboration__spawn_agent")
-            .expect("flattened name");
-        assert_eq!(decl.kind, DeclaredToolKind::Function);
-        assert_eq!(decl.name, "spawn_agent");
-        assert_eq!(decl.namespace.as_deref(), Some("collaboration"));
         let tools = anth.tools.as_ref().unwrap();
-        let t = tools
-            .iter()
-            .find(|t| t.name == "collaboration__spawn_agent")
-            .expect("flattened tool declared to the model");
-        assert!(t.description.contains("Sub-agents."));
-
-        // 应答方向：展平名 → 原名 + namespace 字段
-        let p = parsed_with_tool_calls(vec![json!({
-            "id": "toolu_9", "type": "function",
-            "function": { "name": "collaboration__spawn_agent", "arguments": "{}" },
-        })]);
-        let view = build_view(&p, &kinds);
-        let fc = view
-            .output
-            .iter()
-            .find(|i| i["type"] == "function_call")
-            .unwrap();
-        assert_eq!(fc["name"], "spawn_agent");
-        assert_eq!(fc["namespace"], "collaboration");
-        assert_eq!(fc["call_id"], "toolu_9");
+        assert_eq!(
+            tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["exec", "wait"]
+        );
+        assert_eq!(
+            kinds.get("exec").map(|d| d.kind),
+            Some(DeclaredToolKind::Custom)
+        );
+        assert_eq!(
+            kinds.get("wait").map(|d| d.kind),
+            Some(DeclaredToolKind::Function)
+        );
     }
 
     #[test]
-    fn namespaced_function_call_replay_uses_flat_name() {
+    fn unsupported_namespace_is_not_exposed_as_dead_tools() {
         let req = req_with(
             json!([]),
             json!([
+                { "type": "additional_tools", "tools": [{
+                    "type": "namespace", "name": "collaboration",
+                    "tools": [{ "type": "function", "name": "spawn_agent", "parameters": {} }]
+                }]},
                 { "type": "message", "role": "user", "content": "go" },
-                { "type": "function_call", "call_id": "c9", "name": "spawn_agent",
-                  "namespace": "collaboration", "arguments": "{\"task\":\"x\"}" },
-                { "type": "function_call_output", "call_id": "c9", "output": "spawned" },
             ]),
         );
-        let (anth, _) = responses_to_anthropic(req, None).unwrap();
-        let tu = &anth.messages[1].content.as_array().unwrap()[0];
-        assert_eq!(tu["type"], "tool_use");
-        assert_eq!(
-            tu["name"], "collaboration__spawn_agent",
-            "replayed namespaced call must use the flat name the model was declared"
-        );
+        let (anth, kinds) = responses_to_anthropic(req, None).unwrap();
+        assert!(anth.tools.is_none());
+        assert!(kinds.is_empty());
     }
 
     #[test]
@@ -2338,32 +2303,33 @@ mod tests {
             "tool_choice": "none",
         }))
         .unwrap();
-        let (anth, _) = responses_to_anthropic(req, None).unwrap();
+        let (anth, kinds) = responses_to_anthropic(req, None).unwrap();
         assert!(anth.tools.is_none());
+        assert!(kinds.is_empty());
         assert_eq!(anth.tool_choice, Some(json!({"type": "none"})));
     }
 
     #[test]
-    fn namespaced_tool_choice_is_flattened() {
+    fn functions_namespaced_tool_choice_uses_bare_name() {
         let req: ResponsesRequest = serde_json::from_value(json!({
             "model": "gpt-5.6-sol",
             "input": simple_input(),
             "tools": [{
                 "type": "namespace",
-                "name": "collaboration",
+                "name": "functions",
                 "tools": [{ "type": "function", "name": "spawn_agent", "parameters": {} }]
             }],
             "tool_choice": {
                 "type": "function",
                 "name": "spawn_agent",
-                "namespace": "collaboration"
+                "namespace": "functions"
             },
         }))
         .unwrap();
         let (anth, _) = responses_to_anthropic(req, None).unwrap();
         assert_eq!(
             anth.tool_choice,
-            Some(json!({"type": "tool", "name": "collaboration__spawn_agent"}))
+            Some(json!({"type": "tool", "name": "spawn_agent"}))
         );
     }
 
@@ -2431,10 +2397,10 @@ mod tests {
         let props = ap.input_schema.get("properties").unwrap();
         assert!(props.get("input").is_some(), "wrapper input field required");
         assert_eq!(ap.input_schema.get("required").unwrap(), &json!(["input"]));
-        // grammar 附加到描述
+        // 原描述保留，并追加 JSON 替身适配说明。
         assert!(ap.description.contains("Apply a patch."));
-        assert!(ap.description.contains("lark grammar"));
-        assert!(ap.description.contains("start: PATCH"));
+        assert!(ap.description.contains("[Gateway adaptation]"));
+        assert!(ap.description.contains("`input` string field"));
         // 普通本地工具不应触发缓冲式 WebSearch loop。
         assert!(!tools.iter().any(|t| t.name == "web_search"));
         assert!(!tools.iter().any(|t| t.name == "noop"));
@@ -2842,14 +2808,13 @@ mod tests {
     }
 
     #[test]
-    fn streaming_tool_waits_for_complete_json_and_restores_custom_namespace() {
+    fn streaming_custom_tool_waits_for_complete_json_and_emits_bare_name() {
         let mut kinds = ToolKindMap::new();
         kinds.insert(
-            "collaboration__apply_patch".into(),
+            "apply_patch".into(),
             DeclaredTool {
                 kind: DeclaredToolKind::Custom,
                 name: "apply_patch".into(),
-                namespace: Some("collaboration".into()),
             },
         );
         let mut context = ResponsesStreamContext::new(
@@ -2866,7 +2831,7 @@ mod tests {
                     "type": "content_block_start", "index": 1,
                     "content_block": {
                         "type": "tool_use", "id": "toolu_1",
-                        "name": "collaboration__apply_patch", "input": {}
+                        "name": "apply_patch", "input": {}
                     },
                 }),
             )
@@ -2903,9 +2868,35 @@ mod tests {
         assert!(completed.contains("response.custom_tool_call_input.done"));
         assert!(completed.contains("\"input\":\"PATCH BODY\""));
         assert!(completed.contains("\"name\":\"apply_patch\""));
-        assert!(completed.contains("\"namespace\":\"collaboration\""));
+        assert!(!completed.contains("\"namespace\""));
         assert!(completed.contains("\"call_id\":\"toolu_1\""));
         assert!(!completed.contains("\"done_key\""));
+    }
+
+    #[test]
+    fn streaming_empty_custom_tool_input_stays_empty() {
+        let kinds = kinds_of(&[("exec", DeclaredToolKind::Custom)]);
+        let mut context = ResponsesStreamContext::new(
+            "gpt-5.6-sol".into(),
+            kinds,
+            ResponsesResponseConfig::default(),
+        );
+        context.initial_events();
+        feed_event(
+            &mut context,
+            "content_block_start",
+            json!({
+                "type": "content_block_start", "index": 0,
+                "content_block": { "type": "tool_use", "id": "toolu_empty", "name": "exec", "input": {} },
+            }),
+        );
+        let completed = feed_event(
+            &mut context,
+            "content_block_stop",
+            json!({ "type": "content_block_stop", "index": 0 }),
+        );
+        assert!(completed.contains("\"input\":\"\""));
+        assert!(!completed.contains("\"input\":\"{}\""));
     }
 
     #[test]
