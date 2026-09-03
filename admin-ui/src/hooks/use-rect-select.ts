@@ -1,14 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef } from 'react'
 
 /** 框选起点超过该像素阈值才进入"拖拽框选"模式，避免误把普通点击识别成框选。 */
 const DRAG_THRESHOLD = 5
-
-export interface RectSelectionState {
-  /** 是否处于框选过程（鼠标拖动距离已经超过阈值） */
-  active: boolean
-  /** 框选矩形（fixed 定位坐标） */
-  rect: { left: number; top: number; width: number; height: number } | null
-}
 
 export interface UseRectSelectOptions {
   containerRef: React.RefObject<HTMLElement | null>
@@ -24,18 +17,20 @@ export interface UseRectSelectOptions {
 /**
  * 在指定容器内启用鼠标左键拖拽框选。
  *
- * 设计要点：
- * - 仅在按下点不是按钮 / 输入框 / 下拉等交互元素时才启动，避免误触。
+ * 性能设计：
+ * - 拖拽过程中的虚线矩形通过独立的 DOM Overlay 节点直接更新样式，
+ *   彻底避免在 mousemove 时调用 React setState 导致父组件 60fps 全量重渲染。
+ * - 仅在按下的不是按钮 / 输入框 / 下拉等交互元素时才启动。
  * - 按住 Ctrl/Meta 框选时附加到既有选区，否则替换。
- * - 拖动距离不足阈值时降级为普通点击，由原有 onClick 接管。
- * - 用 fixed 定位虚线矩形显示选区，避免污染父级布局。
  */
-export function useRectSelect(options: UseRectSelectOptions): RectSelectionState {
+export function useRectSelect(options: UseRectSelectOptions): void {
   const { containerRef, itemSelector, idAttribute, onSelectionChange, enabled = true } = options
-  const [state, setState] = useState<RectSelectionState>({ active: false, rect: null })
+  const onSelectionChangeRef = useRef(onSelectionChange)
+  onSelectionChangeRef.current = onSelectionChange
 
   const startRef = useRef<{ x: number; y: number; additive: boolean } | null>(null)
   const activeRef = useRef(false)
+  const overlayRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
     if (!enabled) return
@@ -52,6 +47,18 @@ export function useRectSelect(options: UseRectSelectOptions): RectSelectionState
     }
 
     const dataAttr = `data-${idAttribute}`
+
+    const getOrCreateOverlay = (): HTMLDivElement => {
+      if (!overlayRef.current) {
+        const overlay = document.createElement('div')
+        overlay.className =
+          'pointer-events-none fixed z-50 rounded-sm border border-primary/70 bg-primary/15'
+        overlay.style.display = 'none'
+        document.body.appendChild(overlay)
+        overlayRef.current = overlay
+      }
+      return overlayRef.current
+    }
 
     const onMouseDown = (e: MouseEvent) => {
       if (e.button !== 0) return
@@ -76,12 +83,21 @@ export function useRectSelect(options: UseRectSelectOptions): RectSelectionState
       const top = Math.min(e.clientY, start.y)
       const width = Math.abs(dx)
       const height = Math.abs(dy)
-      setState({ active: true, rect: { left, top, width, height } })
+
+      const overlay = getOrCreateOverlay()
+      overlay.style.display = 'block'
+      overlay.style.left = `${left}px`
+      overlay.style.top = `${top}px`
+      overlay.style.width = `${width}px`
+      overlay.style.height = `${height}px`
     }
 
     const onMouseUp = (e: MouseEvent) => {
       const start = startRef.current
       startRef.current = null
+      if (overlayRef.current) {
+        overlayRef.current.style.display = 'none'
+      }
       if (!start) return
       if (!activeRef.current) return // 普通点击不改变选区
       activeRef.current = false
@@ -103,8 +119,7 @@ export function useRectSelect(options: UseRectSelectOptions): RectSelectionState
         if (Number.isFinite(id)) hits.add(id)
       })
 
-      onSelectionChange(hits, start.additive)
-      setState({ active: false, rect: null })
+      onSelectionChangeRef.current(hits, start.additive)
     }
 
     el.addEventListener('mousedown', onMouseDown)
@@ -116,8 +131,11 @@ export function useRectSelect(options: UseRectSelectOptions): RectSelectionState
       window.removeEventListener('mousemove', onMouseMove)
       window.removeEventListener('mouseup', onMouseUp)
       document.body.style.userSelect = ''
+      if (overlayRef.current) {
+        overlayRef.current.remove()
+        overlayRef.current = null
+      }
     }
-  }, [containerRef, itemSelector, idAttribute, onSelectionChange, enabled])
-
-  return state
+  }, [containerRef, itemSelector, idAttribute, enabled])
 }
+

@@ -782,11 +782,12 @@ pub async fn post_messages(
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
     // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
-        .unwrap_or_default();
+    let cache_usage = match state.cache_meter.as_ref() {
+        Some(cache) => {
+            super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id).await
+        }
+        None => super::cache_metering::CacheUsage::default(),
+    };
 
     if payload.stream {
         // 流式响应
@@ -1770,11 +1771,12 @@ pub async fn post_messages_cc(
     let known_tool_names = conversion_result.known_tool_names;
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（estimate 口径）。
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
-        .unwrap_or_default();
+    let cache_usage = match state.cache_meter.as_ref() {
+        Some(cache) => {
+            super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id).await
+        }
+        None => super::cache_metering::CacheUsage::default(),
+    };
 
     if payload.stream {
         // 流式响应（缓冲模式）
