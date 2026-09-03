@@ -164,7 +164,30 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
           </DialogDescription>
         </DialogHeader>
 
-        <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
+        <form
+          onSubmit={handleSubmit}
+          className="flex flex-col min-h-0 flex-1"
+          autoComplete="off"
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck="false"
+        >
+          {/* 阻止浏览器与密码管理器自动填充账号密码 */}
+          <input
+            type="text"
+            name="prevent_autofill_user"
+            style={{ display: 'none' }}
+            tabIndex={-1}
+            autoComplete="off"
+          />
+          <input
+            type="password"
+            name="prevent_autofill_pwd"
+            style={{ display: 'none' }}
+            tabIndex={-1}
+            autoComplete="new-password"
+          />
+
           <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
             {/* 认证方式 */}
             <div className="space-y-2">
@@ -201,6 +224,9 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
                   value={kiroApiKey}
                   onChange={(e) => setKiroApiKey(e.target.value)}
                   disabled={isPending}
+                  autoComplete="new-password"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                 />
               </div>
             )}
@@ -218,6 +244,9 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
                   value={refreshToken}
                   onChange={(e) => setRefreshToken(e.target.value)}
                   disabled={isPending}
+                  autoComplete="new-password"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                 />
               </div>
             )}
@@ -267,6 +296,9 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
                     value={clientId}
                     onChange={(e) => setClientId(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
                 <div className="space-y-2">
@@ -280,6 +312,9 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
                     value={clientSecret}
                     onChange={(e) => setClientSecret(e.target.value)}
                     disabled={isPending}
+                    autoComplete="new-password"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
               </>
@@ -298,6 +333,9 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
                     value={clientId}
                     onChange={(e) => setClientId(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
                 <div className="space-y-2">
@@ -310,6 +348,9 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
                     value={tokenEndpoint}
                     onChange={(e) => setTokenEndpoint(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                   <p className="text-xs text-muted-foreground">
                     仅允许 *.microsoftonline.com / .us / .cn 主机（https）
@@ -325,6 +366,9 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
                     value={issuerUrl}
                     onChange={(e) => setIssuerUrl(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
                 <div className="space-y-2">
@@ -337,6 +381,9 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
                     value={scopes}
                     onChange={(e) => setScopes(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
               </>
@@ -353,6 +400,9 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
                 value={machineId}
                 onChange={(e) => setMachineId(e.target.value)}
                 disabled={isPending}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
               <p className="text-xs text-muted-foreground">
                 可选，64 位十六进制字符串，留空使用配置中字段, 否则由刷新Token自动派生
@@ -370,6 +420,9 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
                 value={endpoint}
                 onChange={(e) => setEndpoint(e.target.value)}
                 disabled={isPending}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
               <p className="text-xs text-muted-foreground">
                 可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
@@ -401,6 +454,9 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
                 value={sourceChannel}
                 onChange={(e) => setSourceChannel(e.target.value)}
                 disabled={isPending}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
               <p className="text-xs text-muted-foreground">
                 可选。纯备注，标记账号来源/渠道，便于追踪
@@ -423,6 +479,9 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
                 value={proxyUrl}
                 onChange={(e) => setProxyUrl(e.target.value)}
                 disabled={isPending}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
               <div className="grid grid-cols-2 gap-2">
                 <Input
@@ -431,6 +490,9 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
                   value={proxyUsername}
                   onChange={(e) => setProxyUsername(e.target.value)}
                   disabled={isPending}
+                  autoComplete="off"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                 />
                 <Input
                   id="proxyPassword"
@@ -439,6 +501,9 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
                   value={proxyPassword}
                   onChange={(e) => setProxyPassword(e.target.value)}
                   disabled={isPending}
+                  autoComplete="new-password"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                 />
               </div>
               <p className="text-xs text-muted-foreground">
