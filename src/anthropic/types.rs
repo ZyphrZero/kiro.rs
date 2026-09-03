@@ -48,6 +48,8 @@ pub struct Model {
     pub display_name: String,
     #[serde(rename = "type")]
     pub model_type: String,
+    /// 上下文窗口（输入 token 上限），对应上游 `maxInputTokens`。
+    pub context_window: i32,
     pub max_tokens: i32,
 }
 
