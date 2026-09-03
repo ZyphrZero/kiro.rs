@@ -244,6 +244,15 @@ pub struct Config {
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
+    /// 是否启用中转层 prompt cache 本地计量模拟。未设置时回落到
+    /// `KIRO_RS_CACHE_METERING` 环境变量，再回落到默认开启。
+    ///
+    /// 关闭后：不查不写任何缓存态，usage 全量计入 `input_tokens`、
+    /// `cache_creation_input_tokens` / `cache_read_input_tokens` 恒为 0。
+    /// 上游若下发真实 `metadataEvent.tokenUsage`，仍按真值上报，不受此开关影响。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_enabled: Option<bool>,
+
     /// 是否启用请求链路追踪（写 traces.db）。默认 true。
     ///
     /// 关闭后：不再写入 trace 记录、不走 TraceSink，但 `GET /api/admin/traces`
@@ -422,6 +431,7 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
+            cache_metering_enabled: None,
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),

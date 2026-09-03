@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import {
-  Plus, FolderTree, Trash2, Pencil, Users, KeyRound, RefreshCw,
+  Plus, FolderTree, Trash2, Pencil, Users, KeyRound, RefreshCw, Loader2,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -44,6 +44,7 @@ export function GroupsPage() {
   const [editNewName, setEditNewName] = useState('')
   const [editDesc, setEditDesc] = useState('')
   const [batchDeleting, setBatchDeleting] = useState(false)
+  const [deleteProgress, setDeleteProgress] = useState<{ current: number; total: number } | null>(null)
 
   const groups = useMemo(() => data?.groups ?? [], [data?.groups])
 
@@ -178,17 +179,20 @@ export function GroupsPage() {
     }
 
     setBatchDeleting(true)
+    setDeleteProgress({ current: 0, total: names.length })
     let successCount = 0
     let failCount = 0
 
     try {
-      for (const name of names) {
+      for (let i = 0; i < names.length; i++) {
+        const name = names[i]
         try {
           await deleteGroup.mutateAsync({ name, force })
           successCount++
         } catch {
           failCount++
         }
+        setDeleteProgress({ current: i + 1, total: names.length })
       }
       if (failCount === 0) {
         toast.success(`已批量删除 ${successCount} 个分组`)
@@ -198,6 +202,7 @@ export function GroupsPage() {
       setSelectedNames(new Set())
     } finally {
       setBatchDeleting(false)
+      setDeleteProgress(null)
     }
   }
 
@@ -332,8 +337,17 @@ export function GroupsPage() {
           className="h-8 px-3 text-xs gap-1.5 rounded-full"
           disabled={batchDeleting}
         >
-          <Trash2 className="h-3.5 w-3.5" />
-          {batchDeleting ? '删除中…' : '批量删除'}
+          {batchDeleting && deleteProgress ? (
+            <>
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              删除中 {deleteProgress.current}/{deleteProgress.total}
+            </>
+          ) : (
+            <>
+              <Trash2 className="h-3.5 w-3.5" />
+              批量删除
+            </>
+          )}
         </Button>
       </BulkBar>
 

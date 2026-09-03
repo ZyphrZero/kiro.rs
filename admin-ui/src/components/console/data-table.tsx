@@ -1,10 +1,10 @@
-import {
+import React, {
   useCallback,
   useMemo,
   useState,
   type ReactNode,
 } from 'react'
-import { Columns3, Check } from 'lucide-react'
+import { Columns3, Check, ChevronRight } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -51,8 +51,16 @@ export interface ConsoleTableProps<T> {
   selectable?: boolean
   selected?: Set<number | string>
   onSelectedChange?: (next: Set<number | string>) => void
-  /** 点击行触发，通常用来开详情抽屉 */
+  /** 点击行触发 */
   onRowActivate?: (row: T) => void
+  /** 展开行渲染函数；传入即开启可折叠行模式 */
+  renderExpandedRow?: (row: T) => ReactNode
+  /** 受控的已展开行 key 集合 */
+  expandedKeys?: Set<number | string>
+  /** 展开行改变回调 */
+  onExpandedKeysChange?: (next: Set<number | string>) => void
+  /** 点击整行是否切换展开，默认 true */
+  expandOnRowClick?: boolean
   /** 行右侧的处置动作，hover / focus 行才显形 */
   rowActions?: (row: T) => ReactNode
   /** 列可见性持久化 key；不给则不显示列控制菜单 */
@@ -127,6 +135,10 @@ export function ConsoleTable<T>({
   selected,
   onSelectedChange,
   onRowActivate,
+  renderExpandedRow,
+  expandedKeys,
+  onExpandedKeysChange,
+  expandOnRowClick = true,
   rowActions,
   columnsStorageKey,
   loading = false,
@@ -137,6 +149,20 @@ export function ConsoleTable<T>({
     columns,
     columnsStorageKey,
   )
+
+  const [internalExpandedKeys, setInternalExpandedKeys] = useState<Set<number | string>>(new Set())
+  const effectiveExpandedKeys = expandedKeys ?? internalExpandedKeys
+  const setEffectiveExpandedKeys = onExpandedKeysChange ?? setInternalExpandedKeys
+
+  const toggleExpand = useCallback((key: number | string) => {
+    const next = new Set(effectiveExpandedKeys)
+    if (next.has(key)) {
+      next.delete(key)
+    } else {
+      next.add(key)
+    }
+    setEffectiveExpandedKeys(next)
+  }, [effectiveExpandedKeys, setEffectiveExpandedKeys])
 
   const allSelected =
     rows.length > 0 && rows.every((r) => selected?.has(rowKey(r)))
@@ -158,6 +184,11 @@ export function ConsoleTable<T>({
   }
 
   const hasHiddenOption = columns.some((c) => c.optional)
+  const colSpanTotal =
+    ordered.length +
+    (selectable ? 1 : 0) +
+    (renderExpandedRow ? 1 : 0) +
+    (rowActions ? 1 : 0)
 
   return (
     <div className="console-scope space-y-2">
@@ -195,10 +226,11 @@ export function ConsoleTable<T>({
         </div>
       )}
 
-      <div className="overflow-x-auto rounded-xl border border-border/60 bg-card/80 backdrop-blur-xl">
+      <div className="overflow-x-auto rounded-xl border border-border/60 bg-card [transform:translateZ(0)]">
         <table className="console-table">
           <thead>
             <tr>
+              {renderExpandedRow && <th className="w-8 px-1 text-center" />}
               {selectable && (
                 <th className="w-9 pl-3">
                   <Checkbox
@@ -224,48 +256,98 @@ export function ConsoleTable<T>({
             {rows.map((row) => {
               const key = rowKey(row)
               const isSelected = selected?.has(key) ?? false
+              const isExpanded = effectiveExpandedKeys.has(key)
+              const canClickRow = Boolean(onRowActivate || (renderExpandedRow && expandOnRowClick))
               return (
-                <tr
-                  key={key}
-                  data-selected={isSelected || undefined}
-                  className={cn(onRowActivate && 'cursor-pointer')}
-                  onClick={() => onRowActivate?.(row)}
-                >
-                  {selectable && (
-                    <td
-                      className={cn('pl-3', tone && railClass(tone(row)))}
-                      onClick={(e) => e.stopPropagation()}
+                <React.Fragment key={key}>
+                  <tr
+                    data-selected={isSelected || undefined}
+                    data-expanded={isExpanded || undefined}
+                    className={cn(canClickRow && 'cursor-pointer')}
+                    onClick={() => {
+                      onRowActivate?.(row)
+                      if (renderExpandedRow && expandOnRowClick) {
+                        toggleExpand(key)
+                      }
+                    }}
+                  >
+                    {renderExpandedRow && (
+                      <td
+                        className={cn(
+                          'w-8 px-1.5 text-center',
+                          !selectable && tone && railClass(tone(row)),
+                        )}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          toggleExpand(key)
+                        }}
+                      >
+                        <button
+                          type="button"
+                          className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                          title={isExpanded ? '收起详情' : '展开详情'}
+                          aria-label={isExpanded ? '收起详情' : '展开详情'}
+                        >
+                          <ChevronRight
+                            className={cn(
+                              'h-3.5 w-3.5 transition-transform duration-200',
+                              isExpanded && 'rotate-90 text-foreground',
+                            )}
+                          />
+                        </button>
+                      </td>
+                    )}
+                    {selectable && (
+                      <td
+                        className={cn(
+                          'pl-3',
+                          !renderExpandedRow && tone && railClass(tone(row)),
+                        )}
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <Checkbox
+                          checked={isSelected}
+                          onCheckedChange={() => toggleOne(key)}
+                          aria-label="选中此行"
+                        />
+                      </td>
+                    )}
+                    {ordered.map((c, ci) => (
+                      <td
+                        key={c.id}
+                        className={cn(
+                          c.align === 'right' && 'text-right',
+                          // 无展开列与复选框列时，色轨落在第一个数据列上
+                          !renderExpandedRow && !selectable && ci === 0 && tone && railClass(tone(row)),
+                        )}
+                      >
+                        {c.cell(row)}
+                      </td>
+                    ))}
+                    {rowActions && (
+                      <td
+                        className="pr-3 text-right"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <div className="console-row-actions flex items-center justify-end gap-1">
+                          {rowActions(row)}
+                        </div>
+                      </td>
+                    )}
+                  </tr>
+                  {renderExpandedRow && isExpanded && (
+                    <tr
+                      key={`${key}-expanded`}
+                      className="border-b border-border/60 bg-muted/15"
                     >
-                      <Checkbox
-                        checked={isSelected}
-                        onCheckedChange={() => toggleOne(key)}
-                        aria-label="选中此行"
-                      />
-                    </td>
+                      <td colSpan={colSpanTotal} className="p-0">
+                        <div className="border-l-2 border-primary/40 bg-card p-4">
+                          {renderExpandedRow(row)}
+                        </div>
+                      </td>
+                    </tr>
                   )}
-                  {ordered.map((c, ci) => (
-                    <td
-                      key={c.id}
-                      className={cn(
-                        c.align === 'right' && 'text-right',
-                        // 无复选框列时，色轨落在第一个数据列上
-                        !selectable && ci === 0 && tone && railClass(tone(row)),
-                      )}
-                    >
-                      {c.cell(row)}
-                    </td>
-                  ))}
-                  {rowActions && (
-                    <td
-                      className="pr-3 text-right"
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      <div className="console-row-actions flex items-center justify-end gap-1">
-                        {rowActions(row)}
-                      </div>
-                    </td>
-                  )}
-                </tr>
+                </React.Fragment>
               )
             })}
           </tbody>

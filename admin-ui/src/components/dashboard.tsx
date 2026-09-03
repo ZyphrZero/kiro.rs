@@ -1568,7 +1568,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder="搜索来源渠道 / 备注 / 邮箱"
-                  className="h-8 w-full rounded-full border border-border bg-card/60 pl-8 pr-7 text-base backdrop-blur placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:text-sm"
+                  className="h-8 w-full rounded-full border border-border bg-card pl-8 pr-7 text-base placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:text-sm"
                 />
                 {searchQuery ? (
                   <button
@@ -1590,7 +1590,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 onValueChange={(v) => setGroupFilter(v === "all" ? "" : v)}
               >
                 <SelectTrigger
-                  className="h-8 w-full rounded-full border-border bg-card/60 px-3 backdrop-blur sm:w-[140px]"
+                  className="h-8 w-full rounded-full border-border bg-card px-3 sm:w-[140px]"
                   title="按分组筛选凭据"
                 >
                   <SelectValue placeholder="全部分组" />
@@ -1612,7 +1612,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   <button
                     type="button"
                     title="按订阅分级筛选凭据（可多选，依据最近一次余额缓存）"
-                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-full border border-border bg-card/60 px-3 text-sm backdrop-blur hover:bg-accent sm:w-[136px]"
+                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-full border border-border bg-card px-3 text-sm hover:bg-accent sm:w-[136px]"
                   >
                     <span className="truncate">
                       {tierFilter.size > 0
@@ -1660,7 +1660,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   <button
                     type="button"
                     title="按字段排序凭据（再次点击同一字段切换升 / 降序）"
-                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-full border border-border bg-card/60 px-3 text-sm backdrop-blur hover:bg-accent sm:w-[136px]"
+                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-full border border-border bg-card px-3 text-sm hover:bg-accent sm:w-[136px]"
                   >
                     <span className="inline-flex min-w-0 items-center gap-1">
                       {sortField === "manual" ? (
@@ -1713,7 +1713,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </DropdownMenu>
 
               {/* 卡片 / 列表 视图切换（iOS 分段控件） */}
-              <div className="col-span-2 inline-flex h-8 shrink-0 items-center justify-self-start rounded-full border border-border bg-card/60 p-0.5 backdrop-blur sm:col-span-1">
+              <div className="col-span-2 inline-flex h-8 shrink-0 items-center justify-self-start rounded-full border border-border bg-card p-0.5 sm:col-span-1">
                 <button
                   type="button"
                   onClick={() => changeViewMode("card")}
@@ -2107,8 +2107,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 <div
                   className={
                     viewMode === "list"
-                      ? "flex select-none flex-col gap-2"
-                      : "grid select-none gap-3 sm:gap-4 md:grid-cols-2 lg:grid-cols-3"
+                      ? "flex select-none flex-col gap-2 [transform:translateZ(0)]"
+                      : "grid select-none gap-3 sm:gap-4 md:grid-cols-2 lg:grid-cols-3 [transform:translateZ(0)]"
                   }
                 >
                   {currentCredentials.map((credential) => (
@@ -2202,8 +2202,17 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 disabled={batchDeleting}
                 className="h-8 px-3 text-xs gap-1.5 rounded-full text-destructive hover:bg-destructive/10 hover:text-destructive"
               >
-                <Trash2 className="h-3.5 w-3.5" />
-                删除
+                {batchDeleting ? (
+                  <>
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    删除中 {deleteProgress.current}/{deleteProgress.total}
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="h-3.5 w-3.5" />
+                    删除
+                  </>
+                )}
               </Button>
             </BulkBar>
 

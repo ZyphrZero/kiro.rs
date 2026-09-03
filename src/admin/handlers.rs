@@ -26,6 +26,7 @@ use super::{
         CredentialMetadataSchemaConfig,
         SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
         SetGlobalProxyRequest,
+        SetCacheMeteringConfigRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
@@ -634,6 +635,24 @@ pub async fn set_log_governance_config(
     Json(payload): Json<SetLogGovernanceConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_log_governance_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/cache-metering
+/// 获取 prompt cache 本地计量模拟开关
+pub async fn get_cache_metering_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_cache_metering_config())
+}
+
+/// PUT /api/admin/config/cache-metering
+/// 切换 prompt cache 本地计量模拟开关（运行时生效 + 持久化 config.json）
+pub async fn set_cache_metering_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetCacheMeteringConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_cache_metering_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

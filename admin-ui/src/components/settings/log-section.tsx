@@ -12,10 +12,6 @@ import { reportSaveError } from '@/components/settings/report-error'
 
 /**
  * 日志分区：链路追踪开关与两类日志的保留期。
- *
- * 从日志页的「治理设置」下拉搬过来。留在那里的问题不是位置不对，而是它把
- * 「查日志」和「配日志」混在同一个工具栏 —— 排查现场需要的是筛选器，不是配置项，
- * 而配置项一年可能只改两次却常驻占位。
  */
 export function LogSection() {
   const { data, isLoading } = useLogGovernanceConfig()
