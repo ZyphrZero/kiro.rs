@@ -73,7 +73,7 @@ fn default_entry_ttl() -> i64 {
 ///
 /// 调用方据此算 `prefix_ratio = cache_covered_est / prompt_total_est`，再乘到真实
 /// total 上得到缓存覆盖部分，剩余即未缓存的 `input_tokens`，三者互斥相加 == total。
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct CacheUsage {
     /// 缓存读取 token（estimate 口径，最深命中段累计）。
     /// creation 部分 = `cache_covered_est − cache_read`，无需单独存储。
@@ -82,36 +82,88 @@ pub struct CacheUsage {
     pub cache_covered_est: i32,
     /// 整个 prompt 的 estimate token 总量（比例分摊的分母）。
     pub prompt_total_est: i32,
+    /// 实际成本等价折算率（用于下游 NewAPI 计费对齐，例如 0.6 即对齐 6 折，范围 [0.1, 1.0]）
+    pub effective_discount_ratio: f64,
+}
+
+impl Default for CacheUsage {
+    fn default() -> Self {
+        Self {
+            cache_read: 0,
+            cache_covered_est: 0,
+            prompt_total_est: 0,
+            effective_discount_ratio: 0.1,
+        }
+    }
 }
 
 impl CacheUsage {
-    /// 按真实 total 口径做互斥分摊，返回 `(input_tokens, cache_creation, cache_read)`。
+    /// 设置该 usage 实例的折算比例（用于链式或单测微调）
+    #[allow(dead_code)]
+    pub fn with_discount_ratio(mut self, ratio: f64) -> Self {
+        self.effective_discount_ratio = ratio.clamp(0.1, 1.0);
+        self
+    }
+
+    /// 按真实 total 口径以及指定的有效折算率做等价成本分摊。
     ///
-    /// `total_real` 是最终上报口径的全量 prompt token（contextUsage 真值优先，
-    /// 否则 `count_tokens` 估算）。三者满足 `input + creation + read == total_real`。
+    /// 参数 `effective_discount_ratio`：
+    /// 下游 NewAPI 见到 cache_read 强制打 1 折（0.1x）。为了让下游实际扣费当量精确等于
+    /// 上游真实折扣成本（如 0.6 即 6 折），将命中前缀线性拆分为 `eff_read` 与 `comp_input`，满足：
+    /// `eff_read * 0.1 + comp_input * 1.0 = beta * raw_read`（其中 beta 为折算率）。
     ///
-    /// 无缓存覆盖（`cache_covered_est == 0`）或基准缺失时，直接返回
-    /// `(total_real, 0, 0)`——全部计入 input，不凭空造缓存计数。
-    pub fn split_against_total(&self, total_real: i32) -> (i32, i32, i32) {
+    /// 返回 `(input_tokens, cache_creation, cache_read)`，三者在数学上严格守恒且相加 == total_real。
+    pub fn split_against_total_with_ratio(
+        &self,
+        total_real: i32,
+        effective_discount_ratio: f64,
+    ) -> (i32, i32, i32) {
         let total = total_real.max(0);
         if self.cache_covered_est <= 0 || self.prompt_total_est <= 0 {
             return (total, 0, 0);
         }
-        // 比例无量纲，跨估算器成立；clamp 到 [0, total] 防止 estimate 偏差越界。
+        let beta = effective_discount_ratio.clamp(0.1, 1.0);
+
+        // 1. 计算被缓存覆盖的 Token 总量与未缓存尾部（即最深断点之后的内容）
         let ratio = (self.cache_covered_est as f64 / self.prompt_total_est as f64).clamp(0.0, 1.0);
         let cache_total = ((total as f64) * ratio).round() as i32;
         let cache_total = cache_total.min(total);
-        // 在缓存覆盖部分内部，按 estimate 口径的 read/creation 占比二次拆分。
-        let read = if self.cache_covered_est > 0 {
+        let uncached_tail = total - cache_total;
+
+        // 2. 在缓存覆盖部分内部，计算 estimate 口径的命中 read 与新增 creation
+        let raw_read = if self.cache_covered_est > 0 {
             ((cache_total as f64) * (self.cache_read as f64 / self.cache_covered_est as f64))
                 .round() as i32
         } else {
             0
         };
-        let read = read.clamp(0, cache_total);
-        let creation = cache_total - read;
-        let input = total - cache_total;
-        (input, creation, read)
+        let raw_read = raw_read.clamp(0, cache_total);
+        let raw_creation = cache_total - raw_read;
+
+        // 3. 对命中读取的 raw_read 执行【等价成本折扣映射】：
+        // 当下游 NewAPI 按 0.1x 计费时，要使得有效扣费比例为 beta，
+        // 设 T_read * 0.1 + T_comp * 1.0 = beta * raw_read，且 T_read + T_comp = raw_read
+        // => T_read = raw_read * (1 - beta) / 0.9
+        let (eff_read, comp_input) = if raw_read > 0 {
+            let eff_read_ratio = ((1.0 - beta) / 0.9).clamp(0.0, 1.0);
+            let eff_read = ((raw_read as f64) * eff_read_ratio).round() as i32;
+            let eff_read = eff_read.clamp(0, raw_read);
+            let comp_input = raw_read - eff_read;
+            (eff_read, comp_input)
+        } else {
+            (0, 0)
+        };
+
+        let final_read = eff_read;
+        let final_creation = raw_creation;
+        let final_input = uncached_tail + comp_input;
+
+        (final_input, final_creation, final_read)
+    }
+
+    /// 使用自身配置的 `effective_discount_ratio` 做互斥分摊，返回 `(input_tokens, cache_creation, cache_read)`。
+    pub fn split_against_total(&self, total_real: i32) -> (i32, i32, i32) {
+        self.split_against_total_with_ratio(total_real, self.effective_discount_ratio)
     }
 }
 
@@ -415,6 +467,9 @@ pub struct CacheMeter {
     /// 计量模拟总开关（运行时可由 Admin API 切换，无需重启）。
     /// 关闭时 `compute_cache_usage` 直接返回全量 input、零缓存，且不读写任何缓存态。
     enabled: std::sync::atomic::AtomicBool,
+    /// 模拟缓存对齐下游 NewAPI 的有效实际折扣率（范围 0.1 ~ 1.0，默认 0.6 即 6 折）
+    /// 用 u64 存储 f64::to_bits，保证并发读写的原子性与零锁开销
+    effective_discount_ratio: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -459,6 +514,7 @@ impl CacheMeter {
             persist_path,
             remote,
             enabled: std::sync::atomic::AtomicBool::new(true),
+            effective_discount_ratio: std::sync::atomic::AtomicU64::new(0.1_f64.to_bits()),
         }
     }
 
@@ -478,6 +534,37 @@ impl CacheMeter {
     pub fn with_enabled(self, enabled: bool) -> Self {
         self.set_enabled(enabled);
         self
+    }
+
+    /// 获取当前生效的实际成本折算率（范围 0.1 ~ 1.0，默认 0.6 即 6 折）
+    pub fn effective_discount_ratio(&self) -> f64 {
+        let bits = self
+            .effective_discount_ratio
+            .load(std::sync::atomic::Ordering::Relaxed);
+        f64::from_bits(bits)
+    }
+
+    /// 运行时更新实际成本折算率
+    pub fn set_effective_discount_ratio(&self, ratio: f64) {
+        let clamped = ratio.clamp(0.1, 1.0);
+        self.effective_discount_ratio
+            .store(clamped.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// builder 风格设置初始折算率
+    pub fn with_effective_discount_ratio(self, ratio: f64) -> Self {
+        self.set_effective_discount_ratio(ratio);
+        self
+    }
+
+    /// 读取 `KIRO_RS_CACHE_DISCOUNT_RATIO` 环境变量表达的折算率意图（如 "0.6"）。
+    pub fn discount_ratio_from_env() -> Option<f64> {
+        let raw = std::env::var("KIRO_RS_CACHE_DISCOUNT_RATIO").ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        trimmed.parse::<f64>().ok().map(|r| r.clamp(0.1, 1.0))
     }
 
     /// 读取 `KIRO_RS_CACHE_METERING` 环境变量表达的开关意图。
@@ -680,6 +767,8 @@ struct PromptBlock {
     invalid_cache_control: bool,
     cacheable: bool,
     lookback_group: Option<LookbackGroup>,
+    /// 是否为当前轮次的最新用户提问（若是，在多轮对话中自动缓存不应打在其末尾，而应打在上一轮末尾）
+    is_current_turn_input: bool,
 }
 
 /// 识别出的断点
@@ -706,6 +795,7 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                 invalid_cache_control: false,
                 cacheable: true,
                 lookback_group: None,
+                is_current_turn_input: false,
             });
         }
     }
@@ -722,12 +812,22 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                 invalid_cache_control: false,
                 cacheable: !sys.text.trim().is_empty(),
                 lookback_group: None,
+                is_current_turn_input: false,
             });
         }
     }
 
     // 3. messages (按顺序遍历)
-    for msg in &req.messages {
+    let total_messages = req.messages.len();
+    for (m_idx, msg) in req.messages.iter().enumerate() {
+        let is_tool_result = match &msg.content {
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("tool_result")),
+            _ => false,
+        };
+        let is_current_turn_input =
+            (m_idx + 1 == total_messages) && msg.role == "user" && !is_tool_result;
         match &msg.content {
             serde_json::Value::String(s) => {
                 let content = serde_json::Value::String(s.clone());
@@ -738,6 +838,7 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                     invalid_cache_control: false,
                     cacheable: !s.trim().is_empty(),
                     lookback_group: None,
+                    is_current_turn_input,
                 });
             }
             serde_json::Value::Array(arr) => {
@@ -763,6 +864,7 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                         invalid_cache_control,
                         cacheable: block_is_cacheable(&content),
                         lookback_group,
+                        is_current_turn_input,
                     });
                 }
             }
@@ -804,12 +906,21 @@ fn resolve_breakpoints(
         }
     }
 
-    // 2. 顶层自动缓存：落在最后一个合格 block，占用 1 个断点槽
+    // 2. 顶层自动缓存：若有多轮对话且最后一条是当前 user 提问，断点优先挂在当前提问之前的上一轮会话末尾，
+    // 确保当前最新提问 100% 诚实作为未缓存 input_tokens，杜绝 input 归零。
     if let Some(top_cc) = top_cache_control {
         let Some(auto_ttl) = validated_ttl(top_cc) else {
             return Vec::new();
         };
-        if let Some(last_idx) = blocks.iter().rposition(|block| block.cacheable) {
+        let target_idx = if blocks.iter().any(|b| !b.is_current_turn_input && b.cacheable) {
+            blocks
+                .iter()
+                .enumerate()
+                .rposition(|(_idx, block)| block.cacheable && !block.is_current_turn_input)
+        } else {
+            blocks.iter().rposition(|block| block.cacheable)
+        };
+        if let Some(last_idx) = target_idx {
             if let Some(existing) = breakpoints.iter().find(|bp| bp.block_idx == last_idx) {
                 if existing.ttl_secs != auto_ttl {
                     return Vec::new();
@@ -964,6 +1075,7 @@ pub async fn compute_cache_usage(
         cache_read: max_read_tokens as i32,
         cache_covered_est: covered_tokens as i32,
         prompt_total_est: prompt_total_est as i32,
+        effective_discount_ratio: cache.effective_discount_ratio(),
     }
 }
 
@@ -1052,6 +1164,7 @@ pub fn compute_cache_usage_sync(
         cache_read: max_read_tokens as i32,
         cache_covered_est: covered_tokens as i32,
         prompt_total_est: prompt_total_est as i32,
+        effective_discount_ratio: cache.effective_discount_ratio(),
     }
 }
 
@@ -1343,6 +1456,7 @@ mod tests {
             cache_read: 30,
             cache_covered_est: 80,
             prompt_total_est: 100,
+            effective_discount_ratio: 0.1,
         };
         let (input, creation, read) = u.split_against_total(1000);
         assert_eq!(input + creation + read, 1000);
@@ -1352,11 +1466,37 @@ mod tests {
     }
 
     #[test]
+    fn split_against_total_with_cost_equivalence_guardrail() {
+        // 当对齐上游 6 折成本时（beta = 0.6）：
+        // 1000 个 Total，其中 800 个被缓存覆盖，300 个命中历史读取（raw_read = 300），
+        // 500 个为新创建缓存（creation = 500），尾部 200 个为未缓存输入（uncached = 200）。
+        // raw_read(300) 经成本等价折算：eff_read = 300 * (1 - 0.6) / 0.9 = 133，comp_input = 167。
+        // final_read = 133, final_creation = 500, final_input = 200 + 167 = 367。
+        // 下游 NewAPI 扣费当量：367 * 1.0 + 133 * 0.1 + 500 * 1.25 = 367 + 13.3 + 625 = 1005.3，
+        // 仅看 read 部分：167 * 1.0 + 133 * 0.1 = 180.3 ≈ 300 * 0.6 = 180！精确达到 6 折成本对齐！
+        let u = CacheUsage {
+            cache_read: 30,
+            cache_covered_est: 80,
+            prompt_total_est: 100,
+            effective_discount_ratio: 0.6,
+        };
+        let (input, creation, read) = u.split_against_total(1000);
+        assert_eq!(input + creation + read, 1000, "总数必须绝对守恒");
+        assert_eq!(read, 133);
+        assert_eq!(creation, 500);
+        assert_eq!(input, 367);
+        // 验证下游 0.1x 公式下的等价有效费用比例刚好为 60%
+        let effective_read_cost = (input - 200) as f64 + (read as f64) * 0.1;
+        assert!((effective_read_cost - 180.0).abs() < 1.0);
+    }
+
+    #[test]
     fn split_against_total_no_cache_all_input() {
         let u = CacheUsage {
             cache_read: 0,
             cache_covered_est: 0,
             prompt_total_est: 100,
+            effective_discount_ratio: 0.6,
         };
         assert_eq!(u.split_against_total(500), (500, 0, 0));
     }
@@ -3138,5 +3278,40 @@ mod tests {
     fn test_disabled_metering_reports_zero_cache() {
         let (input, creation, read) = CacheUsage::default().split_against_total(12_345);
         assert_eq!((input, creation, read), (12_345, 0, 0));
+    }
+
+    /// 验证成本等价折算映射：彻底消除 input=0 且 NewAPI 扣费当量严格对齐实际成本
+    #[test]
+    fn test_cost_anchored_split_across_different_discount_ratios() {
+        // 场景：历史前缀命中 100,000 tokens，最新提问 1,000 tokens，总计 101,000 tokens
+        let usage = CacheUsage {
+            cache_read: 100_000,
+            cache_covered_est: 100_000,
+            prompt_total_est: 101_000,
+            effective_discount_ratio: 0.6,
+        };
+
+        // 1. 默认对齐 6 折成本 (beta = 0.6)
+        let (inp_60, creation_60, read_60) = usage.split_against_total(101_000);
+        assert_eq!(inp_60 + creation_60 + read_60, 101_000, "三项严格互斥守恒");
+        assert_eq!(creation_60, 0);
+        assert!(inp_60 >= 1_000, "未缓存最新输入绝不可被吞噬，inp={}", inp_60);
+        // raw_read(100k) 经 0.6 成本映射: eff_read = 100k * (1 - 0.6) / 0.9 = 44444
+        assert_eq!(read_60, 44_444);
+        assert_eq!(inp_60, 1_000 + (100_000 - 44_444)); // 56,556
+        // 下游 NewAPI 扣费当量：56556 * 1.0 + 44444 * 0.1 = 61000.4
+        let downstream_cost_60 = (inp_60 as f64) * 1.0 + (read_60 as f64) * 0.1;
+        let effective_pct = downstream_cost_60 / 101_000.0;
+        assert!((effective_pct - 0.604).abs() < 0.005, "下游有效扣费必须精确覆盖约 60% 成本");
+
+        // 2. 设为 100% 原价 (beta = 1.0，完全不给缓存折扣)
+        let (inp_100, _, read_100) = usage.split_against_total_with_ratio(101_000, 1.0);
+        assert_eq!(read_100, 0, "beta=1.0 时不报缓存读");
+        assert_eq!(inp_100, 101_000, "beta=1.0 时全额计入 input");
+
+        // 3. 设为 10% 官方原版折扣 (beta = 0.1)
+        let (inp_10, _, read_10) = usage.split_against_total_with_ratio(101_000, 0.1);
+        assert_eq!(read_10, 100_000, "beta=0.1 时全额报 1 折缓存读");
+        assert_eq!(inp_10, 1_000, "最新提问依然诚实计入 input");
     }
 }

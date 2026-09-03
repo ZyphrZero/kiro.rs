@@ -2490,6 +2490,7 @@ mod tests {
             cache_read: 25,
             cache_covered_est: 50,
             prompt_total_est: 100,
+            effective_discount_ratio: 0.1,
         };
         let provider = TokenUsage {
             uncached_input_tokens: 3,
@@ -2510,6 +2511,7 @@ mod tests {
             cache_read: 25,
             cache_covered_est: 50,
             prompt_total_est: 100,
+            effective_discount_ratio: 0.1,
         };
 
         assert_eq!(

@@ -262,23 +262,32 @@ async fn main() {
 
     // CacheMeter：本地计量模拟，支持可选 Redis 共享元数据层；不承载真实 KV Cache。
     // 持久化到 cache_dir/cache_metering.json，启动时自动加载未过期条目。
-    // 计量模拟开关优先级：config.json 显式值 > KIRO_RS_CACHE_METERING > 默认开启。
-    // 关闭后不查不写缓存态、usage 全量计入 input_tokens（上游真实 tokenUsageEvent 仍按真值上报）。
-    // 开关是组件内原子值，Admin API 可运行时切换，无需重启。
+    // 计量模拟开关与实际成本折算率初始化：
+    // 折算率用于在对齐下游 NewAPI 0.1x 扣费时反向平衡 cache_read 与 input，默认 0.6（6 折成本对齐）。
     let cache_metering_enabled = config
         .cache_metering_enabled
         .or_else(anthropic::cache_metering::CacheMeter::metering_enabled_from_env)
         .unwrap_or(true);
+    let cache_discount_ratio = config
+        .cache_effective_discount_ratio
+        .or_else(anthropic::cache_metering::CacheMeter::discount_ratio_from_env)
+        .unwrap_or(0.6);
     let cache_meter = std::sync::Arc::new(
         anthropic::cache_metering::CacheMeter::from_env(Some(
             cache_dir.join("cache_metering.json"),
         ))
         .await
-        .with_enabled(cache_metering_enabled),
+        .with_enabled(cache_metering_enabled)
+        .with_effective_discount_ratio(cache_discount_ratio),
     );
     cache_meter.clone().spawn_background();
     if !cache_metering_enabled {
         tracing::info!("本地 prompt cache 计量模拟已关闭，usage 将全量计入 input_tokens");
+    } else {
+        tracing::info!(
+            "本地 prompt cache 计量模拟已开启，实际成本等价折算率: {:.0}%",
+            cache_discount_ratio * 100.0
+        );
     }
 
     let anthropic_app = anthropic::create_router_with_shared_provider(

@@ -5420,6 +5420,7 @@ mod tests {
             cache_read: 25,
             cache_covered_est: 50,
             prompt_total_est: 100,
+            effective_discount_ratio: 0.1,
         };
 
         let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
@@ -5463,6 +5464,7 @@ mod tests {
             cache_read: 25,
             cache_covered_est: 50,
             prompt_total_est: 100,
+            effective_discount_ratio: 0.1,
         };
 
         assert_eq!(ctx.resolved_usage(), (40, 20, 20));

@@ -253,6 +253,12 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_metering_enabled: Option<bool>,
 
+    /// 模拟 Prompt Cache 实际成本折算率（用于对齐下游 NewAPI 计费，范围 0.1 ~ 1.0，默认 0.6 即 6 折）。
+    /// 下游 NewAPI 见到 cache_read 强制按 0.1x 计费，通过此折算率反向平衡 cache_read 与 input，
+    /// 使得下游实际扣费当量精确等于上游真实成本（如 0.6），防止站长倒贴亏损。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_effective_discount_ratio: Option<f64>,
+
     /// 是否启用请求链路追踪（写 traces.db）。默认 true。
     ///
     /// 关闭后：不再写入 trace 记录、不走 TraceSink，但 `GET /api/admin/traces`
@@ -432,6 +438,7 @@ impl Default for Config {
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
             cache_metering_enabled: None,
+            cache_effective_discount_ratio: None,
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),

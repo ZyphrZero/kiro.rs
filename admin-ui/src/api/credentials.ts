@@ -541,6 +541,7 @@ export async function setLogGovernanceConfig(
 
 export interface CacheMeteringConfig {
   enabled: boolean
+  effectiveDiscountRatio: number
 }
 
 // 获取 prompt cache 计量模拟开关

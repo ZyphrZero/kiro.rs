@@ -4,7 +4,7 @@ import { Cpu, Bot, Sparkles, Wrench, Plus, Trash2, Save, Loader2, AlertCircle } 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
-import { SettingGroup, SettingSwitch, useFieldSaver } from '@/components/console/setting-row'
+import { SettingGroup, SettingSwitch, SettingNumber, useFieldSaver } from '@/components/console/setting-row'
 import {
   useCustomModels,
   useSetCustomModels,
@@ -90,6 +90,7 @@ export function ModelsSection() {
   const { mutate: mutateCacheMetering } = useSetCacheMeteringConfig()
   const cacheSaver = useFieldSaver(mutateCacheMetering, reportSaveError)
   const cacheMeteringEnabled = cacheMetering?.enabled ?? true
+  const cacheDiscountRatio = cacheMetering?.effectiveDiscountRatio ?? 0.6
 
   // 上游模型
   const upstreamQuery = useCurrentCredentialModels(vendor !== 'custom')
@@ -191,14 +192,14 @@ export function ModelsSection() {
     <div className="space-y-6">
       <SettingGroup
         title="Prompt Cache 提示词缓存"
-        description="控制向客户端返回的用量中是否包含 Anthropic 格式的缓存计量"
+        description="控制向客户端返回的用量中是否包含 Anthropic 格式的缓存计量与下游计费对齐"
       >
         <SettingSwitch
           label="模拟 prompt cache 计量"
           hint={
             cacheMeteringEnabled
               ? '按客户端声明的 cache_control 断点估算缓存读取与创建；终端客户端（如 Claude Code、Cursor）可正常识别缓存命中'
-              : '输入 Token 全额计入 input tokens，缓存两项恒为 0；避免下游计费中转站（如 NewAPI）自动按 1 折打折少收费'
+              : '输入 Token 全额计入 input tokens，缓存两项恒为 0；彻底关闭缓存计量模拟'
           }
           checked={cacheMeteringEnabled}
           onChange={(next) => cacheSaver.save('cacheMetering', { enabled: next })}
@@ -206,6 +207,25 @@ export function ModelsSection() {
           saved={cacheSaver.isSaved('cacheMetering')}
           disabled={cacheLoading}
         />
+        {cacheMeteringEnabled && (
+          <SettingNumber
+            label="实际成本折算率（对齐下游计费）"
+            hint="下游中转站（如 NewAPI）见到缓存读取会自动强制按 1 折（0.1x）扣费。由于上游长对话平均成本约为 6 折（0.6x），本程序会自动将多出的缓存读等价转换为普通输入，使得下游按 0.1x 计算后的总扣费精确等于设定成本，防止站长倒贴亏损。"
+            value={cacheDiscountRatio}
+            min={10}
+            max={100}
+            unit="%"
+            toDisplay={(v) => Math.round(v * 100)}
+            fromDisplay={(v) => Number((v / 100).toFixed(2))}
+            presets={[10, 60, 100]}
+            onCommit={(next) =>
+              cacheSaver.save('discountRatio', { effectiveDiscountRatio: next })
+            }
+            pending={cacheSaver.isSaving('discountRatio')}
+            saved={cacheSaver.isSaved('discountRatio')}
+            disabled={cacheLoading}
+          />
+        )}
       </SettingGroup>
 
       <SettingGroup

@@ -203,7 +203,12 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
   const promptTotal = input + cacheCreation + cacheRead
   const hitRatio =
     promptTotal > 0 && cacheRead > 0
-      ? ((cacheRead / promptTotal) * 100).toFixed(0)
+      ? (() => {
+          const pct = (cacheRead / promptTotal) * 100
+          if (pct >= 100) return '100'
+          if (pct >= 99.95) return '99.9'
+          return pct.toFixed(1)
+        })()
       : null
 
   const titleText = [
