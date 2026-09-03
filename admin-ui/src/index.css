@@ -3,64 +3,107 @@
 
 @layer base {
   :root {
-    /* Apple light theme — macOS Sonoma inspired */
-    --background: 220 20% 97%;
-    --foreground: 220 10% 12%;
+    /* sub2api console light theme — Slate 50 backdrop with crisp white surfaces & Teal 600 */
+    --background: 210 40% 98%;
+    --foreground: 222 47% 11%;
     --card: 0 0% 100%;
-    --card-foreground: 220 10% 12%;
+    --card-foreground: 222 47% 11%;
+    --sidebar: 0 0% 100%;
+    --sidebar-foreground: 222 47% 11%;
+    --sidebar-border: 214 32% 91%;
     --popover: 0 0% 100%;
-    --popover-foreground: 220 10% 12%;
-    /* Apple system blue (#007AFF) */
-    --primary: 211 100% 50%;
+    --popover-foreground: 222 47% 11%;
+    /* sub2api signature Teal 600 (#0d9488) */
+    --primary: 175 84% 32%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 220 14% 94%;
-    --secondary-foreground: 220 10% 12%;
-    --muted: 220 14% 94%;
-    --muted-foreground: 220 8% 45%;
-    --accent: 211 100% 96%;
-    --accent-foreground: 211 100% 35%;
-    /* Apple system red (#FF3B30) */
-    --destructive: 4 100% 59%;
-    --destructive-foreground: 0 0% 100%;
-    --border: 220 13% 88%;
-    --input: 220 13% 88%;
-    --ring: 211 100% 50%;
-    --radius: 0.875rem;
+    --secondary: 210 40% 95%;
+    --secondary-foreground: 222 47% 11%;
+    --muted: 210 40% 95%;
+    --muted-foreground: 215 16% 47%;
+    --accent: 210 40% 93%;
+    --accent-foreground: 175 84% 32%;
+    /* Structured destructive */
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 214 32% 90%;
+    --input: 214 32% 90%;
+    --ring: 175 84% 32%;
+    --radius: 0.375rem;
 
-    /* 状态色轨 —— 三个页面共用的一套异常语言。
-       amber 与 orange 分开是有信息量的：冷却会自己恢复，超额不会。 */
+    /* 状态色轨 —— 工业严谨异常语言 */
     --rail-ok: 160 84% 39%;
     --rail-warn: 38 92% 50%;
-    --rail-cool: 25 95% 53%;
-    --rail-dead: 4 100% 59%;
+    --rail-cool: 199 89% 48%;
+    --rail-dead: 0 84% 60%;
   }
 
   .dark {
-    /* Apple dark theme — macOS Sonoma inspired */
-    --background: 220 14% 8%;
-    --foreground: 220 10% 96%;
-    --card: 220 14% 12%;
-    --card-foreground: 220 10% 96%;
-    --popover: 220 14% 12%;
-    --popover-foreground: 220 10% 96%;
-    --primary: 211 100% 60%;
-    --primary-foreground: 0 0% 100%;
-    --secondary: 220 14% 18%;
-    --secondary-foreground: 220 10% 96%;
-    --muted: 220 14% 16%;
-    --muted-foreground: 220 8% 62%;
-    --accent: 211 70% 22%;
-    --accent-foreground: 211 100% 80%;
-    --destructive: 4 90% 62%;
-    --destructive-foreground: 0 0% 100%;
-    --border: 220 14% 22%;
-    --input: 220 14% 22%;
-    --ring: 211 100% 60%;
+    /* sub2api console dark theme — Slate 950 (#020617) Void with Slate 900 Surface & Teal 500 (#14b8a6) */
+    --background: 222 84% 4.5%;
+    --foreground: 210 40% 98%;
+    --card: 222 47% 9.5%;
+    --card-foreground: 210 40% 98%;
+    --sidebar: 222 47% 8%;
+    --sidebar-foreground: 210 40% 98%;
+    --sidebar-border: 217 33% 16%;
+    --popover: 222 47% 9.5%;
+    --popover-foreground: 210 40% 98%;
+    /* sub2api signature Teal 500 (#14b8a6) */
+    --primary: 173 80% 40%;
+    --primary-foreground: 222 84% 4.5%;
+    --secondary: 217 33% 14%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 217 33% 14%;
+    --muted-foreground: 215 20% 65%;
+    --accent: 217 33% 16%;
+    --accent-foreground: 173 80% 40%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217 33% 16%;
+    --input: 217 33% 16%;
+    --ring: 173 80% 40%;
 
     --rail-ok: 160 84% 45%;
     --rail-warn: 38 92% 55%;
-    --rail-cool: 25 95% 58%;
-    --rail-dead: 4 90% 62%;
+    --rail-cool: 199 89% 55%;
+    --rail-dead: 0 84% 60%;
+  }
+
+  /* 工业调色盘主题覆盖 */
+  [data-theme="graphite"] {
+    --primary: 215 25% 27%;
+    --ring: 215 25% 27%;
+  }
+  .dark[data-theme="graphite"], [data-theme="graphite"].dark {
+    --primary: 210 20% 75%;
+    --ring: 210 20% 75%;
+  }
+
+  [data-theme="ocean"] {
+    --primary: 221 83% 53%;
+    --ring: 221 83% 53%;
+  }
+  .dark[data-theme="ocean"], [data-theme="ocean"].dark {
+    --primary: 217 91% 60%;
+    --ring: 217 91% 60%;
+  }
+
+  [data-theme="forest"] {
+    --primary: 142 76% 36%;
+    --ring: 142 76% 36%;
+  }
+  .dark[data-theme="forest"], [data-theme="forest"].dark {
+    --primary: 142 71% 45%;
+    --ring: 142 71% 45%;
+  }
+
+  [data-theme="amber"] {
+    --primary: 38 92% 50%;
+    --ring: 38 92% 50%;
+  }
+  .dark[data-theme="amber"], [data-theme="amber"].dark {
+    --primary: 38 92% 55%;
+    --ring: 38 92% 55%;
   }
 }
 
@@ -75,78 +118,55 @@
   }
   body {
     @apply bg-background text-foreground;
-    font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont,
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
       "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui,
       sans-serif;
-    font-feature-settings: "rlig" 1, "calt" 1, "ss01" 1;
-    letter-spacing: 0;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    letter-spacing: -0.011em;
   }
   label:not(.flex):not(.inline-flex) {
     display: block;
   }
-  /* Subtle ambient gradient background, macOS-style */
-  body::before {
-    content: "";
-    position: fixed;
-    inset: 0;
-    z-index: -1;
-    pointer-events: none;
-    background:
-      radial-gradient(60rem 40rem at 10% -10%, hsl(211 100% 60% / 0.08), transparent 60%),
-      radial-gradient(50rem 30rem at 110% 0%, hsl(280 90% 60% / 0.06), transparent 60%),
-      radial-gradient(40rem 30rem at 50% 110%, hsl(180 80% 50% / 0.05), transparent 60%);
-  }
-  .dark body::before {
-    background:
-      radial-gradient(60rem 40rem at 10% -10%, hsl(211 100% 50% / 0.16), transparent 60%),
-      radial-gradient(50rem 30rem at 110% 0%, hsl(280 90% 55% / 0.12), transparent 60%),
-      radial-gradient(40rem 30rem at 50% 110%, hsl(180 80% 50% / 0.08), transparent 60%);
-  }
 }
 
 @layer base {
-  /* Apple-style scrollbar */
+  /* Minimal console scrollbar */
   ::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
+    width: 6px;
+    height: 6px;
   }
   ::-webkit-scrollbar-track {
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: hsl(var(--muted-foreground) / 0.25);
-    border-radius: 999px;
-    border: 2px solid transparent;
-    background-clip: padding-box;
+    background: hsl(var(--border) / 0.8);
+    border-radius: 3px;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: hsl(var(--muted-foreground) / 0.45);
-    background-clip: padding-box;
-    border: 2px solid transparent;
+    background: hsl(var(--muted-foreground) / 0.5);
   }
 }
 
 @layer components {
-  /* Frosted glass surface — like macOS toolbar */
+  /* Clean structural console surfaces */
   .glass {
-    @apply bg-background/85 backdrop-blur-md;
-    box-shadow: inset 0 -1px 0 0 hsl(var(--border) / 0.6);
+    @apply bg-card/95 border-b border-border;
   }
   .glass-card {
-    @apply bg-card/90 backdrop-blur-md border border-border/60;
+    @apply bg-card border border-border;
   }
-  /* Soft, layered Apple-style elevation */
+  /* Precise, structural elevation */
   .shadow-apple-sm {
-    box-shadow: 0 1px 2px hsl(220 10% 10% / 0.04), 0 1px 1px hsl(220 10% 10% / 0.03);
+    box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05);
   }
   .shadow-apple {
-    box-shadow: 0 1px 2px hsl(220 10% 10% / 0.05), 0 8px 24px -12px hsl(220 10% 10% / 0.12);
+    box-shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
   }
   .shadow-apple-lg {
-    box-shadow: 0 1px 2px hsl(220 10% 10% / 0.05), 0 20px 50px -20px hsl(220 10% 10% / 0.25);
+    box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
   }
   .hairline {
-    box-shadow: inset 0 -1px 0 0 hsl(var(--border) / 0.7);
+    box-shadow: inset 0 -1px 0 0 hsl(var(--border));
   }
 
   /* 可用模型铭牌逐行入场：与图表同一条 Apple 缓动曲线 */

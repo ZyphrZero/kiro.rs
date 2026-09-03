@@ -355,6 +355,12 @@ async fn main() {
             anthropic_app
                 .nest("/api/admin", admin_app)
                 .nest("/admin", admin_ui_app)
+                .route(
+                    "/admin/",
+                    axum::routing::get(|| async {
+                        axum::response::Redirect::temporary("/admin")
+                    }),
+                )
         }
     } else {
         anthropic_app

@@ -627,7 +627,7 @@ function CredentialCardImpl({
   ) : null;
 
   const stateClasses = [
-    credential.isCurrent ? "ring-2 ring-primary/60 shadow-apple-lg" : "",
+    credential.isCurrent ? "ring-1 ring-primary shadow-xs" : "",
     !credential.disabled && isQuotaExceeded ? "ring-1 ring-amber-500/60" : "",
     disabledByQuota
       ? "ring-1 ring-amber-500/70 bg-amber-50/40 dark:bg-amber-500/[0.04]"
@@ -812,12 +812,12 @@ function CredentialCardImpl({
       ref={setNodeRef}
       style={dragStyle}
       data-credential-id={credential.id}
-      className={`group flex min-w-0 items-center gap-2 rounded-2xl border border-border/60 bg-card px-3 py-2.5 transition-colors sm:gap-3.5 sm:px-4 [transform:translateZ(0)] ${railBorderClass(
+      className={`group flex min-w-0 items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 transition-colors sm:gap-3 sm:px-3.5 [transform:translateZ(0)] ${railBorderClass(
         disposition.tone,
       )} ${
         isDragging
-          ? "shadow-apple-lg opacity-80"
-          : "hover:bg-accent/30 hover:border-border"
+          ? "shadow-md opacity-80"
+          : "hover:bg-accent/40 hover:border-border"
       } ${stateClasses}`}
     >
       {/* 拖拽手柄（字段排序开启时隐藏，此时拖拽无意义） */}
@@ -885,7 +885,7 @@ function CredentialCardImpl({
           </div>
           <div className="mt-0.5 flex h-[26px] items-center justify-center">
             {editingPriority ? (
-              <div className="absolute left-1/2 top-1/2 z-30 -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border/70 bg-popover p-2 shadow-apple-lg">
+              <div className="absolute left-1/2 top-1/2 z-30 -translate-x-1/2 -translate-y-1/2 rounded-md border border-border bg-popover p-1.5 shadow-md">
                 <div className="inline-flex items-center gap-1">
                   <Input
                     type="number"
@@ -1115,8 +1115,8 @@ function CredentialCardImpl({
           ref={setNodeRef}
           style={dragStyle}
           data-credential-id={credential.id}
-          className={`group flex h-full min-w-0 flex-col overflow-hidden rounded-2xl border-border/70 bg-card shadow-apple-sm transition-shadow duration-150 [transform:translateZ(0)] ${
-            isDragging ? "shadow-apple-lg opacity-80" : "hover:shadow-apple hover:border-border"
+          className={`group flex h-full min-w-0 flex-col overflow-hidden rounded-lg border border-border bg-card shadow-xs transition-colors duration-100 [transform:translateZ(0)] ${
+            isDragging ? "shadow-md opacity-80" : "hover:border-primary/40"
           } ${stateClasses}`}
         >
           {/* Card Header: 选择框 + Title + 呼吸指示 + 禁用开关 */}
@@ -1293,7 +1293,7 @@ function CredentialCardImpl({
 
             {/* Usage & Quota Card (余额与额度) */}
             <div
-              className={`rounded-xl border p-3 transition-all space-y-2 ${
+              className={`rounded-xl border p-3 transition-colors duration-200 space-y-2 ${
                 isQuotaExceeded || disabledByQuota
                   ? "border-amber-500/50 bg-amber-500/[0.04]"
                   : "border-border/60 bg-secondary/20"

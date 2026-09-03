@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { memo, useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import {
   Dialog,
@@ -36,7 +36,7 @@ interface AddCredentialDialogProps {
 
 type AuthMethod = 'social' | 'idc' | 'api_key' | 'external_idp'
 
-export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddCredentialDialogProps) {
+function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
@@ -465,3 +465,8 @@ export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddC
     </Dialog>
   )
 }
+
+export const AddCredentialDialog = memo(function AddCredentialDialog(props: AddCredentialDialogProps) {
+  if (!props.open) return null
+  return <AddCredentialDialogInner {...props} />
+})

@@ -2,11 +2,10 @@ export const THEME_STORAGE_KEY = 'adminTheme'
 
 export type ThemeId =
   | 'system'
+  | 'graphite'
   | 'ocean'
   | 'forest'
-  | 'violet'
   | 'amber'
-  | 'rose'
 
 export type ThemeMode = 'light' | 'dark' | 'system'
 
@@ -30,39 +29,33 @@ export const DEFAULT_THEME_SELECTION: ThemeSelection = {
 export const THEME_METADATA: readonly ThemeMetadata[] = [
   {
     id: 'system',
-    name: '系统蓝',
-    description: '清爽中性的系统蓝',
-    swatch: 'hsl(211 100% 50%)',
+    name: 'sub2api 青',
+    description: '官方网关标志性翡翠冷青',
+    swatch: 'hsl(175 84% 32%)',
+  },
+  {
+    id: 'graphite',
+    name: '石墨工业',
+    description: '极简克制的纯粹黑白中性',
+    swatch: 'hsl(215 25% 27%)',
   },
   {
     id: 'ocean',
-    name: '海洋青',
-    description: '冷静通透的海洋青',
-    swatch: 'hsl(193 84% 42%)',
+    name: '深海冷蓝',
+    description: '深邃沉稳的工程冷蓝',
+    swatch: 'hsl(221 83% 53%)',
   },
   {
     id: 'forest',
-    name: '森林绿',
-    description: '稳定自然的森林绿',
-    swatch: 'hsl(151 60% 38%)',
-  },
-  {
-    id: 'violet',
-    name: '紫罗兰',
-    description: '沉静鲜明的紫罗兰',
-    swatch: 'hsl(262 72% 56%)',
+    name: '终端绿',
+    description: '硬核复古终端翡翠绿',
+    swatch: 'hsl(142 71% 45%)',
   },
   {
     id: 'amber',
-    name: '琥珀',
-    description: '温暖醒目的琥珀色',
+    name: '工控琥珀',
+    description: '清晰醒目的工业琥珀金',
     swatch: 'hsl(38 92% 50%)',
-  },
-  {
-    id: 'rose',
-    name: '玫瑰',
-    description: '柔和有力的玫瑰色',
-    swatch: 'hsl(347 75% 52%)',
   },
 ] as const
 

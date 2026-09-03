@@ -1,4 +1,4 @@
-import { useRef } from 'react'
+import { memo, useRef } from 'react'
 import {
   Select,
   SelectGroup,
@@ -63,13 +63,8 @@ const INHERIT = 'inherit'
 
 /**
  * AWS 区域选择：下拉预设区域 + 始终可输入的自定义文本框。
- *
- * `allowInherit` 区分两种调用语义：登录场景 region 必填（不传该项，空值落到「自定义」
- * 让用户去填）；凭据级 region 可留空表示回退全局配置（传 true，空值显式显示为
- * 「跟随全局配置」）。都用「非预设即自定义」会把「留空是合法的」这件事藏起来 ——
- * 用户看到 `-- 自定义输入 --` 只会以为自己漏填了。
  */
-export function RegionSelect({
+export const RegionSelect = memo(function RegionSelect({
   value,
   onChange,
   allowInherit = false,
@@ -144,4 +139,4 @@ export function RegionSelect({
       />
     </div>
   )
-}
+})

@@ -299,7 +299,7 @@ export function SettingSegments<T extends string>({
 }) {
   return (
     <SettingRow label={label} hint={hint} pending={pending} saved={saved}>
-      <div className="inline-flex h-8 items-center rounded-full border border-border bg-card/60 p-0.5">
+      <div className="inline-flex h-7 items-center rounded-md border border-border bg-secondary/50 p-0.5">
         {options.map((o) => (
           <button
             key={o.value}
@@ -311,10 +311,10 @@ export function SettingSegments<T extends string>({
               if (value !== o.value) onChange(o.value)
             }}
             className={cn(
-              'inline-flex h-7 items-center rounded-full px-3 text-[12.5px] transition-colors disabled:opacity-50',
+              'inline-flex h-6 items-center rounded px-2.5 text-xs font-medium transition-colors disabled:opacity-50 active:scale-[0.96] transition-transform',
               value === o.value
-                ? 'bg-background text-foreground shadow-apple-sm'
-                : 'text-muted-foreground hover:text-foreground',
+                ? 'bg-card text-foreground shadow-xs border border-border/80'
+                : 'text-muted-foreground hover:text-foreground border border-transparent',
             )}
           >
             {o.label}

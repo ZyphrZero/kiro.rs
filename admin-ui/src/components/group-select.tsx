@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Button } from '@/components/ui/button'
 import {
@@ -42,7 +43,7 @@ function ManageGroupsHint() {
  *  与改造前的差异：去掉"+ 新建分组"option（避免 typo 漂移）。
  *  新建分组请去 #/groups 管理页。
  */
-export function GroupSingleSelect({
+export const GroupSingleSelect = memo(function GroupSingleSelect({
   value,
   options,
   onChange,
@@ -94,7 +95,7 @@ export function GroupSingleSelect({
       )}
     </div>
   )
-}
+})
 
 /** 多选分组：下拉菜单形式（点击展开 + 多选 checkbox）。用于账号(credential) groups 编辑。
  *
@@ -103,7 +104,7 @@ export function GroupSingleSelect({
  *  - 多选能力保留（一个凭据可以同时属于多个分组）
  *  - 去掉"+ 新建分组"输入框，新建分组请去 #/groups 管理页
  */
-export function GroupMultiSelect({
+export const GroupMultiSelect = memo(function GroupMultiSelect({
   value,
   options,
   onChange,
@@ -210,4 +211,4 @@ export function GroupMultiSelect({
       )}
     </div>
   )
-}
+})

@@ -17,6 +17,7 @@ import { extractErrorMessage } from '@/lib/utils'
 import type { GroupItem } from '@/types/api'
 import { ConsoleTable, type ConsoleColumn } from '@/components/console/data-table'
 import { BulkBar } from '@/components/console/bulk-bar'
+import { PageHeader } from '@/components/console/page-header'
 
 /**
  * 分组管理页：CRUD 已注册分组。
@@ -290,27 +291,34 @@ export function GroupsPage() {
 
   return (
     <div className="console-scope space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <h2 className="text-lg font-semibold flex items-center gap-2">
-            <FolderTree className="h-4 w-4" />
-            分组管理
-          </h2>
-          <p className="text-sm text-muted-foreground mt-0.5">
-            分组是凭据 / 客户端 Key 共享的独立实体；改名与删除会自动级联同步。
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <Button size="sm" variant="outline" onClick={() => refetch()} disabled={isFetching}>
-            <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
-            刷新
-          </Button>
-          <Button size="sm" onClick={openCreate}>
-            <Plus className="h-3.5 w-3.5" />
-            新建分组
-          </Button>
-        </div>
-      </div>
+      <PageHeader
+        breadcrumbs={[{ label: '控制台' }, { label: '分组管理', active: true }]}
+        icon={<FolderTree className="h-4 w-4" />}
+        title="分组管理"
+        description="分组是凭据 / 客户端 Key 共享的独立逻辑实体；改名与删除会自动级联同步。"
+        badge={
+          <Badge variant="secondary" className="font-mono text-xs">
+            {groups.length} 个分组
+          </Badge>
+        }
+        actions={
+          <>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => refetch()}
+              disabled={isFetching}
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
+              刷新
+            </Button>
+            <Button size="sm" onClick={openCreate}>
+              <Plus className="h-3.5 w-3.5" />
+              新建分组
+            </Button>
+          </>
+        }
+      />
 
       <ConsoleTable
         rows={groups}

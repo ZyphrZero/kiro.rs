@@ -126,7 +126,7 @@ function useColumnVisibility<T>(
   return { ordered, visible, toggle }
 }
 
-export function ConsoleTable<T>({
+function ConsoleTableImpl<T>({
   rows,
   columns,
   rowKey,
@@ -367,3 +367,7 @@ export function ConsoleTable<T>({
     </div>
   )
 }
+
+export const ConsoleTable = React.memo(ConsoleTableImpl) as <T>(
+  props: ConsoleTableProps<T>
+) => React.ReactElement | null

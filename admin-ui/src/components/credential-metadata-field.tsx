@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import {
   Select,
   SelectContent,
@@ -96,7 +97,7 @@ interface CredentialMetadataEditorProps {
 }
 
 /** 按 schema 渲染全部已登记字段；schema 外扩展键仍留在 value 中，不会被覆盖。 */
-export function CredentialMetadataEditor({
+export const CredentialMetadataEditor = memo(function CredentialMetadataEditor({
   schema,
   value,
   onChange,
@@ -173,4 +174,4 @@ export function CredentialMetadataEditor({
       })}
     </div>
   )
-}
+})

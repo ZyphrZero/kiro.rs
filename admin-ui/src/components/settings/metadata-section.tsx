@@ -341,7 +341,7 @@ export function MetadataSection() {
     >
       <div className="space-y-3 py-2">
         {/* 表格容器 */}
-        <div className="rounded-2xl border border-border/80 bg-card overflow-hidden shadow-apple-sm">
+        <div className="rounded-lg border border-border bg-card overflow-hidden shadow-xs">
           {/* 表头 Header Row */}
           <div className="hidden md:grid grid-cols-[56px_minmax(0,1.3fr)_minmax(86px,100px)_minmax(0,1fr)_minmax(120px,1.2fr)_72px] items-center gap-2 border-b border-border/60 bg-muted/40 px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
             <div className="min-w-0 text-center">排序</div>
@@ -811,7 +811,7 @@ export function MetadataSection() {
             type="button"
             onClick={save}
             disabled={isLoading || isPending || drafts.length === 0}
-            className="h-9 px-5 text-xs font-semibold shadow-apple-sm"
+            className="h-8 px-4 text-xs font-medium shadow-xs"
           >
             <Save className="mr-1.5 h-4 w-4" />
             {isPending ? '保存中…' : '保存 Schema 配置'}

@@ -24,6 +24,7 @@ import { extractErrorMessage, formatCredits } from '@/lib/utils'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 import { ConsoleTable, type ConsoleColumn } from '@/components/console/data-table'
 import { BulkBar } from '@/components/console/bulk-bar'
+import { PageHeader } from '@/components/console/page-header'
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
@@ -75,7 +76,7 @@ function formatRelative(ts?: string): string {
 }
 
 export function ClientKeysPage() {
-  const { data, isLoading } = useClientKeys()
+  const { data, isLoading, isFetching, refetch } = useClientKeys()
   // 已注册分组列表（来自 groups.json 注册表，与凭据的 groups 字段解耦）
   const groupOptions = useGroupOptions()
   const createKey = useCreateClientKey()
@@ -494,17 +495,34 @@ export function ClientKeysPage() {
 
   return (
     <div className="console-scope space-y-4">
-      <div className="flex items-end justify-between gap-4">
-        <div>
-          <h1 className="text-[28px] font-semibold tracking-tight leading-tight">客户端 Key</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            分发给下游用户/项目的访问密钥。每把 Key 独立计数与禁用，泄露后只需替换一把。
-          </p>
-        </div>
-        <Button onClick={() => setCreateOpen(true)} size="sm">
-          <Plus className="h-3.5 w-3.5" />新建 Key
-        </Button>
-      </div>
+      <PageHeader
+        breadcrumbs={[{ label: '控制台' }, { label: '客户端 Key', active: true }]}
+        icon={<KeyRound className="h-4 w-4" />}
+        title="客户端 Key"
+        description="分发给下游用户/项目的访问密钥。每把 Key 独立计数与禁用，泄露后只需替换一把。"
+        badge={
+          <Badge variant="secondary" className="font-mono text-xs">
+            {keys.length} 把已注册
+          </Badge>
+        }
+        actions={
+          <>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => refetch()}
+              disabled={isFetching}
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
+              刷新
+            </Button>
+            <Button onClick={() => setCreateOpen(true)} size="sm">
+              <Plus className="h-3.5 w-3.5" />
+              新建 Key
+            </Button>
+          </>
+        }
+      />
 
       <ConsoleTable
         rows={keys}
@@ -528,7 +546,7 @@ export function ClientKeysPage() {
           onClick={() => handleBatchSetDisabled(false)}
           size="sm"
           variant="ghost"
-          className="h-8 px-3 text-xs gap-1.5 rounded-full hover:bg-accent"
+          className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
           disabled={batchActionPending}
         >
           <Power className="h-3.5 w-3.5 text-emerald-500" />
@@ -538,7 +556,7 @@ export function ClientKeysPage() {
           onClick={() => handleBatchSetDisabled(true)}
           size="sm"
           variant="ghost"
-          className="h-8 px-3 text-xs gap-1.5 rounded-full hover:bg-accent"
+          className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
           disabled={batchActionPending}
         >
           {batchActionPending && batchProgress?.action === 'toggle' ? (
@@ -557,7 +575,7 @@ export function ClientKeysPage() {
           onClick={handleBatchDelete}
           size="sm"
           variant="destructive"
-          className="h-8 px-3 text-xs gap-1.5 rounded-full"
+          className="h-7 px-2.5 text-xs gap-1 rounded"
           disabled={batchActionPending}
         >
           {batchActionPending && batchProgress?.action === 'delete' ? (
@@ -575,182 +593,188 @@ export function ClientKeysPage() {
       </BulkBar>
 
       {/* 新建对话框 */}
-      <Dialog open={createOpen} onOpenChange={(o) => !createKey.isPending && setCreateOpen(o)}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>新建客户端 Key</DialogTitle>
-            <DialogDescription>
-              创建后明文 Key 仅显示一次，请立即复制保存到安全位置。
-            </DialogDescription>
-          </DialogHeader>
-          <form onSubmit={handleCreate} className="space-y-3 py-2">
-            <div>
-              <label className="text-[12px] text-muted-foreground">名称 *</label>
-              <Input
-                placeholder="VS Code 本机 / 团队 A 等"
-                value={createName}
-                onChange={(e) => setCreateName(e.target.value)}
-                disabled={createKey.isPending}
-                autoFocus
-              />
-            </div>
-            <div>
-              <label className="text-[12px] text-muted-foreground">描述（可选）</label>
-              <Input
-                placeholder="可选备注，如绑定的项目、负责人等"
-                value={createDesc}
-                onChange={(e) => setCreateDesc(e.target.value)}
-                disabled={createKey.isPending}
-              />
-            </div>
-            <div>
-              <label className="text-[12px] text-muted-foreground">绑定分组（可选）</label>
-              <GroupSingleSelect
-                value={createGroup}
-                options={groupOptions}
-                onChange={setCreateGroup}
-                disabled={createKey.isPending}
-                noneLabel="（不绑定，可用全部账号）"
-              />
-              <p className="mt-1 text-[11px] text-muted-foreground">
-                绑定后该 Key 仅会使用含此分组的账号（严格隔离，分组内无可用账号时请求会失败）。
-              </p>
-            </div>
-            <div>
-              <label className="text-[12px] text-muted-foreground">积分上限（可选）</label>
-              <Input
-                type="number"
-                min="0"
-                step="any"
-                inputMode="decimal"
-                placeholder="留空表示不限制"
-                value={createMaxCredits}
-                onChange={(e) => setCreateMaxCredits(e.target.value)}
-                disabled={createKey.isPending}
-              />
-              <p className="mt-1 text-[11px] text-muted-foreground">
-                累计使用的 credit 达到上限后，该 Key 的请求会被拒绝（HTTP 429）。重置统计后重新计费。
-              </p>
-            </div>
-            <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
-                取消
-              </Button>
-              <Button type="submit" disabled={createKey.isPending || !createName.trim()}>
-                {createKey.isPending ? '创建中…' : '创建'}
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
+      {createOpen && (
+        <Dialog open={createOpen} onOpenChange={(o) => !createKey.isPending && setCreateOpen(o)}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>新建客户端 Key</DialogTitle>
+              <DialogDescription>
+                创建后明文 Key 仅显示一次，请立即复制保存到安全位置。
+              </DialogDescription>
+            </DialogHeader>
+            <form onSubmit={handleCreate} className="space-y-3 py-2">
+              <div>
+                <label className="text-[12px] text-muted-foreground">名称 *</label>
+                <Input
+                  placeholder="VS Code 本机 / 团队 A 等"
+                  value={createName}
+                  onChange={(e) => setCreateName(e.target.value)}
+                  disabled={createKey.isPending}
+                  autoFocus
+                />
+              </div>
+              <div>
+                <label className="text-[12px] text-muted-foreground">描述（可选）</label>
+                <Input
+                  placeholder="可选备注，如绑定的项目、负责人等"
+                  value={createDesc}
+                  onChange={(e) => setCreateDesc(e.target.value)}
+                  disabled={createKey.isPending}
+                />
+              </div>
+              <div>
+                <label className="text-[12px] text-muted-foreground">绑定分组（可选）</label>
+                <GroupSingleSelect
+                  value={createGroup}
+                  options={groupOptions}
+                  onChange={setCreateGroup}
+                  disabled={createKey.isPending}
+                  noneLabel="（不绑定，可用全部账号）"
+                />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  绑定后该 Key 仅会使用含此分组的账号（严格隔离，分组内无可用账号时请求会失败）。
+                </p>
+              </div>
+              <div>
+                <label className="text-[12px] text-muted-foreground">积分上限（可选）</label>
+                <Input
+                  type="number"
+                  min="0"
+                  step="any"
+                  inputMode="decimal"
+                  placeholder="留空表示不限制"
+                  value={createMaxCredits}
+                  onChange={(e) => setCreateMaxCredits(e.target.value)}
+                  disabled={createKey.isPending}
+                />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  累计使用的 credit 达到上限后，该 Key 的请求会被拒绝（HTTP 429）。重置统计后重新计费。
+                </p>
+              </div>
+              <DialogFooter>
+                <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
+                  取消
+                </Button>
+                <Button type="submit" disabled={createKey.isPending || !createName.trim()}>
+                  {createKey.isPending ? '创建中…' : '创建'}
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      )}
 
       {/* 创建后明文展示对话框 */}
-      <Dialog open={!!createdKey} onOpenChange={(o) => { if (!o) setCreatedKey(null) }}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <KeyRound className="h-4 w-4 text-emerald-500" />
-              Key 已生成
-            </DialogTitle>
-            <DialogDescription>
-              这是 Key "{createdKey?.name}" 的明文。<strong>关闭对话框后将无法再查看</strong>，请立即复制。
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-3">
-            <div className="relative">
-              <Input
-                readOnly
-                type={showCreatedPlain ? 'text' : 'password'}
-                value={createdKey?.key ?? ''}
-                className="pr-20 font-mono text-[13px]"
-              />
-              <div className="absolute inset-y-0 right-0 flex items-center pr-1">
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="h-7 w-7"
-                  onClick={() => setShowCreatedPlain((v) => !v)}
-                  title={showCreatedPlain ? '隐藏' : '显示'}
-                >
-                  {showCreatedPlain ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                </Button>
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="h-7 w-7"
-                  onClick={() => createdKey && copyText(createdKey.key)}
-                  title="复制"
-                >
-                  <Copy className="h-3.5 w-3.5" />
-                </Button>
+      {createdKey && (
+        <Dialog open={!!createdKey} onOpenChange={(o) => { if (!o) setCreatedKey(null) }}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <KeyRound className="h-4 w-4 text-emerald-500" />
+                Key 已生成
+              </DialogTitle>
+              <DialogDescription>
+                这是 Key "{createdKey?.name}" 的明文。<strong>关闭对话框后将无法再查看</strong>，请立即复制。
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-3">
+              <div className="relative">
+                <Input
+                  readOnly
+                  type={showCreatedPlain ? 'text' : 'password'}
+                  value={createdKey?.key ?? ''}
+                  className="pr-20 font-mono text-[13px]"
+                />
+                <div className="absolute inset-y-0 right-0 flex items-center pr-1">
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    className="h-7 w-7"
+                    onClick={() => setShowCreatedPlain((v) => !v)}
+                    title={showCreatedPlain ? '隐藏' : '显示'}
+                  >
+                    {showCreatedPlain ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    className="h-7 w-7"
+                    onClick={() => createdKey && copyText(createdKey.key)}
+                    title="复制"
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
               </div>
-            </div>
-            <p className="text-[11px] text-muted-foreground">
-              客户端调用 <code>/v1/messages</code> 时，把它放在 <code>x-api-key</code> 或 <code>Authorization: Bearer</code> 头中。
-            </p>
-          </div>
-          <DialogFooter>
-            <Button onClick={() => setCreatedKey(null)}>我已保存好</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* 编辑对话框 */}
-      <Dialog open={editOpen} onOpenChange={(o) => !updateKey.isPending && setEditOpen(o)}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>编辑 Key</DialogTitle>
-            <DialogDescription>修改名称与描述（不影响 Key 值与统计）</DialogDescription>
-          </DialogHeader>
-          <form onSubmit={handleEditSave} className="space-y-3 py-2">
-            <div>
-              <label className="text-[12px] text-muted-foreground">名称</label>
-              <Input value={editName} onChange={(e) => setEditName(e.target.value)} />
-            </div>
-            <div>
-              <label className="text-[12px] text-muted-foreground">描述</label>
-              <Input value={editDesc} onChange={(e) => setEditDesc(e.target.value)} />
-            </div>
-            <div>
-              <label className="text-[12px] text-muted-foreground">绑定分组</label>
-              <GroupSingleSelect
-                value={editGroup}
-                options={groupOptions}
-                onChange={setEditGroup}
-                disabled={updateKey.isPending}
-                noneLabel="（不绑定，可用全部账号）"
-              />
-              <p className="mt-1 text-[11px] text-muted-foreground">
-                绑定后仅调度该分组内账号（严格隔离）。选「不绑定」表示解除绑定。
-              </p>
-            </div>
-            <div>
-              <label className="text-[12px] text-muted-foreground">积分上限</label>
-              <Input
-                type="number"
-                min="0"
-                step="any"
-                inputMode="decimal"
-                placeholder="留空表示不限制"
-                value={editMaxCredits}
-                onChange={(e) => setEditMaxCredits(e.target.value)}
-                disabled={updateKey.isPending || setMaxCredits.isPending}
-              />
-              <p className="mt-1 text-[11px] text-muted-foreground">
-                累计 credit 达到上限后该 Key 请求会被拒绝（HTTP 429）。清空则取消限制；重置统计可清零已用量。
+              <p className="text-[11px] text-muted-foreground">
+                客户端调用 <code>/v1/messages</code> 时，把它放在 <code>x-api-key</code> 或 <code>Authorization: Bearer</code> 头中。
               </p>
             </div>
             <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>
-              <Button type="submit" disabled={updateKey.isPending || setMaxCredits.isPending}>
-                {updateKey.isPending || setMaxCredits.isPending ? '保存中…' : '保存'}
-              </Button>
+              <Button onClick={() => setCreatedKey(null)}>我已保存好</Button>
             </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {/* 编辑对话框 */}
+      {editOpen && (
+        <Dialog open={editOpen} onOpenChange={(o) => !updateKey.isPending && setEditOpen(o)}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>编辑 Key</DialogTitle>
+              <DialogDescription>修改名称与描述（不影响 Key 值与统计）</DialogDescription>
+            </DialogHeader>
+            <form onSubmit={handleEditSave} className="space-y-3 py-2">
+              <div>
+                <label className="text-[12px] text-muted-foreground">名称</label>
+                <Input value={editName} onChange={(e) => setEditName(e.target.value)} />
+              </div>
+              <div>
+                <label className="text-[12px] text-muted-foreground">描述</label>
+                <Input value={editDesc} onChange={(e) => setEditDesc(e.target.value)} />
+              </div>
+              <div>
+                <label className="text-[12px] text-muted-foreground">绑定分组</label>
+                <GroupSingleSelect
+                  value={editGroup}
+                  options={groupOptions}
+                  onChange={setEditGroup}
+                  disabled={updateKey.isPending}
+                  noneLabel="（不绑定，可用全部账号）"
+                />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  绑定后仅调度该分组内账号（严格隔离）。选「不绑定」表示解除绑定。
+                </p>
+              </div>
+              <div>
+                <label className="text-[12px] text-muted-foreground">积分上限</label>
+                <Input
+                  type="number"
+                  min="0"
+                  step="any"
+                  inputMode="decimal"
+                  placeholder="留空表示不限制"
+                  value={editMaxCredits}
+                  onChange={(e) => setEditMaxCredits(e.target.value)}
+                  disabled={updateKey.isPending || setMaxCredits.isPending}
+                />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  累计 credit 达到上限后该 Key 请求会被拒绝（HTTP 429）。清空则取消限制；重置统计可清零已用量。
+                </p>
+              </div>
+              <DialogFooter>
+                <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>
+                <Button type="submit" disabled={updateKey.isPending || setMaxCredits.isPending}>
+                  {updateKey.isPending || setMaxCredits.isPending ? '保存中…' : '保存'}
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      )}
     </div>
   )
 }

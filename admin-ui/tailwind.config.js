@@ -6,9 +6,11 @@ export default {
     extend: {
       fontFamily: {
         sans: [
-          '"Plus Jakarta Sans"',
+          'Inter',
           '-apple-system',
           'BlinkMacSystemFont',
+          '"Segoe UI"',
+          'Roboto',
           '"PingFang SC"',
           '"Hiragino Sans GB"',
           '"Microsoft YaHei"',
@@ -61,25 +63,31 @@ export default {
           DEFAULT: 'hsl(var(--card))',
           foreground: 'hsl(var(--card-foreground))',
         },
+        sidebar: {
+          DEFAULT: 'hsl(var(--sidebar))',
+          foreground: 'hsl(var(--sidebar-foreground))',
+          border: 'hsl(var(--sidebar-border))',
+        },
       },
       borderRadius: {
-        '2xl': 'calc(var(--radius) + 4px)',
-        xl: 'var(--radius)',
-        lg: 'calc(var(--radius) - 2px)',
-        md: 'calc(var(--radius) - 4px)',
-        sm: 'calc(var(--radius) - 6px)',
+        '3xl': '12px',
+        '2xl': '8px',
+        xl: '8px',
+        lg: '6px',
+        md: '4px',
+        sm: '2px',
       },
       keyframes: {
         'fade-in': {
-          '0%': { opacity: '0', transform: 'translateY(4px)' },
+          '0%': { opacity: '0', transform: 'translateY(2px)' },
           '100%': { opacity: '1', transform: 'translateY(0)' },
         },
       },
       animation: {
-        'fade-in': 'fade-in 200ms ease-out',
+        'fade-in': 'fade-in 150ms ease-out',
       },
       transitionTimingFunction: {
-        apple: 'cubic-bezier(0.32, 0.72, 0, 1)',
+        apple: 'cubic-bezier(0.2, 0, 0, 1)',
       },
     },
   },

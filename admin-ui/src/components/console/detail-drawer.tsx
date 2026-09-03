@@ -1,18 +1,12 @@
+import { memo } from 'react'
 import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 /**
  * 右侧详情抽屉。
- *
- * 替掉日志页的「展开行」：展开会把表格行高从 34px 顶到几百 px，下方所有行
- * 位置突变，滚动位置随之跳一下 —— 想对比相邻两条记录时尤其难受。抽屉把详情
- * 移到侧面，表格布局始终稳定，左侧列表和右侧详情能同时看。
- *
- * 基于 Radix Dialog：焦点陷阱、Esc 关闭、滚动锁都是现成的，只把定位从居中
- * 改成贴右侧全高。
  */
-export function DetailDrawer({
+export const DetailDrawer = memo(function DetailDrawer({
   open,
   onOpenChange,
   title,
@@ -30,19 +24,21 @@ export function DetailDrawer({
   /** tailwind 宽度类 */
   width?: string
 }) {
+  if (!open) return null
+
   return (
     <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
       <DialogPrimitive.Portal>
-        <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/25 backdrop-blur-sm data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0" />
+        <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/50 duration-150 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0" />
         <DialogPrimitive.Content
           className={cn(
-            'console-drawer console-scope fixed right-0 top-0 z-50 flex h-full w-[calc(100%-1.5rem)] flex-col border-l border-border/60 bg-card/95 shadow-apple-lg backdrop-blur-2xl backdrop-saturate-150',
+            'console-drawer console-scope fixed right-0 top-0 z-50 flex h-full w-[calc(100%-1.5rem)] flex-col border-l border-border bg-card shadow-2xl duration-150 will-change-transform',
             width,
           )}
         >
-          <div className="flex items-start gap-3 border-b border-border/60 px-4 py-3">
+          <div className="flex items-start gap-3 border-b border-border px-4 py-3">
             <div className="min-w-0 flex-1">
-              <DialogPrimitive.Title className="truncate text-[15px] font-semibold tracking-tight">
+              <DialogPrimitive.Title className="truncate text-sm font-semibold tracking-tight">
                 {title}
               </DialogPrimitive.Title>
               {subtitle && (
@@ -52,7 +48,7 @@ export function DetailDrawer({
               )}
             </div>
             <DialogPrimitive.Close
-              className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-secondary/80 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               title="关闭（Esc）"
             >
               <X className="h-3.5 w-3.5" />
@@ -71,7 +67,7 @@ export function DetailDrawer({
       </DialogPrimitive.Portal>
     </DialogPrimitive.Root>
   )
-}
+})
 
 /** 抽屉内的键值明细行 —— 详情面板的基本排版单元 */
 export function DrawerField({

@@ -154,7 +154,7 @@ const SelectContent = React.forwardRef<
         ref={ref}
         sideOffset={sideOffset}
         className={cn(
-          'z-50 max-h-72 min-w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto rounded-2xl border border-border/60 bg-popover/90 p-1.5 text-popover-foreground shadow-apple-lg backdrop-blur-2xl backdrop-saturate-150',
+          'z-50 max-h-72 min-w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md',
           'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95',
           className
         )}
@@ -174,7 +174,7 @@ const SelectLabel = React.forwardRef<
   <DropdownMenuPrimitive.Label
     ref={ref}
     className={cn(
-      'px-2.5 pb-1 pt-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground',
+      'px-2 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground',
       className
     )}
     {...props}
@@ -194,7 +194,7 @@ const SelectItem = React.forwardRef<
       ref={ref}
       onSelect={() => onValueChange?.(value)}
       className={cn(
-        'relative flex cursor-default select-none items-center rounded-lg py-1.5 pl-7 pr-2.5 text-sm outline-none transition-colors',
+        'relative flex cursor-default select-none items-center rounded py-1 pl-6 pr-2 text-xs outline-none transition-colors',
         'focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-40',
         className
       )}

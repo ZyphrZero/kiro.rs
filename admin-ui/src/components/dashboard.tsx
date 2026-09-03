@@ -59,6 +59,7 @@ import { storage, type CredentialView } from "@/lib/storage";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { PageHeader } from "@/components/console/page-header";
 import { Input } from "@/components/ui/input";
 import {
   Dialog,
@@ -1484,17 +1485,17 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         ref={gridRef}
         className={embedded ? "" : "mx-auto max-w-[1400px] px-4 md:px-8 py-8"}
       >
-        {/* 大标题 */}
-        <div className="mb-5 flex items-end justify-between gap-4 sm:mb-6">
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight leading-tight sm:text-[28px]">
-              凭据管理
-            </h1>
-            <p className="mt-1 text-sm text-muted-foreground">
-              管理 Kiro 的所有访问凭据、负载均衡与登录信息
-            </p>
-          </div>
-        </div>
+        <PageHeader
+          breadcrumbs={[{ label: '控制台' }, { label: '凭据管理', active: true }]}
+          icon={<Server className="h-4 w-4" />}
+          title="凭据管理"
+          description="上游提供商凭据集群、配额健康度与多通道负载均衡管理。"
+          badge={
+            <Badge variant="secondary" className="font-mono text-xs">
+              {allCredentials.length} 个凭据
+            </Badge>
+          }
+        />
 
         {/* 状态标签条已下移到紧贴列表处（见下方 <StatusStrip />）：
             它是列表的表头兼筛选器，放在标题下方会与它筛选的列表隔开两行工具栏。 */}
@@ -1568,19 +1569,19 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder="搜索来源渠道 / 备注 / 邮箱"
-                  className="h-8 w-full rounded-full border border-border bg-card pl-8 pr-7 text-base placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:text-sm"
+                  className="h-8 w-full rounded-md border border-border bg-card pl-8 pr-7 text-xs placeholder:text-muted-foreground/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:text-xs"
                 />
                 {searchQuery ? (
                   <button
                     type="button"
                     onClick={() => setSearchQuery("")}
-                    className="absolute right-2 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                    className="absolute right-2 top-1/2 flex h-4 w-4 -translate-y-1/2 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
                     title="清除搜索 (Esc)"
                   >
-                    <X className="h-3.5 w-3.5" />
+                    <X className="h-3 w-3" />
                   </button>
                 ) : (
-                  <kbd className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 hidden select-none rounded border border-border/70 bg-muted/60 px-1.5 font-mono text-[10px] font-medium text-muted-foreground opacity-60 sm:inline-block">
+                  <kbd className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 hidden select-none rounded border border-border bg-muted/60 px-1 font-mono text-[10px] font-medium text-muted-foreground opacity-70 sm:inline-block">
                     /
                   </kbd>
                 )}
@@ -1590,7 +1591,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 onValueChange={(v) => setGroupFilter(v === "all" ? "" : v)}
               >
                 <SelectTrigger
-                  className="h-8 w-full rounded-full border-border bg-card px-3 sm:w-[140px]"
+                  className="h-8 w-full rounded-md border-border bg-card px-2.5 text-xs sm:w-[130px]"
                   title="按分组筛选凭据"
                 >
                   <SelectValue placeholder="全部分组" />
@@ -1612,7 +1613,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   <button
                     type="button"
                     title="按订阅分级筛选凭据（可多选，依据最近一次余额缓存）"
-                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-full border border-border bg-card px-3 text-sm hover:bg-accent sm:w-[136px]"
+                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-md border border-border bg-card px-2.5 text-xs hover:bg-accent sm:w-[120px]"
                   >
                     <span className="truncate">
                       {tierFilter.size > 0
@@ -1660,7 +1661,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   <button
                     type="button"
                     title="按字段排序凭据（再次点击同一字段切换升 / 降序）"
-                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-full border border-border bg-card px-3 text-sm hover:bg-accent sm:w-[136px]"
+                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-md border border-border bg-card px-2.5 text-xs hover:bg-accent sm:w-[124px]"
                   >
                     <span className="inline-flex min-w-0 items-center gap-1">
                       {sortField === "manual" ? (
@@ -1712,16 +1713,16 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 </DropdownMenuContent>
               </DropdownMenu>
 
-              {/* 卡片 / 列表 视图切换（iOS 分段控件） */}
-              <div className="col-span-2 inline-flex h-8 shrink-0 items-center justify-self-start rounded-full border border-border bg-card p-0.5 sm:col-span-1">
+              {/* 卡片 / 列表 视图切换 */}
+              <div className="col-span-2 inline-flex h-8 shrink-0 items-center justify-self-start rounded-md border border-border bg-secondary/50 p-0.5 sm:col-span-1">
                 <button
                   type="button"
                   onClick={() => changeViewMode("card")}
                   aria-pressed={viewMode === "card"}
                   title="卡片视图"
-                  className={`inline-flex h-7 items-center gap-1 rounded-full px-2.5 text-[13px] transition-colors ${
+                  className={`inline-flex h-7 items-center gap-1 rounded px-2 text-xs font-medium transition-colors ${
                     viewMode === "card"
-                      ? "bg-background text-foreground shadow-apple-sm"
+                      ? "bg-card text-foreground shadow-xs border border-border/80"
                       : "text-muted-foreground hover:text-foreground"
                   }`}
                 >
@@ -1733,9 +1734,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   onClick={() => changeViewMode("list")}
                   aria-pressed={viewMode === "list"}
                   title="列表视图"
-                  className={`inline-flex h-7 items-center gap-1 rounded-full px-2.5 text-[13px] transition-colors ${
+                  className={`inline-flex h-7 items-center gap-1 rounded px-2 text-xs font-medium transition-colors ${
                     viewMode === "list"
-                      ? "bg-background text-foreground shadow-apple-sm"
+                      ? "bg-card text-foreground shadow-xs border border-border/80"
                       : "text-muted-foreground hover:text-foreground"
                   }`}
                 >
@@ -1785,14 +1786,16 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 </Button>
               )}
 
-              {/* 主操作 */}
+              {/* 刷新按钮 */}
               <Button
-                onClick={() => setAddDialogOpen(true)}
                 size="sm"
+                variant="outline"
+                onClick={handleRefresh}
+                title="刷新凭据状态与余额"
                 className="w-full sm:w-auto"
               >
-                <Plus className="h-3.5 w-3.5" />
-                添加凭据
+                <RefreshCw className="h-3.5 w-3.5" />
+                刷新
               </Button>
 
               {/* 导入 / 登录折叠菜单 */}
@@ -1970,6 +1973,16 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
+
+              {/* 主操作：添加凭据 */}
+              <Button
+                onClick={() => setAddDialogOpen(true)}
+                size="sm"
+                className="w-full sm:w-auto"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                添加凭据
+              </Button>
             </div>
           </div>
         </div>
@@ -2151,7 +2164,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 onClick={() => setBatchEditDialogOpen(true)}
                 size="sm"
                 variant="ghost"
-                className="h-8 px-3 text-xs gap-1.5 rounded-full hover:bg-accent"
+                className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
                 title="批量编辑分组 / 来源渠道"
               >
                 <Tags className="h-3.5 w-3.5" />
@@ -2161,7 +2174,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 onClick={handleBatchVerify}
                 size="sm"
                 variant="ghost"
-                className="h-8 px-3 text-xs gap-1.5 rounded-full hover:bg-accent"
+                className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
                 disabled={verifying}
               >
                 <CheckCircle2
@@ -2175,7 +2188,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 onClick={handleBatchForceRefresh}
                 size="sm"
                 variant="ghost"
-                className="h-8 px-3 text-xs gap-1.5 rounded-full hover:bg-accent"
+                className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
                 disabled={batchRefreshing}
               >
                 <RefreshCw
@@ -2189,7 +2202,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 onClick={handleBatchResetFailure}
                 size="sm"
                 variant="ghost"
-                className="h-8 px-3 text-xs gap-1.5 rounded-full hover:bg-accent"
+                className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
                 title="清零失败计数并恢复禁用状态"
               >
                 <RotateCcw className="h-3.5 w-3.5" />
@@ -2200,7 +2213,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 size="sm"
                 variant="ghost"
                 disabled={batchDeleting}
-                className="h-8 px-3 text-xs gap-1.5 rounded-full text-destructive hover:bg-destructive/10 hover:text-destructive"
+                className="h-7 px-2.5 text-xs gap-1 rounded text-destructive hover:bg-destructive/10 hover:text-destructive"
               >
                 {batchDeleting ? (
                   <>
@@ -2219,14 +2232,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             {filteredCredentials.length > 0 && (
               <div className="mt-6 flex flex-col items-center justify-center gap-3 sm:mt-8 sm:flex-row sm:gap-5">
                 {/* 每页数量 */}
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
                   <span className="whitespace-nowrap">每页</span>
                   <Select
                     value={String(pageSize)}
                     onValueChange={(v) => changePageSize(Number(v))}
                   >
                     <SelectTrigger
-                      className="h-8 w-[92px] rounded-full border-border bg-card/60 px-3 backdrop-blur"
+                      className="h-7 w-[80px] rounded-md border-border bg-card px-2 text-xs"
                       title="设置每页显示数量"
                     >
                       <SelectValue />
@@ -2282,179 +2295,201 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         )}
       </main>
 
-      {/* 弹窗们 */}
-      <AddCredentialDialog
-        open={addDialogOpen}
-        onOpenChange={setAddDialogOpen}
-        metadataSchema={data?.metadataSchema}
-      />
-      <BatchImportDialog
-        open={batchImportDialogOpen}
-        onOpenChange={setBatchImportDialogOpen}
-      />
-      <BatchEditCredentialDialog
-        open={batchEditDialogOpen}
-        onOpenChange={setBatchEditDialogOpen}
-        credentials={(data?.credentials ?? []).filter((c) =>
-          selectedIds.has(c.id),
-        )}
-        groupOptions={groupOptions}
-        metadataSchema={data?.metadataSchema}
-        onDone={deselectAll}
-      />
-      <SocialLoginDialog
-        open={socialLoginDialogOpen}
-        onOpenChange={setSocialLoginDialogOpen}
-        onSuccess={() =>
-          queryClient.invalidateQueries({ queryKey: ["credentials"] })
-        }
-      />
-      <IdcLoginDialog
-        open={idcLoginDialogOpen}
-        onOpenChange={setIdcLoginDialogOpen}
-        onSuccess={() =>
-          queryClient.invalidateQueries({ queryKey: ["credentials"] })
-        }
-      />
-      <IdcLoginDialog
-        mode="enterprise"
-        open={enterpriseLoginDialogOpen}
-        onOpenChange={setEnterpriseLoginDialogOpen}
-        onSuccess={() =>
-          queryClient.invalidateQueries({ queryKey: ["credentials"] })
-        }
-      />
-      <KamImportDialog
-        open={kamImportDialogOpen}
-        onOpenChange={setKamImportDialogOpen}
-      />
-      <ProxyPoolDialog
-        open={proxyPoolDialogOpen}
-        onOpenChange={setProxyPoolDialogOpen}
-      />
-      <ImageUpdateDialog
-        open={imageUpdateDialogOpen}
-        onOpenChange={setImageUpdateDialogOpen}
-      />
+      {/* 弹窗们：按需挂载，彻底消除后台 hooks 与 DOM 驻留开销 */}
+      {addDialogOpen && (
+        <AddCredentialDialog
+          open={addDialogOpen}
+          onOpenChange={setAddDialogOpen}
+          metadataSchema={data?.metadataSchema}
+        />
+      )}
+      {batchImportDialogOpen && (
+        <BatchImportDialog
+          open={batchImportDialogOpen}
+          onOpenChange={setBatchImportDialogOpen}
+        />
+      )}
+      {batchEditDialogOpen && (
+        <BatchEditCredentialDialog
+          open={batchEditDialogOpen}
+          onOpenChange={setBatchEditDialogOpen}
+          credentials={(data?.credentials ?? []).filter((c) =>
+            selectedIds.has(c.id),
+          )}
+          groupOptions={groupOptions}
+          metadataSchema={data?.metadataSchema}
+          onDone={deselectAll}
+        />
+      )}
+      {socialLoginDialogOpen && (
+        <SocialLoginDialog
+          open={socialLoginDialogOpen}
+          onOpenChange={setSocialLoginDialogOpen}
+          onSuccess={() =>
+            queryClient.invalidateQueries({ queryKey: ["credentials"] })
+          }
+        />
+      )}
+      {idcLoginDialogOpen && (
+        <IdcLoginDialog
+          open={idcLoginDialogOpen}
+          onOpenChange={setIdcLoginDialogOpen}
+          onSuccess={() =>
+            queryClient.invalidateQueries({ queryKey: ["credentials"] })
+          }
+        />
+      )}
+      {enterpriseLoginDialogOpen && (
+        <IdcLoginDialog
+          mode="enterprise"
+          open={enterpriseLoginDialogOpen}
+          onOpenChange={setEnterpriseLoginDialogOpen}
+          onSuccess={() =>
+            queryClient.invalidateQueries({ queryKey: ["credentials"] })
+          }
+        />
+      )}
+      {kamImportDialogOpen && (
+        <KamImportDialog
+          open={kamImportDialogOpen}
+          onOpenChange={setKamImportDialogOpen}
+        />
+      )}
+      {proxyPoolDialogOpen && (
+        <ProxyPoolDialog
+          open={proxyPoolDialogOpen}
+          onOpenChange={setProxyPoolDialogOpen}
+        />
+      )}
+      {imageUpdateDialogOpen && (
+        <ImageUpdateDialog
+          open={imageUpdateDialogOpen}
+          onOpenChange={setImageUpdateDialogOpen}
+        />
+      )}
 
       {/* 修改登录API密钥对话框（adminApiKey —— 管理面板登录密钥） */}
-      <Dialog
-        open={adminKeyDialogOpen}
-        onOpenChange={(open) => {
-          if (!updatingAdminKey) setAdminKeyDialogOpen(open);
-        }}
-      >
-        <DialogContent className="sm:max-w-sm">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <Key className="h-4 w-4" />
-              修改登录API密钥
-            </DialogTitle>
-            <DialogDescription>
-              用于登录此管理面板。修改后将自动更新本地存储的 Key，无需重新登录。
-            </DialogDescription>
-          </DialogHeader>
-          <form onSubmit={handleUpdateAdminKey} className="space-y-4 py-2">
-            <div className="relative">
-              <Input
-                type={showAdminKeyPlain ? "text" : "password"}
-                placeholder="输入或生成新的登录API密钥"
-                value={newAdminKey}
-                onChange={(e) => setNewAdminKey(e.target.value)}
-                disabled={updatingAdminKey}
-                autoFocus
-                className="pr-20 font-mono text-[13px]"
-              />
-              <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-1.5">
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="pointer-events-auto h-7 w-7"
-                  onClick={() => setShowAdminKeyPlain((v) => !v)}
+      {adminKeyDialogOpen && (
+        <Dialog
+          open={adminKeyDialogOpen}
+          onOpenChange={(open) => {
+            if (!updatingAdminKey) setAdminKeyDialogOpen(open);
+          }}
+        >
+          <DialogContent className="sm:max-w-sm">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <Key className="h-4 w-4" />
+                修改登录API密钥
+              </DialogTitle>
+              <DialogDescription>
+                用于登录此管理面板。修改后将自动更新本地存储的 Key，无需重新登录。
+              </DialogDescription>
+            </DialogHeader>
+            <form onSubmit={handleUpdateAdminKey} className="space-y-4 py-2">
+              <div className="relative">
+                <Input
+                  type={showAdminKeyPlain ? "text" : "password"}
+                  placeholder="输入或生成新的登录API密钥"
+                  value={newAdminKey}
+                  onChange={(e) => setNewAdminKey(e.target.value)}
                   disabled={updatingAdminKey}
-                  title={showAdminKeyPlain ? "隐藏" : "显示"}
-                >
-                  {showAdminKeyPlain ? (
-                    <EyeOff className="h-3.5 w-3.5" />
-                  ) : (
-                    <Eye className="h-3.5 w-3.5" />
-                  )}
-                </Button>
+                  autoFocus
+                  className="pr-20 font-mono text-[13px]"
+                />
+                <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-1.5">
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    className="pointer-events-auto h-7 w-7"
+                    onClick={() => setShowAdminKeyPlain((v) => !v)}
+                    disabled={updatingAdminKey}
+                    title={showAdminKeyPlain ? "隐藏" : "显示"}
+                  >
+                    {showAdminKeyPlain ? (
+                      <EyeOff className="h-3.5 w-3.5" />
+                    ) : (
+                      <Eye className="h-3.5 w-3.5" />
+                    )}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    className="pointer-events-auto h-7 w-7"
+                    onClick={async () => {
+                      if (!newAdminKey.trim()) {
+                        toast.error("请先输入或生成 Key 再复制");
+                        return;
+                      }
+                      try {
+                        await navigator.clipboard.writeText(newAdminKey);
+                        toast.success("已复制到剪贴板");
+                      } catch {
+                        toast.error("复制失败，请手动选择文本");
+                      }
+                    }}
+                    disabled={updatingAdminKey}
+                    title="复制"
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              </div>
+              <div className="flex items-center justify-between gap-2">
                 <Button
                   type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="pointer-events-auto h-7 w-7"
-                  onClick={async () => {
-                    if (!newAdminKey.trim()) {
-                      toast.error("请先输入或生成 Key 再复制");
-                      return;
-                    }
-                    try {
-                      await navigator.clipboard.writeText(newAdminKey);
-                      toast.success("已复制到剪贴板");
-                    } catch {
-                      toast.error("复制失败，请手动选择文本");
-                    }
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    const key = generateApiKey("sk-admin-");
+                    setNewAdminKey(key);
+                    setShowAdminKeyPlain(true);
                   }}
                   disabled={updatingAdminKey}
-                  title="复制"
                 >
-                  <Copy className="h-3.5 w-3.5" />
+                  <Wand2 className="h-3.5 w-3.5" />
+                  生成随机 Key
                 </Button>
+                <p className="text-[11px] text-muted-foreground">
+                  建议生成后立即复制保存，确认更新后即生效。
+                </p>
               </div>
-            </div>
-            <div className="flex items-center justify-between gap-2">
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onClick={() => {
-                  const key = generateApiKey("sk-admin-");
-                  setNewAdminKey(key);
-                  setShowAdminKeyPlain(true);
-                }}
-                disabled={updatingAdminKey}
-              >
-                <Wand2 className="h-3.5 w-3.5" />
-                生成随机 Key
-              </Button>
-              <p className="text-[11px] text-muted-foreground">
-                建议生成后立即复制保存，确认更新后即生效。
-              </p>
-            </div>
-            <DialogFooter>
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => setAdminKeyDialogOpen(false)}
-                disabled={updatingAdminKey}
-              >
-                取消
-              </Button>
-              <Button
-                type="submit"
-                disabled={updatingAdminKey || !newAdminKey.trim()}
-              >
-                {updatingAdminKey ? "更新中…" : "确认更新"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setAdminKeyDialogOpen(false)}
+                  disabled={updatingAdminKey}
+                >
+                  取消
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={updatingAdminKey || !newAdminKey.trim()}
+                >
+                  {updatingAdminKey ? "更新中…" : "确认更新"}
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      )}
 
-      <BatchVerifyDialog
-        open={verifyDialogOpen}
-        onOpenChange={setVerifyDialogOpen}
-        verifying={verifying}
-        progress={verifyProgress}
-        results={verifyResults}
-        onCancel={handleCancelVerify}
-        onDelete={handleDeleteVerifyResult}
-        onDeleteFailed={handleDeleteFailedVerify}
-        deleting={verifyDeleting}
-      />
+      {verifyDialogOpen && (
+        <BatchVerifyDialog
+          open={verifyDialogOpen}
+          onOpenChange={setVerifyDialogOpen}
+          verifying={verifying}
+          progress={verifyProgress}
+          results={verifyResults}
+          onCancel={handleCancelVerify}
+          onDelete={handleDeleteVerifyResult}
+          onDeleteFailed={handleDeleteFailedVerify}
+          deleting={verifyDeleting}
+        />
+      )}
     </div>
   );
 }

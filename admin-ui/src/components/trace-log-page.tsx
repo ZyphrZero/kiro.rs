@@ -30,6 +30,7 @@ import {
   type ConsoleColumn,
 } from '@/components/console/data-table'
 import { BulkBar } from '@/components/console/bulk-bar'
+import { PageHeader } from '@/components/console/page-header'
 import {
   TimeRangePicker,
   rangeToStartMs,
@@ -777,30 +778,38 @@ export function TraceLogPage() {
   ).length
 
   return (
-    <div className="console-scope space-y-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <ScrollText className="h-4 w-4 text-muted-foreground" />
-        <h2 className="text-lg font-semibold tracking-tight">请求日志</h2>
-        <span className="console-num text-[13px] text-muted-foreground">
-          {total} 条
-        </span>
-        {filterCount > 0 && (
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => {
-              resetUrl()
-              setSearchDraft('')
-            }}
-            className="h-7 px-2 text-xs"
-          >
-            清除 {filterCount} 个筛选
-          </Button>
-        )}
-        <span className="ml-auto text-[11px] text-muted-foreground">
-          <kbd className="rounded border border-border/70 px-1">/</kbd> 搜索 · 点击行或箭头展开/折叠明细
-        </span>
-      </div>
+    <div className="console-scope space-y-4">
+      <PageHeader
+        breadcrumbs={[{ label: '控制台' }, { label: '请求日志', active: true }]}
+        icon={<ScrollText className="h-4 w-4" />}
+        title="请求日志"
+        description="端到端请求链路审计追踪、模型用量与重试故障转移明细分析。"
+        badge={
+          <Badge variant="secondary" className="font-mono text-xs">
+            {total} 条记录
+          </Badge>
+        }
+        actions={
+          <>
+            {filterCount > 0 && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  resetUrl()
+                  setSearchDraft('')
+                }}
+              >
+                清除 {filterCount} 个筛选
+              </Button>
+            )}
+            <span className="text-[11px] text-muted-foreground hidden sm:inline-flex items-center gap-1">
+              <kbd className="rounded border border-border/70 bg-muted px-1.5 py-0.5 text-[10px] font-mono">/</kbd>
+              快捷聚焦
+            </span>
+          </>
+        }
+      />
 
       {/* 筛选栏：时间范围在最前，因为排查的第一句话通常是"刚才那几分钟" */}
       <div className="flex flex-wrap items-center gap-2">
@@ -828,14 +837,14 @@ export function TraceLogPage() {
             }}
             placeholder="搜索模型 / 报错 / Trace ID"
             aria-label="搜索日志"
-            className="console-num h-8 w-[min(15rem,52vw)] rounded-lg border border-border bg-card/60 pl-8 pr-7 text-[12.5px] backdrop-blur placeholder:font-sans placeholder:text-muted-foreground/70 focus-visible:border-ring focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+            className="console-num h-8 w-[min(15rem,52vw)] rounded-md border border-border bg-card pl-8 pr-7 text-xs placeholder:font-sans placeholder:text-muted-foreground/60 focus-visible:border-primary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           />
           {searchDraft && (
             <button
               type="button"
               onClick={() => setSearchDraft('')}
               title="清除搜索"
-              className="absolute right-1.5 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-full text-muted-foreground hover:bg-accent hover:text-foreground"
+              className="absolute right-1.5 top-1/2 flex h-4 w-4 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
             >
               <X className="h-3 w-3" />
             </button>

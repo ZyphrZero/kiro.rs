@@ -5,10 +5,10 @@ import {
   ScrollText,
   PackageOpen,
   ShieldCheck,
-  SlidersHorizontal,
   Tags,
 } from 'lucide-react'
 import { PageHeader } from '@/components/console/page-header'
+import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import { useUrlState } from '@/hooks/use-url-state'
 import { cn } from '@/lib/utils'
@@ -81,39 +81,52 @@ export function SettingsPage() {
     ? urlState.s
     : 'dispatch') as SectionKey
 
+  const activeMeta = SECTIONS.find((s) => s.key === active) ?? SECTIONS[0]
+
   return (
     <div className="console-scope space-y-4">
       <PageHeader
-        icon={<SlidersHorizontal className="h-4 w-4" />}
-        title="设置"
-        description="改动即时生效并写入 config.json，无需重启。"
+        breadcrumbs={[
+          { label: '控制台' },
+          { label: '系统设置', onClick: () => patchUrl({ s: 'dispatch' }) },
+          { label: activeMeta.label, active: true },
+        ]}
+        icon={activeMeta.icon}
+        title={`设置 · ${activeMeta.label}`}
+        description="所有改动即时生效并直接落盘写入 config.json，无需重启服务进程。"
+        badge={
+          <Badge variant="outline" className="font-mono text-xs">
+            热重载就绪
+          </Badge>
+        }
       />
 
-      <div className="flex flex-col gap-4 lg:flex-row">
-        {/* 分区导航：桌面端竖排侧栏，窄屏横向滚动的胶囊行 */}
-        <nav
-          className="flex shrink-0 gap-1 overflow-x-auto px-1 py-1 lg:w-48 lg:flex-col lg:overflow-visible lg:px-0 lg:py-0 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-          aria-label="设置分区"
-        >
-          {SECTIONS.map((s) => (
-            <button
-              key={s.key}
-              type="button"
-              onClick={() => patchUrl({ s: s.key })}
-              aria-current={active === s.key ? 'page' : undefined}
-              className={cn(
-                'inline-flex shrink-0 items-center gap-2 rounded-lg px-3 py-2 text-left text-[13px] transition-colors',
-                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40',
-                active === s.key
-                  ? 'bg-primary/12 font-medium text-foreground ring-1 ring-primary/25'
-                  : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground',
-              )}
-            >
-              {s.icon}
-              <span className="whitespace-nowrap">{s.label}</span>
-            </button>
-          ))}
-        </nav>
+      {/* 窄屏设备横向滚动的子菜单导航栏（桌面端由左侧全局侧边栏接管） */}
+      <nav
+        className="flex lg:hidden shrink-0 gap-1 overflow-x-auto px-1 py-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        aria-label="设置分区"
+      >
+        {SECTIONS.map((s) => (
+          <button
+            key={s.key}
+            type="button"
+            onClick={() => patchUrl({ s: s.key })}
+            aria-current={active === s.key ? 'page' : undefined}
+            className={cn(
+              'inline-flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors',
+              'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring',
+              active === s.key
+                ? 'bg-primary/10 text-primary font-semibold'
+                : 'text-muted-foreground hover:bg-accent hover:text-foreground',
+            )}
+          >
+            {s.icon}
+            <span className="whitespace-nowrap">{s.label}</span>
+          </button>
+        ))}
+      </nav>
+
+      <div className="flex flex-col gap-4">
 
         <Card className="min-w-0 flex-1">
           <CardContent className="p-4 sm:p-5">
