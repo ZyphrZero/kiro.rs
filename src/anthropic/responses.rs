@@ -428,6 +428,7 @@ fn responses_to_anthropic(
             thinking,
             output_config,
             metadata,
+            cache_control: None,
         },
         tool_kinds,
     ))

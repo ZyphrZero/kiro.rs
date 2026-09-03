@@ -598,6 +598,26 @@ pub struct SetLogGovernanceConfigRequest {
     pub usage_log_retention_days: Option<u32>,
 }
 
+/// prompt cache 本地计量模拟配置响应。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheMeteringConfigResponse {
+    /// 计量模拟是否启用
+    pub enabled: bool,
+    /// 实际成本等价折算率（例如 0.6 即对齐 6 折，范围 0.1 ~ 1.0）
+    pub effective_discount_ratio: f64,
+}
+
+/// prompt cache 本地计量模拟配置更新请求。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCacheMeteringConfigRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub effective_discount_ratio: Option<f64>,
+}
+
 /// 凭据 metadata schema 配置响应/更新请求。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

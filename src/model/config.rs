@@ -244,6 +244,21 @@ pub struct Config {
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
+    /// 是否启用中转层 prompt cache 本地计量模拟。未设置时回落到
+    /// `KIRO_RS_CACHE_METERING` 环境变量，再回落到默认开启。
+    ///
+    /// 关闭后：不查不写任何缓存态，usage 全量计入 `input_tokens`、
+    /// `cache_creation_input_tokens` / `cache_read_input_tokens` 恒为 0。
+    /// 上游若下发真实 `metadataEvent.tokenUsage`，仍按真值上报，不受此开关影响。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_enabled: Option<bool>,
+
+    /// 模拟 Prompt Cache 实际成本折算率（用于对齐下游 NewAPI 计费，范围 0.1 ~ 1.0，默认 0.6 即 6 折）。
+    /// 下游 NewAPI 见到 cache_read 强制按 0.1x 计费，通过此折算率反向平衡 cache_read 与 input，
+    /// 使得下游实际扣费当量精确等于上游真实成本（如 0.6），防止站长倒贴亏损。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_effective_discount_ratio: Option<f64>,
+
     /// 是否启用请求链路追踪（写 traces.db）。默认 true。
     ///
     /// 关闭后：不再写入 trace 记录、不走 TraceSink，但 `GET /api/admin/traces`
@@ -422,6 +437,8 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
+            cache_metering_enabled: None,
+            cache_effective_discount_ratio: None,
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),

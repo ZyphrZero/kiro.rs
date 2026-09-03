@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useDeferredValue, useCallback, useMemo } from "react";
 import {
   RefreshCw,
   LogOut,
@@ -144,7 +144,6 @@ import {
 import type { BalanceResponse, CredentialStatusItem } from "@/types/api";
 import { StatusStrip } from "@/components/console/status-strip";
 import { BulkBar } from "@/components/console/bulk-bar";
-import { PageHeader } from "@/components/console/page-header";
 import {
   countByState,
   matchesStateFilter,
@@ -353,9 +352,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [tierFilter, setTierFilter] = useState<Set<Tier>>(new Set());
   // 模糊搜索：按来源渠道（备注）/ 邮箱做大小写不敏感的子串匹配；空串 = 不限
   const [searchQuery, setSearchQuery] = useState("");
+  const deferredSearchQuery = useDeferredValue(searchQuery);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
-  // Cmd/Ctrl+K 聚焦搜索框；搜索框聚焦时按 Esc 可快速清空并失焦
+  // 快捷键支持：按下 '/' 或 'Cmd/Ctrl+K' 聚焦搜索框；'Esc' 快速清空并失焦
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -364,6 +364,17 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           searchInputRef.current?.blur();
         }
         return;
+      }
+
+      if (
+        e.key === "/" &&
+        !["INPUT", "TEXTAREA", "SELECT"].includes(
+          (e.target as HTMLElement)?.tagName,
+        ) &&
+        !(e.target as HTMLElement)?.isContentEditable
+      ) {
+        e.preventDefault();
+        searchInputRef.current?.focus();
       }
 
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
@@ -416,7 +427,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   };
 
   // 应用分组 + 分级筛选后的凭据全集（分页前先过滤，确保翻页粒度正确）
-  const filteredCredentials = (() => {
+  const filteredCredentials = useMemo(() => {
     const all = allCredentials;
     let out = all;
     if (groupFilter) {
@@ -430,7 +441,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         tierFilter.has(detectTier(c.balance?.subscriptionTitle)),
       );
     }
-    const q = searchQuery.trim().toLowerCase();
+    const q = deferredSearchQuery.trim().toLowerCase();
     if (q) {
       out = out.filter(
         (c) =>
@@ -439,9 +450,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       );
     }
     // 状态筛选：点状态账条某一段时只留该状态的凭据
-    //
-    // 合并说明：PR #56 曾用一个多选下拉「按状态隐藏」（hiddenStatuses）做同一件事。
-    // 状态账条把计数和筛选合到一处，交互更直接，故以账条取代该下拉；字段排序保留。
     if (stateFilter) {
       out = out.filter((c) =>
         matchesStateFilter(c, balanceMap.get(c.id) ?? c.balance, stateFilter),
@@ -481,7 +489,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       });
     }
     return out;
-  })();
+  }, [allCredentials, groupFilter, tierFilter, deferredSearchQuery, stateFilter, balanceMap, sortField, sortDir]);
 
   // 各状态计数（状态账条用）。基于全量凭据而非当前筛选结果 ——
   // 账条是导航器，点进某一段之后其余段的数字不该跟着变。
@@ -493,7 +501,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   // 切换分组 / 分级筛选 / 搜索 / 状态 / 排序时复位到第 1 页，避免空页
   useEffect(() => {
     setCurrentPage(1);
-  }, [groupFilter, tierFilter, searchQuery, stateFilter, sortField, sortDir]);
+  }, [groupFilter, tierFilter, deferredSearchQuery, stateFilter, sortField, sortDir]);
 
   // pageSize === 0 表示“全部”：单页容纳全部已筛选凭据
   const effectivePageSize =
@@ -614,7 +622,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   };
 
   const gridRef = useRef<HTMLElement | null>(null);
-  const rectSelection = useRectSelect({
+  useRectSelect({
     containerRef: gridRef,
     itemSelector: "[data-credential-id]",
     idAttribute: "credential-id",
@@ -718,12 +726,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
   }, [error]);
 
-  const toggleSelect = (id: number) => {
-    const next = new Set(selectedIds);
-    if (next.has(id)) next.delete(id);
-    else next.add(id);
-    setSelectedIds(next);
-  };
+  const toggleSelect = useCallback((id: number) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
   const deselectAll = () => setSelectedIds(new Set());
 
   /** 全选 / 取消全选当前页凭据。已选中其他页的不会被清除。 */
@@ -970,7 +980,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     else toast.warning(`查询完成：成功 ${s} 个，失败 ${f} 个`);
   };
 
-  const handleRefreshBalance = async (id: number) => {
+  const handleRefreshBalance = useCallback(async (id: number) => {
     setLoadingBalanceIds((prev) => {
       const n = new Set(prev);
       n.add(id);
@@ -993,7 +1003,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         return n;
       });
     }
-  };
+  }, []);
 
   const handleBatchVerify = async () => {
     if (selectedIds.size === 0) {
@@ -1474,12 +1484,17 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         ref={gridRef}
         className={embedded ? "" : "mx-auto max-w-[1400px] px-4 md:px-8 py-8"}
       >
-        <PageHeader
-          className="mb-4"
-          icon={<Server className="h-4 w-4" />}
-          title="凭据管理"
-          description="管理 Kiro 的所有访问凭据、负载均衡与登录信息"
-        />
+        {/* 大标题 */}
+        <div className="mb-5 flex items-end justify-between gap-4 sm:mb-6">
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight leading-tight sm:text-[28px]">
+              凭据管理
+            </h1>
+            <p className="mt-1 text-sm text-muted-foreground">
+              管理 Kiro 的所有访问凭据、负载均衡与登录信息
+            </p>
+          </div>
+        </div>
 
         {/* 状态标签条已下移到紧贴列表处（见下方 <StatusStrip />）：
             它是列表的表头兼筛选器，放在标题下方会与它筛选的列表隔开两行工具栏。 */}
@@ -1545,15 +1560,15 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             {/* 筛选器 — 左（移动端两列网格并排，桌面端内联） */}
             <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:flex-wrap sm:items-center">
               {/* 模糊搜索：来源渠道（备注）/ 邮箱；移动端整行、桌面端 210px */}
-              <div className="relative col-span-2 sm:col-span-1 sm:w-[230px]">
+              <div className="relative col-span-2 sm:col-span-1 sm:w-[210px]">
                 <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground opacity-80" />
                 <input
                   ref={searchInputRef}
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="搜索来源 / 备注 / 邮箱"
-                  className="h-8 w-full rounded-full border border-border bg-card/60 pl-8 pr-9 text-base backdrop-blur placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:text-sm"
+                  placeholder="搜索来源渠道 / 备注 / 邮箱"
+                  className="h-8 w-full rounded-full border border-border bg-card pl-8 pr-7 text-base placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:text-sm"
                 />
                 {searchQuery ? (
                   <button
@@ -1564,14 +1579,18 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   >
                     <X className="h-3.5 w-3.5" />
                   </button>
-                ) : null}
+                ) : (
+                  <kbd className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 hidden select-none rounded border border-border/70 bg-muted/60 px-1.5 font-mono text-[10px] font-medium text-muted-foreground opacity-60 sm:inline-block">
+                    /
+                  </kbd>
+                )}
               </div>
               <Select
                 value={groupFilter || "all"}
                 onValueChange={(v) => setGroupFilter(v === "all" ? "" : v)}
               >
                 <SelectTrigger
-                  className="h-8 w-full rounded-full border-border bg-card/60 px-3 backdrop-blur sm:w-[140px]"
+                  className="h-8 w-full rounded-full border-border bg-card px-3 sm:w-[140px]"
                   title="按分组筛选凭据"
                 >
                   <SelectValue placeholder="全部分组" />
@@ -1593,7 +1612,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   <button
                     type="button"
                     title="按订阅分级筛选凭据（可多选，依据最近一次余额缓存）"
-                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-full border border-border bg-card/60 px-3 text-sm backdrop-blur hover:bg-accent sm:w-[136px]"
+                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-full border border-border bg-card px-3 text-sm hover:bg-accent sm:w-[136px]"
                   >
                     <span className="truncate">
                       {tierFilter.size > 0
@@ -1641,7 +1660,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   <button
                     type="button"
                     title="按字段排序凭据（再次点击同一字段切换升 / 降序）"
-                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-full border border-border bg-card/60 px-3 text-sm backdrop-blur hover:bg-accent sm:w-[136px]"
+                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-full border border-border bg-card px-3 text-sm hover:bg-accent sm:w-[136px]"
                   >
                     <span className="inline-flex min-w-0 items-center gap-1">
                       {sortField === "manual" ? (
@@ -1694,7 +1713,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </DropdownMenu>
 
               {/* 卡片 / 列表 视图切换（iOS 分段控件） */}
-              <div className="col-span-2 inline-flex h-8 shrink-0 items-center justify-self-start rounded-full border border-border bg-card/60 p-0.5 backdrop-blur sm:col-span-1">
+              <div className="col-span-2 inline-flex h-8 shrink-0 items-center justify-self-start rounded-full border border-border bg-card p-0.5 sm:col-span-1">
                 <button
                   type="button"
                   onClick={() => changeViewMode("card")}
@@ -2088,8 +2107,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 <div
                   className={
                     viewMode === "list"
-                      ? "flex select-none flex-col gap-2"
-                      : "grid select-none gap-3 sm:gap-4 md:grid-cols-2 lg:grid-cols-3"
+                      ? "flex select-none flex-col gap-2 [transform:translateZ(0)]"
+                      : "grid select-none gap-3 sm:gap-4 md:grid-cols-2 lg:grid-cols-3 [transform:translateZ(0)]"
                   }
                 >
                   {currentCredentials.map((credential) => (
@@ -2098,16 +2117,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       credential={credential}
                       view={viewMode}
                       selected={selectedIds.has(credential.id)}
-                      onToggleSelect={() => toggleSelect(credential.id)}
+                      onToggleSelect={toggleSelect}
                       balance={
                         balanceMap.get(credential.id) ||
                         credential.balance ||
                         null
                       }
                       loadingBalance={loadingBalanceIds.has(credential.id)}
-                      onRefreshBalance={() =>
-                        handleRefreshBalance(credential.id)
-                      }
+                      onRefreshBalance={handleRefreshBalance}
                       failureStats={failureStatsMap?.[String(credential.id)]}
                       dragDisabled={dragDisabled || credential.id === DEV_PREVIEW_CREDENTIAL.id}
                       preview={credential.id === DEV_PREVIEW_CREDENTIAL.id}
@@ -2185,8 +2202,17 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 disabled={batchDeleting}
                 className="h-8 px-3 text-xs gap-1.5 rounded-full text-destructive hover:bg-destructive/10 hover:text-destructive"
               >
-                <Trash2 className="h-3.5 w-3.5" />
-                删除
+                {batchDeleting ? (
+                  <>
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    删除中 {deleteProgress.current}/{deleteProgress.total}
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="h-3.5 w-3.5" />
+                    删除
+                  </>
+                )}
               </Button>
             </BulkBar>
 
@@ -2418,17 +2444,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         </DialogContent>
       </Dialog>
 
-      {rectSelection.active && rectSelection.rect && (
-        <div
-          className="pointer-events-none fixed z-50 rounded-sm border border-primary/70 bg-primary/15"
-          style={{
-            left: rectSelection.rect.left,
-            top: rectSelection.rect.top,
-            width: rectSelection.rect.width,
-            height: rectSelection.rect.height,
-          }}
-        />
-      )}
       <BatchVerifyDialog
         open={verifyDialogOpen}
         onOpenChange={setVerifyDialogOpen}

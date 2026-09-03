@@ -31,3 +31,6 @@
 .ace-tool/
 .codegraph/
 .claude/
+
+# 本地调研用的外部仓库克隆与草稿，不应进版本库
+.research/

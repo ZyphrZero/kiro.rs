@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { toast } from 'sonner'
 import {
   ScrollText,
+  RefreshCw,
   ChevronRight,
   ChevronLeft,
   AlertTriangle,
@@ -8,15 +10,10 @@ import {
   Unplug,
   Search,
   X,
+  Copy,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from '@/components/ui/tooltip'
 import {
   Select as UiSelect,
   SelectTrigger as UiSelectTrigger,
@@ -25,8 +22,6 @@ import {
   SelectItem as UiSelectItem,
 } from '@/components/ui/select'
 import { useTraces } from '@/hooks/use-traces'
-import { AutoRefreshControl } from '@/components/console/auto-refresh-control'
-import { PageHeader } from '@/components/console/page-header'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { useUrlState } from '@/hooks/use-url-state'
@@ -34,11 +29,7 @@ import {
   ConsoleTable,
   type ConsoleColumn,
 } from '@/components/console/data-table'
-import {
-  DetailDrawer,
-  DrawerField,
-  DrawerSection,
-} from '@/components/console/detail-drawer'
+import { BulkBar } from '@/components/console/bulk-bar'
 import {
   TimeRangePicker,
   rangeToStartMs,
@@ -198,6 +189,7 @@ function AttemptRow({ a }: { a: TraceAttempt }) {
 
 /** 可展开的链路行 */
 /** Token 用量单元格：紧凑展示总量，hover 显示分项明细 */
+/** Token 用量单元格：紧凑展示总量与缓存命中，hover 显示分项明细 */
 function TokenCell({ rec }: { rec: TraceRecord }) {
   const input = rec.inputTokens ?? 0
   const output = rec.outputTokens ?? 0
@@ -208,46 +200,47 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
   if (total === 0) {
     return <span className="text-muted-foreground">—</span>
   }
-  const rows: Array<[string, number]> = [
-    ['输入 Token', input],
-    ['输出 Token', output],
+  const promptTotal = input + cacheCreation + cacheRead
+  const hitRatio =
+    promptTotal > 0 && cacheRead > 0
+      ? (() => {
+          const pct = (cacheRead / promptTotal) * 100
+          if (pct >= 100) return '100'
+          if (pct >= 99.95) return '99.9'
+          return pct.toFixed(1)
+        })()
+      : null
+
+  const titleText = [
+    `输入 Token（未缓存）: ${formatTokenFull(input)}`,
+    cacheCreation > 0 ? `缓存写入 Token: ${formatTokenFull(cacheCreation)}` : null,
+    cacheRead > 0 ? `缓存读取 Token: ${formatTokenFull(cacheRead)} (命中率 ${hitRatio}%)` : null,
+    `输出 Token: ${formatTokenFull(output)}`,
+    `总 Token: ${formatTokenFull(total)}`,
   ]
-  if (cacheCreation > 0) rows.push(['缓存创建 Token', cacheCreation])
-  if (cacheRead > 0) rows.push(['缓存读取 Token', cacheRead])
+    .filter(Boolean)
+    .join('\n')
+
   return (
-    <TooltipProvider delayDuration={150}>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <span className="inline-flex items-center gap-1 font-mono tabular-nums cursor-default border-b border-dotted border-muted-foreground/40">
-            <span className="text-emerald-600 dark:text-emerald-400">
-              ↓{formatTokens(input + cacheCreation + cacheRead)}
-            </span>
-            <span className="text-violet-600 dark:text-violet-400">
-              ↑{formatTokens(output)}
-            </span>
-          </span>
-        </TooltipTrigger>
-        <TooltipContent className="p-0">
-          <div className="min-w-[180px] px-3 py-2">
-            <div className="mb-1.5 text-[13px] font-semibold">Token 明细</div>
-            <div className="space-y-1 text-[12px]">
-              {rows.map(([label, val]) => (
-                <div key={label} className="flex items-center justify-between gap-6">
-                  <span className="text-muted-foreground">{label}</span>
-                  <span className="font-mono tabular-nums">{formatTokenFull(val)}</span>
-                </div>
-              ))}
-              <div className="mt-1 flex items-center justify-between gap-6 border-t border-border/50 pt-1">
-                <span className="font-medium">总 Token</span>
-                <span className="font-mono font-semibold tabular-nums">
-                  {formatTokenFull(total)}
-                </span>
-              </div>
-            </div>
-          </div>
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
+    <span
+      className="inline-flex items-center gap-1.5 font-mono tabular-nums cursor-default"
+      title={titleText}
+    >
+      <span className="border-b border-dotted border-muted-foreground/40 text-emerald-600 dark:text-emerald-400">
+        ↓{formatTokens(promptTotal)}
+      </span>
+      <span className="border-b border-dotted border-muted-foreground/40 text-violet-600 dark:text-violet-400">
+        ↑{formatTokens(output)}
+      </span>
+      {cacheRead > 0 && (
+        <Badge
+          variant="outline"
+          className="h-4 px-1 py-0 text-[10px] font-medium border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+        >
+          命中 {hitRatio}%
+        </Badge>
+      )}
+    </span>
   )
 }
 
@@ -263,135 +256,257 @@ function AttemptChain({ rec }: { rec: TraceRecord }) {
   }
   if (attempts.length === 1 && rec.finalStatus === 'success') {
     return (
-      <span className={`inline-block h-2 w-2 rounded-full ${outcomeDot(attempts[0].outcome)}`} />
+      <span
+        title="1 次尝试即成功"
+        className={`inline-block h-2 w-2 rounded-full ${outcomeDot(attempts[0].outcome)}`}
+      />
     )
   }
   return (
-    <TooltipProvider delayDuration={150}>
-      <span className="inline-flex items-center gap-1">
-        {attempts.map((a, i) => (
+    <span className="inline-flex items-center gap-1">
+      {attempts.map((a, i) => {
+        const hint = `第 ${a.attempt + 1} 跳 · ${outcomeStyle(a.outcome).label}${a.httpStatus != null ? ` · HTTP ${a.httpStatus}` : ''}${a.endpoint ? ` · ${a.endpoint}` : ''} · ${formatDuration(a.durationMs)}`
+        return (
           <span key={a.attempt} className="inline-flex items-center gap-1">
             {i > 0 && <span className="text-muted-foreground/40">→</span>}
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span className="inline-flex cursor-default items-center gap-1 rounded border border-border/60 bg-secondary/40 px-1.5 py-0.5 font-mono text-[11px] tabular-nums">
-                  <span className={`h-1.5 w-1.5 rounded-full ${outcomeDot(a.outcome)}`} />
-                  {a.credentialId > 0 ? `#${a.credentialId}` : '—'}
-                </span>
-              </TooltipTrigger>
-              <TooltipContent className="font-mono text-[11px]">
-                第 {a.attempt + 1} 跳 · {outcomeStyle(a.outcome).label}
-                {a.httpStatus != null ? ` · HTTP ${a.httpStatus}` : ''}
-                {a.endpoint ? ` · ${a.endpoint}` : ''} · {formatDuration(a.durationMs)}
-              </TooltipContent>
-            </Tooltip>
+            <span
+              title={hint}
+              className="inline-flex cursor-default items-center gap-1 rounded border border-border/60 bg-secondary/40 px-1.5 py-0.5 font-mono text-[11px] tabular-nums hover:bg-secondary/70 transition-colors"
+            >
+              <span className={`h-1.5 w-1.5 rounded-full ${outcomeDot(a.outcome)}`} />
+              {a.credentialId > 0 ? `#${a.credentialId}` : '—'}
+            </span>
           </span>
-        ))}
-      </span>
-    </TooltipProvider>
+        )
+      })}
+    </span>
   )
 }
 
 /**
- * 计费面板：以 credit（上游 meteringEvent 的真实计费）为核心，直观体现缓存省钱效果。
- *
- * 关键指标「每千输入 token 的 credit」：Kiro 后端对命中缓存的输入按更低费率计费，
- * 所以同规模输入下，该比值越低 = 缓存命中越多 = 越省钱。冷启动请求（大前缀首次进
- * 缓存）该比值偏高，之后重复内容命中后明显下降——对比同类请求的这个值即可看出缓存
- * 有没有帮你省钱。
- *
- * 注：input token 为 contextUsage 推算的粗粒度估算；credit 是上游真实计费口径，
- * 是判断成本的可信信号（缓存的 cache_read token 为中转层估算，仅供参考）。
+ * Token 与缓存构成面板：
+ * 完整展示输入/输出/缓存命中/写入/上游计费等各项指标，保证无论是否产生 credits 都清晰可见。
  */
-function CacheBillingPanel({ rec }: { rec: TraceRecord }) {
-  const credit = rec.credits ?? 0
-  if (credit <= 0) return null
-  // 总输入 = 未缓存输入 + 缓存创建 + 缓存读取。
-  // 这是缓存拆分的不变量（split_against_total 保证三者之和 == 总 prompt），
-  // 用作分母才稳定；rec.inputTokens 在有缓存拆分时只剩「未缓存那部分」，不能当分母。
+function TokenAndCachePanel({ rec }: { rec: TraceRecord }) {
   const freshInput = rec.inputTokens ?? 0
   const cacheCreation = rec.cacheCreationTokens ?? 0
   const cacheRead = rec.cacheReadTokens ?? 0
   const promptTotal = freshInput + cacheCreation + cacheRead
-  const perK = promptTotal > 0 ? credit / (promptTotal / 1000) : null
+  const output = rec.outputTokens ?? 0
+  const total = rec.totalTokens ?? promptTotal + output
+  const credit = rec.credits ?? 0
 
-  // boldness 只花在一处：credit（真实成本）为主角，其余中性陪衬。
-  const items: Array<{ label: string; value: string; hint?: string; primary?: boolean }> = [
-    { label: '真实计费', value: credit.toFixed(4), hint: 'credit（上游 metering）', primary: true },
-    { label: '总输入 Token', value: formatTokens(promptTotal), hint: '含缓存命中·估算' },
-  ]
-  if (perK != null) {
-    items.push({
-      label: '每千输入 credit',
-      value: perK.toFixed(4),
-      hint: '越低=缓存命中越多',
-    })
-  }
-  // 有缓存拆分时，额外展示「未缓存输入」（真正按全价计费的部分）
-  if (cacheRead > 0 || cacheCreation > 0) {
-    items.push({
-      label: '未缓存输入',
-      value: formatTokens(freshInput),
-      hint: '按全价计费部分·估算',
-    })
-  }
+  const hitRatio =
+    promptTotal > 0 && cacheRead > 0
+      ? ((cacheRead / promptTotal) * 100).toFixed(1)
+      : null
+  const perK =
+    promptTotal > 0 && credit > 0 ? credit / (promptTotal / 1000) : null
+
+  // 进度条百分比（基于 promptTotal）
+  const readPct = promptTotal > 0 ? (cacheRead / promptTotal) * 100 : 0
+  const creationPct = promptTotal > 0 ? (cacheCreation / promptTotal) * 100 : 0
+  const freshPct = promptTotal > 0 ? (freshInput / promptTotal) * 100 : 0
 
   return (
-    <div className="rounded-lg border border-border/50 bg-secondary/30 p-3">
-      <div className="mb-2 flex items-center gap-2 text-[12px] font-medium text-muted-foreground">
-        <span>计费与缓存效率</span>
-        <span className="text-[11px] font-normal text-muted-foreground/70">
-          credit 为上游真实计费，是判断缓存省钱的可信信号
-        </span>
+    <div className="rounded-lg border border-border/60 bg-card/60 p-3.5 space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/40 pb-2">
+        <div className="flex items-center gap-2">
+          <span className="text-[13px] font-semibold tracking-tight">Token 与缓存构成</span>
+          {cacheRead > 0 ? (
+            <Badge variant="success" className="text-[11px] h-5 gap-1">
+              <span>命中率 {hitRatio}%</span>
+            </Badge>
+          ) : (
+            <Badge variant="outline" className="text-[11px] h-5 text-muted-foreground">
+              未命中缓存
+            </Badge>
+          )}
+        </div>
+        <div className="text-[11px] text-muted-foreground font-mono">
+          总计 {formatTokenFull(total)} Token
+        </div>
       </div>
-      <div className="grid grid-cols-2 gap-x-6 gap-y-2 sm:grid-cols-3">
-        {items.map((it) => (
-          <div key={it.label} className="min-w-0">
-            <div className="text-[11px] text-muted-foreground">{it.label}</div>
-            <div
-              className={
-                it.primary
-                  ? 'font-mono tabular-nums text-[15px] font-semibold text-sky-700 dark:text-sky-300'
-                  : 'font-mono tabular-nums text-[15px] font-medium text-foreground/85'
-              }
-            >
-              {it.value}
-            </div>
-            {it.hint && (
-              <div className="text-[10px] text-muted-foreground/70">{it.hint}</div>
+
+      {/* 视觉化占比条（仅在有 prompt 时显示） */}
+      {promptTotal > 0 && (
+        <div className="space-y-1">
+          <div className="flex h-2 w-full overflow-hidden rounded-full bg-secondary/80">
+            {readPct > 0 && (
+              <div
+                style={{ width: `${readPct}%` }}
+                className="bg-emerald-500 transition-all"
+                title={`缓存读取: ${formatTokenFull(cacheRead)} (${hitRatio}%)`}
+              />
+            )}
+            {creationPct > 0 && (
+              <div
+                style={{ width: `${creationPct}%` }}
+                className="bg-amber-500 transition-all"
+                title={`缓存写入: ${formatTokenFull(cacheCreation)}`}
+              />
+            )}
+            {freshPct > 0 && (
+              <div
+                style={{ width: `${freshPct}%` }}
+                className="bg-sky-500/70 transition-all"
+                title={`未缓存输入: ${formatTokenFull(freshInput)}`}
+              />
             )}
           </div>
-        ))}
+          <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-muted-foreground pt-0.5">
+            <span className="inline-flex items-center gap-1">
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 inline-block" />
+              缓存读取 (命中): {formatTokenFull(cacheRead)} ({readPct.toFixed(1)}%)
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="h-1.5 w-1.5 rounded-full bg-amber-500 inline-block" />
+              缓存创建 (写入): {formatTokenFull(cacheCreation)}
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="h-1.5 w-1.5 rounded-full bg-sky-500/70 inline-block" />
+              未缓存输入 (常规): {formatTokenFull(freshInput)}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* 具体数据网格 */}
+      <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 lg:grid-cols-6 pt-1">
+        <div className="rounded-md bg-secondary/40 p-2">
+          <div className="text-[11px] text-muted-foreground">总输入 (Prompt)</div>
+          <div className="font-mono text-[14px] font-semibold tabular-nums text-foreground">
+            {formatTokenFull(promptTotal)}
+          </div>
+          <div className="text-[10px] text-muted-foreground/80">含缓存命中总量</div>
+        </div>
+
+        <div className={`rounded-md p-2 ${cacheRead > 0 ? 'bg-emerald-500/10 border border-emerald-500/20' : 'bg-secondary/40'}`}>
+          <div className="text-[11px] text-emerald-600 dark:text-emerald-400 font-medium">缓存读取 (命中)</div>
+          <div className="font-mono text-[14px] font-semibold tabular-nums text-emerald-700 dark:text-emerald-300">
+            {formatTokenFull(cacheRead)}
+          </div>
+          <div className="text-[10px] text-muted-foreground/80">
+            {cacheRead > 0 ? `占比 ${hitRatio}% (省钱)` : '0 (无命中)'}
+          </div>
+        </div>
+
+        <div className="rounded-md bg-secondary/40 p-2">
+          <div className="text-[11px] text-amber-600 dark:text-amber-400 font-medium">缓存创建 (写入)</div>
+          <div className="font-mono text-[14px] font-semibold tabular-nums text-amber-700 dark:text-amber-300">
+            {formatTokenFull(cacheCreation)}
+          </div>
+          <div className="text-[10px] text-muted-foreground/80">初次断点写入</div>
+        </div>
+
+        <div className="rounded-md bg-secondary/40 p-2">
+          <div className="text-[11px] text-muted-foreground">未缓存输入</div>
+          <div className="font-mono text-[14px] font-semibold tabular-nums text-foreground">
+            {formatTokenFull(freshInput)}
+          </div>
+          <div className="text-[10px] text-muted-foreground/80">全价计费部分</div>
+        </div>
+
+        <div className="rounded-md bg-secondary/40 p-2">
+          <div className="text-[11px] text-muted-foreground">输出 Token</div>
+          <div className="font-mono text-[14px] font-semibold tabular-nums text-violet-600 dark:text-violet-400">
+            {formatTokenFull(output)}
+          </div>
+          <div className="text-[10px] text-muted-foreground/80">模型生成内容</div>
+        </div>
+
+        <div className="rounded-md bg-secondary/40 p-2">
+          <div className="text-[11px] text-muted-foreground">真实计费 (Credit)</div>
+          <div className="font-mono text-[14px] font-semibold tabular-nums text-sky-600 dark:text-sky-400">
+            {credit > 0 ? credit.toFixed(4) : '—'}
+          </div>
+          <div className="text-[10px] text-muted-foreground/80">
+            {perK != null ? `${perK.toFixed(4)} / 千Token` : '上游未下发'}
+          </div>
+        </div>
       </div>
     </div>
   )
 }
 
-/** 展开后的链路详情：计费/缓存效率 + 错误摘要 + 每跳时间线 */
-function ExpandedDetail({ rec }: { rec: TraceRecord }) {
+/** 展开折叠后的完整链路详情 */
+function TraceExpandedDetail({ rec }: { rec: TraceRecord }) {
+  const [copied, setCopied] = useState(false)
+
+  const copyTraceId = () => {
+    navigator.clipboard.writeText(rec.traceId)
+    setCopied(true)
+    toast.success('已复制 Trace ID')
+    setTimeout(() => setCopied(false), 2000)
+  }
+
   return (
-    <div className="space-y-3">
-      <CacheBillingPanel rec={rec} />
-      {rec.errorMessage && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-[13px] text-destructive">
-          {rec.errorMessage}
+    <div className="space-y-3 text-[13px]">
+      {/* 顶部：基本信息条 */}
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-border/50 bg-secondary/30 px-3.5 py-2">
+        <div className="flex items-center gap-2">
+          <StatusBadge status={rec.finalStatus} />
+          {rec.errorType && (
+            <Badge variant={outcomeStyle(rec.errorType).variant}>
+              {outcomeStyle(rec.errorType).label}
+            </Badge>
+          )}
+          <span className="font-semibold text-foreground">{rec.model}</span>
+          {rec.isStream && (
+            <Badge variant="outline" className="text-[10px] px-1 py-0">流式</Badge>
+          )}
         </div>
-      )}
-      {rec.interruptedAfterBytes != null && (
-        <div className="text-[12px] text-muted-foreground">
-          中断前已发送 {rec.interruptedAfterBytes} 字节
+
+        <div className="flex items-center gap-1.5 text-xs text-muted-foreground font-mono">
+          <span>ID: {rec.traceId}</span>
+          <button
+            type="button"
+            onClick={copyTraceId}
+            className="inline-flex h-5 w-5 items-center justify-center rounded hover:bg-accent hover:text-foreground transition-colors"
+            title="复制完整 Trace ID"
+          >
+            {copied ? <CheckCircle2 className="h-3 w-3 text-emerald-500" /> : <Copy className="h-3 w-3" />}
+          </button>
         </div>
-      )}
-      <div className="text-[12px] font-medium text-muted-foreground">
-        尝试链路（{rec.attempts.length} 次
-        {rec.attempts.length > 1 ? `，含 ${rec.attempts.length - 1} 次重试` : "，未重试"}）
+
+        <div className="ml-auto flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+          <span>最终凭据: <span className="font-mono text-foreground font-medium">{credLabel(rec.finalCredentialId, rec.finalEmail)}</span></span>
+          <span>入口 Key: <span className="font-mono text-foreground font-medium">{keyLabel(rec.keyId, rec.keyName)}</span></span>
+          <span>总耗时: <span className="font-mono text-foreground font-medium">{formatDuration(rec.durationMs)}</span></span>
+          {rec.firstTokenMs != null && (
+            <span>首 Token: <span className="font-mono text-foreground font-medium">{formatDuration(rec.firstTokenMs)}</span></span>
+          )}
+          {rec.interruptedAfterBytes != null && (
+            <span>中断已发: <span className="font-mono text-foreground font-medium">{rec.interruptedAfterBytes} 字节</span></span>
+          )}
+        </div>
       </div>
+
+      {/* 核心：Token 与缓存构成面板 */}
+      <TokenAndCachePanel rec={rec} />
+
+      {/* 报错信息（若存在） */}
+      {rec.errorMessage && (
+        <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-[12.5px] text-destructive flex items-start gap-2">
+          <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+          <div className="flex-1 font-mono break-all whitespace-pre-wrap">{rec.errorMessage}</div>
+        </div>
+      )}
+
+      {/* 尝试链路时间线 */}
       <div className="space-y-2">
-        {rec.attempts.length === 0 ? (
-          <div className="text-[13px] text-muted-foreground">无尝试记录（请求未到达上游）</div>
-        ) : (
-          rec.attempts.map((a) => <AttemptRow key={a.attempt} a={a} />)
-        )}
+        <div className="text-[12px] font-medium text-muted-foreground">
+          尝试链路（共 {rec.attempts.length} 次尝试{rec.attempts.length > 1 ? `，含 ${rec.attempts.length - 1} 次重试/故障转移` : '，未重试'}）
+        </div>
+        <div className="space-y-2">
+          {rec.attempts.length === 0 ? (
+            <div className="rounded-lg border border-border/40 bg-secondary/20 p-3 text-center text-xs text-muted-foreground">
+              无上游尝试记录（请求在到达上游凭据前被拦截或校验失败）
+            </div>
+          ) : (
+            rec.attempts.map((a) => <AttemptRow key={a.attempt} a={a} />)
+          )}
+        </div>
       </div>
     </div>
   )
@@ -451,6 +566,29 @@ function useDebounced<T>(value: T, delay = 300): T {
     return () => window.clearTimeout(t)
   }, [value, delay])
   return debounced
+}
+
+/** `/` 聚焦搜索框 —— 手不离键盘就能开始筛 */
+function useSlashFocus(ref: React.RefObject<HTMLInputElement | null>) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return
+      const t = e.target as HTMLElement | null
+      if (
+        t &&
+        (t.tagName === 'INPUT' ||
+          t.tagName === 'TEXTAREA' ||
+          t.isContentEditable)
+      ) {
+        return
+      }
+      e.preventDefault()
+      ref.current?.focus()
+      ref.current?.select()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [ref])
 }
 
 /** 表格列定义。默认 8 列，其余进列控制菜单 —— 12 列全摆开必然横向滚动。 */
@@ -578,8 +716,16 @@ export function TraceLogPage() {
   const [url, patchUrl, resetUrl] = useUrlState('traces', URL_DEFAULTS)
   const [searchDraft, setSearchDraft] = useState(url.q)
   const debouncedSearch = useDebounced(searchDraft)
-  const [detail, setDetail] = useState<TraceRecord | null>(null)
+  const searchRef = useRef<HTMLInputElement>(null)
+  const [expandedTraceIds, setExpandedTraceIds] = useState<Set<number | string>>(new Set())
+  const [selectedTraceIds, setSelectedTraceIds] = useState<Set<number | string>>(new Set())
   const [now, setNow] = useState(() => Date.now())
+  useSlashFocus(searchRef)
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   // 搜索词稳定后才写进 URL / 触发查询
   useEffect(() => {
@@ -631,50 +777,46 @@ export function TraceLogPage() {
   ).length
 
   return (
-    <div className="console-scope space-y-4">
-      <PageHeader
-        icon={<ScrollText className="h-4 w-4" />}
-        title="请求日志"
-        meta={
-          <>
-            <span className="console-num text-[13px] text-muted-foreground">
-              {total} 条
-            </span>
-            {filterCount > 0 && (
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => {
-                  resetUrl()
-                  setSearchDraft('')
-                }}
-                className="h-7 px-2 text-xs"
-              >
-                清除 {filterCount} 个筛选
-              </Button>
-            )}
-          </>
-        }
-        actions={
-          <AutoRefreshControl
-            onRefresh={() => {
-              // 相对时间窗口需要在每次刷新时重新取“现在”；即使同一秒内点击，也直接 refetch。
-              if (range.minutes != null) {
-                setNow(Date.now())
-              }
-              return refetch()
-            }}
-            isRefreshing={isFetching}
-            resourceLabel="请求日志"
-          />
-        }
-      />
-
-      {/* 筛选栏：文本与分类条件优先，时间范围收在末尾。 */}
+    <div className="console-scope space-y-3">
       <div className="flex flex-wrap items-center gap-2">
+        <ScrollText className="h-4 w-4 text-muted-foreground" />
+        <h2 className="text-lg font-semibold tracking-tight">请求日志</h2>
+        <span className="console-num text-[13px] text-muted-foreground">
+          {total} 条
+        </span>
+        {filterCount > 0 && (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => {
+              resetUrl()
+              setSearchDraft('')
+            }}
+            className="h-7 px-2 text-xs"
+          >
+            清除 {filterCount} 个筛选
+          </Button>
+        )}
+        <span className="ml-auto text-[11px] text-muted-foreground">
+          <kbd className="rounded border border-border/70 px-1">/</kbd> 搜索 · 点击行或箭头展开/折叠明细
+        </span>
+      </div>
+
+      {/* 筛选栏：时间范围在最前，因为排查的第一句话通常是"刚才那几分钟" */}
+      <div className="flex flex-wrap items-center gap-2">
+        <TimeRangePicker
+          value={range}
+          onChange={(next) =>
+            patchUrl({
+              range: next.minutes == null ? '' : String(next.minutes),
+              page: '0',
+            })
+          }
+        />
         <div className="relative">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <input
+            ref={searchRef}
             type="text"
             value={searchDraft}
             onChange={(e) => setSearchDraft(e.target.value)}
@@ -719,15 +861,15 @@ export function TraceLogPage() {
           onChange={(v) => patchUrl({ group: v, page: '0' })}
           options={groupSelectOptions}
         />
-        <TimeRangePicker
-          value={range}
-          onChange={(next) =>
-            patchUrl({
-              range: next.minutes == null ? '' : String(next.minutes),
-              page: '0',
-            })
-          }
-        />
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => refetch()}
+          disabled={isFetching}
+          title="立即刷新（每 30 秒自动刷新）"
+        >
+          <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
+        </Button>
       </div>
 
       <ConsoleTable
@@ -735,7 +877,12 @@ export function TraceLogPage() {
         columns={columns}
         rowKey={(r) => r.traceId}
         tone={traceTone}
-        onRowActivate={setDetail}
+        selectable
+        selected={selectedTraceIds}
+        onSelectedChange={setSelectedTraceIds}
+        renderExpandedRow={(rec) => <TraceExpandedDetail rec={rec} />}
+        expandedKeys={expandedTraceIds}
+        onExpandedKeysChange={setExpandedTraceIds}
         columnsStorageKey="kiro.traces.columns"
         loading={isLoading}
         empty={
@@ -744,6 +891,27 @@ export function TraceLogPage() {
             : '暂无记录。发起几次 /v1/messages 请求后即可看到链路。'
         }
       />
+
+      {/* 吸底批量操作栏 */}
+      <BulkBar
+        count={selectedTraceIds.size}
+        onClear={() => setSelectedTraceIds(new Set())}
+        noun="条日志"
+      >
+        <Button
+          onClick={() => {
+            const list = Array.from(selectedTraceIds).join('\n')
+            navigator.clipboard.writeText(list)
+            toast.success(`已复制 ${selectedTraceIds.size} 个 Trace ID`)
+          }}
+          size="sm"
+          variant="ghost"
+          className="h-8 px-3 text-xs gap-1.5 rounded-full hover:bg-accent"
+        >
+          <Copy className="h-3.5 w-3.5" />
+          复制 Trace ID
+        </Button>
+      </BulkBar>
 
       {total > PAGE_SIZE && (
         <div className="flex items-center justify-center gap-2">
@@ -773,71 +941,6 @@ export function TraceLogPage() {
           </Button>
         </div>
       )}
-
-      <TraceDetailDrawer rec={detail} onClose={() => setDetail(null)} />
     </div>
-  )
-}
-
-/**
- * 详情抽屉，替掉原先的行展开。
- *
- * 行展开会把 34px 的行顶到几百 px，下方所有行位置突变、滚动位置跟着跳 —— 想对比
- * 相邻两条记录时格外难受。抽屉让表格布局始终稳定，左边列表和右边详情能同时看。
- */
-function TraceDetailDrawer({
-  rec,
-  onClose,
-}: {
-  rec: TraceRecord | null
-  onClose: () => void
-}) {
-  return (
-    <DetailDrawer
-      open={rec != null}
-      onOpenChange={(open) => {
-        if (!open) onClose()
-      }}
-      title={rec?.model ?? ''}
-      subtitle={rec ? `${formatTime(rec.ts)} · ${rec.traceId}` : undefined}
-    >
-      {rec && (
-        <div className="space-y-1">
-          <DrawerSection title="结果">
-            <DrawerField label="状态">
-              <StatusBadge status={rec.finalStatus} />
-            </DrawerField>
-            {rec.errorType && (
-              <DrawerField label="错误类型">
-                <Badge variant={outcomeStyle(rec.errorType).variant}>
-                  {outcomeStyle(rec.errorType).label}
-                </Badge>
-              </DrawerField>
-            )}
-            <DrawerField label="最终凭据" mono>
-              {credLabel(rec.finalCredentialId, rec.finalEmail)}
-            </DrawerField>
-            <DrawerField label="入口 Key" mono>
-              {keyLabel(rec.keyId, rec.keyName)}
-            </DrawerField>
-            <DrawerField label="总耗时" mono>
-              {formatDuration(rec.durationMs)}
-            </DrawerField>
-            {rec.firstTokenMs != null && (
-              <DrawerField label="首 Token" mono>
-                {formatDuration(rec.firstTokenMs)}
-              </DrawerField>
-            )}
-            {rec.interruptedAfterBytes != null && (
-              <DrawerField label="中断前已发送" mono>
-                {rec.interruptedAfterBytes} 字节
-              </DrawerField>
-            )}
-          </DrawerSection>
-
-          <ExpandedDetail rec={rec} />
-        </div>
-      )}
-    </DetailDrawer>
   )
 }

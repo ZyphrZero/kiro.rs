@@ -33,7 +33,6 @@
     --rail-warn: 38 92% 50%;
     --rail-cool: 25 95% 53%;
     --rail-dead: 4 100% 59%;
-    --theme-hue: 211;
   }
 
   .dark {
@@ -63,62 +62,6 @@
     --rail-cool: 25 95% 58%;
     --rail-dead: 4 90% 62%;
   }
-
-  /* Palette tokens stay semantic so existing Tailwind classes continue to work. */
-  html[data-theme] {
-    --background: var(--theme-hue) 20% 97%;
-    --foreground: var(--theme-hue) 10% 12%;
-    --card: 0 0% 100%;
-    --card-foreground: var(--theme-hue) 10% 12%;
-    --popover: 0 0% 100%;
-    --popover-foreground: var(--theme-hue) 10% 12%;
-    --primary: var(--theme-hue) 76% 46%;
-    --primary-foreground: 0 0% 100%;
-    --secondary: var(--theme-hue) 14% 94%;
-    --secondary-foreground: var(--theme-hue) 10% 12%;
-    --muted: var(--theme-hue) 14% 94%;
-    --muted-foreground: var(--theme-hue) 8% 43%;
-    --accent: var(--theme-hue) 72% 95%;
-    --accent-foreground: var(--theme-hue) 76% 30%;
-    --border: var(--theme-hue) 13% 87%;
-    --input: var(--theme-hue) 13% 87%;
-    --ring: var(--theme-hue) 76% 46%;
-    --rail-ok: 151 60% 38%;
-    --rail-warn: 38 92% 50%;
-    --rail-cool: var(--theme-hue) 78% 48%;
-    --rail-dead: 4 82% 56%;
-  }
-
-  html.dark[data-theme] {
-    --background: var(--theme-hue) 18% 8%;
-    --foreground: var(--theme-hue) 12% 96%;
-    --card: var(--theme-hue) 16% 12%;
-    --card-foreground: var(--theme-hue) 12% 96%;
-    --popover: var(--theme-hue) 16% 12%;
-    --popover-foreground: var(--theme-hue) 12% 96%;
-    --primary: var(--theme-hue) 90% 62%;
-    --primary-foreground: 0 0% 100%;
-    --secondary: var(--theme-hue) 16% 18%;
-    --secondary-foreground: var(--theme-hue) 12% 96%;
-    --muted: var(--theme-hue) 16% 16%;
-    --muted-foreground: var(--theme-hue) 10% 68%;
-    --accent: var(--theme-hue) 62% 22%;
-    --accent-foreground: var(--theme-hue) 90% 84%;
-    --border: var(--theme-hue) 15% 23%;
-    --input: var(--theme-hue) 15% 23%;
-    --ring: var(--theme-hue) 90% 62%;
-    --rail-ok: 151 64% 48%;
-    --rail-warn: 38 92% 58%;
-    --rail-cool: var(--theme-hue) 84% 62%;
-    --rail-dead: 4 90% 64%;
-  }
-
-  html[data-theme="system"] { --theme-hue: 211; }
-  html[data-theme="ocean"] { --theme-hue: 193; }
-  html[data-theme="forest"] { --theme-hue: 151; }
-  html[data-theme="violet"] { --theme-hue: 262; }
-  html[data-theme="amber"] { --theme-hue: 38; }
-  html[data-theme="rose"] { --theme-hue: 347; }
 }
 
 @layer base {
@@ -149,13 +92,13 @@
     z-index: -1;
     pointer-events: none;
     background:
-      radial-gradient(60rem 40rem at 10% -10%, hsl(var(--theme-hue) 100% 60% / 0.08), transparent 60%),
+      radial-gradient(60rem 40rem at 10% -10%, hsl(211 100% 60% / 0.08), transparent 60%),
       radial-gradient(50rem 30rem at 110% 0%, hsl(280 90% 60% / 0.06), transparent 60%),
       radial-gradient(40rem 30rem at 50% 110%, hsl(180 80% 50% / 0.05), transparent 60%);
   }
   .dark body::before {
     background:
-      radial-gradient(60rem 40rem at 10% -10%, hsl(var(--theme-hue) 100% 50% / 0.16), transparent 60%),
+      radial-gradient(60rem 40rem at 10% -10%, hsl(211 100% 50% / 0.16), transparent 60%),
       radial-gradient(50rem 30rem at 110% 0%, hsl(280 90% 55% / 0.12), transparent 60%),
       radial-gradient(40rem 30rem at 50% 110%, hsl(180 80% 50% / 0.08), transparent 60%);
   }
@@ -184,50 +127,13 @@
 }
 
 @layer components {
-  html.theme-transition *,
-  html.theme-transition *::before,
-  html.theme-transition *::after {
-    transition-property: color, background-color, border-color, box-shadow, fill, stroke;
-    transition-duration: 240ms;
-    transition-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
-  }
-
-  .theme-picker-trigger svg {
-    transition: transform 180ms cubic-bezier(0.32, 0.72, 0, 1), opacity 180ms ease;
-  }
-  .theme-picker-trigger:hover svg,
-  .theme-picker-trigger[data-state="open"] svg {
-    transform: rotate(12deg);
-    opacity: 0.82;
-  }
-  html.theme-transition .theme-picker-trigger svg {
-    animation: theme-icon-settle 240ms cubic-bezier(0.32, 0.72, 0, 1);
-  }
-  @keyframes theme-icon-settle {
-    0% { opacity: 0.35; transform: rotate(-8deg); }
-    55% { opacity: 1; transform: rotate(8deg); }
-    100% { opacity: 1; transform: rotate(0deg); }
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    html.theme-transition *,
-    html.theme-transition *::before,
-    html.theme-transition *::after {
-      transition-duration: 0ms !important;
-    }
-    .theme-picker-trigger svg {
-      transition: none;
-      animation: none !important;
-    }
-  }
-
   /* Frosted glass surface — like macOS toolbar */
   .glass {
-    @apply bg-background/70 backdrop-blur-xl backdrop-saturate-150;
+    @apply bg-background/85 backdrop-blur-md;
     box-shadow: inset 0 -1px 0 0 hsl(var(--border) / 0.6);
   }
   .glass-card {
-    @apply bg-card/80 backdrop-blur-2xl backdrop-saturate-150 border border-border/60;
+    @apply bg-card/90 backdrop-blur-md border border-border/60;
   }
   /* Soft, layered Apple-style elevation */
   .shadow-apple-sm {
@@ -314,6 +220,7 @@
     text-align: left;
     font-size: 12.5px;
     line-height: 1.35;
+    contain: paint;
   }
   .console-table thead th {
     position: sticky;
@@ -338,6 +245,10 @@
   }
   .console-table tbody tr:hover td {
     background: hsl(var(--accent) / 0.45);
+  }
+  /* 键盘游标行（j/k 导航）—— 比 hover 更实心，两者可叠加 */
+  .console-table tbody tr[data-cursor="true"] td {
+    background: hsl(var(--accent) / 0.75);
   }
   .console-table tbody tr[data-selected="true"] td {
     background: hsl(var(--primary) / 0.09);
@@ -370,7 +281,8 @@
     transition: opacity 120ms ease-out;
   }
   tr:hover .console-row-actions,
-  tr:focus-within .console-row-actions {
+  tr:focus-within .console-row-actions,
+  tr[data-cursor="true"] .console-row-actions {
     opacity: 1;
   }
 

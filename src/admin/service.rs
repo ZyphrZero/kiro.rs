@@ -44,6 +44,7 @@ use super::types::{
     EnableOverageAllResult, ExportedAccount,
     ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
     CredentialMetadataSchemaConfig,
+    CacheMeteringConfigResponse, SetCacheMeteringConfigRequest,
     LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
@@ -317,6 +318,8 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    /// prompt cache 本地计量模拟句柄（开关运行时可改）
+    cache_meter: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
 }
 
 /// Social 登录会话状态
@@ -672,6 +675,7 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
+            cache_meter: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -711,6 +715,82 @@ impl AdminService {
         self.trace_store = trace_store;
         self.usage_recorder = usage_recorder;
         self
+    }
+
+    /// 注入 prompt cache 计量模拟句柄，用于运行时切换总开关。
+    pub fn with_cache_meter(
+        mut self,
+        cache_meter: crate::anthropic::cache_metering::SharedCacheMeter,
+    ) -> Self {
+        self.cache_meter = Some(cache_meter);
+        self
+    }
+
+    /// 查询 prompt cache 计量模拟配置（含开关与实际成本折算率）。
+    ///
+    /// 运行时句柄优先（反映当前真实生效状态）；句柄缺失时回落到 config.json
+    /// 显式值、再回落到环境变量与默认值，与启动时的优先级一致。
+    pub fn get_cache_metering_config(&self) -> CacheMeteringConfigResponse {
+        let (enabled, effective_discount_ratio) = match self.cache_meter.as_ref() {
+            Some(meter) => (meter.is_enabled(), meter.effective_discount_ratio()),
+            None => {
+                let cfg = self.token_manager.config();
+                let en = cfg
+                    .cache_metering_enabled
+                    .or_else(crate::anthropic::cache_metering::CacheMeter::metering_enabled_from_env)
+                    .unwrap_or(true);
+                let ratio = cfg
+                    .cache_effective_discount_ratio
+                    .or_else(crate::anthropic::cache_metering::CacheMeter::discount_ratio_from_env)
+                    .unwrap_or(0.6);
+                (en, ratio)
+            }
+        };
+        CacheMeteringConfigResponse {
+            enabled,
+            effective_discount_ratio,
+        }
+    }
+
+    /// 更新 prompt cache 计量模拟配置：改运行时原子值 + 持久化到 config.json。
+    pub fn set_cache_metering_config(
+        &self,
+        req: SetCacheMeteringConfigRequest,
+    ) -> Result<CacheMeteringConfigResponse, AdminServiceError> {
+        if req.enabled.is_none() && req.effective_discount_ratio.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "请至少提供 enabled 或 effectiveDiscountRatio 字段".to_string(),
+            ));
+        }
+
+        // 1. 处理开关
+        if let Some(enabled) = req.enabled {
+            if let Some(meter) = &self.cache_meter {
+                meter.set_enabled(enabled);
+            }
+            if let Err(e) = self
+                .token_manager
+                .update_config_file(|config| config.cache_metering_enabled = Some(enabled))
+            {
+                tracing::warn!("持久化 prompt cache 计量开关配置失败: {}", e);
+            }
+        }
+
+        // 2. 处理实际成本折算率
+        if let Some(ratio) = req.effective_discount_ratio {
+            let clamped = ratio.clamp(0.1, 1.0);
+            if let Some(meter) = &self.cache_meter {
+                meter.set_effective_discount_ratio(clamped);
+            }
+            if let Err(e) = self
+                .token_manager
+                .update_config_file(|config| config.cache_effective_discount_ratio = Some(clamped))
+            {
+                tracing::warn!("持久化 prompt cache 成本折算率配置失败: {}", e);
+            }
+        }
+
+        Ok(self.get_cache_metering_config())
     }
 
     /// 获取所有凭据状态

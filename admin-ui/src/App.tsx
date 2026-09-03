@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Activity, KeyRound, Server, LogOut, ScrollText, FolderTree, SlidersHorizontal } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
 import { ThemePicker } from "@/components/theme-picker";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { tabFromHash } from "@/hooks/use-url-state";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -243,19 +244,21 @@ function LoggedInApp({
   tab,
 }: AppHeaderProps) {
   return (
-    <ConfirmProvider>
-      <AppHeader
-        theme={theme}
-        isDarkMode={isDarkMode}
-        tab={tab}
-        onLogout={onLogout}
-        onSwitchTab={onSwitchTab}
-        onSelectPalette={onSelectPalette}
-        onSelectMode={onSelectMode}
-      />
-      <AppMain tab={tab} onLogout={onLogout} />
-      <Toaster position="top-center" />
-    </ConfirmProvider>
+    <TooltipProvider delayDuration={150}>
+      <ConfirmProvider>
+        <AppHeader
+          theme={theme}
+          isDarkMode={isDarkMode}
+          tab={tab}
+          onLogout={onLogout}
+          onSwitchTab={onSwitchTab}
+          onSelectPalette={onSelectPalette}
+          onSelectMode={onSelectMode}
+        />
+        <AppMain tab={tab} onLogout={onLogout} />
+        <Toaster position="top-center" />
+      </ConfirmProvider>
+    </TooltipProvider>
   );
 }
 
