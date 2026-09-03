@@ -1,6 +1,6 @@
 [package]
 name = "kiro-rs"
-version = "0.7.6"
+version = "0.8.0"
 edition = "2024"
 
 [features]
@@ -47,3 +47,4 @@ flate2 = "1"        # tar.gz 解压（在线更新）
 tar = "0.4"         # tar 解析（在线更新）
 zip = { version = "2", default-features = false, features = ["deflate"] }  # zip 解压（Windows 在线更新）
 rusqlite = { version = "0.32", features = ["bundled"] }  # 请求链路追踪持久化（自带 SQLite 源码）
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }

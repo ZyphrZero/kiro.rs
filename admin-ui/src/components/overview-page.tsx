@@ -1,9 +1,11 @@
-import { useMemo, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Activity, Calendar, Coins, Cpu, KeyRound, Server } from 'lucide-react'
 import { useByCredential, useByKey, useByModel, useOverview, useTimeSeries } from '@/hooks/use-stats'
+import { AutoRefreshControl } from '@/components/console/auto-refresh-control'
+import { PageHeader } from '@/components/console/page-header'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import type {
@@ -79,13 +81,39 @@ function timeLabel(filter: StatsTimeFilter): string {
 
 export function OverviewPage() {
   const filters = useOverviewFilters()
-  const { data: overview } = useOverview()
-  const { data: keysData } = useClientKeys()
+  const overviewQuery = useOverview()
+  const keysQuery = useClientKeys()
   const groupOptions = useGroupOptions()
-  const { data: series } = useTimeSeries(filters.timeFilter, filters.statsFilter)
-  const { data: byModel } = useByModel(filters.timeFilter, filters.statsFilter)
-  const { data: byCred } = useByCredential(filters.timeFilter, filters.statsFilter)
-  const { data: byKey } = useByKey(filters.timeFilter, filters.statsFilter)
+  const seriesQuery = useTimeSeries(filters.timeFilter, filters.statsFilter)
+  const modelQuery = useByModel(filters.timeFilter, filters.statsFilter)
+  const credentialQuery = useByCredential(filters.timeFilter, filters.statsFilter)
+  const keyQuery = useByKey(filters.timeFilter, filters.statsFilter)
+  const refreshStats = useCallback(
+    async () => {
+      await Promise.all([
+        overviewQuery.refetch(),
+        keysQuery.refetch(),
+        seriesQuery.refetch(),
+        modelQuery.refetch(),
+        credentialQuery.refetch(),
+        keyQuery.refetch(),
+      ])
+    }, [credentialQuery, keyQuery, keysQuery, modelQuery, overviewQuery, seriesQuery],
+  )
+  const isRefreshing = [
+    overviewQuery,
+    keysQuery,
+    seriesQuery,
+    modelQuery,
+    credentialQuery,
+    keyQuery,
+  ].some((query) => query.isFetching)
+  const overview = overviewQuery.data
+  const keysData = keysQuery.data
+  const series = seriesQuery.data
+  const byModel = modelQuery.data
+  const byCred = credentialQuery.data
+  const byKey = keyQuery.data
   const seriesData = useMemo(() => series ?? [], [series])
   const modelData = useMemo(() => byModel ?? [], [byModel])
   const credData = useMemo(() => byCred ?? [], [byCred])
@@ -96,7 +124,19 @@ export function OverviewPage() {
 
   return (
     <div>
-      <PageHeader />
+      <PageHeader
+        className="mb-4"
+        icon={<Activity className="h-4 w-4" />}
+        title="概览"
+        description="中转站调用情况、Token 消耗趋势与上游凭据贡献"
+        actions={
+          <AutoRefreshControl
+            onRefresh={refreshStats}
+            isRefreshing={isRefreshing}
+            resourceLabel="概览数据"
+          />
+        }
+      />
       <StatsCards
         activeCredentials={overview?.activeCredentials ?? 0}
         activeKeys={overview?.activeClientKeys ?? 0}
@@ -197,17 +237,6 @@ function useOverviewFilters() {
 function selectedStatsKeyLabel(keyFilter: string, keys: ClientKeyItem[]): string {
   if (keyFilter === 'all') return '全部入口 Key'
   return keys.find((k) => String(k.id) === keyFilter)?.name ?? `#${keyFilter}`
-}
-
-function PageHeader() {
-  return (
-    <div className="mb-6">
-      <h1 className="text-[28px] font-semibold tracking-tight leading-tight">概览</h1>
-      <p className="mt-1 text-sm text-muted-foreground">
-        中转站调用情况、Token 消耗趋势与上游凭据贡献
-      </p>
-    </div>
-  )
 }
 
 interface RangeStats {

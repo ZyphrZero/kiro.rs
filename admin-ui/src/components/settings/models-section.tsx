@@ -4,8 +4,15 @@ import { Cpu, Bot, Sparkles, Wrench, Plus, Trash2, Save, Loader2, AlertCircle } 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
-import { SettingGroup } from '@/components/console/setting-row'
-import { useCustomModels, useSetCustomModels, useCurrentCredentialModels } from '@/hooks/use-credentials'
+import { SettingGroup, SettingSwitch, useFieldSaver } from '@/components/console/setting-row'
+import {
+  useCustomModels,
+  useSetCustomModels,
+  useCurrentCredentialModels,
+  useCacheMeteringConfig,
+  useSetCacheMeteringConfig,
+} from '@/hooks/use-credentials'
+import { reportSaveError } from '@/components/settings/report-error'
 import { extractErrorMessage, cn, parseError } from '@/lib/utils'
 import type { CustomModelItem, AvailableModelItem } from '@/types/api'
 
@@ -77,6 +84,12 @@ function UpstreamModelRow({ model }: { model: AvailableModelItem }) {
 
 export function ModelsSection() {
   const [vendor, setVendor] = useState<VendorKey>('anthropic')
+
+  // Prompt Cache 计量模拟开关
+  const { data: cacheMetering, isLoading: cacheLoading } = useCacheMeteringConfig()
+  const { mutate: mutateCacheMetering } = useSetCacheMeteringConfig()
+  const cacheSaver = useFieldSaver(mutateCacheMetering, reportSaveError)
+  const cacheMeteringEnabled = cacheMetering?.enabled ?? true
 
   // 上游模型
   const upstreamQuery = useCurrentCredentialModels(vendor !== 'custom')
@@ -175,13 +188,32 @@ export function ModelsSection() {
   const customCount = drafts.length
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
+      <SettingGroup
+        title="Prompt Cache 提示词缓存"
+        description="控制向客户端返回的用量中是否包含 Anthropic 格式的缓存计量"
+      >
+        <SettingSwitch
+          label="模拟 prompt cache 计量"
+          hint={
+            cacheMeteringEnabled
+              ? '按客户端声明的 cache_control 断点估算缓存读取与创建；终端客户端（如 Claude Code、Cursor）可正常识别缓存命中'
+              : '输入 Token 全额计入 input tokens，缓存两项恒为 0；避免下游计费中转站（如 NewAPI）自动按 1 折打折少收费'
+          }
+          checked={cacheMeteringEnabled}
+          onChange={(next) => cacheSaver.save('cacheMetering', { enabled: next })}
+          pending={cacheSaver.isSaving('cacheMetering')}
+          saved={cacheSaver.isSaved('cacheMetering')}
+          disabled={cacheLoading}
+        />
+      </SettingGroup>
+
       <SettingGroup
         title="可用模型"
         description="按厂商查看上游可用模型，或自定义模型别名与元数据。"
       >
         {/* 厂商 Tab */}
-        <nav className="mb-3 flex gap-0.5" aria-label="模型厂商">
+        <nav className="mb-3 flex flex-wrap gap-0.5" aria-label="模型厂商">
           {VENDORS.map((v) => (
             <button
               key={v.key}
@@ -239,7 +271,7 @@ export function ModelsSection() {
         {/* ── 自定义模型 Tab ───────────────────────────────────────────── */}
         {vendor === 'custom' && (
           <>
-            <div className="mb-3 flex items-center justify-between">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
               <span className="text-xs text-muted-foreground">
                 {customCount > 0 ? `${customCount} 条自定义模型` : '暂无自定义模型'}
               </span>
@@ -271,7 +303,7 @@ export function ModelsSection() {
             )}
 
             {customCount > 0 && (
-              <div className="overflow-x-auto">
+              <div className="hidden overflow-x-auto md:block">
                 <div className="mb-1 grid min-w-[52rem] grid-cols-[1fr_1fr_80px_70px_90px_1fr_100px_36px] gap-1.5 px-1 text-[11px] font-medium text-muted-foreground">
                   <span>id</span>
                   <span>backendId</span>
@@ -370,6 +402,124 @@ export function ModelsSection() {
                     </div>
                   ))}
                 </div>
+              </div>
+            )}
+
+            {customCount > 0 && (
+              <div className="space-y-2 md:hidden">
+                {drafts.map((m, i) => (
+                  <div
+                    key={`mobile-${i}`}
+                    className="space-y-3 rounded-md border border-border/60 p-3"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-semibold text-muted-foreground">
+                        模型 {i + 1}
+                      </span>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        onClick={() => removeRow(i)}
+                        disabled={customSaving}
+                        title="删除此行"
+                        className="h-7 w-7 text-muted-foreground hover:text-destructive"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+
+                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      <label className="min-w-0 space-y-1">
+                        <span className="text-[11px] font-medium text-muted-foreground">id</span>
+                        <Input
+                          value={m.id}
+                          onChange={(e) => updateField(i, 'id', e.target.value)}
+                          placeholder="my-gpt"
+                          disabled={customSaving}
+                          spellCheck={false}
+                          className="h-8 text-[12.5px]"
+                        />
+                      </label>
+                      <label className="min-w-0 space-y-1">
+                        <span className="text-[11px] font-medium text-muted-foreground">backendId</span>
+                        <Input
+                          value={m.backendId}
+                          onChange={(e) => updateField(i, 'backendId', e.target.value)}
+                          placeholder="gpt-5.7"
+                          disabled={customSaving}
+                          spellCheck={false}
+                          className="h-8 text-[12.5px]"
+                        />
+                      </label>
+                      <label className="min-w-0 space-y-1">
+                        <span className="text-[11px] font-medium text-muted-foreground">上下文窗口</span>
+                        <Input
+                          type="number"
+                          value={m.contextWindow ?? ''}
+                          onChange={(e) => {
+                            const v = e.target.value
+                            updateField(i, 'contextWindow', v === '' ? undefined : Number(v))
+                          }}
+                          placeholder="200000"
+                          disabled={customSaving}
+                          className="h-8 text-[12.5px] [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                        />
+                      </label>
+                      <label className="min-w-0 space-y-1">
+                        <span className="text-[11px] font-medium text-muted-foreground">最大 tokens</span>
+                        <Input
+                          type="number"
+                          value={m.maxTokens ?? ''}
+                          onChange={(e) => {
+                            const v = e.target.value
+                            updateField(i, 'maxTokens', v === '' ? undefined : Number(v))
+                          }}
+                          placeholder="64000"
+                          disabled={customSaving}
+                          className="h-8 text-[12.5px] [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                        />
+                      </label>
+                      <label className="min-w-0 space-y-1">
+                        <span className="text-[11px] font-medium text-muted-foreground">displayName</span>
+                        <Input
+                          value={m.displayName ?? ''}
+                          onChange={(e) =>
+                            updateField(i, 'displayName', e.target.value || undefined)
+                          }
+                          placeholder="同 id"
+                          disabled={customSaving}
+                          spellCheck={false}
+                          className="h-8 text-[12.5px]"
+                        />
+                      </label>
+                      <label className="min-w-0 space-y-1">
+                        <span className="text-[11px] font-medium text-muted-foreground">ownedBy</span>
+                        <Input
+                          value={m.ownedBy ?? ''}
+                          onChange={(e) =>
+                            updateField(i, 'ownedBy', e.target.value || undefined)
+                          }
+                          placeholder="custom"
+                          disabled={customSaving}
+                          spellCheck={false}
+                          className="h-8 text-[12.5px]"
+                        />
+                      </label>
+                    </div>
+
+                    <div className="flex items-center justify-between rounded-md bg-muted/40 px-2.5 py-2">
+                      <span className="text-xs text-muted-foreground">支持 Reasoning</span>
+                      <Switch
+                        checked={m.supportsReasoning ?? false}
+                        onCheckedChange={(checked) =>
+                          updateField(i, 'supportsReasoning', checked)
+                        }
+                        disabled={customSaving}
+                        aria-label={`第 ${i + 1} 条模型 reasoning`}
+                      />
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
           </>

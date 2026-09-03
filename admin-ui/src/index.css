@@ -220,6 +220,7 @@
     text-align: left;
     font-size: 12.5px;
     line-height: 1.35;
+    contain: paint;
   }
   .console-table thead th {
     position: sticky;

@@ -115,10 +115,306 @@ impl CacheUsage {
     }
 }
 
-/// 进程内提示词缓存
+/// 异步装箱 Future 别名
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// 远端/共享 Prompt Cache 存储抽象（用于 Redis 共享后端及单元测试 Mock）
+pub trait RemoteCacheStore: Send + Sync {
+    /// 按哈希查找并按 entry 自身 TTL 滑动续期。成功命中返回 Some(tokens)，未命中或失败返回 None
+    fn lookup_and_renew<'a>(&'a self, hash: u64) -> BoxFuture<'a, Option<u32>>;
+
+    /// 按哈希写入断点条目并设置 TTL
+    fn record_entry<'a>(&'a self, hash: u64, tokens: u32, ttl_secs: i64) -> BoxFuture<'a, ()>;
+
+    /// 多实例并发冷启动同一断点时的轻量去重短锁（best-effort），加锁失败直接返回 false，不阻塞调用方
+    fn try_acquire_lock<'a>(&'a self, hash: u64, ttl_ms: u64) -> BoxFuture<'a, bool>;
+}
+
+/// 生成 Redis 断点元数据 Key（带版本与命名空间隔离）
+pub fn redis_entry_key(hash: u64) -> String {
+    format!("kiro:pcm:v1:entry:{:016x}", hash)
+}
+
+/// 生成 Redis 去重短锁 Key
+pub fn redis_lock_key(hash: u64) -> String {
+    format!("kiro:pcm:v1:lock:{:016x}", hash)
+}
+
+/// 脱敏 Redis 连接 URL（隐藏密码与认证信息）
+pub fn sanitize_redis_url(raw: &str) -> String {
+    if let Some((scheme, rest)) = raw.split_once("://") {
+        if let Some((_auth_part, host_part)) = rest.split_once('@') {
+            return format!("{}://***@{}", scheme, host_part);
+        }
+    }
+    raw.to_string()
+}
+
+/// 限频日志记录器（避免 Redis 异常时高频刷屏）
+#[derive(Debug)]
+pub struct ThrottledLogger {
+    last_logged_secs: std::sync::atomic::AtomicI64,
+    interval_secs: i64,
+}
+
+impl ThrottledLogger {
+    pub const fn new(interval_secs: i64) -> Self {
+        Self {
+            last_logged_secs: std::sync::atomic::AtomicI64::new(0),
+            interval_secs,
+        }
+    }
+
+    pub fn warn(&self, action: &str, err: &dyn std::fmt::Display) {
+        let now = now_secs();
+        let last = self
+            .last_logged_secs
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if now - last >= self.interval_secs {
+            if self
+                .last_logged_secs
+                .compare_exchange(
+                    last,
+                    now,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                tracing::warn!(
+                    "Prompt cache Redis {} 异常 (降级本地, {}s 内限频): {}",
+                    action,
+                    self.interval_secs,
+                    err
+                );
+            }
+        }
+    }
+}
+
+/// 基于 Redis 的共享 Prompt Cache 存储
+pub struct RedisCacheStore {
+    manager: redis::aio::ConnectionManager,
+    timeout_duration: std::time::Duration,
+    logger: ThrottledLogger,
+}
+
+impl RedisCacheStore {
+    /// 通过 Redis URL 建立连接管理器，设置默认 200ms 命令超时
+    pub async fn new(redis_url: &str) -> Result<Self, redis::RedisError> {
+        let client = redis::Client::open(redis_url)?;
+        let connect_timeout = std::time::Duration::from_millis(500);
+        let manager =
+            match tokio::time::timeout(connect_timeout, redis::aio::ConnectionManager::new(client))
+                .await
+            {
+                Ok(res) => res?,
+                Err(_) => {
+                    return Err(redis::RedisError::from((
+                        redis::ErrorKind::IoError,
+                        "Redis 连接建立超时 (500ms)",
+                    )));
+                }
+            };
+        Ok(Self {
+            manager,
+            timeout_duration: std::time::Duration::from_millis(200),
+            logger: ThrottledLogger::new(10),
+        })
+    }
+
+    /// 设置自定义命令超时
+    #[allow(dead_code)]
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout_duration = timeout;
+        self
+    }
+}
+
+impl RemoteCacheStore for RedisCacheStore {
+    fn lookup_and_renew<'a>(&'a self, hash: u64) -> BoxFuture<'a, Option<u32>> {
+        Box::pin(async move {
+            let key = redis_entry_key(hash);
+            let mut conn = self.manager.clone();
+            let fut = async {
+                let raw: Option<String> =
+                    redis::cmd("GET").arg(&key).query_async(&mut conn).await?;
+                if let Some(s) = raw {
+                    if let Ok(entry) = serde_json::from_str::<CacheEntry>(&s) {
+                        let now = now_secs();
+                        if entry.expires_at > now {
+                            let ttl = entry.ttl_secs.clamp(60, MAX_TTL_SECS);
+                            let _: redis::RedisResult<()> = redis::cmd("EXPIRE")
+                                .arg(&key)
+                                .arg(ttl)
+                                .query_async(&mut conn)
+                                .await;
+                            return Ok::<Option<u32>, redis::RedisError>(Some(entry.tokens));
+                        }
+                    }
+                }
+                Ok(None)
+            };
+
+            match tokio::time::timeout(self.timeout_duration, fut).await {
+                Ok(Ok(tokens)) => tokens,
+                Ok(Err(e)) => {
+                    self.logger.warn("lookup", &e);
+                    None
+                }
+                Err(_) => {
+                    self.logger.warn("lookup", &"命令超时 (降级本地)");
+                    None
+                }
+            }
+        })
+    }
+
+    fn record_entry<'a>(&'a self, hash: u64, tokens: u32, ttl_secs: i64) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let ttl = ttl_secs.clamp(60, MAX_TTL_SECS);
+            let now = now_secs();
+            let entry = CacheEntry {
+                tokens,
+                ttl_secs: ttl,
+                expires_at: now + ttl,
+                last_hit_at: now,
+            };
+            let json = match serde_json::to_string(&entry) {
+                Ok(j) => j,
+                Err(e) => {
+                    self.logger.warn("record 序列化", &e);
+                    return;
+                }
+            };
+            let key = redis_entry_key(hash);
+            let mut conn = self.manager.clone();
+            let fut = async {
+                redis::cmd("SET")
+                    .arg(&key)
+                    .arg(&json)
+                    .arg("EX")
+                    .arg(ttl)
+                    .query_async(&mut conn)
+                    .await
+            };
+
+            match tokio::time::timeout(self.timeout_duration, fut).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    self.logger.warn("record", &e);
+                }
+                Err(_) => {
+                    self.logger.warn("record", &"命令超时 (降级本地)");
+                }
+            }
+        })
+    }
+
+    fn try_acquire_lock<'a>(&'a self, hash: u64, ttl_ms: u64) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let key = redis_lock_key(hash);
+            let mut conn = self.manager.clone();
+            let fut = async {
+                let res: redis::RedisResult<Option<String>> = redis::cmd("SET")
+                    .arg(&key)
+                    .arg("1")
+                    .arg("NX")
+                    .arg("PX")
+                    .arg(ttl_ms)
+                    .query_async(&mut conn)
+                    .await;
+                match res {
+                    Ok(Some(_)) => true,
+                    _ => false,
+                }
+            };
+
+            match tokio::time::timeout(self.timeout_duration, fut).await {
+                Ok(acquired) => acquired,
+                Err(_) => false,
+            }
+        })
+    }
+}
+
+/// 测试用的内存 Fake 远程存储（支持模拟延迟、超时与故障注入）
+#[allow(dead_code)]
+#[derive(Default)]
+pub struct FakeRemoteStore {
+    pub entries: Mutex<HashMap<u64, CacheEntry>>,
+    pub locks: Mutex<HashMap<u64, i64>>,
+    pub fail_lookups: std::sync::atomic::AtomicBool,
+    pub fail_records: std::sync::atomic::AtomicBool,
+    pub record_count: std::sync::atomic::AtomicUsize,
+}
+
+impl RemoteCacheStore for FakeRemoteStore {
+    fn lookup_and_renew<'a>(&'a self, hash: u64) -> BoxFuture<'a, Option<u32>> {
+        Box::pin(async move {
+            if self.fail_lookups.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            let now = now_secs();
+            let mut map = self.entries.lock();
+            if let Some(entry) = map.get_mut(&hash) {
+                if entry.expires_at > now {
+                    let ttl = entry.ttl_secs.clamp(60, MAX_TTL_SECS);
+                    entry.last_hit_at = now;
+                    entry.expires_at = now + ttl;
+                    return Some(entry.tokens);
+                }
+            }
+            None
+        })
+    }
+
+    fn record_entry<'a>(&'a self, hash: u64, tokens: u32, ttl_secs: i64) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if self.fail_records.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            self.record_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let ttl = ttl_secs.clamp(60, MAX_TTL_SECS);
+            let now = now_secs();
+            let mut map = self.entries.lock();
+            map.insert(
+                hash,
+                CacheEntry {
+                    tokens,
+                    ttl_secs: ttl,
+                    expires_at: now + ttl,
+                    last_hit_at: now,
+                },
+            );
+        })
+    }
+
+    fn try_acquire_lock<'a>(&'a self, hash: u64, ttl_ms: u64) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let now = now_secs();
+            let expires_at = now + (ttl_ms.max(1000) / 1000) as i64;
+            let mut map = self.locks.lock();
+            if let Some(exp) = map.get(&hash) {
+                if *exp > now {
+                    return false;
+                }
+            }
+            map.insert(hash, expires_at);
+            true
+        })
+    }
+}
+
+/// 进程内提示词缓存（带可选 Redis 共享层）
 pub struct CacheMeter {
     inner: Mutex<Inner>,
     persist_path: Option<PathBuf>,
+    remote: Option<Arc<dyn RemoteCacheStore>>,
+    /// 计量模拟总开关（运行时可由 Admin API 切换，无需重启）。
+    /// 关闭时 `compute_cache_usage` 直接返回全量 input、零缓存，且不读写任何缓存态。
+    enabled: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -129,8 +425,17 @@ struct Inner {
 }
 
 impl CacheMeter {
-    /// 创建一个空 cache。`persist_path` 为 `Some` 时会自动从该文件加载历史。
+    /// 创建一个纯本地 cache。`persist_path` 为 `Some` 时会自动从该文件加载历史。
+    #[allow(dead_code)]
     pub fn new(persist_path: Option<PathBuf>) -> Self {
+        Self::with_remote(persist_path, None)
+    }
+
+    /// 创建带可选远端共享存储的 cache。
+    pub fn with_remote(
+        persist_path: Option<PathBuf>,
+        remote: Option<Arc<dyn RemoteCacheStore>>,
+    ) -> Self {
         let mut inner = Inner::default();
         if let Some(path) = persist_path.as_ref() {
             if let Ok(bytes) = std::fs::read(path) {
@@ -152,27 +457,100 @@ impl CacheMeter {
         Self {
             inner: Mutex::new(inner),
             persist_path,
+            remote,
+            enabled: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    /// 计量模拟是否启用。
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 运行时切换计量模拟开关。关闭时保留已有缓存条目（重新开启即可继续命中），
+    /// 但期间既不查询也不写入。
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// builder 风格设置初始开关状态。
+    pub fn with_enabled(self, enabled: bool) -> Self {
+        self.set_enabled(enabled);
+        self
+    }
+
+    /// 读取 `KIRO_RS_CACHE_METERING` 环境变量表达的开关意图。
+    ///
+    /// `0` / `off` / `false` / `no` / `disabled`（大小写不敏感、自动 trim）为关闭，
+    /// 其余非空值为开启；未设置或空串返回 `None` 表示「未表态」。
+    ///
+    /// 生效优先级：config.json 显式值 > 本环境变量 > 默认开启。环境变量只作为
+    /// 未落配置时的初值（适合全新 docker 部署），一旦从 UI 改过就以 config.json 为准。
+    pub fn metering_enabled_from_env() -> Option<bool> {
+        let raw = std::env::var("KIRO_RS_CACHE_METERING").ok()?;
+        let raw = raw.trim().to_ascii_lowercase();
+        if raw.is_empty() {
+            return None;
+        }
+        Some(!matches!(
+            raw.as_str(),
+            "0" | "off" | "false" | "no" | "disabled"
+        ))
+    }
+
+    /// 从环境变量 `KIRO_RS_CACHE_REDIS_URL` 初始化 CacheMeter。
+    /// 未设置或连接失败时平滑回退到纯本地存储。
+    pub async fn from_env(persist_path: Option<PathBuf>) -> Self {
+        let redis_url = std::env::var("KIRO_RS_CACHE_REDIS_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let remote: Option<Arc<dyn RemoteCacheStore>> = match redis_url {
+            Some(url) => match RedisCacheStore::new(&url).await {
+                Ok(store) => {
+                    tracing::info!(
+                        "Prompt cache 共享 Redis 后端已启用: {}",
+                        sanitize_redis_url(&url)
+                    );
+                    Some(Arc::new(store))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Prompt cache 共享 Redis 连接失败，已平滑降级为本地存储: {}",
+                        e
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
+        Self::with_remote(persist_path, remote)
     }
 
     /// 查询单个哈希是否在缓存中且未过期。若命中则进行滑动续期（按 entry 自身 TTL），并返回 tokens。
     pub fn lookup_and_renew(&self, hash: u64) -> Option<u32> {
         let now = now_secs();
         let mut inner = self.inner.lock();
-        let hit = match inner.entries.get_mut(&hash) {
-            Some(entry) if entry.expires_at > now => {
+        let tokens = if let Some(entry) = inner.entries.get_mut(&hash) {
+            if entry.expires_at > now {
                 let ttl = entry.ttl_secs.clamp(60, MAX_TTL_SECS);
                 entry.ttl_secs = ttl;
                 entry.last_hit_at = now;
                 entry.expires_at = now + ttl;
                 Some(entry.tokens)
+            } else {
+                None
             }
-            _ => None,
+        } else {
+            None
         };
-        if hit.is_some() {
+        if tokens.is_some() {
             inner.dirty = true;
         }
-        hit
+        tokens
     }
 
     /// 写入单个断点条目，按指定的 ttl_secs 设置过期时间
@@ -285,14 +663,7 @@ pub type SharedCacheMeter = Arc<CacheMeter>;
 // ============================================================================
 
 use super::stream::estimate_tokens;
-use super::types::{CacheControl, MessagesRequest, Tool};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PromptSection {
-    Tool,
-    System,
-    Message,
-}
+use super::types::{CacheControl, MessagesRequest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LookbackGroup {
@@ -303,7 +674,6 @@ enum LookbackGroup {
 /// 协议层打平后的一个 Prompt Block
 #[derive(Debug, Clone)]
 struct PromptBlock {
-    section: PromptSection,
     signature: Vec<u8>,
     tokens: u32,
     cache_control: Option<CacheControl>,
@@ -328,10 +698,10 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
         for t in tools {
             let value = serde_json::to_value(t).unwrap_or(serde_json::Value::Null);
             let content = without_cache_control(&value);
+            let serialized = serde_json::to_string(&content).unwrap_or_default();
             blocks.push(PromptBlock {
-                section: PromptSection::Tool,
                 signature: prompt_block_signature("tool", None, &content),
-                tokens: estimate_tokens(&tool_token_text(t)).max(0) as u32,
+                tokens: estimate_tokens(&serialized).max(0) as u32,
                 cache_control: t.cache_control.clone(),
                 invalid_cache_control: false,
                 cacheable: true,
@@ -346,7 +716,6 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
             let value = serde_json::to_value(sys).unwrap_or(serde_json::Value::Null);
             let content = without_cache_control(&value);
             blocks.push(PromptBlock {
-                section: PromptSection::System,
                 signature: prompt_block_signature("system", None, &content),
                 tokens: estimate_tokens(&sys.text).max(0) as u32,
                 cache_control: sys.cache_control.clone(),
@@ -363,7 +732,6 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
             serde_json::Value::String(s) => {
                 let content = serde_json::Value::String(s.clone());
                 blocks.push(PromptBlock {
-                    section: PromptSection::Message,
                     signature: prompt_block_signature("message", Some(&msg.role), &content),
                     tokens: estimate_tokens(s).max(0) as u32,
                     cache_control: None,
@@ -389,7 +757,6 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                         _ => None,
                     };
                     blocks.push(PromptBlock {
-                        section: PromptSection::Message,
                         signature: prompt_block_signature("message", Some(&msg.role), &content),
                         tokens: block_tokens(&content),
                         cache_control,
@@ -483,9 +850,18 @@ fn resolve_breakpoints(
     breakpoints
 }
 
-/// 调用 CacheMeter 计算本次请求的缓存覆盖情况，并把断点记录回 cache、刷新 TTL。
+/// 异步调用 CacheMeter 计算本次请求的缓存覆盖情况（优先查询共享 Redis，失败降级本地），并把断点记录回 cache、刷新 TTL。
 /// 返回 [`CacheUsage`]，由调用方在拿到真实 total 后做互斥分摊。
-pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u64) -> CacheUsage {
+pub async fn compute_cache_usage(
+    cache: &CacheMeter,
+    req: &MessagesRequest,
+    key_id: u64,
+) -> CacheUsage {
+    // 总开关关闭：不查不写，全量 prompt 计入 input（缓存两项为 0）。
+    if !cache.is_enabled() {
+        return CacheUsage::default();
+    }
+
     let blocks = extract_blocks(req);
     if blocks.is_empty() {
         return CacheUsage::default();
@@ -521,12 +897,7 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
     let mut cum_hashes = Vec::with_capacity(blocks.len());
     let mut current_cum: u32 = 0;
 
-    let mut message_context_hashed = false;
     for b in &blocks {
-        if b.section == PromptSection::Message && !message_context_hashed {
-            hash_frame(&mut hasher, &request_message_cache_context(req));
-            message_context_hashed = true;
-        }
         hash_frame(&mut hasher, &b.signature);
         current_cum = current_cum.saturating_add(b.tokens);
         cum_tokens.push(current_cum);
@@ -544,7 +915,23 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
         let start_idx = lookback_start_index(&blocks, bp.block_idx);
         for check_idx in (start_idx..=bp.block_idx).rev() {
             let hash = cum_hashes[check_idx];
-            if let Some(tokens) = cache.lookup_and_renew(hash) {
+            let mut hit_tokens = None;
+
+            // 优先查远端 Redis 共享后端
+            if let Some(remote) = &cache.remote {
+                if let Some(tokens) = remote.lookup_and_renew(hash).await {
+                    // 回填本地保持同步
+                    cache.record_entry(hash, tokens, bp.ttl_secs);
+                    hit_tokens = Some(tokens);
+                }
+            }
+
+            // 若远端未配置或 miss / 出错降级，查本地
+            if hit_tokens.is_none() {
+                hit_tokens = cache.lookup_and_renew(hash);
+            }
+
+            if let Some(tokens) = hit_tokens {
                 if tokens > max_read_tokens {
                     max_read_tokens = tokens;
                 }
@@ -555,6 +942,101 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
     }
 
     // Record: 仅在实际断点处写入 entry，每个 entry 保留自身的 TTL
+    for bp in &breakpoints {
+        let hash = cum_hashes[bp.block_idx];
+        let tokens = cum_tokens[bp.block_idx];
+        // 本地必须记录
+        cache.record_entry(hash, tokens, bp.ttl_secs);
+
+        // 若配置了远端，写入远端（附带轻量去重锁尝试，不阻塞）
+        if let Some(remote) = &cache.remote {
+            let _ = remote.try_acquire_lock(hash, 1500).await;
+            remote.record_entry(hash, tokens, bp.ttl_secs).await;
+        }
+    }
+
+    let covered_tokens = breakpoints
+        .last()
+        .map(|bp| cum_tokens[bp.block_idx])
+        .unwrap_or(0);
+
+    CacheUsage {
+        cache_read: max_read_tokens as i32,
+        cache_covered_est: covered_tokens as i32,
+        prompt_total_est: prompt_total_est as i32,
+    }
+}
+
+/// 同步计算本地缓存覆盖情况（仅使用进程内内存存储，供无异步上下文或纯同步测试复用）。
+#[allow(dead_code)]
+pub fn compute_cache_usage_sync(
+    cache: &CacheMeter,
+    req: &MessagesRequest,
+    key_id: u64,
+) -> CacheUsage {
+    // 总开关关闭：不查不写，全量 prompt 计入 input（缓存两项为 0）。
+    if !cache.is_enabled() {
+        return CacheUsage::default();
+    }
+
+    let blocks = extract_blocks(req);
+    if blocks.is_empty() {
+        return CacheUsage::default();
+    }
+
+    let prompt_total_est: u32 = blocks.iter().map(|b| b.tokens).sum();
+
+    // 解析断点（显式 + 顶层自动）
+    let breakpoints = resolve_breakpoints(&blocks, req.cache_control.as_ref());
+    if breakpoints.is_empty() {
+        return CacheUsage {
+            prompt_total_est: prompt_total_est as i32,
+            ..Default::default()
+        };
+    }
+
+    let Some(seed) = isolation_seed(req, key_id) else {
+        return CacheUsage {
+            prompt_total_est: prompt_total_est as i32,
+            ..Default::default()
+        };
+    };
+
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hash_frame(&mut hasher, seed.as_bytes());
+    hash_frame(&mut hasher, &request_global_cache_context(req));
+
+    let mut cum_tokens = Vec::with_capacity(blocks.len());
+    let mut cum_hashes = Vec::with_capacity(blocks.len());
+    let mut current_cum: u32 = 0;
+
+    for b in &blocks {
+        hash_frame(&mut hasher, &b.signature);
+        current_cum = current_cum.saturating_add(b.tokens);
+        cum_tokens.push(current_cum);
+
+        let digest = hasher.clone().finalize();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&digest[..8]);
+        cum_hashes.push(u64::from_be_bytes(buf));
+    }
+
+    let mut max_read_tokens: u32 = 0;
+
+    for bp in &breakpoints {
+        let start_idx = lookback_start_index(&blocks, bp.block_idx);
+        for check_idx in (start_idx..=bp.block_idx).rev() {
+            let hash = cum_hashes[check_idx];
+            if let Some(tokens) = cache.lookup_and_renew(hash) {
+                if tokens > max_read_tokens {
+                    max_read_tokens = tokens;
+                }
+                break;
+            }
+        }
+    }
+
     for bp in &breakpoints {
         let hash = cum_hashes[bp.block_idx];
         let tokens = cum_tokens[bp.block_idx];
@@ -609,11 +1091,6 @@ fn extract_session_id(user_id: &str) -> Option<String> {
         .split_once("_session_")
         .map(|(_, sid)| sid.trim().to_string())
         .filter(|s| !s.is_empty())
-}
-
-fn tool_token_text(t: &Tool) -> String {
-    let schema = serde_json::to_string(&t.input_schema).unwrap_or_default();
-    format!("{} {} {}", t.name, t.description, schema)
 }
 
 fn validated_ttl(cache_control: &CacheControl) -> Option<i64> {
@@ -699,23 +1176,9 @@ fn request_global_cache_context(req: &MessagesRequest) -> Vec<u8> {
     });
     serde_json::to_vec(&serde_json::json!({
         "model": req.model,
+        "tool_choice": req.tool_choice,
         "thinking": thinking,
         "output_config": output_config,
-    }))
-    .unwrap_or_default()
-}
-
-fn request_message_cache_context(req: &MessagesRequest) -> Vec<u8> {
-    let has_image = req.messages.iter().any(|message| {
-        message.content.as_array().is_some_and(|blocks| {
-            blocks
-                .iter()
-                .any(|block| block.get("type").and_then(|value| value.as_str()) == Some("image"))
-        })
-    });
-    serde_json::to_vec(&serde_json::json!({
-        "tool_choice": req.tool_choice,
-        "has_image": has_image,
     }))
     .unwrap_or_default()
 }
@@ -855,7 +1318,7 @@ mod tests {
         let req = build_request_with_system_breakpoint();
 
         // 第一次：显式断点在 system，miss → 全部覆盖前缀算 creation（read == 0）
-        let u1 = compute_cache_usage(&cache, &req, 1);
+        let u1 = compute_cache_usage_sync(&cache, &req, 1);
         assert!(u1.cache_covered_est > 0, "first call should cover prefix");
         assert_eq!(u1.cache_read, 0, "first call has nothing cached to read");
         let total = u1.prompt_total_est;
@@ -865,7 +1328,7 @@ mod tests {
         assert_eq!(in1 + cc1 + cr1, total, "互斥口径必须自洽");
 
         // 第二次：相同请求 → 命中
-        let u2 = compute_cache_usage(&cache, &req, 1);
+        let u2 = compute_cache_usage_sync(&cache, &req, 1);
         assert!(u2.cache_read > 0, "second call should hit");
         let (in2, cc2, cr2) = u2.split_against_total(total);
         assert_eq!(cc2, 0, "second call creation should be 0, got {}", cc2);
@@ -929,13 +1392,13 @@ mod tests {
             metadata: None,
             cache_control: None,
         };
-        let u1 = compute_cache_usage(&cache, &req1, 1);
+        let u1 = compute_cache_usage_sync(&cache, &req1, 1);
         assert_eq!(u1.cache_covered_est, 0);
         assert_eq!(u1.cache_read, 0);
         assert_eq!(cache.len(), 0, "无 cache_control 不得写入任何条目");
 
         // 第二轮相同前缀请求依然不缓存
-        let u2 = compute_cache_usage(&cache, &req1, 1);
+        let u2 = compute_cache_usage_sync(&cache, &req1, 1);
         assert_eq!(u2.cache_covered_est, 0);
         assert_eq!(u2.cache_read, 0);
         assert_eq!(cache.len(), 0);
@@ -973,7 +1436,7 @@ mod tests {
             cache_control: auto_cc.clone(),
         };
 
-        let res1 = compute_cache_usage(&cache, &turn1, 1);
+        let res1 = compute_cache_usage_sync(&cache, &turn1, 1);
         assert!(res1.cache_covered_est > 0, "Turn 1 应覆盖到 User 1");
         assert_eq!(res1.cache_read, 0, "Turn 1 无历史可读");
         assert_eq!(cache.len(), 1, "Turn 1 应且仅在 User 1 处写入 1 个断点");
@@ -1006,7 +1469,7 @@ mod tests {
             cache_control: auto_cc.clone(),
         };
 
-        let res2 = compute_cache_usage(&cache, &turn2, 1);
+        let res2 = compute_cache_usage_sync(&cache, &turn2, 1);
         // Turn 2 自动断点落在 User 2，lookback 查找到 Turn 1 写入的 User 1
         assert_eq!(
             res2.cache_read, res1.cache_covered_est,
@@ -1064,7 +1527,7 @@ mod tests {
             cache_control: None, // 无顶层自动缓存
         };
 
-        let res1 = compute_cache_usage(&cache, &req1, 1);
+        let res1 = compute_cache_usage_sync(&cache, &req1, 1);
         assert_eq!(res1.cache_read, 0);
         assert_eq!(
             res1.cache_covered_est,
@@ -1111,7 +1574,7 @@ mod tests {
             cache_control: None,
         };
 
-        let res2 = compute_cache_usage(&cache, &req2, 1);
+        let res2 = compute_cache_usage_sync(&cache, &req2, 1);
         assert_eq!(
             res2.cache_read, res1.cache_covered_est,
             "命中上一轮写入的 system 断点"
@@ -1150,7 +1613,7 @@ mod tests {
             metadata: None,
             cache_control: None,
         };
-        let res1 = compute_cache_usage(&cache, &turn1, 1);
+        let res1 = compute_cache_usage_sync(&cache, &turn1, 1);
         assert_eq!(res1.cache_read, 0);
         assert!(res1.cache_covered_est > 0);
 
@@ -1195,7 +1658,7 @@ mod tests {
             metadata: None,
             cache_control: None,
         };
-        let res_within = compute_cache_usage(&cache, &req_within_20, 1);
+        let res_within = compute_cache_usage_sync(&cache, &req_within_20, 1);
         assert_eq!(
             res_within.cache_read, res1.cache_covered_est,
             "Block 19 lookback 20 blocks 应该命中 Block 0"
@@ -1203,7 +1666,7 @@ mod tests {
 
         // 场景 B：构造总共 22 个 block（index 0..=21），在隔离的新 session 中测试超限
         let cache_exceeded = CacheMeter::new(None);
-        compute_cache_usage(&cache_exceeded, &turn1, 1);
+        compute_cache_usage_sync(&cache_exceeded, &turn1, 1);
 
         let mut msgs_exceeded = Vec::new();
         for i in 0..22 {
@@ -1245,7 +1708,7 @@ mod tests {
             metadata: None,
             cache_control: None,
         };
-        let res_exceeded = compute_cache_usage(&cache_exceeded, &req_exceeded, 1);
+        let res_exceeded = compute_cache_usage_sync(&cache_exceeded, &req_exceeded, 1);
         assert_eq!(
             res_exceeded.cache_read, 0,
             "Block 21 lookback 20 blocks（仅到 Block 2）无法触及 Block 0，必须 miss"
@@ -1279,7 +1742,7 @@ mod tests {
 
         for block_type in ["tool_use", "tool_result"] {
             let cache = CacheMeter::new(None);
-            let cold = compute_cache_usage(&cache, &first_request(), 1);
+            let cold = compute_cache_usage_sync(&cache, &first_request(), 1);
 
             let parallel_blocks: Vec<serde_json::Value> = (0..25)
                 .map(|index| {
@@ -1337,7 +1800,7 @@ mod tests {
                 cache_control: None,
             };
 
-            let warm = compute_cache_usage(&cache, &next_request, 1);
+            let warm = compute_cache_usage_sync(&cache, &next_request, 1);
             assert_eq!(
                 warm.cache_read, cold.cache_covered_est,
                 "连续 {block_type} 块必须只占一个回溯位置"
@@ -1381,7 +1844,7 @@ mod tests {
             cache_control: None,
         };
 
-        let u1 = compute_cache_usage(&cache, &req, 1);
+        let u1 = compute_cache_usage_sync(&cache, &req, 1);
         assert_eq!(u1.cache_read, 0);
 
         // 模拟 350 秒后：5m 断点过期（300s），1h 断点仍然有效（3600s）
@@ -1393,7 +1856,7 @@ mod tests {
         }
 
         // 再次请求
-        let u2 = compute_cache_usage(&cache, &req, 1);
+        let u2 = compute_cache_usage_sync(&cache, &req, 1);
         let sys_tokens = estimate_tokens(&sys_text) as i32;
         assert_eq!(
             u2.cache_read, sys_tokens,
@@ -1434,7 +1897,7 @@ mod tests {
             cache_control: None,
         };
 
-        let usage = compute_cache_usage(&cache, &req, 1);
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
         assert_eq!(usage.cache_covered_est, 0);
         assert_eq!(usage.cache_read, 0);
         assert_eq!(cache.len(), 0, "非法请求不得写入任何本地缓存条目");
@@ -1472,7 +1935,7 @@ mod tests {
             cache_control: None,
         };
 
-        let usage = compute_cache_usage(&cache, &req, 1);
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
         assert_eq!(usage.cache_covered_est, 0);
         assert_eq!(usage.cache_read, 0);
         assert_eq!(cache.len(), 0, "超过 4 个断点时不得模拟部分成功");
@@ -1482,75 +1945,146 @@ mod tests {
     fn structured_tool_fields_are_part_of_prefix_key() {
         use super::super::types::{CacheControl, Message, MessagesRequest};
 
-        let make = |path: &str, result: &str| MessagesRequest {
-            model: "claude-sonnet-4-5-20250929".to_string(),
-            max_tokens: 32,
-            messages: vec![
-                Message {
-                    role: "user".to_string(),
-                    content: serde_json::json!([{"type":"text","text":"inspect a file"}]),
-                },
-                Message {
-                    role: "assistant".to_string(),
-                    content: serde_json::json!([{
-                        "type": "tool_use",
-                        "id": "toolu_1",
-                        "name": "Read",
-                        "input": {"file_path": path}
-                    }]),
-                },
-                Message {
-                    role: "user".to_string(),
-                    content: serde_json::json!([{
-                        "type": "tool_result",
-                        "tool_use_id": "toolu_1",
-                        "content": result,
-                        "is_error": false
-                    }]),
-                },
-            ],
-            stream: false,
-            system: None,
-            tools: None,
-            tool_choice: None,
-            thinking: None,
-            output_config: None,
-            metadata: None,
-            cache_control: Some(CacheControl {
-                cache_type: "ephemeral".to_string(),
-                ttl: None,
-            }),
-        };
+        let make =
+            |name: &str, id: &str, path: &str, result: &str, is_error: bool| MessagesRequest {
+                model: "claude-sonnet-4-5-20250929".to_string(),
+                max_tokens: 32,
+                messages: vec![
+                    Message {
+                        role: "user".to_string(),
+                        content: serde_json::json!([{"type":"text","text":"inspect a file"}]),
+                    },
+                    Message {
+                        role: "assistant".to_string(),
+                        content: serde_json::json!([{
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": {"file_path": path}
+                        }]),
+                    },
+                    Message {
+                        role: "user".to_string(),
+                        content: serde_json::json!([{
+                            "type": "tool_result",
+                            "tool_use_id": id,
+                            "content": result,
+                            "is_error": is_error
+                        }]),
+                    },
+                ],
+                stream: false,
+                system: None,
+                tools: None,
+                tool_choice: None,
+                thinking: None,
+                output_config: None,
+                metadata: None,
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            };
 
         let identical_cache = CacheMeter::new(None);
-        let cold = compute_cache_usage(&identical_cache, &make("/a.rs", "alpha"), 1);
-        let warm = compute_cache_usage(&identical_cache, &make("/a.rs", "alpha"), 1);
+        let cold = compute_cache_usage_sync(
+            &identical_cache,
+            &make("Read", "toolu_1", "/a.rs", "alpha", false),
+            1,
+        );
+        let warm = compute_cache_usage_sync(
+            &identical_cache,
+            &make("Read", "toolu_1", "/a.rs", "alpha", false),
+            1,
+        );
         assert_eq!(warm.cache_read, cold.cache_covered_est);
 
         let changed_input_cache = CacheMeter::new(None);
-        compute_cache_usage(&changed_input_cache, &make("/a.rs", "alpha"), 1);
-        let changed_input = compute_cache_usage(&changed_input_cache, &make("/b.rs", "alpha"), 1);
+        compute_cache_usage_sync(
+            &changed_input_cache,
+            &make("Read", "toolu_1", "/a.rs", "alpha", false),
+            1,
+        );
+        let changed_input = compute_cache_usage_sync(
+            &changed_input_cache,
+            &make("Read", "toolu_1", "/b.rs", "alpha", false),
+            1,
+        );
         assert_eq!(
             changed_input.cache_read, 0,
             "tool_use.input 变化必须使前缀失效"
         );
 
         let changed_result_cache = CacheMeter::new(None);
-        compute_cache_usage(&changed_result_cache, &make("/a.rs", "alpha"), 1);
-        let changed_result = compute_cache_usage(&changed_result_cache, &make("/a.rs", "beta"), 1);
+        compute_cache_usage_sync(
+            &changed_result_cache,
+            &make("Read", "toolu_1", "/a.rs", "alpha", false),
+            1,
+        );
+        let changed_result = compute_cache_usage_sync(
+            &changed_result_cache,
+            &make("Read", "toolu_1", "/a.rs", "beta", false),
+            1,
+        );
         assert_eq!(
             changed_result.cache_read, 0,
             "tool_result.content 变化不得与旧断点产生虚假命中"
+        );
+
+        let changed_name_cache = CacheMeter::new(None);
+        compute_cache_usage_sync(
+            &changed_name_cache,
+            &make("Read", "toolu_1", "/a.rs", "alpha", false),
+            1,
+        );
+        let changed_name = compute_cache_usage_sync(
+            &changed_name_cache,
+            &make("Write", "toolu_1", "/a.rs", "alpha", false),
+            1,
+        );
+        assert_eq!(
+            changed_name.cache_read, 0,
+            "tool_use.name 变化必须使前缀失效"
+        );
+
+        let changed_id_cache = CacheMeter::new(None);
+        compute_cache_usage_sync(
+            &changed_id_cache,
+            &make("Read", "toolu_1", "/a.rs", "alpha", false),
+            1,
+        );
+        let changed_id = compute_cache_usage_sync(
+            &changed_id_cache,
+            &make("Read", "toolu_2", "/a.rs", "alpha", false),
+            1,
+        );
+        assert_eq!(changed_id.cache_read, 0, "tool_use.id 变化必须使前缀失效");
+
+        let changed_err_cache = CacheMeter::new(None);
+        compute_cache_usage_sync(
+            &changed_err_cache,
+            &make("Read", "toolu_1", "/a.rs", "alpha", false),
+            1,
+        );
+        let changed_err = compute_cache_usage_sync(
+            &changed_err_cache,
+            &make("Read", "toolu_1", "/a.rs", "alpha", true),
+            1,
+        );
+        assert_eq!(
+            changed_err.cache_read, 0,
+            "tool_result.is_error 变化必须使前缀失效"
         );
     }
 
     #[test]
     fn request_configuration_changes_invalidate_prefix() {
-        use super::super::types::{CacheControl, Message, MessagesRequest, Thinking};
+        use super::super::types::{CacheControl, Message, MessagesRequest, OutputConfig, Thinking};
 
         let make = |model: &str,
                     tool_choice: Option<serde_json::Value>,
-                    budget_tokens: Option<i32>| MessagesRequest {
+                    budget_tokens: Option<i32>,
+                    effort: Option<&str>| MessagesRequest {
             model: model.to_string(),
             max_tokens: 32,
             messages: vec![Message {
@@ -1565,7 +2099,9 @@ mod tests {
                 thinking_type: "enabled".to_string(),
                 budget_tokens,
             }),
-            output_config: None,
+            output_config: effort.map(|effort| OutputConfig {
+                effort: effort.to_string(),
+            }),
             metadata: None,
             cache_control: Some(CacheControl {
                 cache_type: "ephemeral".to_string(),
@@ -1574,116 +2110,56 @@ mod tests {
         };
 
         let model_cache = CacheMeter::new(None);
-        compute_cache_usage(&model_cache, &make("model-a", None, None), 1);
+        compute_cache_usage_sync(&model_cache, &make("model-a", None, None, None), 1);
         assert_eq!(
-            compute_cache_usage(&model_cache, &make("model-b", None, None), 1).cache_read,
-            0
+            compute_cache_usage_sync(&model_cache, &make("model-b", None, None, None), 1)
+                .cache_read,
+            0,
+            "model 变化必须 miss"
         );
 
         let tool_choice_cache = CacheMeter::new(None);
-        compute_cache_usage(&tool_choice_cache, &make("model-a", None, None), 1);
+        compute_cache_usage_sync(&tool_choice_cache, &make("model-a", None, None, None), 1);
         assert_eq!(
-            compute_cache_usage(
+            compute_cache_usage_sync(
                 &tool_choice_cache,
-                &make("model-a", Some(serde_json::json!({"type":"auto"})), None),
+                &make(
+                    "model-a",
+                    Some(serde_json::json!({"type":"auto"})),
+                    None,
+                    None
+                ),
                 1,
             )
             .cache_read,
-            0
+            0,
+            "tool_choice 变化必须 miss"
         );
 
         let thinking_cache = CacheMeter::new(None);
-        compute_cache_usage(&thinking_cache, &make("model-a", None, Some(1024)), 1);
+        compute_cache_usage_sync(&thinking_cache, &make("model-a", None, Some(1024), None), 1);
         assert_eq!(
-            compute_cache_usage(&thinking_cache, &make("model-a", None, Some(2048)), 1).cache_read,
-            0
+            compute_cache_usage_sync(&thinking_cache, &make("model-a", None, Some(2048), None), 1)
+                .cache_read,
+            0,
+            "thinking 变化必须 miss"
         );
-    }
 
-    #[test]
-    fn tool_choice_change_preserves_system_cache() {
-        use super::super::types::{CacheControl, Message, MessagesRequest, SystemMessage};
-
-        let make = |tool_choice: Option<serde_json::Value>| MessagesRequest {
-            model: "model-a".to_string(),
-            max_tokens: 32,
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: serde_json::json!("new request"),
-            }],
-            stream: false,
-            system: Some(vec![SystemMessage {
-                text: "stable system prompt ".repeat(50),
-                cache_control: Some(CacheControl {
-                    cache_type: "ephemeral".to_string(),
-                    ttl: None,
-                }),
-            }]),
-            tools: None,
-            tool_choice,
-            thinking: None,
-            output_config: None,
-            metadata: None,
-            cache_control: None,
-        };
-
-        let cache = CacheMeter::new(None);
-        let cold = compute_cache_usage(&cache, &make(None), 1);
-        let warm = compute_cache_usage(&cache, &make(Some(serde_json::json!({"type": "auto"}))), 1);
-        assert_eq!(
-            warm.cache_read, cold.cache_covered_est,
-            "tool_choice 变化只应使 message 缓存失效"
-        );
-    }
-
-    #[test]
-    fn image_presence_invalidates_message_cache() {
-        use super::super::types::{Message, MessagesRequest};
-
-        let make = |tail: serde_json::Value| MessagesRequest {
-            model: "model-a".to_string(),
-            max_tokens: 32,
-            messages: vec![
-                Message {
-                    role: "user".to_string(),
-                    content: serde_json::json!([{
-                        "type": "text",
-                        "text": "stable message prefix",
-                        "cache_control": {"type": "ephemeral"}
-                    }]),
-                },
-                Message {
-                    role: "user".to_string(),
-                    content: tail,
-                },
-            ],
-            stream: false,
-            system: None,
-            tools: None,
-            tool_choice: None,
-            thinking: None,
-            output_config: None,
-            metadata: None,
-            cache_control: None,
-        };
-
-        let cache = CacheMeter::new(None);
-        compute_cache_usage(
-            &cache,
-            &make(serde_json::json!([{"type": "text", "text": "tail"}])),
-            1,
-        );
-        let with_image = compute_cache_usage(
-            &cache,
-            &make(serde_json::json!([{
-                "type": "image",
-                "source": {"type": "base64", "media_type": "image/png", "data": ""}
-            }])),
+        let output_config_cache = CacheMeter::new(None);
+        compute_cache_usage_sync(
+            &output_config_cache,
+            &make("model-a", None, None, Some("high")),
             1,
         );
         assert_eq!(
-            with_image.cache_read, 0,
-            "图片存在性变化必须使 message 缓存失效"
+            compute_cache_usage_sync(
+                &output_config_cache,
+                &make("model-a", None, None, Some("low")),
+                1
+            )
+            .cache_read,
+            0,
+            "output_config 变化必须 miss"
         );
     }
 
@@ -1698,7 +2174,9 @@ mod tests {
                 role: "assistant".to_string(),
                 content: serde_json::json!([
                     {"type":"text","text":"stable visible content"},
-                    {"type":"thinking","thinking":"not a direct breakpoint"}
+                    {"type":"thinking","thinking":"not a direct breakpoint"},
+                    {"type":"redacted_thinking","data":"redacted"},
+                    {"type":"text","text":""}
                 ]),
             }],
             stream: false,
@@ -1715,15 +2193,47 @@ mod tests {
         };
 
         let cache = CacheMeter::new(None);
-        let cold = compute_cache_usage(&cache, &make(), 1);
+        let cold = compute_cache_usage_sync(&cache, &make(), 1);
         assert_eq!(
             cold.cache_covered_est,
             estimate_tokens("stable visible content"),
             "automatic 断点应回退到最后一个合格文本块"
         );
         assert!(cold.prompt_total_est > cold.cache_covered_est);
-        let warm = compute_cache_usage(&cache, &make(), 1);
+        let warm = compute_cache_usage_sync(&cache, &make(), 1);
         assert_eq!(warm.cache_read, cold.cache_covered_est);
+
+        // 全部 block 都不合格时，不模拟缓存
+        let all_ineligible = MessagesRequest {
+            model: "model-a".to_string(),
+            max_tokens: 32,
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type":"thinking","thinking":"cannot cache"},
+                    {"type":"redacted_thinking","data":"redacted"},
+                    {"type":"text","text":"   "}
+                ]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: Some(CacheControl {
+                cache_type: "ephemeral".to_string(),
+                ttl: None,
+            }),
+        };
+
+        let empty_cache = CacheMeter::new(None);
+        let res = compute_cache_usage_sync(&empty_cache, &all_ineligible, 1);
+        assert_eq!(res.cache_covered_est, 0);
+        assert_eq!(res.cache_read, 0);
+        assert_eq!(empty_cache.len(), 0);
+        assert!(res.prompt_total_est > 0);
     }
 
     #[test]
@@ -1748,8 +2258,9 @@ mod tests {
                 cache_control: top_cache_control,
             };
 
+        // 1. 非 ephemeral 类型
         let invalid_type_cache = CacheMeter::new(None);
-        let invalid_type = compute_cache_usage(
+        let invalid_type = compute_cache_usage_sync(
             &invalid_type_cache,
             &request(
                 serde_json::json!([{"type":"text","text":"hello"}]),
@@ -1763,8 +2274,9 @@ mod tests {
         assert_eq!(invalid_type.cache_covered_est, 0);
         assert_eq!(invalid_type_cache.len(), 0);
 
+        // 2. 显式 cache_control 在 thinking 上
         let thinking_cache = CacheMeter::new(None);
-        let explicit_thinking = compute_cache_usage(
+        let explicit_thinking = compute_cache_usage_sync(
             &thinking_cache,
             &request(
                 serde_json::json!([{
@@ -1779,8 +2291,43 @@ mod tests {
         assert_eq!(explicit_thinking.cache_covered_est, 0);
         assert_eq!(thinking_cache.len(), 0);
 
+        // 3. 显式 cache_control 在 redacted_thinking 上
+        let redacted_cache = CacheMeter::new(None);
+        let explicit_redacted = compute_cache_usage_sync(
+            &redacted_cache,
+            &request(
+                serde_json::json!([{
+                    "type":"redacted_thinking",
+                    "data":"secret",
+                    "cache_control":{"type":"ephemeral"}
+                }]),
+                None,
+            ),
+            1,
+        );
+        assert_eq!(explicit_redacted.cache_covered_est, 0);
+        assert_eq!(redacted_cache.len(), 0);
+
+        // 4. 显式 cache_control 在空 text 上
+        let empty_text_cache = CacheMeter::new(None);
+        let explicit_empty = compute_cache_usage_sync(
+            &empty_text_cache,
+            &request(
+                serde_json::json!([{
+                    "type":"text",
+                    "text":"",
+                    "cache_control":{"type":"ephemeral"}
+                }]),
+                None,
+            ),
+            1,
+        );
+        assert_eq!(explicit_empty.cache_covered_est, 0);
+        assert_eq!(empty_text_cache.len(), 0);
+
+        // 5. 顶层自动与显式 TTL 冲突 (5m vs 1h)
         let conflict_cache = CacheMeter::new(None);
-        let conflict = compute_cache_usage(
+        let conflict = compute_cache_usage_sync(
             &conflict_cache,
             &request(
                 serde_json::json!([{
@@ -1797,6 +2344,26 @@ mod tests {
         );
         assert_eq!(conflict.cache_covered_est, 0);
         assert_eq!(conflict_cache.len(), 0);
+
+        // 6. 顶层自动与显式同位置同 TTL (5m + 5m) 是 no-op，成功模拟
+        let noop_cache = CacheMeter::new(None);
+        let noop = compute_cache_usage_sync(
+            &noop_cache,
+            &request(
+                serde_json::json!([{
+                    "type":"text",
+                    "text":"hello world",
+                    "cache_control":{"type":"ephemeral","ttl":"5m"}
+                }]),
+                Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: Some("5m".to_string()),
+                }),
+            ),
+            1,
+        );
+        assert!(noop.cache_covered_est > 0);
+        assert_eq!(noop_cache.len(), 1);
     }
 
     /// 代表性多轮会话 fixture：热缓存后自然产生 75%～90% 的 cache_read 占比目标
@@ -1875,7 +2442,7 @@ mod tests {
             cache_control: top_cc.clone(),
         };
 
-        let u1 = compute_cache_usage(&cache, &turn1, 100);
+        let u1 = compute_cache_usage_sync(&cache, &turn1, 100);
         assert_eq!(u1.cache_read, 0, "Turn 1 冷启动 cache_read 为 0");
         assert!(u1.cache_covered_est > 0);
 
@@ -1910,7 +2477,7 @@ mod tests {
             cache_control: top_cc.clone(),
         };
 
-        compute_cache_usage(&cache, &turn2, 100);
+        compute_cache_usage_sync(&cache, &turn2, 100);
 
         // Turn 3 请求（热缓存代表性测试）：拥有完整的工具定义、系统提示词、前两轮完整历史和新一轮输入
         let turn3 = MessagesRequest {
@@ -1951,7 +2518,7 @@ mod tests {
             cache_control: top_cc.clone(),
         };
 
-        let u3 = compute_cache_usage(&cache, &turn3, 100);
+        let u3 = compute_cache_usage_sync(&cache, &turn3, 100);
         let total = u3.prompt_total_est;
         let (input, creation, read) = u3.split_against_total(total);
 
@@ -2017,16 +2584,16 @@ mod tests {
         };
 
         // Key=1 建立缓存
-        let a = compute_cache_usage(&cache, &make_req(), 1);
+        let a = compute_cache_usage_sync(&cache, &make_req(), 1);
         assert!(a.cache_covered_est > 0);
         assert_eq!(a.cache_read, 0);
 
         // Key=2 相同内容，但隔离种子不同 → 不命中
-        let b = compute_cache_usage(&cache, &make_req(), 2);
+        let b = compute_cache_usage_sync(&cache, &make_req(), 2);
         assert_eq!(b.cache_read, 0, "不同 key_id 不应命中彼此的前缀");
 
         // Key=1 再次请求 → 命中自己写入的
-        let c = compute_cache_usage(&cache, &make_req(), 1);
+        let c = compute_cache_usage_sync(&cache, &make_req(), 1);
         assert!(c.cache_read > 0, "同一 key_id 应命中自己的前缀");
     }
 
@@ -2076,14 +2643,16 @@ mod tests {
         };
 
         let cache = CacheMeter::new(None);
-        let s1a = compute_cache_usage(&cache, &make("c479866d-b846-4e87-807b-a5ed0d84948c"), 0);
+        let s1a =
+            compute_cache_usage_sync(&cache, &make("c479866d-b846-4e87-807b-a5ed0d84948c"), 0);
         assert_eq!(s1a.cache_read, 0, "首轮无历史可命中");
         assert!(s1a.cache_covered_est > 0, "JSON session 应启用缓存模拟");
 
-        let s2 = compute_cache_usage(&cache, &make("00000000-0000-0000-0000-000000000000"), 0);
+        let s2 = compute_cache_usage_sync(&cache, &make("00000000-0000-0000-0000-000000000000"), 0);
         assert_eq!(s2.cache_read, 0, "不同 session 不应命中");
 
-        let s1b = compute_cache_usage(&cache, &make("c479866d-b846-4e87-807b-a5ed0d84948c"), 0);
+        let s1b =
+            compute_cache_usage_sync(&cache, &make("c479866d-b846-4e87-807b-a5ed0d84948c"), 0);
         assert!(s1b.cache_read > 0, "相同 session 应命中");
     }
 
@@ -2124,13 +2693,13 @@ mod tests {
         };
 
         let cache = CacheMeter::new(None);
-        let s1a = compute_cache_usage(&cache, &make("aaa"), 0);
+        let s1a = compute_cache_usage_sync(&cache, &make("aaa"), 0);
         assert_eq!(s1a.cache_read, 0);
 
-        let s2 = compute_cache_usage(&cache, &make("bbb"), 0);
+        let s2 = compute_cache_usage_sync(&cache, &make("bbb"), 0);
         assert_eq!(s2.cache_read, 0, "不同 session 不应命中");
 
-        let s1b = compute_cache_usage(&cache, &make("aaa"), 0);
+        let s1b = compute_cache_usage_sync(&cache, &make("aaa"), 0);
         assert!(s1b.cache_read > 0, "相同 session 应命中");
     }
 
@@ -2169,17 +2738,18 @@ mod tests {
             }),
         };
 
-        let a = compute_cache_usage(&cache, &make_req(), 0);
+        let a = compute_cache_usage_sync(&cache, &make_req(), 0);
         assert_eq!(a.cache_read, 0);
         assert_eq!(a.cache_covered_est, 0, "主 Key 无 session 不应产生缓存覆盖");
 
-        let b = compute_cache_usage(&cache, &make_req(), 0);
+        let b = compute_cache_usage_sync(&cache, &make_req(), 0);
         assert_eq!(b.cache_read, 0);
         assert_eq!(b.cache_covered_est, 0);
     }
 
     #[test]
     fn tool_signature_stable_across_insert_order() {
+        use super::super::types::Tool;
         let build_tool = |insert_required_first: bool| {
             let mut schema = std::collections::BTreeMap::new();
             if insert_required_first {
@@ -2240,7 +2810,7 @@ mod tests {
         };
 
         let cache = CacheMeter::new(None);
-        let u1 = compute_cache_usage(&cache, &make(vec![image_message()]), 1);
+        let u1 = compute_cache_usage_sync(&cache, &make(vec![image_message()]), 1);
         let text_only = estimate_tokens("describe") as i32;
         assert!(
             u1.cache_covered_est >= img_tokens + text_only - 5,
@@ -2250,7 +2820,7 @@ mod tests {
         );
         assert_eq!(u1.cache_read, 0);
 
-        let u2 = compute_cache_usage(
+        let u2 = compute_cache_usage_sync(
             &cache,
             &make(vec![
                 image_message(),
@@ -2315,5 +2885,258 @@ mod tests {
             extract_session_id(r#"{"device_id":"abc","session_id":""}"#),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn test_redis_key_namespace_and_isolation() {
+        let key1 = redis_entry_key(0x123456789abcdef0);
+        assert_eq!(key1, "kiro:pcm:v1:entry:123456789abcdef0");
+        let lock1 = redis_lock_key(0x123456789abcdef0);
+        assert_eq!(lock1, "kiro:pcm:v1:lock:123456789abcdef0");
+
+        // URL 脱敏
+        let sensitive = "redis://:secret_password@10.0.0.1:6379/1";
+        assert_eq!(sanitize_redis_url(sensitive), "redis://***@10.0.0.1:6379/1");
+        let user_pass = "redis://user:pass123@redis-cluster.internal:6379/0";
+        assert_eq!(
+            sanitize_redis_url(user_pass),
+            "redis://***@redis-cluster.internal:6379/0"
+        );
+        let normal = "redis://127.0.0.1:6379";
+        assert_eq!(sanitize_redis_url(normal), "redis://127.0.0.1:6379");
+    }
+
+    #[tokio::test]
+    async fn test_redis_shared_hit_and_independent_ttl_renewal() {
+        use super::super::types::{CacheControl, Message, MessagesRequest, SystemMessage};
+
+        let fake_redis = Arc::new(FakeRemoteStore::default());
+
+        let sys_text = "System Prompt 1h stability ".repeat(40);
+        let u1_text = "User Question 5m ephemeral ".repeat(40);
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 32,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([{
+                    "type": "text",
+                    "text": u1_text.clone(),
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                }]),
+            }],
+            system: Some(vec![SystemMessage {
+                text: sys_text.clone(),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: Some("1h".to_string()),
+                }),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+            stream: false,
+        };
+
+        // 实例 1：挂载 fake_redis，首次请求（冷启动 miss）
+        let instance_1 = CacheMeter::with_remote(None, Some(fake_redis.clone()));
+        let u1 = compute_cache_usage(&instance_1, &req, 1).await;
+        assert_eq!(u1.cache_read, 0, "首次调用应为 miss");
+        assert!(u1.cache_covered_est > 0);
+        assert_eq!(
+            fake_redis
+                .record_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "应向 Redis 写入 2 个断点"
+        );
+
+        // 实例 2：全新的本地内存，但挂载相同的 fake_redis 共享层
+        let instance_2 = CacheMeter::with_remote(None, Some(fake_redis.clone()));
+        assert_eq!(instance_2.len(), 0, "实例 2 本地内存初始为空");
+
+        // 实例 2 请求相同 Prompt：应从共享 Redis 命中！
+        let u2 = compute_cache_usage(&instance_2, &req, 1).await;
+        assert!(u2.cache_read > 0, "实例 2 必须通过共享 Redis 命中");
+        assert_eq!(u2.cache_read, u1.cache_covered_est);
+        assert_eq!(instance_2.len(), 2, "命中后断点应回填至实例 2 的本地缓存");
+
+        // 模拟 350 秒后：5m 断点过期（300s），1h 断点依然有效（3600s）
+        {
+            let mut remote_map = fake_redis.entries.lock();
+            for (_, v) in remote_map.iter_mut() {
+                v.expires_at -= 350;
+            }
+            let mut local_map = instance_2.inner.lock();
+            for (_, v) in local_map.entries.iter_mut() {
+                v.expires_at -= 350;
+            }
+        }
+
+        // 实例 2 再次请求：5m 断点过期，1h 断点仍然命中
+        let u3 = compute_cache_usage(&instance_2, &req, 1).await;
+        let sys_tokens = estimate_tokens(&sys_text) as i32;
+        assert_eq!(
+            u3.cache_read, sys_tokens,
+            "350 秒后 5m 消息过期 miss，1h 的 system 断点必须依然命中并滑动续期"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_redis_failure_and_timeout_fallback_to_local() {
+        let fake_redis = Arc::new(FakeRemoteStore::default());
+        let cache = CacheMeter::with_remote(None, Some(fake_redis.clone()));
+        let req = build_request_with_system_breakpoint();
+
+        // 首次请求，写入本地与 Redis
+        let u1 = compute_cache_usage(&cache, &req, 1).await;
+        assert_eq!(u1.cache_read, 0);
+        assert!(u1.cache_covered_est > 0);
+
+        // 模拟 Redis 故障（Lookup 异常 / 超时）
+        fake_redis
+            .fail_lookups
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // 第二次请求：Redis 失败时必须平滑降级到本地 CacheMeter，正常命中且请求不失败
+        let u2 = compute_cache_usage(&cache, &req, 1).await;
+        assert!(u2.cache_read > 0, "Redis 故障时应平滑降级到本地缓存并命中");
+        assert_eq!(u2.cache_read, u1.cache_covered_est);
+
+        // 模拟 Redis 写入也发生故障
+        fake_redis
+            .fail_records
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // 第三次请求依然正常完成，不抛错不中断
+        let u3 = compute_cache_usage(&cache, &req, 1).await;
+        assert!(u3.cache_read > 0);
+    }
+
+    #[tokio::test]
+    async fn test_redis_concurrency_singleflight_lock() {
+        let fake_redis = Arc::new(FakeRemoteStore::default());
+        let hash = 0xabcdef1234567890;
+
+        // 首次获取锁成功
+        let acq1 = fake_redis.try_acquire_lock(hash, 2000).await;
+        assert!(acq1, "首次加锁应成功");
+
+        // 在锁持有期内二次获取应失败（去重锁生效）
+        let acq2 = fake_redis.try_acquire_lock(hash, 2000).await;
+        assert!(!acq2, "锁未过期时加锁应返回 false");
+
+        // 锁失败不影响 compute_cache_usage
+        let cache = CacheMeter::with_remote(None, Some(fake_redis.clone()));
+        let req = build_request_with_system_breakpoint();
+        let u = compute_cache_usage(&cache, &req, 1).await;
+        assert!(
+            u.cache_covered_est > 0,
+            "即使锁已被占用，也能作为普通 miss 完成处理"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_from_env_fallback_behavior() {
+        // 未设置环境变量时，返回纯本地实例
+        unsafe {
+            std::env::remove_var("KIRO_RS_CACHE_REDIS_URL");
+        }
+        let cache_local = CacheMeter::from_env(None).await;
+        assert!(cache_local.remote.is_none());
+
+        // 设置无效的 Redis 地址时，连接失败平滑降级为本地实例
+        unsafe {
+            std::env::set_var("KIRO_RS_CACHE_REDIS_URL", "redis://127.0.0.1:9");
+        }
+        let cache_fallback = CacheMeter::from_env(None).await;
+        assert!(cache_fallback.remote.is_none());
+
+        unsafe {
+            std::env::remove_var("KIRO_RS_CACHE_REDIS_URL");
+        }
+    }
+
+    #[test]
+    fn test_metering_enabled_from_env() {
+        unsafe {
+            std::env::remove_var("KIRO_RS_CACHE_METERING");
+        }
+        assert_eq!(
+            CacheMeter::metering_enabled_from_env(),
+            None,
+            "未设置时不表态，由 config.json / 默认值决定"
+        );
+
+        for off in ["0", "off", "OFF", "false", "No", " disabled "] {
+            unsafe {
+                std::env::set_var("KIRO_RS_CACHE_METERING", off);
+            }
+            assert_eq!(
+                CacheMeter::metering_enabled_from_env(),
+                Some(false),
+                "{off:?} 应关闭计量模拟"
+            );
+        }
+
+        for on in ["1", "on", "true", "yes"] {
+            unsafe {
+                std::env::set_var("KIRO_RS_CACHE_METERING", on);
+            }
+            assert_eq!(
+                CacheMeter::metering_enabled_from_env(),
+                Some(true),
+                "{on:?} 应开启计量模拟"
+            );
+        }
+
+        // 空串等同未设置
+        unsafe {
+            std::env::set_var("KIRO_RS_CACHE_METERING", "   ");
+        }
+        assert_eq!(
+            CacheMeter::metering_enabled_from_env(),
+            None,
+            "空串视为未表态"
+        );
+
+        unsafe {
+            std::env::remove_var("KIRO_RS_CACHE_METERING");
+        }
+    }
+
+    /// 关闭开关后 `compute_cache_usage` 不查不写：既不命中已有条目，也不写入新条目。
+    #[tokio::test]
+    async fn test_disabled_meter_neither_reads_nor_writes() {
+        let cache = CacheMeter::new(None);
+        let req = build_request_with_system_breakpoint();
+
+        // 先在开启状态下写入一次，制造可命中的条目
+        let warm = compute_cache_usage(&cache, &req, 1).await;
+        assert!(warm.cache_covered_est > 0, "开启时应写入缓存条目");
+
+        // 关闭后：即使条目仍在，也不再命中，且返回全零
+        cache.set_enabled(false);
+        let off = compute_cache_usage(&cache, &req, 1).await;
+        assert_eq!(off.cache_read, 0);
+        assert_eq!(off.cache_covered_est, 0);
+        assert_eq!(off.prompt_total_est, 0, "关闭时不产出任何 estimate 基准");
+        assert_eq!(off.split_against_total(9_999), (9_999, 0, 0));
+
+        // 重新开启：此前条目未被清除，应能继续命中
+        cache.set_enabled(true);
+        let back = compute_cache_usage(&cache, &req, 1).await;
+        assert!(back.cache_read > 0, "重新开启后应命中关闭前写入的条目");
+    }
+
+    /// 关闭开关后 handler 走 `CacheUsage::default()`：全量计入 input、缓存恒为 0。
+    #[test]
+    fn test_disabled_metering_reports_zero_cache() {
+        let (input, creation, read) = CacheUsage::default().split_against_total(12_345);
+        assert_eq!((input, creation, read), (12_345, 0, 0));
     }
 }

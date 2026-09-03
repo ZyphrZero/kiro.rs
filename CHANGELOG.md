@@ -4,26 +4,61 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.8.0] - 2026-08-26
 
-主题：**客户端 Key 的用量可观测与配额治理**。新增「按入口 Key 的用量分布」视图，并支持为单个 Key 设置**最高使用积分（credit）上限**，达到上限后自动拒绝其请求。新增数据字段均 `serde(default)`，旧 `client_api_keys.json` 无需改动。
+主题：**Responses / Codex 流式链路稳定性、客户端 Key 配额治理、运维控制台与凭据元数据管理，以及 Enterprise / IdC 兼容性修复**。本版合并 PR #66、#67、#70、#71、#74、#75，并补充后续的控制台主题、刷新和移动端布局改进。新增字段均提供默认值，升级无需迁移现有配置、凭据或客户端 Key 文件。
 
-### ✨ 新增 — 按入口 Key 用量分布
+### ✨ 新增 — 按入口 Key 用量分布与积分上限
 
-- 新增 `GET /api/admin/stats/by-key`：按入口 Key 横向汇总所选时间窗内的调用次数、输入/输出/缓存 Token、异常数与 credit 计费量，附加 Key 名称。
-- 聚合层新增 `UsageAggregator::query_by_key`，复用既有的每桶 `by_key` 预聚合；启用**分组筛选**时按凭据白名单走 `by_key_credential` 求和，与「按上游凭据分布」的过滤口径一致。
-- 概览页新增「按入口 Key 分布」面板：柱状图（Top 12）+ 明细表（异常数飘红、附 credit 列）。该面板为横向对比，**不随上方「统计筛选」的单 Key 选择变化**，前端已加说明文案避免困惑。
+> 来源：[PR #70](https://github.com/ZyphrZero/kiro.rs/pull/70)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。
 
-### ✨ 新增 — 单个 Key 最高使用积分上限
+- 新增 `GET /api/admin/stats/by-key` 与「按入口 Key 分布」面板，按时间窗横向汇总调用次数、输入/输出/缓存 Token、异常数和 credit，并支持按分组过滤。
+- `ClientKey` 支持 `maxCredits` 累计积分上限；新增 `POST /api/admin/client-keys/{id}/max-credits`，创建 Key 时也可设置，传 `null` 可清除限制。
+- 达到上限的请求返回 HTTP 429 `rate_limit_error`，不累加调用次数，也不写入用量日志与链路追踪；重置统计后可重新计费。
+- 上限是请求结束时入账的软配额，并发中的请求可能在最终计量前同时通过检查，实际用量可能略超配置值。
 
-- `ClientKey` 新增 `maxCredits` 字段（`None`/省略 = 不限制）。上限基于**累计 `totalCredits`** 判定，「重置统计」清零后即可重新计费。
-- 鉴权层新增 `verify_and_touch_ex`，返回 `Ok` / `OverLimit` / `NotFound` 三态；命中但已达上限的请求返回 **HTTP 429 `rate_limit_error`**（提示已用/上限），且**不累加调用次数**。
-- 新增 `POST /api/admin/client-keys/{id}/max-credits`（body `{ "maxCredits": <number|null> }`，`null` 取消限制）；创建 Key 时亦可通过 `maxCredits` 直接指定。入参强制为**非负有限数**；`0` 表示零预算（立即拒绝）。
-- Key 管理页新增「积分 / 上限」列：接近上限（≥80%）转琥珀、达到/超过转红；创建与编辑对话框均可设置或清除上限。
+### ✨ 新增 — 运维控制台、凭据元数据与模型管理
 
-### ⚠️ 行为说明 — 上限为「软配额」
+> 来源：[PR #71](https://github.com/ZyphrZero/kiro.rs/pull/71)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。
 
-积分为**累计**判定，且 credit 由上游 `meteringEvent.usage` 在**请求结束时**才入账。因此上限是软约束：在某个 Key 逼近上限时，**并发进行中的多个请求会在各自入账前都通过上限检查**，实际用量可能超出上限，超出幅度取决于并发数与单次请求的 credit 量。此设计避免请求执行中途被打断；若需要更硬的约束，应叠加外部限流。被拒的 429 请求为提前返回，不写入用量日志与链路追踪。
+- 凭据、设置、请求日志三页重构为运维控制台：设置项集中管理并即时保存，日志支持时间范围 / 关键字筛选、URL 状态同步、列控制和右侧详情抽屉，凭据页提供状态筛选条、分页、批量操作和优先级预览。
+- 新增可扩展凭据 Metadata schema：字段定义、默认值、`oneOf` 描述和值标签由后端统一提供；支持实时预览、全局缓存刷新、批量编辑 / 导入，以及凭据卡片和列表中的元数据展示。
+- 新增自定义模型管理与凭据编辑 Tab，按厂商组织模型设置；校验并报告模型持久化失败，代理 URL / 认证字段校验更严格，凭据级代理故障时可自动切换，全局代理支持独立用户名和密码。
+- 优先级调度严格跳过无效凭据；空字符串 `proxyUrl` 按未配置处理，避免启动失败。
+
+### 🔧 修复 — Responses / Codex 流式传输与 WebSearch 长连接
+
+> 来源：[PR #67](https://github.com/ZyphrZero/kiro.rs/pull/67)。提交人：[@stormrise](https://github.com/stormrise)，感谢贡献。
+
+- Responses API 改为增量翻译 Anthropic 事件，稳定输出 item / SSE 顺序，减少 Codex 长连接中的断流、空响应和重复结束事件。
+- WebSearch 多轮请求持续发送保活与搜索进度；客户端取消会向上游传播，错误、中断和正常结束统一结算 usage 与 trace，避免悬挂请求或漏记计量。
+- 改进近期 Codex reasoning、function / custom 工具及工具结果续接的兼容性，保持与 Anthropic 流式链路一致。
+
+### 🔧 修复 — 混合 WebSearch 请求的链路追踪
+
+> 来源：[PR #66](https://github.com/ZyphrZero/kiro.rs/pull/66)。提交人：[@KtzeAbyss](https://github.com/KtzeAbyss)，感谢贡献。
+
+- 混合 `web_search` + 客户端工具的请求现在完整记录 trace、尝试链路和最终状态；内部搜索循环不再让请求从追踪统计中消失。
+- 统一混合场景的 WebSearch 路由、工具去重和失败传播，便于在 Admin 日志中还原实际执行过程。
+
+### 🔧 修复 — Enterprise / IdC 的真实 `profileArn`
+
+> 来源：[PR #74](https://github.com/ZyphrZero/kiro.rs/pull/74) 与 [PR #75](https://github.com/ZyphrZero/kiro.rs/pull/75)。提交人：[@lijmyeah](https://github.com/lijmyeah)、[@ZyphrZero](https://github.com/ZyphrZero)，感谢贡献。
+
+- `getUsageLimits`、`ListAvailableModels` 等用量 / 模型接口调用前解析并携带真实 `profileArn`，修复 Enterprise / IAM Identity Center 凭据刷新余额和模型列表时的 403。
+- `setUserPreference` 同样按账号解析真实 ARN；Builder ID 占位 ARN 不再误用于需要真实用户配置的请求。
+- 复用已有的凭据级解析与缓存逻辑，解析失败时返回明确错误，不改变普通 Builder ID / Social 请求行为。
+
+### 🎨 Admin UI 体验改进
+
+- 新增可持久化的多主题选择器，主题偏好写入本地存储并在启动时恢复。
+- 控制台页面统一页头、自动刷新与刷新状态；模型、Metadata、日志和分组页面的筛选与操作布局更紧凑。
+- 修复客户端 Key 表格圆角裁切、凭据卡片与批量操作栏在窄屏下的溢出和遮挡，移动端菜单与操作按钮布局更加稳定。
+
+### 🔒 兼容性与测试
+
+- `Cargo.toml`、`Cargo.lock`、`admin-ui/package.json` 版本统一为 `0.8.0`。
+- 新增配置、客户端 Key、凭据 Metadata 字段均兼容旧文件；未设置 `maxCredits` 时行为与此前一致。
 
 ## [0.7.6] - 2026-08-13
 

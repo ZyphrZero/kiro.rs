@@ -39,12 +39,12 @@ export function SettingRow({
   return (
     <div
       className={cn(
-        'flex flex-wrap items-start justify-between gap-x-4 gap-y-2 border-b border-border/50 py-3 last:border-b-0',
+        'flex flex-col items-stretch gap-2 border-b border-border/50 py-3 last:border-b-0 sm:flex-row sm:flex-wrap sm:items-start sm:justify-between sm:gap-x-4 sm:gap-y-2',
         disabled && 'opacity-55',
         className,
       )}
     >
-      <div className="min-w-0 flex-1 basis-56">
+      <div className="min-w-0 sm:flex-1 sm:basis-56">
         <div className="flex items-center gap-1.5 text-[13.5px] font-medium">
           {label}
           {pending && (
@@ -60,7 +60,9 @@ export function SettingRow({
           </p>
         )}
       </div>
-      <div className="flex shrink-0 items-center gap-2">{children}</div>
+      <div className="flex min-w-0 w-full flex-wrap items-center gap-2 sm:w-auto sm:shrink-0 sm:justify-end">
+        {children}
+      </div>
     </div>
   )
 }
@@ -354,10 +356,12 @@ export function SettingGroup({
 }) {
   return (
     <section className="console-scope">
-      <div className="mb-1">
-        <h3 className="text-[15px] font-semibold tracking-tight">{title}</h3>
+      <div className="mb-3">
+        <h2 className="text-base font-semibold tracking-tight">{title}</h2>
         {description && (
-          <p className="mt-0.5 text-xs text-muted-foreground">{description}</p>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            {description}
+          </p>
         )}
       </div>
       <div>{children}</div>

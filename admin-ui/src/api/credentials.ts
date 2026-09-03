@@ -539,6 +539,24 @@ export async function setLogGovernanceConfig(
   return data
 }
 
+export interface CacheMeteringConfig {
+  enabled: boolean
+}
+
+// 获取 prompt cache 计量模拟开关
+export async function getCacheMeteringConfig(): Promise<CacheMeteringConfig> {
+  const { data } = await api.get<CacheMeteringConfig>('/config/cache-metering')
+  return data
+}
+
+// 切换 prompt cache 计量模拟开关
+export async function setCacheMeteringConfig(
+  patch: Partial<CacheMeteringConfig>,
+): Promise<CacheMeteringConfig> {
+  const { data } = await api.put<CacheMeteringConfig>('/config/cache-metering', patch)
+  return data
+}
+
 // 发起 IdC 设备授权登录
 export async function startIdcLogin(
   req: StartIdcLoginRequest

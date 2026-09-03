@@ -5,8 +5,10 @@ import {
   ScrollText,
   PackageOpen,
   ShieldCheck,
+  SlidersHorizontal,
   Tags,
 } from 'lucide-react'
+import { PageHeader } from '@/components/console/page-header'
 import { Card, CardContent } from '@/components/ui/card'
 import { useUrlState } from '@/hooks/use-url-state'
 import { cn } from '@/lib/utils'
@@ -34,49 +36,41 @@ type SectionKey = 'dispatch' | 'metadata' | 'network' | 'log' | 'models' | 'syst
 const SECTIONS: {
   key: SectionKey
   label: string
-  hint: string
   icon: React.ReactNode
 }[] = [
   {
     key: 'dispatch',
     label: '调度',
-    hint: '凭据怎么选、失败怎么转、禁用怎么恢复',
     icon: <Gauge className="h-4 w-4" />,
   },
   {
     key: 'metadata',
     label: '凭据字段',
-    hint: '定义 metadata 的 key、类型、默认值和枚举 value',
     icon: <Tags className="h-4 w-4" />,
   },
   {
     key: 'network',
     label: '网络',
-    hint: '出站代理',
     icon: <Globe className="h-4 w-4" />,
   },
   {
     key: 'log',
     label: '日志',
-    hint: '链路追踪与保留期',
     icon: <ScrollText className="h-4 w-4" />,
   },
   {
     key: 'models',
     label: '模型',
-    hint: '自定义模型别名与元数据',
     icon: <Cpu className="h-4 w-4" />,
   },
   {
     key: 'system',
     label: '系统',
-    hint: '镜像在线更新',
     icon: <PackageOpen className="h-4 w-4" />,
   },
   {
     key: 'security',
     label: '安全',
-    hint: '管理面板登录密钥',
     icon: <ShieldCheck className="h-4 w-4" />,
   },
 ]
@@ -87,21 +81,18 @@ export function SettingsPage() {
     ? urlState.s
     : 'dispatch') as SectionKey
 
-  const current = SECTIONS.find((s) => s.key === active)!
-
   return (
     <div className="console-scope space-y-4">
-      <div>
-        <h2 className="text-lg font-semibold tracking-tight">设置</h2>
-        <p className="mt-0.5 text-sm text-muted-foreground">
-          改动即时生效并写入 config.json，无需重启。
-        </p>
-      </div>
+      <PageHeader
+        icon={<SlidersHorizontal className="h-4 w-4" />}
+        title="设置"
+        description="改动即时生效并写入 config.json，无需重启。"
+      />
 
       <div className="flex flex-col gap-4 lg:flex-row">
         {/* 分区导航：桌面端竖排侧栏，窄屏横向滚动的胶囊行 */}
         <nav
-          className="flex shrink-0 gap-1 overflow-x-auto pb-1 lg:w-48 lg:flex-col lg:overflow-visible lg:pb-0 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          className="flex shrink-0 gap-1 overflow-x-auto px-1 py-1 lg:w-48 lg:flex-col lg:overflow-visible lg:px-0 lg:py-0 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           aria-label="设置分区"
         >
           {SECTIONS.map((s) => (
@@ -126,15 +117,6 @@ export function SettingsPage() {
 
         <Card className="min-w-0 flex-1">
           <CardContent className="p-4 sm:p-5">
-            <div className="mb-3 border-b border-border/60 pb-3">
-              <h3 className="text-[15px] font-semibold tracking-tight">
-                {current.label}
-              </h3>
-              <p className="mt-0.5 text-xs text-muted-foreground">
-                {current.hint}
-              </p>
-            </div>
-
             {active === 'dispatch' && <DispatchSection />}
             {active === 'metadata' && <MetadataSection />}
             {active === 'models' && <ModelsSection />}

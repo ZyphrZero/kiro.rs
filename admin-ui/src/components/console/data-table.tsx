@@ -1,12 +1,10 @@
-import {
+import React, {
   useCallback,
-  useEffect,
   useMemo,
-  useRef,
   useState,
   type ReactNode,
 } from 'react'
-import { Columns3, Check } from 'lucide-react'
+import { Columns3, Check, ChevronRight } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -23,13 +21,12 @@ import { railClass, type RailTone } from './rail'
  * 运维密集表格 —— 凭据 / 日志共用。
  *
  * 与「卡片」形态的分工：卡片是看的，表格是做的。所以这里的每个取舍都偏向
- * 「一屏能扫多少行」和「手不离键盘能不能走完」：
+ * 「一屏能扫多少行」和「操作是否紧凑」：
  *
  * - 行高 34px、字号 12.5px（`.console-table`，见 index.css）
  * - sticky 表头，长列表滚动时列名不丢
  * - 左侧 3px 状态色轨代替整行染色：既标状态，又不牺牲文字对比度
  * - 行内操作 hover 才显形（`.console-row-actions`），静默时不干扰扫读
- * - j/k 移动游标、Enter 打开详情、x 切换选中、Esc 清空
  * - 可选列进列控制菜单并记住选择，避免 12 列硬挤出横向滚动
  */
 export interface ConsoleColumn<T> {
@@ -50,13 +47,21 @@ export interface ConsoleTableProps<T> {
   rowKey: (row: T) => number | string
   /** 行状态 → 左侧色轨；不给则无轨 */
   tone?: (row: T) => RailTone
-  /** 开启行选中（复选框列 + x 键） */
+  /** 开启行选中（复选框列） */
   selectable?: boolean
   selected?: Set<number | string>
   onSelectedChange?: (next: Set<number | string>) => void
-  /** 点击行 / 按 Enter 触发，通常用来开详情抽屉 */
+  /** 点击行触发 */
   onRowActivate?: (row: T) => void
-  /** 行右侧的处置动作，hover / 游标行才显形 */
+  /** 展开行渲染函数；传入即开启可折叠行模式 */
+  renderExpandedRow?: (row: T) => ReactNode
+  /** 受控的已展开行 key 集合 */
+  expandedKeys?: Set<number | string>
+  /** 展开行改变回调 */
+  onExpandedKeysChange?: (next: Set<number | string>) => void
+  /** 点击整行是否切换展开，默认 true */
+  expandOnRowClick?: boolean
+  /** 行右侧的处置动作，hover / focus 行才显形 */
   rowActions?: (row: T) => ReactNode
   /** 列可见性持久化 key；不给则不显示列控制菜单 */
   columnsStorageKey?: string
@@ -121,98 +126,6 @@ function useColumnVisibility<T>(
   return { ordered, visible, toggle }
 }
 
-/**
- * 键盘导航：j/k 移动游标、Enter 激活、x 切换选中、Esc 清空选中。
- *
- * 只在表格容器获得焦点（或焦点在表格内）时生效，且输入框内不劫持按键 ——
- * 否则用户在搜索框里打 "j" 会意外跳行。
- */
-function useRowKeyboard<T>(opts: {
-  rows: T[]
-  rowKey: (row: T) => number | string
-  cursor: number
-  setCursor: (n: number) => void
-  onRowActivate?: (row: T) => void
-  selectable?: boolean
-  selected?: Set<number | string>
-  onSelectedChange?: (next: Set<number | string>) => void
-}) {
-  const {
-    rows,
-    rowKey,
-    cursor,
-    setCursor,
-    onRowActivate,
-    selectable,
-    selected,
-    onSelectedChange,
-  } = opts
-
-  return useCallback(
-    (e: React.KeyboardEvent) => {
-      const target = e.target as HTMLElement
-      // 输入类控件内不劫持按键
-      if (
-        target.tagName === 'INPUT' ||
-        target.tagName === 'TEXTAREA' ||
-        target.isContentEditable
-      ) {
-        return
-      }
-      if (rows.length === 0) return
-
-      const move = (delta: number) => {
-        e.preventDefault()
-        const next = Math.min(Math.max(cursor + delta, 0), rows.length - 1)
-        setCursor(next)
-      }
-
-      switch (e.key) {
-        case 'j':
-        case 'ArrowDown':
-          move(1)
-          break
-        case 'k':
-        case 'ArrowUp':
-          move(-1)
-          break
-        case 'Enter':
-          if (cursor >= 0 && rows[cursor] && onRowActivate) {
-            e.preventDefault()
-            onRowActivate(rows[cursor])
-          }
-          break
-        case 'x':
-          if (selectable && cursor >= 0 && rows[cursor] && onSelectedChange) {
-            e.preventDefault()
-            const key = rowKey(rows[cursor])
-            const next = new Set(selected ?? [])
-            if (next.has(key)) next.delete(key)
-            else next.add(key)
-            onSelectedChange(next)
-          }
-          break
-        case 'Escape':
-          if (selectable && onSelectedChange && (selected?.size ?? 0) > 0) {
-            e.preventDefault()
-            onSelectedChange(new Set())
-          }
-          break
-      }
-    },
-    [
-      rows,
-      rowKey,
-      cursor,
-      setCursor,
-      onRowActivate,
-      selectable,
-      selected,
-      onSelectedChange,
-    ],
-  )
-}
-
 export function ConsoleTable<T>({
   rows,
   columns,
@@ -222,6 +135,10 @@ export function ConsoleTable<T>({
   selected,
   onSelectedChange,
   onRowActivate,
+  renderExpandedRow,
+  expandedKeys,
+  onExpandedKeysChange,
+  expandOnRowClick = true,
   rowActions,
   columnsStorageKey,
   loading = false,
@@ -232,35 +149,20 @@ export function ConsoleTable<T>({
     columns,
     columnsStorageKey,
   )
-  const [cursor, setCursor] = useState(-1)
-  const bodyRef = useRef<HTMLTableSectionElement | null>(null)
 
-  // 行数变化后把游标夹回合法范围，而不是复位。
-  //
-  // 依赖 rows.length 而非 rows：rows 通常是 `data?.records ?? []`，每次渲染都是新的
-  // 数组标识，用它做依赖会让游标被反复清零——30 秒自动刷新一到，j/k 走到哪就丢在哪。
-  // 夹取还顺带处理了列表变短（筛选收紧、记录被删）时游标越界的情况。
-  useEffect(() => {
-    setCursor((prev) => (prev < 0 ? prev : Math.min(prev, rows.length - 1)))
-  }, [rows.length])
+  const [internalExpandedKeys, setInternalExpandedKeys] = useState<Set<number | string>>(new Set())
+  const effectiveExpandedKeys = expandedKeys ?? internalExpandedKeys
+  const setEffectiveExpandedKeys = onExpandedKeysChange ?? setInternalExpandedKeys
 
-  // 游标移动时把行滚进视野
-  useEffect(() => {
-    if (cursor < 0 || !bodyRef.current) return
-    const tr = bodyRef.current.children[cursor] as HTMLElement | undefined
-    tr?.scrollIntoView({ block: 'nearest' })
-  }, [cursor])
-
-  const onKeyDown = useRowKeyboard({
-    rows,
-    rowKey,
-    cursor,
-    setCursor,
-    onRowActivate,
-    selectable,
-    selected,
-    onSelectedChange,
-  })
+  const toggleExpand = useCallback((key: number | string) => {
+    const next = new Set(effectiveExpandedKeys)
+    if (next.has(key)) {
+      next.delete(key)
+    } else {
+      next.add(key)
+    }
+    setEffectiveExpandedKeys(next)
+  }, [effectiveExpandedKeys, setEffectiveExpandedKeys])
 
   const allSelected =
     rows.length > 0 && rows.every((r) => selected?.has(rowKey(r)))
@@ -282,6 +184,11 @@ export function ConsoleTable<T>({
   }
 
   const hasHiddenOption = columns.some((c) => c.optional)
+  const colSpanTotal =
+    ordered.length +
+    (selectable ? 1 : 0) +
+    (renderExpandedRow ? 1 : 0) +
+    (rowActions ? 1 : 0)
 
   return (
     <div className="console-scope space-y-2">
@@ -319,16 +226,11 @@ export function ConsoleTable<T>({
         </div>
       )}
 
-      <div
-        className="overflow-x-auto rounded-xl border border-border/60 bg-card/80 backdrop-blur-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
-        tabIndex={0}
-        onKeyDown={onKeyDown}
-        role="group"
-        aria-label="数据表格，j / k 移动，Enter 查看详情"
-      >
+      <div className="overflow-x-auto rounded-xl border border-border/60 bg-card [transform:translateZ(0)]">
         <table className="console-table">
           <thead>
             <tr>
+              {renderExpandedRow && <th className="w-8 px-1 text-center" />}
               {selectable && (
                 <th className="w-9 pl-3">
                   <Checkbox
@@ -350,56 +252,102 @@ export function ConsoleTable<T>({
               {rowActions && <th className="w-px" />}
             </tr>
           </thead>
-          <tbody ref={bodyRef}>
-            {rows.map((row, i) => {
+          <tbody>
+            {rows.map((row) => {
               const key = rowKey(row)
               const isSelected = selected?.has(key) ?? false
+              const isExpanded = effectiveExpandedKeys.has(key)
+              const canClickRow = Boolean(onRowActivate || (renderExpandedRow && expandOnRowClick))
               return (
-                <tr
-                  key={key}
-                  data-selected={isSelected || undefined}
-                  data-cursor={cursor === i || undefined}
-                  className={cn(onRowActivate && 'cursor-pointer')}
-                  onClick={() => {
-                    setCursor(i)
-                    onRowActivate?.(row)
-                  }}
-                >
-                  {selectable && (
-                    <td
-                      className={cn('pl-3', tone && railClass(tone(row)))}
-                      onClick={(e) => e.stopPropagation()}
+                <React.Fragment key={key}>
+                  <tr
+                    data-selected={isSelected || undefined}
+                    data-expanded={isExpanded || undefined}
+                    className={cn(canClickRow && 'cursor-pointer')}
+                    onClick={() => {
+                      onRowActivate?.(row)
+                      if (renderExpandedRow && expandOnRowClick) {
+                        toggleExpand(key)
+                      }
+                    }}
+                  >
+                    {renderExpandedRow && (
+                      <td
+                        className={cn(
+                          'w-8 px-1.5 text-center',
+                          !selectable && tone && railClass(tone(row)),
+                        )}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          toggleExpand(key)
+                        }}
+                      >
+                        <button
+                          type="button"
+                          className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                          title={isExpanded ? '收起详情' : '展开详情'}
+                          aria-label={isExpanded ? '收起详情' : '展开详情'}
+                        >
+                          <ChevronRight
+                            className={cn(
+                              'h-3.5 w-3.5 transition-transform duration-200',
+                              isExpanded && 'rotate-90 text-foreground',
+                            )}
+                          />
+                        </button>
+                      </td>
+                    )}
+                    {selectable && (
+                      <td
+                        className={cn(
+                          'pl-3',
+                          !renderExpandedRow && tone && railClass(tone(row)),
+                        )}
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <Checkbox
+                          checked={isSelected}
+                          onCheckedChange={() => toggleOne(key)}
+                          aria-label="选中此行"
+                        />
+                      </td>
+                    )}
+                    {ordered.map((c, ci) => (
+                      <td
+                        key={c.id}
+                        className={cn(
+                          c.align === 'right' && 'text-right',
+                          // 无展开列与复选框列时，色轨落在第一个数据列上
+                          !renderExpandedRow && !selectable && ci === 0 && tone && railClass(tone(row)),
+                        )}
+                      >
+                        {c.cell(row)}
+                      </td>
+                    ))}
+                    {rowActions && (
+                      <td
+                        className="pr-3 text-right"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <div className="console-row-actions flex items-center justify-end gap-1">
+                          {rowActions(row)}
+                        </div>
+                      </td>
+                    )}
+                  </tr>
+                  {renderExpandedRow && isExpanded && (
+                    <tr
+                      key={`${key}-expanded`}
+                      className="border-b border-border/60 bg-muted/15"
                     >
-                      <Checkbox
-                        checked={isSelected}
-                        onCheckedChange={() => toggleOne(key)}
-                        aria-label="选中此行"
-                      />
-                    </td>
+                      <td colSpan={colSpanTotal} className="p-0">
+                        <div className="border-l-2 border-primary/40 bg-card p-4">
+                          {renderExpandedRow(row)}
+                        </div>
+                      </td>
+                    </tr>
                   )}
-                  {ordered.map((c, ci) => (
-                    <td
-                      key={c.id}
-                      className={cn(
-                        c.align === 'right' && 'text-right',
-                        // 无复选框列时，色轨落在第一个数据列上
-                        !selectable && ci === 0 && tone && railClass(tone(row)),
-                      )}
-                    >
-                      {c.cell(row)}
-                    </td>
-                  ))}
-                  {rowActions && (
-                    <td
-                      className="pr-3 text-right"
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      <div className="console-row-actions flex items-center justify-end gap-1">
-                        {rowActions(row)}
-                      </div>
-                    </td>
-                  )}
-                </tr>
+                </React.Fragment>
               )
             })}
           </tbody>

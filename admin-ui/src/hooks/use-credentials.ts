@@ -24,6 +24,8 @@ import {
   setSelfHealConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
+  getCacheMeteringConfig,
+  setCacheMeteringConfig,
   getGlobalProxy,
   setGlobalProxy,
   getCustomModels,
@@ -331,6 +333,25 @@ export function useSetLogGovernanceConfig() {
     mutationFn: setLogGovernanceConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['logGovernanceConfig'] })
+    },
+  })
+}
+
+// 获取 prompt cache 计量模拟开关
+export function useCacheMeteringConfig() {
+  return useQuery({
+    queryKey: ['cacheMeteringConfig'],
+    queryFn: getCacheMeteringConfig,
+  })
+}
+
+// 切换 prompt cache 计量模拟开关
+export function useSetCacheMeteringConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setCacheMeteringConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['cacheMeteringConfig'] })
     },
   })
 }

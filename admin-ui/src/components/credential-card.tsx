@@ -812,12 +812,12 @@ function CredentialCardImpl({
       ref={setNodeRef}
       style={dragStyle}
       data-credential-id={credential.id}
-      className={`group flex min-w-0 items-center gap-2 rounded-2xl border bg-card/90 px-3 py-2.5 transition-all sm:gap-3.5 sm:px-4 ${railBorderClass(
+      className={`group flex min-w-0 items-center gap-2 rounded-2xl border border-border/60 bg-card px-3 py-2.5 transition-colors sm:gap-3.5 sm:px-4 [transform:translateZ(0)] ${railBorderClass(
         disposition.tone,
       )} ${
         isDragging
           ? "shadow-apple-lg opacity-80"
-          : "hover:bg-accent/30 hover:shadow-apple-sm"
+          : "hover:bg-accent/30 hover:border-border"
       } ${stateClasses}`}
     >
       {/* 拖拽手柄（字段排序开启时隐藏，此时拖拽无意义） */}
@@ -885,7 +885,7 @@ function CredentialCardImpl({
           </div>
           <div className="mt-0.5 flex h-[26px] items-center justify-center">
             {editingPriority ? (
-              <div className="absolute left-1/2 top-1/2 z-30 -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border/70 bg-popover/95 p-2 shadow-apple-lg backdrop-blur-md">
+              <div className="absolute left-1/2 top-1/2 z-30 -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border/70 bg-popover p-2 shadow-apple-lg">
                 <div className="inline-flex items-center gap-1">
                   <Input
                     type="number"
@@ -1115,8 +1115,8 @@ function CredentialCardImpl({
           ref={setNodeRef}
           style={dragStyle}
           data-credential-id={credential.id}
-          className={`group flex h-full min-w-0 flex-col overflow-hidden rounded-2xl border-border/70 bg-gradient-to-b from-card via-card/95 to-card/90 shadow-apple transition-all duration-200 backdrop-blur-md ${
-            isDragging ? "shadow-apple-lg opacity-80 scale-[1.01]" : "hover:shadow-apple-lg hover:-translate-y-0.5"
+          className={`group flex h-full min-w-0 flex-col overflow-hidden rounded-2xl border-border/70 bg-card shadow-apple-sm transition-shadow duration-150 [transform:translateZ(0)] ${
+            isDragging ? "shadow-apple-lg opacity-80" : "hover:shadow-apple hover:border-border"
           } ${stateClasses}`}
         >
           {/* Card Header: 选择框 + Title + 呼吸指示 + 禁用开关 */}

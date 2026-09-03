@@ -1,7 +1,7 @@
 import { useState, useMemo } from 'react'
 import { toast } from 'sonner'
 import {
-  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw,
+  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw, Loader2,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -248,6 +248,7 @@ export function ClientKeysPage() {
 
   const [selectedIds, setSelectedIds] = useState<Set<number | string>>(new Set())
   const [batchActionPending, setBatchActionPending] = useState(false)
+  const [batchProgress, setBatchProgress] = useState<{ current: number; total: number; action: 'delete' | 'toggle' } | null>(null)
 
   const keys: ClientKeyItem[] = useMemo(() => data?.keys ?? [], [data?.keys])
 
@@ -272,16 +273,19 @@ export function ClientKeysPage() {
     if (!ok) return
 
     setBatchActionPending(true)
+    setBatchProgress({ current: 0, total: deletableItems.length, action: 'delete' })
     let s = 0
     let f = 0
     try {
-      for (const item of deletableItems) {
+      for (let i = 0; i < deletableItems.length; i++) {
+        const item = deletableItems[i]
         try {
           await deleteKey.mutateAsync(item.id)
           s++
         } catch {
           f++
         }
+        setBatchProgress({ current: i + 1, total: deletableItems.length, action: 'delete' })
       }
       if (f === 0) {
         toast.success(`已批量删除 ${s} 把 Key`)
@@ -291,6 +295,7 @@ export function ClientKeysPage() {
       setSelectedIds(new Set())
     } finally {
       setBatchActionPending(false)
+      setBatchProgress(null)
     }
   }
 
@@ -298,21 +303,25 @@ export function ClientKeysPage() {
     if (selectedIds.size === 0) return
     const ids = Array.from(selectedIds).map(Number)
     setBatchActionPending(true)
+    setBatchProgress({ current: 0, total: ids.length, action: 'toggle' })
     let s = 0
     let f = 0
     try {
-      for (const id of ids) {
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i]
         try {
           await setDisabled.mutateAsync({ id, disabled })
           s++
         } catch {
           f++
         }
+        setBatchProgress({ current: i + 1, total: ids.length, action: 'toggle' })
       }
       toast.success(`已批量${disabled ? '禁用' : '启用'} ${s} 把 Key${f > 0 ? `，失败 ${f} 个` : ''}`)
       setSelectedIds(new Set())
     } finally {
       setBatchActionPending(false)
+      setBatchProgress(null)
     }
   }
 
@@ -532,8 +541,17 @@ export function ClientKeysPage() {
           className="h-8 px-3 text-xs gap-1.5 rounded-full hover:bg-accent"
           disabled={batchActionPending}
         >
-          <Power className="h-3.5 w-3.5 text-amber-500" />
-          批量禁用
+          {batchActionPending && batchProgress?.action === 'toggle' ? (
+            <>
+              <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-500" />
+              处理中 {batchProgress.current}/{batchProgress.total}
+            </>
+          ) : (
+            <>
+              <Power className="h-3.5 w-3.5 text-amber-500" />
+              批量禁用
+            </>
+          )}
         </Button>
         <Button
           onClick={handleBatchDelete}
@@ -542,8 +560,17 @@ export function ClientKeysPage() {
           className="h-8 px-3 text-xs gap-1.5 rounded-full"
           disabled={batchActionPending}
         >
-          <Trash2 className="h-3.5 w-3.5" />
-          {batchActionPending ? '删除中…' : '批量删除'}
+          {batchActionPending && batchProgress?.action === 'delete' ? (
+            <>
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              删除中 {batchProgress.current}/{batchProgress.total}
+            </>
+          ) : (
+            <>
+              <Trash2 className="h-3.5 w-3.5" />
+              批量删除
+            </>
+          )}
         </Button>
       </BulkBar>
 

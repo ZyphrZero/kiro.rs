@@ -48,6 +48,19 @@ interface TopbarToolsProps {
   compact?: boolean
 }
 
+// 顶栏“刷新数据”只刷新数据查询；配置查询有各自的保存/轮询语义。
+const NON_DATA_QUERY_ROOTS = new Set([
+  'loadBalancingMode',
+  'accountThrottleConfig',
+  'accountRpmLimitConfig',
+  'selfHealConfig',
+  'logGovernanceConfig',
+  'global-proxy',
+  'custom-models',
+  'update-config',
+  'system-update-check',
+])
+
 /** 一个开关的完整描述，compact / full 两种排布共用 */
 interface ToggleSpec {
   key: string
@@ -77,11 +90,13 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const [modelsOpen, setModelsOpen] = useState(false)
 
   const handleRefresh = () => {
-    queryClient.invalidateQueries({ queryKey: ['credentials'] })
-    queryClient.invalidateQueries({ queryKey: ['client-keys'] })
-    queryClient.invalidateQueries({ queryKey: ['stats'] })
-    queryClient.invalidateQueries({ queryKey: ['current-credential-models'] })
-    queryClient.invalidateQueries({ queryKey: ['credential-models'] })
+    // 刷新所有数据查询；配置查询不属于“刷新数据”，也不会因此触发上游检查。
+    queryClient.invalidateQueries({
+      predicate: ({ queryKey }) => {
+        const root = queryKey[0]
+        return typeof root === 'string' && !NON_DATA_QUERY_ROOTS.has(root)
+      },
+    })
     toast.success('已刷新')
   }
 
@@ -253,7 +268,7 @@ function CompactTools({
   return (
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
-        <Button variant="outline" size="icon" title="更多操作" className="relative">
+        <Button variant="ghost" size="icon" title="更多操作" className="relative">
           <MoreHorizontal className="h-4 w-4" />
           {hasUpdate && <UpdateDot />}
         </Button>

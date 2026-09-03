@@ -1,11 +1,20 @@
 import { useState, useEffect, lazy, Suspense } from "react";
 import { storage } from "@/lib/storage";
+import {
+  applyTheme,
+  applyThemeWithTransition,
+  resolveDarkMode,
+  type ThemeId,
+  type ThemeMode,
+  type ThemeSelection,
+} from "@/lib/theme";
 import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
-import { ConfirmProvider } from "@/components/ui/confirm-dialog";
+import { ConfirmProvider, useConfirm } from "@/components/ui/confirm-dialog";
 import { Button } from "@/components/ui/button";
-import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, FolderTree, SlidersHorizontal } from "lucide-react";
+import { Activity, KeyRound, Server, LogOut, ScrollText, FolderTree, SlidersHorizontal } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
+import { ThemePicker } from "@/components/theme-picker";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { tabFromHash } from "@/hooks/use-url-state";
 
@@ -120,11 +129,13 @@ function readTabFromHash(): Tab {
 }
 
 interface AppHeaderProps {
-  darkMode: boolean;
+  theme: ThemeSelection;
+  isDarkMode: boolean;
   tab: Tab;
   onLogout: () => void;
   onSwitchTab: (next: Tab) => void;
-  onToggleDarkMode: () => void;
+  onSelectPalette: (palette: ThemeId) => void;
+  onSelectMode: (mode: ThemeMode) => void;
 }
 
 function App() {
@@ -136,11 +147,13 @@ function App() {
 
   return (
     <LoggedInApp
-      darkMode={app.darkMode}
+      theme={app.theme}
+      isDarkMode={app.isDarkMode}
       tab={app.tab}
       onLogout={app.handleLogout}
       onSwitchTab={app.switchTab}
-      onToggleDarkMode={app.toggleDarkMode}
+      onSelectPalette={app.selectPalette}
+      onSelectMode={app.selectMode}
     />
   );
 }
@@ -148,12 +161,8 @@ function App() {
 function useAppShell() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [tab, setTab] = useState<Tab>(readTabFromHash);
-  const [darkMode, setDarkMode] = useState(() => {
-    if (typeof window !== "undefined") {
-      return document.documentElement.classList.contains("dark");
-    }
-    return false;
-  });
+  const [theme, setTheme] = useState<ThemeSelection>(() => storage.getThemeSelection());
+  const [isDarkMode, setIsDarkMode] = useState(() => resolveDarkMode(theme));
 
   useEffect(() => {
     if (storage.getApiKey()) setIsLoggedIn(true);
@@ -165,6 +174,27 @@ function useAppShell() {
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
+  useEffect(() => {
+    storage.setThemeSelection(theme);
+    const resolved = resolveDarkMode(theme);
+    const root = document.documentElement;
+    const alreadyApplied =
+      root.dataset.theme === theme.palette && root.classList.contains("dark") === resolved;
+    setIsDarkMode(alreadyApplied ? resolved : applyThemeWithTransition(theme, resolved));
+    if (alreadyApplied) applyTheme(theme, resolved);
+  }, [theme]);
+
+  useEffect(() => {
+    if (theme.mode !== "system" || typeof window.matchMedia !== "function") return;
+
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const onSystemThemeChange = (event: MediaQueryListEvent) => {
+      setIsDarkMode(applyThemeWithTransition(theme, event.matches));
+    };
+    media.addEventListener("change", onSystemThemeChange);
+    return () => media.removeEventListener("change", onSystemThemeChange);
+  }, [theme]);
+
   const switchTab = (next: Tab) => {
     window.location.hash = `#/${next}`;
     setTab(next);
@@ -175,19 +205,23 @@ function useAppShell() {
     storage.removeApiKey();
     setIsLoggedIn(false);
   };
-  const toggleDarkMode = () => {
-    setDarkMode((v) => !v);
-    document.documentElement.classList.toggle("dark");
+  const selectPalette = (palette: ThemeId) => {
+    setTheme((current) => ({ ...current, palette }));
+  };
+  const selectMode = (mode: ThemeMode) => {
+    setTheme((current) => ({ ...current, mode }));
   };
 
   return {
-    darkMode,
     handleLogin,
     handleLogout,
     isLoggedIn,
+    isDarkMode,
+    selectMode,
+    selectPalette,
     switchTab,
     tab,
-    toggleDarkMode,
+    theme,
   };
 }
 
@@ -201,21 +235,25 @@ function LoggedOutApp({ onLogin }: { onLogin: () => void }) {
 }
 
 function LoggedInApp({
-  darkMode,
+  theme,
+  isDarkMode,
   onLogout,
   onSwitchTab,
-  onToggleDarkMode,
+  onSelectPalette,
+  onSelectMode,
   tab,
 }: AppHeaderProps) {
   return (
     <TooltipProvider delayDuration={150}>
       <ConfirmProvider>
         <AppHeader
-          darkMode={darkMode}
+          theme={theme}
+          isDarkMode={isDarkMode}
           tab={tab}
           onLogout={onLogout}
           onSwitchTab={onSwitchTab}
-          onToggleDarkMode={onToggleDarkMode}
+          onSelectPalette={onSelectPalette}
+          onSelectMode={onSelectMode}
         />
         <AppMain tab={tab} onLogout={onLogout} />
         <Toaster position="top-center" />
@@ -225,10 +263,12 @@ function LoggedInApp({
 }
 
 function AppHeader({
-  darkMode,
+  theme,
+  isDarkMode,
   onLogout,
   onSwitchTab,
-  onToggleDarkMode,
+  onSelectPalette,
+  onSelectMode,
   tab,
 }: AppHeaderProps) {
   return (
@@ -236,9 +276,11 @@ function AppHeader({
       <div className="mx-auto flex h-14 max-w-[1400px] min-w-0 items-center gap-2 px-3 sm:h-16 sm:px-4 xl:px-8">
         <HeaderBrand tab={tab} onSwitchTab={onSwitchTab} />
         <HeaderActions
-          darkMode={darkMode}
+          theme={theme}
+          isDarkMode={isDarkMode}
           onLogout={onLogout}
-          onToggleDarkMode={onToggleDarkMode}
+          onSelectPalette={onSelectPalette}
+          onSelectMode={onSelectMode}
         />
       </div>
       <MobileTabs tab={tab} onSwitchTab={onSwitchTab} />
@@ -291,14 +333,30 @@ function DesktopTabs({
 }
 
 function HeaderActions({
-  darkMode,
+  theme,
+  isDarkMode,
   onLogout,
-  onToggleDarkMode,
+  onSelectPalette,
+  onSelectMode,
 }: {
-  darkMode: boolean;
+  theme: ThemeSelection;
+  isDarkMode: boolean;
   onLogout: () => void;
-  onToggleDarkMode: () => void;
+  onSelectPalette: (palette: ThemeId) => void;
+  onSelectMode: (mode: ThemeMode) => void;
 }) {
+  const confirm = useConfirm();
+
+  const handleLogout = async () => {
+    const confirmed = await confirm({
+      title: "退出登录？",
+      description: "退出后需要重新输入管理面板密钥才能继续使用。",
+      confirmText: "退出登录",
+      destructive: true,
+    });
+    if (confirmed) onLogout();
+  };
+
   return (
     <div className="flex shrink-0 items-center gap-1">
       <div className="xl:hidden">
@@ -309,10 +367,13 @@ function HeaderActions({
       </div>
       <span className="mx-1 hidden h-5 w-px bg-border/70 xl:inline-block" />
       <GithubButton />
-      <Button variant="ghost" size="icon" onClick={onToggleDarkMode} title="切换主题">
-        {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-      </Button>
-      <Button variant="ghost" size="icon" onClick={onLogout} title="退出登录">
+      <ThemePicker
+        theme={theme}
+        isDarkMode={isDarkMode}
+        onSelectPalette={onSelectPalette}
+        onSelectMode={onSelectMode}
+      />
+      <Button variant="ghost" size="icon" onClick={handleLogout} title="退出登录">
         <LogOut className="h-4 w-4" />
       </Button>
     </div>
@@ -348,7 +409,7 @@ function MobileTabs({
   tab: Tab;
 }) {
   return (
-    <div className="mx-auto flex max-w-[1400px] items-center gap-1 overflow-x-auto px-3 pb-2 xl:hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+    <div className="mx-auto grid w-full max-w-[1400px] grid-cols-6 items-center gap-0.5 overflow-hidden px-2 pb-2 xl:hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
       {TABS.map((t) => (
         <TabButton
           key={t.key}
@@ -374,7 +435,7 @@ function TabButton({
   tab: (typeof TABS)[number];
 }) {
   const className = mobile
-    ? "h-8 min-w-[4.25rem] flex-1 overflow-hidden rounded-full px-2 text-[11px] min-[360px]:min-w-[4.75rem] min-[390px]:px-3 min-[390px]:text-xs md:min-w-0 md:flex-none md:px-3"
+    ? "h-8 w-full min-w-0 overflow-hidden rounded-full px-0.5 text-[10px] min-[360px]:px-1 min-[360px]:text-[11px] min-[390px]:px-1.5 min-[390px]:text-xs md:w-auto md:min-w-0 md:px-3"
     : "h-7 rounded-full px-3 text-xs";
   const label = mobile ? tab.mobileLabel : tab.label;
 
