@@ -600,7 +600,7 @@ pub enum ConversionError {
     InvalidModel(String),
     EmptyMessages,
     InvalidMessageSequence(String),
-    /// Claude Code 工具无法映射到 Kiro 内置工具（如 Read.pages 无对应、内置缺 schema）。
+    /// Claude Code 工具无法映射到 Kiro 内置工具（如内置缺 schema）。
     UnsupportedToolMapping(String),
 }
 
@@ -1367,11 +1367,9 @@ fn map_tool_input_to_kiro(
             maybe_insert(&mut out, "timeout", take_first(&obj, &["timeout"]));
         }
         ("Read", "read_file") => {
-            if obj.contains_key("pages") && !obj.get("pages").is_some_and(|v| v.is_null()) {
-                return Err(ConversionError::UnsupportedToolMapping(
-                    "Claude Code Read.pages has no Kiro read_file equivalent".to_string(),
-                ));
-            }
+            // Claude Code 的 `pages`（PDF 页范围）在 Kiro read_file 中无对应字段。本函数只处理
+            // 回放的历史 tool_use，客户端无法修正，拒绝会让整个会话永久 400；这里随白名单
+            // 构造自然丢弃，Kiro 看到的只是一次普通读取历史。
             maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
             let offset = obj.get("offset").and_then(optional_number);
             let limit = obj.get("limit").and_then(optional_number);
@@ -2939,14 +2937,52 @@ mod tests {
     }
 
     #[test]
-    fn cc_outbound_read_pages_errors() {
-        let err = map_tool_input_to_kiro(
+    fn cc_outbound_read_pages_is_dropped() {
+        let out = map_tool_input_to_kiro(
             "Read",
-            serde_json::json!({"file_path": "/a", "pages": "1-3"}),
+            serde_json::json!({"file_path": "/a", "offset": 3, "pages": "1-3"}),
             ToolCompatibilityMode::ClaudeCode,
         )
-        .unwrap_err();
-        assert!(matches!(err, ConversionError::UnsupportedToolMapping(_)));
+        .unwrap();
+        assert!(out.get("pages").is_none());
+        assert_eq!(out["path"], serde_json::json!("/a"));
+        assert_eq!(out["start_line"], serde_json::json!(3));
+    }
+
+    /// 回归：历史 assistant 消息里的 Read.pages（含空串）不应让整个请求 400。
+    /// 该入参只会出现在回放历史中，客户端无法修正，报错会让该会话此后每次请求都失败。
+    #[test]
+    fn cc_history_read_with_pages_converts_without_error() {
+        use super::super::types::Message as AnthropicMessage;
+
+        for pages in [serde_json::json!("1-3"), serde_json::json!("")] {
+            let msg = AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "toolu_01PDF", "name": "Read",
+                     "input": {"file_path": "/a.pdf", "pages": pages}}
+                ]),
+            };
+            let mut map = HashMap::new();
+            let result = convert_assistant_message(
+                &msg,
+                &mut map,
+                ToolCompatibilityMode::ClaudeCode,
+                ConversionPurpose::Generate,
+            )
+            .unwrap_or_else(|e| panic!("pages={pages} 的历史 Read 应能转换: {e}"));
+
+            let tool_uses = result
+                .assistant_response_message
+                .tool_uses
+                .expect("应保留 tool_use");
+            assert_eq!(tool_uses[0].name, "read_file");
+            assert_eq!(tool_uses[0].input["path"], serde_json::json!("/a.pdf"));
+            assert!(
+                tool_uses[0].input.get("pages").is_none(),
+                "Kiro read_file schema 为 additionalProperties:false，不能带 pages"
+            );
+        }
     }
 
     #[test]
