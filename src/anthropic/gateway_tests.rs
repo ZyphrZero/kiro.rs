@@ -198,7 +198,7 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
         "fixture".to_owned(),
         Arc::new(LocalEndpoint(url)) as Arc<dyn KiroEndpoint>,
     )]);
-    let provider = KiroProvider::with_proxy(manager, None, endpoints, "fixture".to_owned());
+    let provider = KiroProvider::new(manager, endpoints, "fixture".to_owned());
     let state = AppState::new(false, ToolCompatibilityMode::Raw)
         .with_shared_kiro_provider(Arc::new(provider));
     Fixture {

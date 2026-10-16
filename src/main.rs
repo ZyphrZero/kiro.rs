@@ -164,9 +164,8 @@ async fn main() {
     });
     let token_manager = Arc::new(token_manager);
     token_manager.start_model_cache_warmer();
-    let kiro_provider = Arc::new(KiroProvider::with_proxy(
+    let kiro_provider = Arc::new(KiroProvider::new(
         token_manager.clone(),
-        proxy_config.clone(),
         endpoints,
         config.default_endpoint.clone(),
     ));
