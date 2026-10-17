@@ -48,7 +48,8 @@ Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
 - 自动 token 刷新：支持刷新后回写 `credentials.json`。
 - **多凭据调度**：`priority` 固定优先级和 `balanced` 均衡分配。
 - **故障转移**：凭据失败、额度用尽、账号级 429 限流冷却、token 失效强制刷新。
-- **profileArn 策略**：流式端点按账号类型注入真实 ARN 或 Builder ID 占位 ARN；用量类 / 头部类调用跳过占位 ARN。
+- **profileArn 策略**：流式端点与 MCP（WebSearch）按账号类型注入真实 ARN 或 Builder ID 占位 ARN；用量类调用跳过占位 ARN。
+- **可切换上游域名**：对话 / MCP 可发往 `q.{region}.amazonaws.com`（默认）或新版 Kiro 客户端使用的 `runtime.{region}.kiro.dev`，Admin 面板热切换。
 - **端点抽象**：按凭据选择 `ide` 或 `cli` endpoint。
 - **工具调用**：支持 `tool_use` / `tool_result` 配对、工具名缩短与反向映射。
 - **Thinking / Reasoning 兼容**：支持 `thinking.type=enabled` / `adaptive`、Claude Code 默认 thinking 请求、Kiro 原生 `reasoningContentEvent` 到 Anthropic thinking / signature / redacted thinking 事件的转换。
@@ -322,7 +323,7 @@ codex
 | `/api/admin/stats/*` | 用量统计 |
 | `/api/admin/traces` | 请求链路追踪查询 |
 | `/api/admin/proxy-pool` | 代理池 |
-| `/api/admin/config/*` | 运行时配置 |
+| `/api/admin/config/*` | 运行时配置（含 `GET/PUT /api/admin/config/api-domain` 上游域名） |
 | `/api/admin/auth/*` | Social / IdC 登录流程 |
 | `/api/admin/system/update/*` | 在线更新、回退、版本检查 |
 
@@ -362,6 +363,7 @@ Admin API 鉴权同样支持：
 | `authRegion` | 无 | token 刷新用 Region，未配置时回退 `region` |
 | `apiRegion` | 无 | Kiro API 请求用 Region，未配置时回退 `region` |
 | `defaultEndpoint` | `ide` | 凭据未指定 endpoint 时使用的端点 |
+| `apiDomain` | `amazonaws` | 对话 / MCP 上游域名：`amazonaws` → `q.{region}.amazonaws.com`，`kiro` → `runtime.{region}.kiro.dev`。见[上游域名](#api-domain) |
 | `tlsBackend` | `rustls` | `rustls` 或 `native-tls` |
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
@@ -442,6 +444,8 @@ Admin API 鉴权同样支持：
 ```
 
 Enterprise / IdC 账号在流式调用前会按需调用 `ListAvailableProfiles` 解析真实 `profileArn`，成功后写回凭据。纯 Builder ID/free 账号没有 Enterprise profile 时，会回退到官方 IDE 使用的 Builder ID 占位 ARN，以避免流式端点缺少 `profileArn` 返回 400。
+
+上游对这类账号的 `ListAvailableProfiles` 固定返回 403 `AWS Builder ID is not supported for this operation`，该结果按「无 Enterprise profile」处理：不再请求另一区域，并在进程内标记已解析，后续请求不再重复查询（避免每个请求首字前多出两次串行握手）。
 
 #### Social 登录
 
@@ -659,6 +663,8 @@ Kiro 上游可能返回原生 `reasoningContentEvent`。`kiro-rs` 会把它转�
 
 纯 web_search 请求会直接走上游 MCP 搜索接口。混合工具场景下，如果上游返回只包含 `web_search` 的工具调用，`kiro-rs` 会内部调用同一套 MCP 搜索接口，把结果作为 tool_result 喂回上游，直到上游停止搜索或达到轮数限制；其它工具调用会原样返回给客户端。
 
+MCP 搜索请求通过 `x-amzn-kiro-profile-arn` 头携带 profileArn，取值规则与对话请求相同（真实 ARN，或 Builder ID / Social 占位 ARN；API Key 凭据不发送）。上游 `/mcp` 缺少该头会返回 400 `profileArn is required for this request.`，表现为客户端收到 502 `Upstream API request failed.`。
+
 <a id="images"></a>
 ## 图片处理
 
@@ -827,6 +833,18 @@ credential.apiRegion -> credential.region -> config.apiRegion -> config.region
 仅配置凭据 `region` 时，Token 刷新和 API 请求都默认使用该区域。需要分开设置时，使用凭据级 `authRegion` 和 `apiRegion`；`authRegion` 本身不作为 API 请求区域的回退值。
 
 部分 REST / 管理类上游接口只在 `us-east-1` 和 `eu-central-1` 提供服务，代码会按账号区域选择候选端点并在必要时回退。
+
+<a id="api-domain"></a>
+### 上游域名
+
+`apiDomain` 决定对话（`generateAssistantResponse`）和 MCP（WebSearch）请求的 host：
+
+| 值 | host | 说明 |
+|---|---|---|
+| `amazonaws`（默认） | `q.{apiRegion}.amazonaws.com` | 原有行为 |
+| `kiro` | `runtime.{apiRegion}.kiro.dev` | 新版 Kiro IDE / Kiro CLI 使用的域名；官方客户端只内置 `us-east-1`、`eu-central-1` 等少数区域 |
+
+Token 刷新、用量查询、`ListAvailableProfiles` 等 REST 接口不受影响。可在 Admin 面板「调度设置 → 上游域名」切换，或调用 `PUT /api/admin/config/api-domain`（Body：`{"domain":"kiro"}`），立即生效并写回 `config.json`，无需重启。
 
 ### 代理优先级
 

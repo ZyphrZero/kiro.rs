@@ -473,6 +473,7 @@ impl KiroProvider {
                 token: &ctx.token,
                 machine_id: &machine_id,
                 config,
+                api_domain: self.token_manager.api_domain(),
             };
 
             let url = endpoint.mcp_url(&rctx);
@@ -848,6 +849,7 @@ impl KiroProvider {
                 token: &ctx.token,
                 machine_id: &machine_id,
                 config,
+                api_domain: self.token_manager.api_domain(),
             };
 
             let url = endpoint.api_url(&rctx);

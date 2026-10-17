@@ -1,7 +1,7 @@
 //! Kiro CLI 端点（Amazon Q for CLI）
 //!
 //! 对应 Kiro CLI / Amazon Q for CLI 使用的 AWS JSON 协议端点：
-//! - URL: `https://q.{api_region}.amazonaws.com/`（根路径 + x-amz-target 头）
+//! - URL: `https://{host}/`（根路径 + x-amz-target 头），`host` 由 `config.apiDomain` 决定
 //! - Content-Type: `application/x-amz-json-1.0`
 //! - User-Agent: aws-sdk-rust 格式
 //! - 请求体 origin: `KIRO_CLI`
@@ -22,12 +22,8 @@ impl CliEndpoint {
         Self
     }
 
-    fn api_region<'a>(&self, ctx: &'a RequestContext<'_>) -> &'a str {
-        ctx.credentials.effective_api_region(ctx.config)
-    }
-
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("q.{}.amazonaws.com", self.api_region(ctx))
+        ctx.runtime_host()
     }
 
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
@@ -62,11 +58,11 @@ impl KiroEndpoint for CliEndpoint {
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://q.{}.amazonaws.com/", self.api_region(ctx))
+        format!("https://{}/", self.host(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
+        format!("https://{}/mcp", self.host(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
@@ -98,7 +94,9 @@ impl KiroEndpoint for CliEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if let Some(arn) = ctx.credentials.effective_profile_arn() {
+        // 上游 MCP 同样强制要求 profileArn（缺失 → 400 profileArn is required），
+        // 与对话请求一致：BuilderID 占位符账号也要带上占位符
+        if let Some(arn) = ctx.credentials.streaming_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
         if let Some(token_type) = ctx.credentials.token_type_header() {
@@ -107,8 +105,12 @@ impl KiroEndpoint for CliEndpoint {
         req
     }
 
-    fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
-        set_origin_kiro_cli(body)
+    fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
+        // OAuth 凭据走 CLI 协议时上游要求 profileArn；API Key 凭据 streaming_profile_arn() 为 None，不注入
+        super::ide::inject_profile_arn(
+            &set_origin_kiro_cli(body),
+            ctx.credentials.streaming_profile_arn().as_deref(),
+        )
     }
 }
 

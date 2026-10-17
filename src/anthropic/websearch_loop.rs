@@ -581,9 +581,9 @@ fn append_search_round(
             "type": "server_tool_use", "id": srv_id, "name": "web_search",
             "input": {"query": query}
         }));
-        // Contract A: web_search_tool_result has only type + content (no tool_use_id), consistent with generate_websearch_events
         presentation.push(json!({
             "type": "web_search_tool_result",
+            "tool_use_id": srv_id,
             "content": build_result_block(results)
         }));
     }
@@ -775,6 +775,7 @@ fn build_flush_content(
             let results: &Option<WebSearchResults> = searched.get(idx).unwrap_or(&None);
             content.push(json!({
                 "type": "web_search_tool_result",
+                "tool_use_id": srv_id,
                 "content": build_result_block(results)
             }));
         } else {
@@ -928,6 +929,7 @@ impl Drop for WebSearchUsageSettlement {
 #[derive(Debug)]
 struct PendingWebSearch {
     block_index: i32,
+    tool_use_id: String,
 }
 
 /// Emits one coherent Anthropic SSE message while the agentic loop runs in a
@@ -981,7 +983,10 @@ impl WebSearchSseEmitter {
             }),
         ))
         .await;
-        PendingWebSearch { block_index }
+        PendingWebSearch {
+            block_index,
+            tool_use_id,
+        }
     }
 
     /// Closes a search block that was opened via `begin_search` but must not be
@@ -1027,6 +1032,7 @@ impl WebSearchSseEmitter {
                 "index": result_index,
                 "content_block": {
                     "type": "web_search_tool_result",
+                    "tool_use_id": pending.tool_use_id,
                     "content": build_result_block(results)
                 }
             }),
@@ -2061,6 +2067,16 @@ mod tests {
             1,
             "the final flush must not repeat an already streamed result"
         );
+        let srv_id = &starts
+            .iter()
+            .find(|data| data["content_block"]["type"] == "server_tool_use")
+            .unwrap()["content_block"]["id"];
+        let result_ref = &starts
+            .iter()
+            .find(|data| data["content_block"]["type"] == "web_search_tool_result")
+            .unwrap()["content_block"]["tool_use_id"];
+        assert!(srv_id.is_string());
+        assert_eq!(result_ref, srv_id, "streamed result must reference its server_tool_use");
 
         let stops: Vec<i64> = events
             .iter()
@@ -2604,6 +2620,15 @@ mod tests {
                 .any(|c| c["type"] == "web_search_tool_result"),
             "web_search must carry a web_search_tool_result block"
         );
+        let srv = content
+            .iter()
+            .find(|c| c["type"] == "server_tool_use")
+            .unwrap();
+        let res = content
+            .iter()
+            .find(|c| c["type"] == "web_search_tool_result")
+            .unwrap();
+        assert_eq!(res["tool_use_id"], srv["id"], "result must reference its server_tool_use");
         assert!(
             content
                 .iter()

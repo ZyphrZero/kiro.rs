@@ -19,8 +19,8 @@ use super::{
     middleware::AdminState,
     trace_db::TraceQuery,
     types::{
-        AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
-        BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
+        AddCredentialRequest, AddProxyRequest, ApiDomainConfig, AssignProxyRequest,
+        AssignRoundRobinRequest, BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
         CreateClientKeyResponse, ModelTestRequest,
         CredentialMetadataSchemaConfig,
@@ -565,6 +565,24 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/api-domain
+/// 获取对话 / MCP 上游域名
+pub async fn get_api_domain(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_api_domain())
+}
+
+/// PUT /api/admin/config/api-domain
+/// 设置对话 / MCP 上游域名
+pub async fn set_api_domain(
+    State(state): State<AdminState>,
+    Json(payload): Json<ApiDomainConfig>,
+) -> impl IntoResponse {
+    match state.service.set_api_domain(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

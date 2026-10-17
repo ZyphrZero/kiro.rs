@@ -9,6 +9,7 @@
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
   "defaultEndpoint": "ide",
+  "apiDomain": "amazonaws",
   "updateAutoApply": false,
   "updateAutoApplyTime": "03:00",
   "modelCacheTtlSecs": 3600,

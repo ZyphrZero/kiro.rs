@@ -9,6 +9,8 @@ import {
   useSetQuotaResetRecoveryConfig,
   useLoadBalancingMode,
   useSetLoadBalancingMode,
+  useApiDomain,
+  useSetApiDomain,
   useSelfHealConfig,
   useSetSelfHealConfig,
 } from '@/hooks/use-credentials'
@@ -38,6 +40,7 @@ export function DispatchSection() {
   return (
     <div className="space-y-6">
       <LoadBalancingGroup />
+      <ApiDomainGroup />
       <RateLimitHandlingGroup />
       <RpmLimitGroup />
       <QuotaResetRecoveryGroup />
@@ -68,6 +71,37 @@ function LoadBalancingGroup() {
         onChange={(next) => saver.save('mode', next)}
         pending={saver.isSaving('mode')}
         saved={saver.isSaved('mode')}
+        disabled={isLoading}
+      />
+    </SettingGroup>
+  )
+}
+
+function ApiDomainGroup() {
+  const { data, isLoading } = useApiDomain()
+  const { mutate } = useSetApiDomain()
+  const saver = useFieldSaver(mutate, reportSaveError)
+
+  return (
+    <SettingGroup
+      title="上游域名"
+      description="请求发往哪个 Kiro 服务器；立即生效并写入 config.json，无需重启"
+    >
+      <SettingSegments
+        label="API 域名"
+        hint={
+          data?.domain === 'kiro'
+            ? '发往 runtime.{区域}.kiro.dev（新版 Kiro IDE / CLI 用的域名）'
+            : '发往 q.{区域}.amazonaws.com（kiro-rs 原默认）'
+        }
+        value={data?.domain ?? 'amazonaws'}
+        options={[
+          { value: 'amazonaws', label: '老域名', hint: 'q.{区域}.amazonaws.com' },
+          { value: 'kiro', label: '新域名', hint: 'runtime.{区域}.kiro.dev' },
+        ]}
+        onChange={(next) => saver.save('domain', next)}
+        pending={saver.isSaving('domain')}
+        saved={saver.isSaved('domain')}
         disabled={isLoading}
       />
     </SettingGroup>

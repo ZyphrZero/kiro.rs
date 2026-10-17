@@ -348,7 +348,7 @@ fn generate_websearch_events(
     ));
 
     // 5. content_block_start (web_search_tool_result, index 2)
-    // 官方 API 的 web_search_tool_result 没有 tool_use_id 字段
+    // 官方 API 要求 tool_use_id 指向对应的 server_tool_use，AI SDK 等严格客户端缺了会解析失败
     let search_content = websearch_result_content(&search_results);
 
     events.push(SseEvent::new(
@@ -358,6 +358,7 @@ fn generate_websearch_events(
             "index": 2,
             "content_block": {
                 "type": "web_search_tool_result",
+                "tool_use_id": tool_use_id,
                 "content": search_content
             }
         }),
@@ -510,6 +511,7 @@ fn build_websearch_content(
         }),
         json!({
             "type": "web_search_tool_result",
+            "tool_use_id": tool_use_id,
             "content": websearch_result_content(search_results)
         }),
         json!({"type": "text", "text": generate_search_summary(query, search_results)}),
@@ -990,5 +992,22 @@ mod tests {
         assert!(summary.contains("Test Result"));
         assert!(summary.contains("https://example.com"));
         assert!(summary.contains("This is a test snippet"));
+    }
+
+    #[test]
+    fn web_search_tool_result_references_server_tool_use_id() {
+        let events = generate_websearch_events("claude-sonnet-4.5", "q", "srvtoolu_abc", None, 1);
+        let result_block = events
+            .iter()
+            .find(|e| e.data["content_block"]["type"] == "web_search_tool_result")
+            .expect("web_search_tool_result block");
+        assert_eq!(result_block.data["content_block"]["tool_use_id"], "srvtoolu_abc");
+
+        let content = build_websearch_content("q", "srvtoolu_abc", &None);
+        let block = content
+            .iter()
+            .find(|b| b["type"] == "web_search_tool_result")
+            .expect("web_search_tool_result block");
+        assert_eq!(block["tool_use_id"], "srvtoolu_abc");
     }
 }

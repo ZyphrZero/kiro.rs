@@ -9,7 +9,7 @@
 use reqwest::RequestBuilder;
 
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::model::config::Config;
+use crate::model::config::{ApiDomain, Config};
 
 pub mod cli;
 pub mod ide;
@@ -110,6 +110,16 @@ pub struct RequestContext<'a> {
     pub machine_id: &'a str,
     /// 全局配置
     pub config: &'a Config,
+    /// 对话 / MCP 上游域名（运行时值，Admin 可热修改，不读 `config.api_domain`）
+    pub api_domain: ApiDomain,
+}
+
+impl RequestContext<'_> {
+    /// 对话 / MCP 请求的上游 host
+    pub fn runtime_host(&self) -> String {
+        self.api_domain
+            .runtime_host(self.credentials.effective_api_region(self.config))
+    }
 }
 
 /// 触发"额度耗尽 → 禁用并切换"的 reason 取值集合
@@ -308,6 +318,7 @@ mod tests {
                 token: "test-token",
                 machine_id: "test-machine",
                 config: &config,
+                api_domain: config.api_domain,
             };
             let host = format!("q.{expected_region}.amazonaws.com");
 
@@ -335,6 +346,84 @@ mod tests {
                     .unwrap();
                 assert_eq!(mcp.url().as_str(), format!("https://{host}/mcp"));
                 assert_eq!(mcp.headers()["host"].to_str().unwrap(), host);
+            }
+        }
+    }
+
+    #[test]
+    fn test_api_domain_kiro_switches_api_and_mcp_host() {
+        let client = reqwest::Client::new();
+        let endpoints: [&dyn KiroEndpoint; 2] = [&IdeEndpoint::new(), &CliEndpoint::new()];
+        let credentials: KiroCredentials = serde_json::from_str(r#"{"region":"eu-central-1"}"#).unwrap();
+        let config: Config = serde_json::from_str(r#"{"apiDomain":"kiro"}"#).unwrap();
+        assert_eq!(config.api_domain, crate::model::config::ApiDomain::Kiro);
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "test-token",
+            machine_id: "test-machine",
+            config: &config,
+            api_domain: config.api_domain,
+        };
+        let host = "runtime.eu-central-1.kiro.dev";
+
+        for endpoint in endpoints {
+            let api = endpoint
+                .decorate_api(client.post(endpoint.api_url(&ctx)), &ctx)
+                .build()
+                .unwrap();
+            assert!(api.url().as_str().starts_with(&format!("https://{host}/")));
+            assert_eq!(api.headers()["host"].to_str().unwrap(), host);
+
+            let mcp = endpoint
+                .decorate_mcp(client.post(endpoint.mcp_url(&ctx)), &ctx)
+                .build()
+                .unwrap();
+            assert_eq!(mcp.url().as_str(), format!("https://{host}/mcp"));
+            assert_eq!(mcp.headers()["host"].to_str().unwrap(), host);
+        }
+    }
+
+    #[test]
+    fn test_api_domain_defaults_to_amazonaws() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.api_domain, crate::model::config::ApiDomain::Amazonaws);
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["apiDomain"],
+            serde_json::json!("amazonaws")
+        );
+    }
+
+    #[test]
+    fn test_mcp_sends_placeholder_profile_arn_header() {
+        let client = reqwest::Client::new();
+        let endpoints: [&dyn KiroEndpoint; 2] = [&IdeEndpoint::new(), &CliEndpoint::new()];
+        let placeholder = crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN;
+        let config = Config::default();
+        let cases = [
+            (format!(r#"{{"authMethod":"idc","profileArn":"{placeholder}"}}"#), Some(placeholder)),
+            (r#"{"authMethod":"idc"}"#.to_string(), Some(placeholder)),
+            (r#"{"kiroApiKey":"k"}"#.to_string(), None),
+        ];
+
+        for (json, expected) in &cases {
+            let credentials: KiroCredentials = serde_json::from_str(json).unwrap();
+            let ctx = RequestContext {
+                credentials: &credentials,
+                token: "test-token",
+                machine_id: "test-machine",
+                config: &config,
+                api_domain: config.api_domain,
+            };
+            for endpoint in endpoints {
+                let mcp = endpoint
+                    .decorate_mcp(client.post(endpoint.mcp_url(&ctx)), &ctx)
+                    .build()
+                    .unwrap();
+                let header = mcp
+                    .headers()
+                    .get("x-amzn-kiro-profile-arn")
+                    .map(|v| v.to_str().unwrap());
+                assert_eq!(header, *expected, "{} {json}", endpoint.name());
             }
         }
     }

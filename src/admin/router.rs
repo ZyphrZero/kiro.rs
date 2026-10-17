@@ -18,7 +18,7 @@ use super::{
         get_account_throttle_config, get_all_credentials,
         get_credential_balance, get_credential_metadata_schema, get_credential_models,
         get_current_models, get_global_proxy, get_custom_models,
-        get_cache_metering_config, get_session_affinity_config,
+        get_api_domain, get_cache_metering_config, get_session_affinity_config,
         get_load_balancing_mode, get_log_governance_config, get_model_api_retry_config,
         get_proxy_pool, get_quota_reset_recovery_config, get_self_heal_config, get_update_config, list_client_keys, list_groups,
         list_traces, poll_idc_login,
@@ -28,7 +28,7 @@ use super::{
         set_account_throttle_config, set_client_key_disabled, set_client_key_max_credits,
         set_credential_disabled, set_credential_metadata_schema, set_credential_overage,
         set_credential_priority, set_custom_models, set_global_proxy, set_load_balancing_mode,
-        set_cache_metering_config, set_session_affinity_config,
+        set_api_domain, set_cache_metering_config, set_session_affinity_config,
         set_log_governance_config, set_model_api_retry_config, set_proxy_enabled, set_quota_reset_recovery_config,
         set_self_heal_config, set_update_config, start_idc_login, start_idc_relogin,
         start_social_login, start_social_relogin,
@@ -111,6 +111,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
+        )
+        .route(
+            "/config/api-domain",
+            get(get_api_domain).put(set_api_domain),
         )
         .route(
             "/config/account-throttle",
