@@ -16,6 +16,8 @@ import {
   updateRefreshToken,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getApiDomain,
+  setApiDomain,
   getAccountThrottleConfig,
   setAccountThrottleConfig,
   getModelApiRetryConfig,
@@ -262,6 +264,25 @@ export function useSetLoadBalancingMode() {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
       queryClient.invalidateQueries({ queryKey: ['current-credential-models'] })
+    },
+  })
+}
+
+// 获取上游域名
+export function useApiDomain() {
+  return useQuery({
+    queryKey: ['apiDomain'],
+    queryFn: getApiDomain,
+  })
+}
+
+// 设置上游域名
+export function useSetApiDomain() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setApiDomain,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['apiDomain'] })
     },
   })
 }

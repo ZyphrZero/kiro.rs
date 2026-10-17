@@ -448,6 +448,20 @@ export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promi
   return data
 }
 
+export type ApiDomain = 'amazonaws' | 'kiro'
+
+// 获取上游域名
+export async function getApiDomain(): Promise<{ domain: ApiDomain }> {
+  const { data } = await api.get<{ domain: ApiDomain }>('/config/api-domain')
+  return data
+}
+
+// 设置上游域名
+export async function setApiDomain(domain: ApiDomain): Promise<{ domain: ApiDomain }> {
+  const { data } = await api.put<{ domain: ApiDomain }>('/config/api-domain', { domain })
+  return data
+}
+
 export interface AccountThrottleConfig {
   failover: boolean
   cooldownSecs: number

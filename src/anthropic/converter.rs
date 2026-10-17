@@ -902,6 +902,21 @@ pub(crate) fn convert_request_with_purpose(
     // by upstream model capability rather than by the mere presence of client output_config.
     let additional_model_request_fields = build_additional_model_request_fields(req, &model_id);
 
+    let upstream_effort = additional_model_request_fields.as_ref().and_then(|f| {
+        f.output_config
+            .as_ref()
+            .map(|c| c.effort.as_str())
+            .or_else(|| f.reasoning.as_ref().map(|r| r.effort.as_str()))
+    });
+    tracing::info!(
+        model_id = %model_id,
+        thinking_type = req.thinking.as_ref().map(|t| t.thinking_type.as_str()).unwrap_or("-"),
+        budget_tokens = req.thinking.as_ref().map(|t| t.budget_tokens).unwrap_or(0),
+        client_effort = req.output_config.as_ref().map(|c| c.effort.as_str()).unwrap_or("-"),
+        upstream_effort = upstream_effort.unwrap_or("-"),
+        "thinking 配置"
+    );
+
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,

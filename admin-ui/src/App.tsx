@@ -91,14 +91,10 @@ function App() {
 }
 
 function useAppShell() {
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [isLoggedIn, setIsLoggedIn] = useState(() => !!storage.getApiKey());
   const [tab, setTab] = useState<Tab>(readTabFromHash);
   const [theme, setTheme] = useState<ThemeSelection>(() => storage.getThemeSelection());
   const [isDarkMode, setIsDarkMode] = useState(() => resolveDarkMode(theme));
-
-  useEffect(() => {
-    if (storage.getApiKey()) setIsLoggedIn(true);
-  }, []);
 
   useEffect(() => {
     const onHash = () => setTab(readTabFromHash());

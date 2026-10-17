@@ -496,6 +496,14 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
+/// 上游域名配置（GET 响应 / PUT 请求共用）
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiDomainConfig {
+    /// "amazonaws" 或 "kiro"
+    pub domain: crate::model::config::ApiDomain,
+}
+
 /// 账号级 429 限流故障转移配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
