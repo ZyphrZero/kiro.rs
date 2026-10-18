@@ -1448,7 +1448,7 @@ async fn run_web_search_loop_inner(
 
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
         let mut empty_retries = 0usize;
-        let round = loop {
+        let mut round = loop {
             let round_fallback_input_tokens = token::count_all_tokens(
                 payload.model.clone(),
                 payload.system.clone(),
@@ -1552,6 +1552,13 @@ async fn run_web_search_loop_inner(
 
             break round;
         };
+
+        if is_refusal(&round.stop_reason_override) {
+            // Cancel this round's calls before either search path runs. Clearing
+            // the recovery table also prevents text leaks from becoming calls.
+            round.tool_uses.clear();
+            round.known_tool_names.clear();
+        }
 
         // 拒答是终态：即便本轮带了 web_search，也不再续跑搜索轮次，直接带 refusal 收尾。
         if !is_refusal(&round.stop_reason_override)

@@ -1709,7 +1709,11 @@ pub(crate) async fn execute_non_stream_request(
     // 收尾：无参工具的 0 字节滞留缓冲在此还原为 {} 补进 content；累积了非空内容
     // 却从未收到 stop=true 的（上游在参数写到一半时截断）返回 IncompleteJson。
     // 已有错误则保持不变。
-    if tool_json_error.is_none() {
+    if refused {
+        // A filter refusal can cut off tool arguments. Do not recover pending
+        // calls or replace the authoritative refusal with their JSON errors.
+        tool_json_error = None;
+    } else if tool_json_error.is_none() {
         match tool_accumulator.finish(&tool_name_map) {
             Ok(recovered) => {
                 for completed in recovered {

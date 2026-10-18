@@ -57,6 +57,11 @@ enum Mode {
     /// 上游内容过滤拦截：只有 reasoning，`metadataEvent.stopReason = CONTENT_FILTERED`，
     /// 随后 contextUsage 100%（验证拒答不被上下文溢出覆盖）。帧序列取自线上抓包。
     Refused,
+    RefusedWithSearch,
+    RefusedWithPartialTool,
+    RefusedWithInvalidTool,
+    RefusedWithEmptyTool,
+    RefusedBare,
 }
 
 struct Fixture {
@@ -165,8 +170,24 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 ] { bytes.extend_from_slice(&part); }
                 return Response::new(Body::from(bytes));
             }
-            if matches!(mode, Mode::Refused) {
+            if matches!(mode, Mode::Refused | Mode::RefusedWithSearch | Mode::RefusedWithPartialTool | Mode::RefusedWithInvalidTool | Mode::RefusedWithEmptyTool | Mode::RefusedBare) {
                 let mut bytes = Vec::new();
+                if matches!(mode, Mode::RefusedWithSearch) {
+                    bytes.extend_from_slice(&frame("toolUseEvent", json!({"name":"web_search","toolUseId":"search_1","input":"{\"query\":\"example\"}","stop":true})));
+                }
+                if matches!(mode, Mode::RefusedWithPartialTool) {
+                    bytes.extend_from_slice(&frame("toolUseEvent", json!({"name":"run","toolUseId":"run_1","input":"{\"command\":","stop":false})));
+                }
+                if matches!(mode, Mode::RefusedWithInvalidTool) {
+                    bytes.extend_from_slice(&frame("toolUseEvent", json!({"name":"run","toolUseId":"run_1","input":"{\"command\":","stop":true})));
+                }
+                if matches!(mode, Mode::RefusedWithEmptyTool) {
+                    bytes.extend_from_slice(&frame("toolUseEvent", json!({"name":"run","toolUseId":"run_1","input":"","stop":false})));
+                }
+                if matches!(mode, Mode::RefusedBare) {
+                    bytes.extend_from_slice(&frame("metadataEvent", json!({"stopReason":"CONTENT_FILTERED"})));
+                    return Response::new(Body::from(bytes));
+                }
                 for part in [
                     frame("reasoningContentEvent", json!({"text":"The"})),
                     frame("metadataEvent", json!({"stopReason":"CONTENT_FILTERED","stopDetails":{"refusal":{"category":"CYBER","explanation":"The selected model cannot continue this conversation."}}})),
@@ -473,6 +494,102 @@ async fn gateway_content_filter_refusal_is_not_a_successful_end_turn() {
     let responses = text(request(f.state.clone(), "responses", true).await).await;
     assert!(responses.contains("event: response.incomplete"), "{responses}");
     assert!(responses.contains(r#""reason":"content_filter""#), "{responses}");
+}
+
+#[tokio::test]
+async fn gateway_refusal_nonstream_compatibility_and_bare_metadata() {
+    for mode in [Mode::Refused, Mode::RefusedBare] {
+        let f = fixture(mode).await;
+        for (endpoint, field, expected) in [
+            ("messages", "/stop_reason", "refusal"),
+            ("chat", "/choices/0/finish_reason", "content_filter"),
+            ("responses", "/incomplete_details/reason", "content_filter"),
+        ] {
+            let response = request(f.state.clone(), endpoint, false).await;
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status, StatusCode::OK, "{endpoint}: {body}");
+            assert_eq!(
+                body.pointer(field).and_then(|v| v.as_str()),
+                Some(expected),
+                "{endpoint}: {body}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_refused_round_does_not_execute_search() {
+    let mut failures = Vec::new();
+    for streaming in [false, true] {
+        let f = fixture(Mode::RefusedWithSearch).await;
+        let payload = json!({
+            "model":"gpt-5.6-sol","max_tokens":64,"stream":streaming,
+            "messages":[{"role":"user","content":"hello"}],
+            "tools":[
+                {"type":"web_search_20250305","name":"web_search"},
+                {"name":"run","description":"test command","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}
+            ]
+        });
+        let response = post_messages(
+            axum::extract::State(f.state.clone()),
+            Extension(key()),
+            Json(serde_json::from_value(payload).unwrap()),
+        )
+        .await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        let calls = f.calls.load(Ordering::Relaxed);
+        if status != StatusCode::OK
+            || calls != 1
+            || !body.contains("\"refusal\"")
+            || body.contains("server_tool_use")
+            || body.contains("web_search_tool_result")
+        {
+            failures.push(format!(
+                "stream={streaming}, calls={calls}, status={status}, body={body}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn gateway_partial_tool_before_refusal_preserves_terminal_reason() {
+    let mut failures = Vec::new();
+    for mode in [
+        Mode::RefusedWithPartialTool,
+        Mode::RefusedWithInvalidTool,
+        Mode::RefusedWithEmptyTool,
+    ] {
+        for streaming in [false, true] {
+            let f = fixture(mode).await;
+            let payload = json!({
+                "model":"gpt-5.6-sol","max_tokens":64,"stream":streaming,
+                "messages":[{"role":"user","content":"hello"}],
+                "tools":[{"name":"run","description":"test command","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}]
+            });
+            let response = post_messages(
+                axum::extract::State(f.state.clone()),
+                Extension(key()),
+                Json(serde_json::from_value(payload).unwrap()),
+            )
+            .await;
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let body = String::from_utf8_lossy(&bytes);
+            if status != StatusCode::OK
+                || !body.contains("\"refusal\"")
+                || body.contains("upstream_tool_json_error")
+                || body.contains("\"type\":\"tool_use\"")
+            {
+                failures.push(format!("stream={streaming}, status={status}, body={body}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[tokio::test]

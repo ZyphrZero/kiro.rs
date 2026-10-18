@@ -2591,7 +2591,11 @@ impl StreamContext {
         // 收尾检查工具调用累积器：无参工具（0 字节滞留）在此还原为 `{}` 并正常发出；
         // 累积了非空内容却从未 stop=true 的才是上游中途截断，记为错误。
         // process_tool_use 中已置位的错误保持不变。
-        if self.tool_json_error.is_none() {
+        if self.state_manager.get_stop_reason() == REFUSAL_STOP_REASON {
+            // Refused generation can end in the middle of a tool call. Drop
+            // pending calls rather than recovering them or reporting JSON errors.
+            self.tool_json_error = None;
+        } else if self.tool_json_error.is_none() {
             let finished = self.tool_json_accumulator.finish(&self.tool_name_map);
             match finished {
                 Ok(recovered) => {
