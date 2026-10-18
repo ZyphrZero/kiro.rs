@@ -19,6 +19,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixes
 
 - Stop rejecting requests whose history contains a Claude Code `Read` call with `pages` (HTTP 400 `工具映射不支持: Claude Code Read.pages has no Kiro read_file equivalent`). The field has no Kiro `read_file` equivalent and only appears in replayed history the client cannot correct, so it is now dropped instead of failing the whole session.
+- Surface upstream content-filter refusals instead of returning them as successful empty answers. When Kiro stops a conversation with `metadataEvent.stopReason = CONTENT_FILTERED` it sends only reasoning, no text and no meteringEvent; kiro.rs ignored the signal and answered `end_turn` (or `model_context_window_exceeded` when the trailing contextUsage hit 100%), so clients kept resending the same blocked history. Such turns now end with `stop_reason: "refusal"` on `/v1/messages` and `/cc/v1/messages`, `finish_reason: "content_filter"` on Chat Completions, `incomplete_details.reason: "content_filter"` on Responses, and a `content_filter` failure on compaction. The refusal is terminal within a turn and is logged with the upstream category and explanation.
 
 ## [0.9.1] - 2026-10-08
 

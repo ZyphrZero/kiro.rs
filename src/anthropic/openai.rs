@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 use super::handlers::post_messages;
 use super::middleware::{AppState, KeyContext};
+use super::stream::REFUSAL_STOP_REASON;
 use super::types::{Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Tool};
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
@@ -588,6 +589,8 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
 
 fn map_finish_reason(stop_reason: &str, has_tool_calls: bool) -> &'static str {
     match stop_reason {
+        // 拒答优先于工具调用：被拦截的轮次不应让客户端去执行半截的 tool_calls。
+        REFUSAL_STOP_REASON => "content_filter",
         "tool_use" => "tool_calls",
         "max_tokens" | "model_context_window_exceeded" => "length",
         _ if has_tool_calls => "tool_calls",

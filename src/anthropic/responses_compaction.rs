@@ -645,6 +645,14 @@ fn validate(parsed: ParsedResponse, usage: Value) -> Outcome {
     match parsed.upstream_stop_reason.as_str() {
         "max_tokens" => return Outcome::Incomplete { usage },
         CONTEXT_WINDOW_EXCEEDED => return context_overflow_outcome(usage),
+        // 拒答时上游不给摘要；明确报 content_filter，而不是笼统的「没有摘要」。
+        super::super::stream::REFUSAL_STOP_REASON => {
+            return Outcome::Failed {
+                code: "content_filter",
+                message: "upstream content filter refused the compaction request".to_string(),
+                usage,
+            };
+        }
         _ => {}
     }
     if !parsed.tool_calls.is_empty() {

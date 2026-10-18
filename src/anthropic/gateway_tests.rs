@@ -54,6 +54,9 @@ enum Mode {
     SlowErrorBody,
     MetadataFirst,
     Active,
+    /// 上游内容过滤拦截：只有 reasoning，`metadataEvent.stopReason = CONTENT_FILTERED`，
+    /// 随后 contextUsage 100%（验证拒答不被上下文溢出覆盖）。帧序列取自线上抓包。
+    Refused,
 }
 
 struct Fixture {
@@ -159,6 +162,15 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                     frame("toolUseEvent", json!({"name":"run", "toolUseId":"call_1", "input":"{\"command\":", "stop":false})),
                     frame("toolUseEvent", json!({"name":"run", "toolUseId":"call_1", "input":"\"hello\"}", "stop":true})),
                     frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})),
+                ] { bytes.extend_from_slice(&part); }
+                return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::Refused) {
+                let mut bytes = Vec::new();
+                for part in [
+                    frame("reasoningContentEvent", json!({"text":"The"})),
+                    frame("metadataEvent", json!({"stopReason":"CONTENT_FILTERED","stopDetails":{"refusal":{"category":"CYBER","explanation":"The selected model cannot continue this conversation."}}})),
+                    frame("contextUsageEvent", json!({"contextUsagePercentage":100.0})),
                 ] { bytes.extend_from_slice(&part); }
                 return Response::new(Body::from(bytes));
             }
@@ -433,6 +445,34 @@ async fn gateway_chat_tool_arguments_and_final_usage_are_complete() {
     assert_eq!(usage["prompt_tokens"], 18);
     assert_eq!(usage["completion_tokens"], 17);
     assert!(text.ends_with("data: [DONE]\n\n"));
+}
+
+#[tokio::test]
+async fn gateway_content_filter_refusal_is_not_a_successful_end_turn() {
+    let f = fixture(Mode::Refused).await;
+    async fn text(response: Response) -> String {
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    let response = request(f.state.clone(), "messages", false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&text(response).await).unwrap();
+    assert_eq!(body["stop_reason"], "refusal", "{body}");
+
+    for endpoint in ["cc", "messages"] {
+        let sse = text(request(f.state.clone(), endpoint, true).await).await;
+        assert!(sse.contains(r#""stop_reason":"refusal""#), "{endpoint}: {sse}");
+        assert!(!sse.contains("model_context_window_exceeded"), "{endpoint}: {sse}");
+    }
+
+    let chat = text(request(f.state.clone(), "chat", true).await).await;
+    assert!(chat.contains(r#""finish_reason":"content_filter""#), "{chat}");
+    assert!(!chat.contains(r#""finish_reason":"stop""#), "{chat}");
+
+    let responses = text(request(f.state.clone(), "responses", true).await).await;
+    assert!(responses.contains("event: response.incomplete"), "{responses}");
+    assert!(responses.contains(r#""reason":"content_filter""#), "{responses}");
 }
 
 #[tokio::test]

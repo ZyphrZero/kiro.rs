@@ -921,8 +921,26 @@ struct ResponsesView {
     usage: Value,
 }
 
+/// `finish_reason`（OpenAI 口径）→ Responses `incomplete_details.reason`；`None` 表示正常完成。
+fn incomplete_reason(finish_reason: &str) -> Option<&'static str> {
+    match finish_reason {
+        "length" => Some("max_output_tokens"),
+        "content_filter" => Some("content_filter"),
+        _ => None,
+    }
+}
+
+/// 上游 Anthropic `stop_reason` → Responses `incomplete_details.reason`；`None` 表示正常完成。
+fn incomplete_reason_for_stop(stop_reason: Option<&str>) -> Option<&'static str> {
+    match stop_reason? {
+        "max_tokens" | "model_context_window_exceeded" => Some("max_output_tokens"),
+        super::stream::REFUSAL_STOP_REASON => Some("content_filter"),
+        _ => None,
+    }
+}
+
 fn build_view(p: &ParsedResponse, kinds: &ToolKindMap) -> ResponsesView {
-    let status = if p.finish_reason == "length" {
+    let status = if incomplete_reason(&p.finish_reason).is_some() {
         "incomplete".to_string()
     } else {
         "completed".to_string()
@@ -1071,8 +1089,8 @@ fn build_response_object_from(
         "tool_choice": config.tool_choice,
         "tools": config.tools,
     });
-    if view.status == "incomplete" {
-        obj["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+    if let Some(reason) = incomplete_reason(&p.finish_reason) {
+        obj["incomplete_details"] = json!({ "reason": reason });
     }
     obj
 }
@@ -1761,7 +1779,7 @@ impl ResponsesStreamContext {
     }
 
     fn response_object(&self, status: &str) -> Value {
-        let mut response = json!({
+        json!({
             "id": self.response_id,
             "object": "response",
             "created_at": self.created_at,
@@ -1772,11 +1790,7 @@ impl ResponsesStreamContext {
             "parallel_tool_calls": self.response_config.parallel_tool_calls,
             "tool_choice": self.response_config.tool_choice,
             "tools": self.response_config.tools,
-        });
-        if status == "incomplete" {
-            response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
-        }
-        response
+        })
     }
 
     fn finish(&mut self) -> Vec<Bytes> {
@@ -1786,22 +1800,18 @@ impl ResponsesStreamContext {
         if !self.saw_message_stop {
             return vec![self.fail("server_error", "upstream stream ended before message_stop")];
         }
-        let incomplete = matches!(
-            self.stop_reason.as_deref(),
-            Some("max_tokens" | "model_context_window_exceeded")
-        );
-        let status = if incomplete {
-            "incomplete"
+        let incomplete = incomplete_reason_for_stop(self.stop_reason.as_deref());
+        let (status, event) = if incomplete.is_some() {
+            ("incomplete", "response.incomplete")
         } else {
-            "completed"
-        };
-        let event = if incomplete {
-            "response.incomplete"
-        } else {
-            "response.completed"
+            ("completed", "response.completed")
         };
         self.terminal = true;
-        vec![self.emit(event, json!({ "response": self.response_object(status) }))]
+        let mut response = self.response_object(status);
+        if let Some(reason) = incomplete {
+            response["incomplete_details"] = json!({ "reason": reason });
+        }
+        vec![self.emit(event, json!({ "response": response }))]
     }
 
     fn fail(&mut self, error_type: &str, message: &str) -> Bytes {

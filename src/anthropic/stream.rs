@@ -22,6 +22,10 @@ use crate::kiro::model::events::{Event, MeteringEvent, TokenUsage};
 /// signature，因此该占位字符串只在客户端 ↔ kiro.rs 之间存在，不会影响转发。
 pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signature";
 
+/// 上游内容过滤拦截（`metadataEvent.stopReason = CONTENT_FILTERED`）映射到的
+/// Anthropic `stop_reason`。一经设置即为终态，后续事件不得覆盖。
+pub(super) const REFUSAL_STOP_REASON: &str = "refusal";
+
 const TOOL_USE_XML_PREFIX: &str = "<tool_use";
 const TOOL_USE_XML_CLOSE: &str = "</tool_use>";
 
@@ -1172,8 +1176,12 @@ impl SseStateManager {
         self.has_tool_use = has;
     }
 
-    /// 设置 stop_reason
+    /// 设置 stop_reason。`refusal` 是终态：拦截后同一条流里再到的
+    /// contextUsage / exception 不得把它覆盖成 max_tokens 之类的可重试原因。
     pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
+        if self.stop_reason.as_deref() == Some(REFUSAL_STOP_REASON) {
+            return;
+        }
         self.stop_reason = Some(reason.into());
     }
 
@@ -1636,6 +1644,10 @@ impl StreamContext {
                     // tokenUsage 是最终快照；同一 provider 流内重复出现时取最后一份，
                     // 不能累加，否则会重复计费。
                     self.provider_token_usage = Some(usage);
+                }
+                if let Some(refusal) = metadata.content_filter_refusal() {
+                    tracing::warn!("上游内容过滤拒答: {}", refusal);
+                    self.state_manager.set_stop_reason(REFUSAL_STOP_REASON);
                 }
                 Vec::new()
             }
@@ -5456,8 +5468,9 @@ mod tests {
                 cache_read_input_tokens: 7,
                 cache_write_input_tokens: 4,
             }),
+            ..Default::default()
         }));
-        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent { token_usage: None }));
+        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent::default()));
         assert_eq!(ctx.resolved_usage(), (3, 4, 7));
         assert_eq!(ctx.resolved_output_tokens(), 11);
 
@@ -5468,6 +5481,7 @@ mod tests {
                 cache_read_input_tokens: 23,
                 cache_write_input_tokens: 24,
             }),
+            ..Default::default()
         }));
         assert_eq!(ctx.resolved_usage(), (0, 24, 23));
         assert_eq!(ctx.resolved_output_tokens(), 22);
@@ -5558,6 +5572,7 @@ mod tests {
         let mut events = ctx.generate_initial_events();
         events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
             token_usage: Some(usage),
+            ..Default::default()
         })));
         events.extend(ctx.generate_final_events());
 

@@ -44,7 +44,7 @@ use super::handlers::{
     RequestTracer, TraceUsage, UsageRecordHook, UsageSource, last_attempt_outcome,
     map_provider_error,
 };
-use super::stream::{CompletedToolUse, SseEvent};
+use super::stream::{CompletedToolUse, REFUSAL_STOP_REASON, SseEvent};
 use super::types::{ErrorResponse, Message, MessagesRequest};
 use super::websearch::{self, WebSearchResults};
 use crate::model::config::ToolCompatibilityMode;
@@ -95,7 +95,7 @@ struct RoundOutcome {
     /// 在 run_web_search_loop 出口处透传到响应 usage 字段；如果上游多次下发
     /// 则取最后一次（与 /v1/messages 非流 / 流式路径一致）。
     last_metering: Option<MeteringEvent>,
-    /// stop_reason override (max_tokens / model_context_window_exceeded)
+    /// stop_reason override (refusal / max_tokens / model_context_window_exceeded)
     stop_reason_override: Option<String>,
     /// Upstream body-read error, if any. Content decoded before this error is
     /// partial and must not be treated as a successful round.
@@ -339,12 +339,16 @@ async fn decode_round(
                         // 单条流内重复 metadata 是快照，取最后一份。
                         provider_token_usage = Some(usage.sanitized());
                     }
+                    if let Some(refusal) = metadata.content_filter_refusal() {
+                        tracing::warn!("上游内容过滤拒答: {}", refusal);
+                        stop_reason_override = Some(REFUSAL_STOP_REASON.to_string());
+                    }
                 }
                 Event::ContextUsage(cu) => {
                     let window = get_context_window_size(model);
                     let actual = (cu.context_usage_percentage * (window as f64) / 100.0) as i32;
                     context_input_tokens = Some(actual);
-                    if cu.context_usage_percentage >= 100.0 {
+                    if cu.context_usage_percentage >= 100.0 && !is_refusal(&stop_reason_override) {
                         stop_reason_override = Some("model_context_window_exceeded".to_string());
                     }
                 }
@@ -353,7 +357,9 @@ async fn decode_round(
                     last_metering = Some(m.clone());
                 }
                 Event::Exception { exception_type, .. } => {
-                    if exception_type == "ContentLengthExceededException" {
+                    if exception_type == "ContentLengthExceededException"
+                        && !is_refusal(&stop_reason_override)
+                    {
                         stop_reason_override = Some("max_tokens".to_string());
                     }
                 }
@@ -670,6 +676,11 @@ fn resolve_flush_stop_reason(
     } else {
         "end_turn".to_string()
     }
+}
+
+/// `refusal` 是终态：同一轮里后到的 contextUsage / exception 不得覆盖它。
+fn is_refusal(override_reason: &Option<String>) -> bool {
+    override_reason.as_deref() == Some(REFUSAL_STOP_REASON)
 }
 
 /// Builds the final flush content with the web_search invariant baked in:
@@ -1542,7 +1553,10 @@ async fn run_web_search_loop_inner(
             break round;
         };
 
-        if should_search_round(round_idx, &round.tool_uses) {
+        // 拒答是终态：即便本轮带了 web_search，也不再续跑搜索轮次，直接带 refusal 收尾。
+        if !is_refusal(&round.stop_reason_override)
+            && should_search_round(round_idx, &round.tool_uses)
+        {
             // Real search: if any one fails -> propagate the error, never silently turn it into "No results found"
             let mut searched: Vec<Option<WebSearchResults>> =
                 Vec::with_capacity(round.tool_uses.len());
