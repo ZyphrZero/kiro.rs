@@ -367,7 +367,7 @@ class TrayContext : ApplicationContext
         if (PortOpen())
         {
             SetStatus(false, "端口 " + port + " 已被占用");
-            tray.ShowBalloonTip(5000, "KiroTray", "端口 " + port + " 已被占用，可能已有 kiro-rs 在运行（比如原来的 cmd 窗口），请先关掉它再点"重启服务"。", ToolTipIcon.Warning);
+            tray.ShowBalloonTip(5000, "KiroTray", "端口 " + port + " 已被占用，可能已有 kiro-rs 在运行（比如原来的 cmd 窗口），请先关掉它再点\"重启服务\"。", ToolTipIcon.Warning);
             return;
         }
 
@@ -428,7 +428,7 @@ class TrayContext : ApplicationContext
             return;
         }
         var t2 = new System.Windows.Forms.Timer { Interval = 3000 };
-        t2.Tick += delegate { t2.Stop(); t2.Dispose(); if (proc == null && !exiting) StartKiro(); };
+        t2.Tick += delegate { t2.Stop(); t2.Dispose(); if (proc == null && !exiting && cfg.AutoRestart) StartKiro(); };
         t2.Start();
     }
 

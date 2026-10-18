@@ -4548,6 +4548,7 @@ impl MultiTokenManager {
 
     /// 设置对话 / MCP 上游域名（运行时生效 + 持久化 config.json，持久化失败则回滚）
     pub fn set_api_domain(&self, domain: ApiDomain) -> anyhow::Result<()> {
+        let _update_guard = self.runtime_config_update_lock.lock();
         let previous = self.api_domain();
         if previous == domain {
             return Ok(());
@@ -6148,6 +6149,124 @@ mod tests {
         // 切换到下一个
         assert!(manager.switch_to_next());
         assert_ne!(manager.snapshot().current_id, initial_id);
+    }
+
+    #[test]
+    fn api_domain_update_persists_and_survives_restart() {
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-api-domain-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &config_path,
+            r#"{"apiDomain":"amazonaws","region":"eu-central-1"}"#,
+        )
+        .unwrap();
+        let manager = MultiTokenManager::new(
+            Config::load(&config_path).unwrap(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        for domain in [ApiDomain::Kiro, ApiDomain::Amazonaws, ApiDomain::Kiro] {
+            manager.set_api_domain(domain).unwrap();
+            assert_eq!(manager.api_domain(), domain);
+            let persisted = Config::load(&config_path).unwrap();
+            assert_eq!(persisted.api_domain, domain);
+            assert_eq!(persisted.region, "eu-central-1");
+        }
+        let restarted = MultiTokenManager::new(
+            Config::load(&config_path).unwrap(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(restarted.api_domain(), ApiDomain::Kiro);
+        std::fs::remove_file(config_path).unwrap();
+    }
+
+    #[test]
+    fn api_domain_update_rolls_back_on_config_reload_and_write_errors() {
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-api-domain-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&config_path, "{}").unwrap();
+        let manager = MultiTokenManager::new(
+            Config::load(&config_path).unwrap(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        std::fs::write(&config_path, "invalid json").unwrap();
+        assert!(manager.set_api_domain(ApiDomain::Kiro).is_err());
+        assert_eq!(manager.api_domain(), ApiDomain::Amazonaws);
+        std::fs::write(&config_path, "{}").unwrap();
+        #[cfg(windows)]
+        {
+            let permissions = std::fs::metadata(&config_path).unwrap().permissions();
+            let mut readonly_permissions = permissions.clone();
+            readonly_permissions.set_readonly(true);
+            std::fs::set_permissions(&config_path, readonly_permissions).unwrap();
+            let result = manager.set_api_domain(ApiDomain::Kiro);
+            std::fs::set_permissions(&config_path, permissions).unwrap();
+            assert!(result.is_err());
+            assert_eq!(manager.api_domain(), ApiDomain::Amazonaws);
+            assert_eq!(
+                Config::load(&config_path).unwrap().api_domain,
+                ApiDomain::Amazonaws
+            );
+        }
+        std::fs::remove_file(config_path).unwrap();
+    }
+
+    #[test]
+    fn api_domain_concurrent_update_cannot_acknowledge_a_rolled_back_value() {
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-api-domain-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&config_path, "{}").unwrap();
+        let manager = std::sync::Arc::new(
+            MultiTokenManager::new(
+                Config::load(&config_path).unwrap(),
+                vec![KiroCredentials::default()],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        std::fs::write(&config_path, "invalid json").unwrap();
+        let file_guard = manager.config_write_lock.lock();
+        let first_manager = manager.clone();
+        let first = std::thread::spawn(move || first_manager.set_api_domain(ApiDomain::Kiro));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while manager.api_domain() != ApiDomain::Kiro && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let second_manager = manager.clone();
+        let second = std::thread::spawn(move || {
+            sender
+                .send(second_manager.set_api_domain(ApiDomain::Kiro))
+                .unwrap();
+        });
+        let early_result = receiver
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .ok();
+        drop(file_guard);
+        let first_result = first.join().unwrap();
+        second.join().unwrap();
+        let second_result = early_result.unwrap_or_else(|| receiver.recv().unwrap());
+        let actual = manager.api_domain();
+        std::fs::remove_file(config_path).unwrap();
+        assert!(first_result.is_err());
+        assert!(
+            second_result.is_err(),
+            "a concurrent caller acknowledged a domain that was rolled back"
+        );
+        assert_eq!(actual, ApiDomain::Amazonaws);
     }
 
     #[test]

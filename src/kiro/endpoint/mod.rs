@@ -351,6 +351,106 @@ mod tests {
     }
 
     #[test]
+    fn api_domain_account_matrix_preserves_protocol_and_profile_arn() {
+        use crate::kiro::model::credentials::{BUILDER_ID_PROFILE_ARN, SOCIAL_PROFILE_ARN};
+        let endpoints: [&dyn KiroEndpoint; 2] = [&IdeEndpoint::new(), &CliEndpoint::new()];
+        let client = reqwest::Client::new();
+        let real_arn = "arn:aws:codewhisperer:eu-central-1:123456789012:profile/test";
+        let cases = [
+            (
+                serde_json::json!({"authMethod":"idc"}),
+                Some(BUILDER_ID_PROFILE_ARN),
+                "us-east-1",
+            ),
+            (
+                serde_json::json!({"authMethod":"social"}),
+                Some(SOCIAL_PROFILE_ARN),
+                "us-east-1",
+            ),
+            (
+                serde_json::json!({"authMethod":"idc","profileArn":real_arn}),
+                Some(real_arn),
+                "eu-central-1",
+            ),
+            (
+                serde_json::json!({"kiroApiKey":"ksk_test"}),
+                None,
+                "us-east-1",
+            ),
+        ];
+        for domain in [ApiDomain::Amazonaws, ApiDomain::Kiro] {
+            for (value, expected_arn, region) in &cases {
+                let credentials: KiroCredentials = serde_json::from_value(value.clone()).unwrap();
+                let config = Config::default();
+                let ctx = RequestContext {
+                    credentials: &credentials,
+                    token: "test-token",
+                    machine_id: "test-machine",
+                    config: &config,
+                    api_domain: domain,
+                };
+                for endpoint in endpoints {
+                    let body = r#"{"conversationState":{"currentMessage":{"userInputMessage":{"origin":"AI_EDITOR","content":"hello"}},"agentContinuationId":"test","history":[{"userInputMessage":{"modelId":"test","origin":"AI_EDITOR"}}]}}"#;
+                    let transformed: serde_json::Value =
+                        serde_json::from_str(&endpoint.transform_api_body(body, &ctx)).unwrap();
+                    assert_eq!(
+                        transformed["profileArn"].as_str(),
+                        *expected_arn,
+                        "{} {value}",
+                        endpoint.name()
+                    );
+                    let state = &transformed["conversationState"];
+                    let expected_origin = if endpoint.name() == "cli" {
+                        "KIRO_CLI"
+                    } else {
+                        "AI_EDITOR"
+                    };
+                    assert_eq!(
+                        state["currentMessage"]["userInputMessage"]["origin"],
+                        expected_origin
+                    );
+                    if endpoint.name() == "cli" {
+                        assert!(state.get("agentContinuationId").is_none());
+                        assert!(
+                            state["history"][0]["userInputMessage"]
+                                .get("modelId")
+                                .is_none()
+                        );
+                    }
+                    let host = domain.runtime_host(region);
+                    let mcp = endpoint
+                        .decorate_mcp(client.post(endpoint.mcp_url(&ctx)), &ctx)
+                        .build()
+                        .unwrap();
+                    assert_eq!(mcp.url().host_str(), Some(host.as_str()));
+                    assert_eq!(
+                        mcp.headers()
+                            .get("x-amzn-kiro-profile-arn")
+                            .map(|v| v.to_str().unwrap()),
+                        *expected_arn
+                    );
+                    let api = endpoint
+                        .decorate_api(client.post(endpoint.api_url(&ctx)), &ctx)
+                        .build()
+                        .unwrap();
+                    assert_eq!(api.url().host_str(), Some(host.as_str()));
+                    assert_eq!(api.headers()["authorization"], "Bearer test-token");
+                    assert_eq!(api.headers()["host"], host);
+                    if endpoint.name() == "cli" {
+                        assert_eq!(api.url().path(), "/");
+                        assert_eq!(
+                            api.headers()["x-amz-target"],
+                            "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+                        );
+                    } else {
+                        assert_eq!(api.url().path(), "/generateAssistantResponse");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_api_domain_kiro_switches_api_and_mcp_host() {
         let client = reqwest::Client::new();
         let endpoints: [&dyn KiroEndpoint; 2] = [&IdeEndpoint::new(), &CliEndpoint::new()];
