@@ -296,7 +296,7 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 / 5.5 同 1M
+/// Sonnet 5 / Sonnet 5.5 / Opus 4.7 / 4.8 / Opus 5 / 5.5 同 1M
 ///
 /// 注意：本函数的返回值会在 `Event::ContextUsage` 处被用来把上游只回报的
 /// 百分比换算成 token 数（`pct × window / 100`）。漏配某个 1M 模型不会影响
@@ -326,6 +326,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
             if mapped == "claude-sonnet-4.6"
                 || mapped == "claude-sonnet-4.8"
                 || mapped == "claude-sonnet-5"
+                || mapped == "claude-sonnet-5.5"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8"
@@ -2133,6 +2134,11 @@ mod tests {
             Some("claude-sonnet-5".to_string())
         );
         assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
+        assert_eq!(
+            map_model("claude-sonnet-5-5"),
+            Some("claude-sonnet-5.5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-sonnet-5-5"), 1_000_000);
         assert_eq!(
             map_model("claude-3-5-sonnet-20241022"),
             Some("claude-sonnet-3.5".to_string())
