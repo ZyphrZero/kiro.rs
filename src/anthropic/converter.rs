@@ -296,7 +296,7 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5 / Sonnet 5.5 / Opus 4.7 / 4.8 / Opus 5 / 5.5 同 1M
+/// Sonnet 5 / Sonnet 5.5 / Opus 4.7 / 4.8 / Opus 5 / 5.5 / Haiku 5.5 同 1M
 ///
 /// 注意：本函数的返回值会在 `Event::ContextUsage` 处被用来把上游只回报的
 /// 百分比换算成 token 数（`pct × window / 100`）。漏配某个 1M 模型不会影响
@@ -332,6 +332,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
                 || mapped == "claude-opus-4.8"
                 || mapped == "claude-opus-5"
                 || mapped == "claude-opus-5.5"
+                || mapped == "claude-haiku-5.5"
                 || mapped == "claude-fable-5" =>
         {
             1_000_000
@@ -364,6 +365,7 @@ fn model_supports_native_reasoning(model_id: &str) -> bool {
         || m.contains("mythos-5")
         || m.contains("sonnet-5")
         || m.contains("opus-5")
+        || m.contains("haiku-5")
         || m.contains("claude-5")
 }
 
@@ -2249,6 +2251,8 @@ mod tests {
             "claude-opus-5",
             "claude-opus-5-5",
             "claude-opus-5.5-thinking",
+            "claude-haiku-5-5",
+            "claude-haiku-5.5-20270101",
             "claude-fable-5",
         ] {
             assert_eq!(
@@ -2425,6 +2429,31 @@ mod tests {
             .additional_model_request_fields
             .expect("opus 5.5 adaptive thinking should keep output_config");
         assert_eq!(fields.output_config.unwrap().effort, "xhigh");
+    }
+
+    #[test]
+    fn test_haiku_5_5_maps_upstream_id_and_keeps_effort() {
+        // Kiro 为 Haiku 5.5 提供 low / medium / high / xhigh / max 全部档位
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            let req = minimal_adaptive_thinking_request_with_effort("claude-haiku-5-5", effort);
+            let result = convert_request(&req).unwrap();
+
+            assert_eq!(
+                result
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .model_id,
+                "claude-haiku-5.5"
+            );
+            let fields = result
+                .additional_model_request_fields
+                .expect("haiku 5.5 adaptive thinking should keep output_config");
+            assert_eq!(fields.output_config.unwrap().effort, effort);
+        }
+
+        // haiku-4.5 不得被误判为支持原生 reasoning
+        assert!(!model_supports_native_reasoning("claude-haiku-4.5"));
     }
 
     #[test]
