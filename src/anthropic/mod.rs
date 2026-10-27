@@ -29,6 +29,8 @@ mod middleware;
 mod openai;
 mod responses;
 mod router;
+mod structured_output;
+mod structured_rewrite;
 pub mod stream;
 pub mod types;
 mod websearch;

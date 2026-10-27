@@ -452,7 +452,10 @@ fn responses_to_anthropic(
         .as_ref()
         .and_then(|r| r.effort.clone())
         .filter(|e| !e.trim().is_empty())
-        .map(|effort| OutputConfig { effort });
+        .map(|effort| OutputConfig {
+            effort,
+            format: None,
+        });
     let thinking = req.reasoning.and_then(|reasoning| {
         reasoning
             .effort

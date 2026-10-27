@@ -631,6 +631,10 @@ Kiro 上游可能返回原生 `reasoningContentEvent`。`kiro-rs` 会把它转�
 
 非流式响应优先使用原生 reasoning 事件；只有没有原生 reasoning 时，才回退到旧的 `<thinking>...</thinking>` 文本提取路径。
 
+### 结构化输出（`output_config.format`）
+
+Kiro 上游没有原生的结构化输出字段，因此 `output_config.format = {"type":"json_schema","schema":{...}}` 通过「提示词注入 + 响应提取」实现（`/v1/messages`、`/cc/v1/messages`）：schema 以系统提示追加到请求末尾，响应中第一个合法且符合 schema 的 JSON 会替换 text 内容（校验支持 `type`、`required`、`properties`、`additionalProperties`、`enum`、`const`、`items`、`anyOf`/`oneOf`/`allOf`、本地 `$ref`，其它关键字忽略）。该模式下流式响应会缓冲到结束后再一次性输出；找不到合规 JSON 时原样返回并记录一条不含内容的 warn。`format` 不会转发给 Kiro；未带 `format` 的请求行为不变。暂不覆盖 Chat Completions / Responses 适配层和 web_search 混合工具循环。
+
 ### Tool Use
 
 服务端会把 Anthropic tools 转成 Kiro 工具定义，并处理以下兼容逻辑：

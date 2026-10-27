@@ -35,6 +35,9 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{SseEvent, StreamContext};
+use super::structured_rewrite::{
+    StructuredCollector, inject_system_instruction, rewrite_message_json, split_initial_events,
+};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
@@ -908,6 +911,9 @@ pub async fn post_messages(
         .await;
     }
 
+    // output_config.format=json_schema：Kiro 无原生字段，注入 schema 指令，响应侧再提取改写。
+    let structured_schema = inject_system_instruction(&mut payload);
+
     // 转换请求
     let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
     {
@@ -1014,6 +1020,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            structured_schema.clone(),
         )
         .await
     } else {
@@ -1042,6 +1049,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            structured_schema.clone(),
         )
         .await
     }
@@ -1060,6 +1068,7 @@ async fn handle_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    structured_schema: Option<serde_json::Value>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
@@ -1098,7 +1107,15 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events, hook, credential_id, tracer);
+    let stream = create_sse_stream(
+        response,
+        ctx,
+        initial_events,
+        hook,
+        credential_id,
+        tracer,
+        structured_schema.map(|schema| StructuredCollector::new(schema, model)),
+    );
 
     // 返回 SSE 响应
     // `x-accel-buffering: no` 让前置 nginx 对本次响应关闭 proxy_buffering。
@@ -1130,7 +1147,17 @@ fn create_sse_stream(
     hook: UsageRecordHook,
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
+    mut structured: Option<StructuredCollector>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    // 结构化输出模式：只先发 message_start，其余初始事件与后续内容缓冲到流结束再改写发出。
+    let initial_events = match structured.as_mut() {
+        Some(collector) => {
+            let (sent, held) = split_initial_events(initial_events);
+            collector.hold(held);
+            sent
+        }
+        None => initial_events,
+    };
     // 先发送初始事件
     let initial_stream = stream::iter(
         initial_events
@@ -1140,7 +1167,8 @@ fn create_sse_stream(
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
-    let settlement = StreamSettlement::new(hook, credential_id, tracer, &ctx);
+    let mut settlement = StreamSettlement::new(hook, credential_id, tracer, &ctx);
+    settlement.structured = structured;
 
     let processing_stream = stream::unfold(
         (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), settlement, 0u64),
@@ -1189,6 +1217,7 @@ fn create_sse_stream(
                                 }
                             }
 
+                            let events = settlement.hold_if_structured(events);
                             // 转换为 SSE 字节流
                             let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
@@ -1229,6 +1258,7 @@ fn create_sse_stream(
                             } else {
                                 settlement.finish("success", "success", None, None, None);
                             }
+                            let final_events = settlement.finish_structured(final_events);
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -1264,9 +1294,30 @@ struct StreamSettlement {
     usage: TraceUsage,
     sent_bytes: u64,
     settled: bool,
+    /// 结构化输出模式下的事件缓冲；None 表示按原样实时转发。
+    structured: Option<StructuredCollector>,
 }
 
 impl StreamSettlement {
+    /// 结构化模式下缓冲事件（返回空）；否则原样返回。
+    fn hold_if_structured(&mut self, events: Vec<SseEvent>) -> Vec<SseEvent> {
+        match self.structured.as_mut() {
+            Some(collector) => {
+                collector.hold(events);
+                Vec::new()
+            }
+            None => events,
+        }
+    }
+
+    /// 流正常结束：结构化模式下把缓冲 + 结尾事件改写后一次性返回。
+    fn finish_structured(&mut self, final_events: Vec<SseEvent>) -> Vec<SseEvent> {
+        match self.structured.as_mut() {
+            Some(collector) => collector.finish(final_events),
+            None => final_events,
+        }
+    }
+
     fn interrupt(
         &mut self,
         ctx: &mut StreamContext,
@@ -1274,6 +1325,12 @@ impl StreamSettlement {
         error: &str,
         bytes: u64,
     ) -> Vec<Result<Bytes, Infallible>> {
+        if let Some(collector) = self.structured.as_mut() {
+            // 流被中断：已缓冲的事件按原顺序放在 error 事件之前，不做改写。
+            let mut held = collector.take_unchanged();
+            held.extend(events);
+            events = held;
+        }
         tracing::error!(error, "Upstream response stream was interrupted");
         events.extend(
             ctx.generate_error_events("api_error", "Upstream response stream was interrupted"),
@@ -1305,6 +1362,7 @@ impl StreamSettlement {
             usage: stream_trace_usage(ctx),
             sent_bytes: 0,
             settled: false,
+            structured: None,
         }
     }
 
@@ -1417,6 +1475,7 @@ async fn handle_non_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    structured_schema: Option<serde_json::Value>,
 ) -> Response {
     match execute_non_stream_request(
         provider,
@@ -1432,7 +1491,12 @@ async fn handle_non_stream_request(
     )
     .await
     {
-        Ok(response_body) => (StatusCode::OK, Json(response_body)).into_response(),
+        Ok(mut response_body) => {
+            if let Some(schema) = &structured_schema {
+                rewrite_message_json(&mut response_body, schema, model);
+            }
+            (StatusCode::OK, Json(response_body)).into_response()
+        }
         Err(NonStreamExecutionError::Provider(error)) => map_provider_error(error),
         Err(NonStreamExecutionError::Response(response)) => response,
     }
@@ -1961,8 +2025,14 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     });
 
     if is_opus_4_6 {
+        // 只覆写 effort，保留客户端的 format（结构化输出）。
+        let format = payload
+            .output_config
+            .take()
+            .and_then(|config| config.format);
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
+            format,
         });
     }
 }
@@ -2091,6 +2161,9 @@ pub async fn post_messages_cc(
         .await;
     }
 
+    // output_config.format=json_schema：Kiro 无原生字段，注入 schema 指令，响应侧再提取改写。
+    let structured_schema = inject_system_instruction(&mut payload);
+
     // 转换请求
     let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
     {
@@ -2196,6 +2269,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            structured_schema.clone(),
         )
         .await
     } else {
@@ -2221,6 +2295,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            structured_schema.clone(),
         )
         .await
     }
@@ -2240,6 +2315,7 @@ async fn handle_cc_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    structured_schema: Option<serde_json::Value>,
 ) -> Response {
     handle_stream_request(
         provider,
@@ -2253,6 +2329,7 @@ async fn handle_cc_stream_request(
         cache_usage,
         tracer,
         group,
+        structured_schema,
     )
     .await
 }
@@ -2261,6 +2338,21 @@ async fn handle_cc_stream_request(
 mod tests {
     use super::*;
     use crate::model::config::ToolCompatibilityMode;
+
+    #[test]
+    fn opus_4_6_thinking_override_keeps_output_format() {
+        let mut payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-6-thinking",
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"format": {"type": "json_schema", "schema": {"type": "object"}}}
+        }))
+        .unwrap();
+        override_thinking_from_model_name(&mut payload);
+        let config = payload.output_config.as_ref().unwrap();
+        assert_eq!(config.effort, "high");
+        assert!(config.json_schema().is_some());
+        assert!(inject_system_instruction(&mut payload).is_some());
+    }
 
     #[test]
     fn dropped_stream_settles_latest_usage_exactly_once() {

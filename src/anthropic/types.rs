@@ -96,10 +96,63 @@ where
 }
 
 /// OutputConfig 配置
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub struct OutputConfig {
-    #[serde(default = "default_effort")]
+    /// 思考强度。未给出 `effort` 时恒为 `"high"`（与历史行为一致）：
+    /// 只要请求带了 `output_config`，无论是否只带 `format`，都按 `effort: "high"` 处理。
     pub effort: String,
+    /// `output_config.format`（结构化输出）。Kiro 上游没有对应字段，不会透传。
+    pub format: Option<OutputFormat>,
+}
+
+/// `output_config.format`，目前只关心 `{"type":"json_schema","schema":{...}}`。
+#[derive(Debug, Clone, Deserialize)]
+pub struct OutputFormat {
+    #[serde(rename = "type", default)]
+    pub format_type: String,
+    #[serde(default)]
+    pub schema: Option<serde_json::Value>,
+}
+
+impl OutputFormat {
+    /// 仅当 `type == "json_schema"` 且 `schema` 是对象时返回 schema。
+    pub fn json_schema(&self) -> Option<&serde_json::Value> {
+        (self.format_type == "json_schema")
+            .then_some(self.schema.as_ref())
+            .flatten()
+            .filter(|schema| schema.is_object())
+    }
+}
+
+impl OutputConfig {
+    /// 请求携带的 JSON Schema 结构化输出约束。
+    pub fn json_schema(&self) -> Option<&serde_json::Value> {
+        self.format.as_ref().and_then(OutputFormat::json_schema)
+    }
+}
+
+impl<'de> Deserialize<'de> for OutputConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            effort: Option<String>,
+            // 形状不对的 format 视为未提供，而不是让整个请求 400。
+            #[serde(default)]
+            format: Option<serde_json::Value>,
+        }
+        let mut raw = Raw::deserialize(deserializer)?;
+        let format = raw
+            .format
+            .take()
+            .and_then(|value| serde_json::from_value::<OutputFormat>(value).ok());
+        // 与 master 的 `#[serde(default = "default_effort")]` 等价：缺省 effort 恒为 "high",
+        // 只带 `format` 的 output_config 也不会退化成空串（否则会改变 reasoning 行为）。
+        let effort = raw.effort.unwrap_or_else(default_effort);
+        Ok(Self { effort, format })
+    }
 }
 
 fn default_effort() -> String {
@@ -317,7 +370,7 @@ pub struct CountTokensResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::MessagesRequest;
+    use super::{MessagesRequest, OutputConfig};
 
     fn request_json(max_tokens: Option<i32>) -> serde_json::Value {
         let mut value = serde_json::json!({
@@ -354,5 +407,67 @@ mod tests {
         let cc = request.cache_control.unwrap();
         assert_eq!(cc.cache_type, "ephemeral");
         assert_eq!(cc.ttl.as_deref(), Some("1h"));
+    }
+
+    fn output_config(value: serde_json::Value) -> OutputConfig {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn output_config_effort_parsing_is_unchanged() {
+        assert_eq!(output_config(serde_json::json!({"effort": "max"})).effort, "max");
+        assert_eq!(output_config(serde_json::json!({})).effort, "high");
+        let effort_only = output_config(serde_json::json!({"effort": "low"}));
+        assert!(effort_only.format.is_none());
+        assert!(effort_only.json_schema().is_none());
+    }
+
+    #[test]
+    fn output_config_parses_json_schema_format() {
+        let schema = serde_json::json!({"type": "object", "properties": {"ok": {"type": "boolean"}}});
+        let config = output_config(serde_json::json!({
+            "effort": "low",
+            "format": {"type": "json_schema", "schema": schema}
+        }));
+        assert_eq!(config.effort, "low");
+        assert_eq!(config.json_schema(), Some(&schema));
+
+        // 仅 format：effort 仍按 master 的默认值走 "high"。
+        let format_only = output_config(serde_json::json!({
+            "format": {"type": "json_schema", "schema": schema}
+        }));
+        assert_eq!(format_only.effort, "high");
+        assert_eq!(format_only.json_schema(), Some(&schema));
+        // 未知字段（如只有 format 的真实请求）同样落到默认 effort。
+        assert_eq!(
+            output_config(serde_json::json!({"unknown": 1})).effort,
+            "high"
+        );
+    }
+
+    #[test]
+    fn output_config_ignores_non_json_schema_formats() {
+        for format in [
+            serde_json::json!({"type": "text"}),
+            serde_json::json!({"type": "json_schema"}),
+            serde_json::json!({"type": "json_schema", "schema": "nope"}),
+            serde_json::json!({"schema": {"type": "object"}}),
+        ] {
+            let config = output_config(serde_json::json!({"format": format}));
+            assert!(config.json_schema().is_none(), "{format}");
+        }
+    }
+
+    #[test]
+    fn output_config_tolerates_malformed_format() {
+        for format in [
+            serde_json::json!("json_schema"),
+            serde_json::json!({"type": null}),
+            serde_json::json!(42),
+        ] {
+            let config = output_config(serde_json::json!({"effort": "low", "format": format}));
+            assert_eq!(config.effort, "low");
+            assert!(config.json_schema().is_none());
+        }
     }
 }
