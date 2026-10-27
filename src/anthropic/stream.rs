@@ -1185,13 +1185,6 @@ impl SseStateManager {
         self.stop_reason = Some(reason.into());
     }
 
-    /// 检查是否存在非 thinking 类型的内容块（如 text 或 tool_use）
-    fn has_non_thinking_blocks(&self) -> bool {
-        self.active_blocks
-            .values()
-            .any(|b| b.block_type != "thinking")
-    }
-
     /// 获取最终的 stop_reason
     pub fn get_stop_reason(&self) -> String {
         if let Some(ref reason) = self.stop_reason {
@@ -1632,6 +1625,13 @@ impl StreamContext {
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
             Event::Metadata(metadata) => {
+                // 只补充上游报告的截断原因，不覆盖网关已确定的结束原因
+                // （refusal / 上下文溢出 / ContentLengthExceededException）。
+                if let Some(reason) = metadata.truncation_stop_reason() {
+                    if self.state_manager.stop_reason.is_none() {
+                        self.state_manager.set_stop_reason(reason);
+                    }
+                }
                 if let Some(usage) = metadata.token_usage {
                     let usage = usage.sanitized();
                     tracing::debug!(
@@ -2569,17 +2569,6 @@ impl StreamContext {
                 events.extend(self.create_text_delta_events(&buffer_content));
             }
             self.thinking_buffer.clear();
-        }
-
-        // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
-        // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
-        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
-        if self.thinking_enabled
-            && self.thinking_block_index.is_some()
-            && !self.state_manager.has_non_thinking_blocks()
-        {
-            self.state_manager.set_stop_reason("max_tokens");
-            events.extend(self.create_text_delta_events(" "));
         }
 
         // Flush invoke 嗅探缓冲区的残留：先再嗅探一次完整块（万一最后一块就是完整 invoke），
@@ -4574,64 +4563,88 @@ mod tests {
     }
 
     #[test]
-    fn test_thinking_only_sets_max_tokens_stop_reason() {
-        // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
-        let mut ctx = StreamContext::new_with_thinking(
-            "test-model",
-            1,
-            true,
-            HashMap::new(),
-            test_known_tools(),
-        );
-        let _initial_events = ctx.generate_initial_events();
+    fn native_thinking_only_does_not_fabricate_output_limit() {
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-5.5", 100, true, HashMap::new(), test_known_tools());
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: Some("I should summarize the directory.".to_string()),
+                ..Default::default()
+            },
+        )));
+        events.extend(ctx.process_kiro_event(&Event::Metadata(
+            serde_json::from_value(json!({"stopReason":"END_TURN"})).unwrap(),
+        )));
+        events.extend(ctx.generate_final_events());
+        let terminal = events.iter().find(|event| event.event == "message_delta").unwrap();
+        assert_ne!(terminal.data["delta"]["stop_reason"], "max_tokens");
+        assert_eq!(collect_text_content(&events), "");
+    }
 
-        let mut all_events = Vec::new();
-        all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
-        all_events.extend(ctx.generate_final_events());
+    #[test]
+    fn native_output_limit_is_preserved_when_metadata_reports_it() {
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-5.5", 100, true, HashMap::new(), test_known_tools());
+        ctx.process_assistant_response("A partial answer");
+        ctx.process_kiro_event(&Event::Metadata(
+            serde_json::from_value(json!({"stopReason":"MAX_TOKENS"})).unwrap(),
+        ));
+        let events = ctx.generate_final_events();
+        let terminal = events.iter().find(|event| event.event == "message_delta").unwrap();
+        assert_eq!(terminal.data["delta"]["stop_reason"], "max_tokens");
+    }
 
-        let message_delta = all_events
-            .iter()
-            .find(|e| e.event == "message_delta")
-            .expect("should have message_delta event");
+    fn final_stop_reason(ctx: &mut StreamContext) -> serde_json::Value {
+        let events = ctx.generate_final_events();
+        let terminal = events.iter().find(|event| event.event == "message_delta").unwrap();
+        terminal.data["delta"]["stop_reason"].clone()
+    }
 
-        assert_eq!(
-            message_delta.data["delta"]["stop_reason"], "max_tokens",
-            "stop_reason should be max_tokens when only thinking is produced"
-        );
+    #[test]
+    fn metadata_end_turn_before_tool_use_still_reports_tool_use() {
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-5.5", 100, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::Metadata(
+            serde_json::from_value(json!({"stopReason":"END_TURN"})).unwrap(),
+        ));
+        ctx.process_kiro_event(&Event::ToolUse(tool_evt("t1", "list_apps", "{}", true)));
+        assert_eq!(final_stop_reason(&mut ctx), "tool_use");
+    }
 
-        // 应补发一套完整的 text 事件（content_block_start + delta 空格 + content_block_stop）
-        assert!(
-            all_events.iter().any(|e| {
-                e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
-            }),
-            "should emit text content_block_start"
-        );
-        assert!(
-            all_events.iter().any(|e| {
-                e.event == "content_block_delta"
-                    && e.data["delta"]["type"] == "text_delta"
-                    && e.data["delta"]["text"] == " "
-            }),
-            "should emit text_delta with a single space"
-        );
-        // text block 应被 generate_final_events 自动关闭
-        let text_block_index = all_events
-            .iter()
-            .find_map(|e| {
-                if e.event == "content_block_start" && e.data["content_block"]["type"] == "text" {
-                    e.data["index"].as_i64()
-                } else {
-                    None
-                }
-            })
-            .expect("text block should exist");
-        assert!(
-            all_events.iter().any(|e| {
-                e.event == "content_block_stop"
-                    && e.data["index"].as_i64() == Some(text_block_index)
-            }),
-            "text block should be stopped"
-        );
+    #[test]
+    fn metadata_tool_use_without_tool_block_reports_end_turn() {
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-5.5", 100, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        ctx.process_assistant_response("No tool after all.");
+        ctx.process_kiro_event(&Event::Metadata(
+            serde_json::from_value(json!({"stopReason":"TOOL_USE"})).unwrap(),
+        ));
+        assert_eq!(final_stop_reason(&mut ctx), "end_turn");
+    }
+
+    #[test]
+    fn metadata_stop_reason_does_not_override_context_window_exceeded() {
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-5.5", 100, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        ctx.process_assistant_response("A partial answer");
+        ctx.process_kiro_event(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent { context_usage_percentage: 100.0 },
+        ));
+        ctx.process_kiro_event(&Event::Metadata(
+            serde_json::from_value(json!({"stopReason":"MAX_TOKENS"})).unwrap(),
+        ));
+        assert_eq!(final_stop_reason(&mut ctx), "model_context_window_exceeded");
+    }
+
+    #[test]
+    fn legacy_thinking_only_does_not_invent_limit_or_blank_answer() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("<thinking>abc</thinking>"));
+        events.extend(ctx.generate_final_events());
+        let terminal = events.iter().find(|event| event.event == "message_delta").unwrap();
+        assert_eq!(terminal.data["delta"]["stop_reason"], "end_turn");
+        assert_eq!(collect_text_content(&events), "");
+        assert_eq!(collect_thinking_content(&events), "abc");
     }
 
     #[test]

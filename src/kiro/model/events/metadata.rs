@@ -122,6 +122,19 @@ impl MetadataEvent {
             (None, None) => CONTENT_FILTERED_STOP_REASON.to_string(),
         })
     }
+
+    /// 上游 `stopReason` 中表示生成被截断的部分，映射到 Anthropic `stop_reason`。
+    /// `END_TURN` / `TOOL_USE` 返回 `None`：是否为 `tool_use` 以网关实际产出的
+    /// tool_use 块为准（工具调用可能被过滤，也可能在流末才从文本中回收）。
+    /// CONTENT_FILTERED 由 `content_filter_refusal` 单独处理。
+    pub fn truncation_stop_reason(&self) -> Option<&'static str> {
+        match self.stop_reason.as_deref()?.to_ascii_lowercase().as_str() {
+            "max_tokens" => Some("max_tokens"),
+            "stop_sequence" => Some("stop_sequence"),
+            "model_context_window_exceeded" => Some("model_context_window_exceeded"),
+            _ => None,
+        }
+    }
 }
 
 impl EventPayload for MetadataEvent {
@@ -133,6 +146,29 @@ impl EventPayload for MetadataEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_provider_stop_reason_without_token_usage() {
+        for (raw, mapped) in [
+            ("END_TURN", None),
+            ("TOOL_USE", None),
+            ("MAX_TOKENS", Some("max_tokens")),
+            ("STOP_SEQUENCE", Some("stop_sequence")),
+            ("MODEL_CONTEXT_WINDOW_EXCEEDED", Some("model_context_window_exceeded")),
+        ] {
+            let event: MetadataEvent =
+                serde_json::from_value(serde_json::json!({"stopReason":raw})).unwrap();
+            assert_eq!(event.truncation_stop_reason(), mapped, "{raw}");
+            assert!(event.content_filter_refusal().is_none());
+            assert!(event.token_usage.is_none());
+        }
+        let filtered: MetadataEvent = serde_json::from_value(serde_json::json!({"stopReason":"CONTENT_FILTERED","stopDetails":{"private_provider_detail":"not forwarded"}})).unwrap();
+        assert_eq!(
+            filtered.content_filter_refusal().as_deref(),
+            Some(CONTENT_FILTERED_STOP_REASON)
+        );
+        assert_eq!(filtered.truncation_stop_reason(), None);
+    }
 
     #[test]
     fn parses_official_token_usage_shape() {

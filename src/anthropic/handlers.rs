@@ -1629,6 +1629,12 @@ pub(crate) async fn execute_non_stream_request(
                                 }
                             }
                             Event::Metadata(metadata) => {
+                                // 只补充截断原因，不覆盖已确定的上下文溢出 / max_tokens。
+                                if let Some(reason) = metadata.truncation_stop_reason() {
+                                    if stop_reason == "end_turn" {
+                                        stop_reason = reason.to_string();
+                                    }
+                                }
                                 if let Some(usage) = metadata.token_usage {
                                     let usage = usage.sanitized();
                                     tracing::debug!(

@@ -335,6 +335,12 @@ async fn decode_round(
                     entry.1.push_str(&tu.input);
                 }
                 Event::Metadata(metadata) => {
+                    // 只补充截断原因；tool_use / end_turn 由 resolve_flush_stop_reason 按实际内容决定。
+                    if let Some(reason) = metadata.truncation_stop_reason() {
+                        if stop_reason_override.is_none() {
+                            stop_reason_override = Some(reason.to_string());
+                        }
+                    }
                     if let Some(usage) = metadata.token_usage {
                         // 单条流内重复 metadata 是快照，取最后一份。
                         provider_token_usage = Some(usage.sanitized());
