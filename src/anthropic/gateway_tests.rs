@@ -49,6 +49,7 @@ enum Mode {
     InvalidFrame,
     Empty,
     Tools,
+    Filtered,
     Stalled,
     SlowHeaders,
     SlowErrorBody,
@@ -151,6 +152,15 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 return Response::builder().status(500).body(Body::from_stream(stream::pending::<Result<Bytes, Infallible>>())).unwrap();
             }
             if matches!(mode, Mode::Empty) { return Response::new(Body::empty()); }
+            if matches!(mode, Mode::Filtered) {
+                let mut bytes = Vec::new();
+                for part in [
+                    frame("reasoningContentEvent", json!({"text":"I should summarize the result."})),
+                    frame("metadataEvent", json!({"stopReason":"CONTENT_FILTERED","stopDetails":{"detail":"private provider detail"},"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})),
+                ] { bytes.extend_from_slice(&part); }
+                let chunks: Vec<_> = bytes.chunks(7).map(Bytes::copy_from_slice).collect();
+                return Response::new(Body::from_stream(stream::iter(chunks.into_iter().map(Ok::<_, Infallible>))));
+            }
             if matches!(mode, Mode::Large) {
                 let frames = (0..18000).map(|_| frame("assistantResponseEvent", json!({"content": "x".repeat(1024)})));
                 return Response::new(Body::from_stream(stream::iter(frames.map(Ok::<_, Infallible>))));
@@ -403,6 +413,29 @@ async fn gateway_damaged_frames_are_errors_not_success() {
         }
         let response = request(f.state.clone(), "messages", false).await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+}
+
+#[tokio::test]
+async fn gateway_content_filter_is_reported_instead_of_output_limit_or_success() {
+    // 只有 reasoning + CONTENT_FILTERED（带 tokenUsage、无 refusal 详情）：
+    // 必须报告为拒答，不得伪造 max_tokens / 成功结束，也不泄露上游私有字段。
+    let f = fixture(Mode::Filtered).await;
+    for (endpoint, streaming, expected) in [
+        ("messages", false, r#""stop_reason":"refusal""#),
+        ("messages", true, r#""stop_reason":"refusal""#),
+        ("cc", true, r#""stop_reason":"refusal""#),
+        ("chat", true, r#""finish_reason":"content_filter""#),
+        ("responses", true, r#""reason":"content_filter""#),
+    ] {
+        let response = request(f.state.clone(), endpoint, streaming).await;
+        assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains(expected), "{endpoint}: {body}");
+        assert!(!body.contains("max_tokens"), "{endpoint}: {body}");
+        assert!(!body.contains("model_context_window_exceeded"), "{endpoint}: {body}");
+        assert!(!body.contains("private provider detail"), "{endpoint}: {body}");
     }
 }
 

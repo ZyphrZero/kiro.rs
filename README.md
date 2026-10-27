@@ -631,6 +631,10 @@ Kiro 上游可能返回原生 `reasoningContentEvent`。`kiro-rs` 会把它转�
 
 非流式响应优先使用原生 reasoning 事件；只有没有原生 reasoning 时，才回退到旧的 `<thinking>...</thinking>` 文本提取路径。
 
+结束原因优先采用上游 `metadataEvent.stopReason`。只有 thinking 的响应不会被自动改写成 `max_tokens`，也不会补造空格正文；真实的输出上限仍按上游事件报告。
+
+上游返回 `CONTENT_FILTERED` 时按拒答处理：Anthropic 响应 `stop_reason` 为 `refusal`（Chat Completions 为 `content_filter`，Responses 为 `incomplete`）。它表示 Kiro 上游终止了生成，不表示客户端用完了输出 Token，也不会被后续的 `max_tokens` 或上下文窗口事件覆盖。
+
 ### Tool Use
 
 服务端会把 Anthropic tools 转成 Kiro 工具定义，并处理以下兼容逻辑：
