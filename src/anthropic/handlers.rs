@@ -35,6 +35,10 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{SseEvent, StreamContext};
+use super::structured_rewrite::{
+    StructuredCollector, append_schema_instruction, inject_system_instruction,
+    rewrite_message_json, split_initial_events,
+};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
@@ -849,6 +853,7 @@ pub async fn post_messages(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    warn_structured_output_with_web_search(&payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -907,6 +912,9 @@ pub async fn post_messages(
         )
         .await;
     }
+
+    // output_config.format=json_schema：Kiro 无原生字段，注入 schema 指令，响应侧再提取改写。
+    let structured_schema = inject_system_instruction(&mut payload);
 
     // 转换请求
     let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
@@ -1014,6 +1022,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            structured_schema.clone(),
         )
         .await
     } else {
@@ -1042,6 +1051,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            structured_schema.clone(),
         )
         .await
     }
@@ -1060,6 +1070,7 @@ async fn handle_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    structured_schema: Option<serde_json::Value>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
@@ -1098,7 +1109,15 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events, hook, credential_id, tracer);
+    let stream = create_sse_stream(
+        response,
+        ctx,
+        initial_events,
+        hook,
+        credential_id,
+        tracer,
+        structured_schema.map(|schema| StructuredCollector::new(schema, model)),
+    );
 
     // 返回 SSE 响应
     // `x-accel-buffering: no` 让前置 nginx 对本次响应关闭 proxy_buffering。
@@ -1130,7 +1149,17 @@ fn create_sse_stream(
     hook: UsageRecordHook,
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
+    mut structured: Option<StructuredCollector>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    // 结构化输出模式：只先发 message_start，其余初始事件与后续内容缓冲到流结束再改写发出。
+    let initial_events = match structured.as_mut() {
+        Some(collector) => {
+            let (sent, held) = split_initial_events(initial_events);
+            collector.hold(held);
+            sent
+        }
+        None => initial_events,
+    };
     // 先发送初始事件
     let initial_stream = stream::iter(
         initial_events
@@ -1140,7 +1169,8 @@ fn create_sse_stream(
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
-    let settlement = StreamSettlement::new(hook, credential_id, tracer, &ctx);
+    let mut settlement = StreamSettlement::new(hook, credential_id, tracer, &ctx);
+    settlement.structured = structured;
 
     let processing_stream = stream::unfold(
         (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), settlement, 0u64),
@@ -1173,7 +1203,10 @@ fn create_sse_stream(
                                                     return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
                                                 }
                                                 let generated = ctx.process_kiro_event(&event);
-                                                settlement.tracer.mark_first_content(&generated);
+                                                // 结构化模式下内容被缓冲，首字时间在流末真正发出时再记
+                                                if settlement.structured.is_none() {
+                                                    settlement.tracer.mark_first_content(&generated);
+                                                }
                                                 events.extend(generated);
                                             }
                                             Err(error) => {
@@ -1189,6 +1222,7 @@ fn create_sse_stream(
                                 }
                             }
 
+                            let events = settlement.hold_if_structured(events);
                             // 转换为 SSE 字节流
                             let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
@@ -1214,6 +1248,7 @@ fn create_sse_stream(
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             let final_events = ctx.generate_final_events();
+                            let final_events = settlement.finish_structured(final_events);
                             settlement.tracer.mark_first_content(&final_events);
                             settlement.update(&ctx, sent_bytes);
                             if let Some(message) = ctx.tool_json_error_message() {
@@ -1264,9 +1299,30 @@ struct StreamSettlement {
     usage: TraceUsage,
     sent_bytes: u64,
     settled: bool,
+    /// 结构化输出模式下的事件缓冲；None 表示按原样实时转发。
+    structured: Option<StructuredCollector>,
 }
 
 impl StreamSettlement {
+    /// 结构化模式下缓冲事件（返回空）；否则原样返回。
+    fn hold_if_structured(&mut self, events: Vec<SseEvent>) -> Vec<SseEvent> {
+        match self.structured.as_mut() {
+            Some(collector) => {
+                collector.hold(events);
+                Vec::new()
+            }
+            None => events,
+        }
+    }
+
+    /// 流正常结束：结构化模式下把缓冲 + 结尾事件改写后一次性返回。
+    fn finish_structured(&mut self, final_events: Vec<SseEvent>) -> Vec<SseEvent> {
+        match self.structured.as_mut() {
+            Some(collector) => collector.finish(final_events),
+            None => final_events,
+        }
+    }
+
     fn interrupt(
         &mut self,
         ctx: &mut StreamContext,
@@ -1274,6 +1330,12 @@ impl StreamSettlement {
         error: &str,
         bytes: u64,
     ) -> Vec<Result<Bytes, Infallible>> {
+        if let Some(collector) = self.structured.as_mut() {
+            // 流被中断：已缓冲的事件按原顺序放在 error 事件之前，不做改写。
+            let mut held = collector.take_unchanged();
+            held.extend(events);
+            events = held;
+        }
         tracing::error!(error, "Upstream response stream was interrupted");
         events.extend(
             ctx.generate_error_events("api_error", "Upstream response stream was interrupted"),
@@ -1305,6 +1367,7 @@ impl StreamSettlement {
             usage: stream_trace_usage(ctx),
             sent_bytes: 0,
             settled: false,
+            structured: None,
         }
     }
 
@@ -1417,6 +1480,7 @@ async fn handle_non_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    structured_schema: Option<serde_json::Value>,
 ) -> Response {
     match execute_non_stream_request(
         provider,
@@ -1432,7 +1496,12 @@ async fn handle_non_stream_request(
     )
     .await
     {
-        Ok(response_body) => (StatusCode::OK, Json(response_body)).into_response(),
+        Ok(mut response_body) => {
+            if let Some(schema) = &structured_schema {
+                rewrite_message_json(&mut response_body, schema, model);
+            }
+            (StatusCode::OK, Json(response_body)).into_response()
+        }
         Err(NonStreamExecutionError::Provider(error)) => map_provider_error(error),
         Err(NonStreamExecutionError::Response(response)) => response,
     }
@@ -1961,9 +2030,34 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     });
 
     if is_opus_4_6 {
+        // 只覆写 effort，保留客户端的 format（结构化输出）。
+        let format = payload
+            .output_config
+            .take()
+            .and_then(|config| config.format);
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
+            format,
         });
+    }
+}
+
+/// web_search 路径（纯 web_search 与混合工具循环）暂不支持结构化输出：请求按普通方式处理，
+/// 这里只记一条 warn，避免调用方拿到自由文本却无从排查。
+fn warn_structured_output_with_web_search(payload: &MessagesRequest) {
+    let wants_schema = payload
+        .output_config
+        .as_ref()
+        .and_then(|config| config.json_schema())
+        .is_some();
+    if wants_schema
+        && (websearch::has_web_search_tool(payload)
+            || websearch::has_web_search_among_tools(payload))
+    {
+        tracing::warn!(
+            model = %payload.model,
+            "structured output: output_config.format is not supported together with web_search; the reply is returned unchanged"
+        );
     }
 }
 
@@ -1972,13 +2066,16 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 /// 计算消息的 token 数量
 pub async fn count_tokens(
     Extension(_key_ctx): Extension<KeyContext>,
-    JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
+    JsonExtractor(mut payload): JsonExtractor<CountTokensRequest>,
 ) -> impl IntoResponse {
     tracing::info!(
         model = %payload.model,
         message_count = %payload.messages.len(),
         "Received POST /v1/messages/count_tokens request"
     );
+
+    // 与 /v1/messages 一致：结构化输出注入的 schema 指令也要计入
+    append_schema_instruction(payload.output_config.as_ref(), &mut payload.system);
 
     let total_tokens = token::count_all_tokens(
         payload.model,
@@ -2033,6 +2130,7 @@ pub async fn post_messages_cc(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    warn_structured_output_with_web_search(&payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -2090,6 +2188,9 @@ pub async fn post_messages_cc(
         )
         .await;
     }
+
+    // output_config.format=json_schema：Kiro 无原生字段，注入 schema 指令，响应侧再提取改写。
+    let structured_schema = inject_system_instruction(&mut payload);
 
     // 转换请求
     let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
@@ -2196,6 +2297,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            structured_schema.clone(),
         )
         .await
     } else {
@@ -2221,6 +2323,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            structured_schema.clone(),
         )
         .await
     }
@@ -2240,6 +2343,7 @@ async fn handle_cc_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    structured_schema: Option<serde_json::Value>,
 ) -> Response {
     handle_stream_request(
         provider,
@@ -2253,6 +2357,7 @@ async fn handle_cc_stream_request(
         cache_usage,
         tracer,
         group,
+        structured_schema,
     )
     .await
 }
@@ -2261,6 +2366,45 @@ async fn handle_cc_stream_request(
 mod tests {
     use super::*;
     use crate::model::config::ToolCompatibilityMode;
+
+    #[test]
+    fn count_tokens_includes_structured_output_instruction() {
+        let request = |output_config: serde_json::Value| -> CountTokensRequest {
+            serde_json::from_value(json!({
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "Is the goal done?"}],
+                "output_config": output_config
+            }))
+            .unwrap()
+        };
+        let schema = json!({"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]});
+        let mut with_format = request(json!({"format": {"type": "json_schema", "schema": schema}}));
+        assert!(append_schema_instruction(with_format.output_config.as_ref(), &mut with_format.system).is_some());
+        let system = with_format.system.as_ref().unwrap();
+        assert_eq!(system.len(), 1);
+        assert!(system[0].text.contains("\"ok\""));
+        // 不带 format：不注入
+        let mut plain = request(json!({"effort": "high"}));
+        assert!(append_schema_instruction(plain.output_config.as_ref(), &mut plain.system).is_none());
+        assert!(plain.system.is_none());
+        // output_config 不会被转发给外部 count_tokens API
+        assert!(serde_json::to_value(&with_format).unwrap().get("output_config").is_none());
+    }
+
+    #[test]
+    fn opus_4_6_thinking_override_keeps_output_format() {
+        let mut payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-6-thinking",
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"format": {"type": "json_schema", "schema": {"type": "object"}}}
+        }))
+        .unwrap();
+        override_thinking_from_model_name(&mut payload);
+        let config = payload.output_config.as_ref().unwrap();
+        assert_eq!(config.effort, "high");
+        assert!(config.json_schema().is_some());
+        assert!(inject_system_instruction(&mut payload).is_some());
+    }
 
     #[test]
     fn dropped_stream_settles_latest_usage_exactly_once() {
