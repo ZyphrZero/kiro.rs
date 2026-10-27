@@ -1,7 +1,7 @@
 //! Structured output (`output_config.format = json_schema`) emulation.
 //!
 //! The upstream has no native JSON-schema mode, so we instruct the model via the
-//! system prompt and then pull the first conforming JSON value out of its reply.
+//! system prompt and then pull the last conforming JSON value out of its reply.
 
 use serde_json::Value;
 
@@ -197,14 +197,15 @@ fn json_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// Finds the first JSON value in `text` (scanning every `{` / `[`candidate, also
+/// Finds the last JSON value in `text` (scanning every `{` / `[`candidate, also
 /// inside ```json fences) that parses AND conforms to `schema`; returns its compact
-/// serialization.
+/// serialization. The last one wins because models put the verdict after their
+/// reasoning, and a loose schema may also match example values quoted earlier.
 ///
-/// A candidate that parses but does not conform is skipped as a whole (scanning
-/// resumes after its end), so sub-objects nested inside a non-conforming outer
-/// value are never picked. Scalar roots are only accepted when the whole trimmed
-/// text (optionally wrapped in a code fence) is that JSON value.
+/// Every parsed candidate is skipped as a whole (scanning resumes after its end),
+/// so sub-objects nested inside an outer value are never picked. Scalar roots are
+/// only accepted when the whole trimmed text (optionally wrapped in a code fence)
+/// is that JSON value.
 pub fn extract_conforming_json(text: &str, schema: &Value) -> Option<String> {
     // 整段文本（或围栏内容）本身就是一个合法值，覆盖标量根
     let whole = strip_fence(text.trim());
@@ -217,6 +218,7 @@ pub fn extract_conforming_json(text: &str, schema: &Value) -> Option<String> {
     let bytes = text.as_bytes();
     let mut pos = 0;
     let mut failed = 0;
+    let mut last = None;
     while pos < bytes.len() {
         // '{' 和 '[' 都是 ASCII，按字节定位必在 char 边界上
         let Some(rel) = bytes[pos..].iter().position(|&b| b == b'{' || b == b'[') else {
@@ -227,20 +229,20 @@ pub fn extract_conforming_json(text: &str, schema: &Value) -> Option<String> {
         match stream.next() {
             Some(Ok(v)) => {
                 if conforms(schema, &v) {
-                    return serde_json::to_string(&v).ok();
+                    last = Some(v);
                 }
                 pos = start + stream.byte_offset().max(1);
             }
             _ => {
                 failed += 1;
                 if failed >= MAX_FAILED_PARSES {
-                    return None;
+                    break;
                 }
                 pos = start + 1;
             }
         }
     }
-    None
+    last.and_then(|v| serde_json::to_string(&v).ok())
 }
 
 /// 去掉最外层 ``` / ```json 围栏（若存在）
@@ -585,6 +587,22 @@ mod tests {
         assert_eq!(
             extract(text).as_deref(),
             Some(r#"{"ok":false,"reason":"z"}"#)
+        );
+    }
+
+    #[test]
+    fn extract_prefers_last_conforming_value_with_loose_schema() {
+        let loose = json!({"type": "object", "properties": {"answer": {"type": "string"}}});
+        let text = r#"Use {} for an empty config. {"answer":"42"}"#;
+        assert_eq!(
+            extract_conforming_json(text, &loose).as_deref(),
+            Some(r#"{"answer":"42"}"#)
+        );
+        // 后面的合规值胜出，但被扫过的外层值里的子对象不会被单独选中
+        let text = r#"{"answer":"draft"} then {"wrapper":{"answer":"inner"}}"#;
+        assert_eq!(
+            extract_conforming_json(text, &loose).as_deref(),
+            Some(r#"{"wrapper":{"answer":"inner"}}"#)
         );
     }
 

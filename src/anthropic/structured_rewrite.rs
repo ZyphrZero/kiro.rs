@@ -1,7 +1,7 @@
 //! `output_config.format = json_schema` 的请求注入与响应改写。
 //!
 //! Kiro 上游没有原生 structured output 字段，因此：请求侧把 schema 以系统提示形式注入，
-//! 响应侧从模型回复里提取第一个符合 schema 的 JSON，并用它替换 text 内容。
+//! 响应侧从模型回复里提取最后一个符合 schema 的 JSON，并用它替换 text 内容。
 //! 提取不到合规 JSON 时原样返回，只打一行不含内容的 warn。
 
 use std::collections::HashMap;
@@ -10,23 +10,24 @@ use serde_json::{Value, json};
 
 use super::stream::SseEvent;
 use super::structured_output::{extract_conforming_json, system_instruction};
-use super::types::{MessagesRequest, SystemMessage};
+use super::types::{MessagesRequest, OutputConfig, SystemMessage};
 
 /// 请求带有 `output_config.format = json_schema` 时，把 schema 指令追加到 system 末尾
 /// （不动已有块，保持其上的 cache 断点有效），并返回 schema 供响应改写使用。
 pub(super) fn inject_system_instruction(payload: &mut MessagesRequest) -> Option<Value> {
-    let schema = payload
-        .output_config
-        .as_ref()
-        .and_then(|config| config.json_schema())
-        .cloned()?;
-    payload
-        .system
-        .get_or_insert_with(Vec::new)
-        .push(SystemMessage {
-            text: system_instruction(&schema),
-            cache_control: None,
-        });
+    append_schema_instruction(payload.output_config.as_ref(), &mut payload.system)
+}
+
+/// `inject_system_instruction` 的底层实现；count_tokens 也用它，使估算包含注入的指令。
+pub(super) fn append_schema_instruction(
+    output_config: Option<&OutputConfig>,
+    system: &mut Option<Vec<SystemMessage>>,
+) -> Option<Value> {
+    let schema = output_config.and_then(OutputConfig::json_schema).cloned()?;
+    system.get_or_insert_with(Vec::new).push(SystemMessage {
+        text: system_instruction(&schema),
+        cache_control: None,
+    });
     Some(schema)
 }
 

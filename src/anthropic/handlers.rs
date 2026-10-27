@@ -36,7 +36,8 @@ use super::converter::{ConversionError, convert_request_with_mode, get_context_w
 use super::middleware::{AppState, KeyContext};
 use super::stream::{SseEvent, StreamContext};
 use super::structured_rewrite::{
-    StructuredCollector, inject_system_instruction, rewrite_message_json, split_initial_events,
+    StructuredCollector, append_schema_instruction, inject_system_instruction,
+    rewrite_message_json, split_initial_events,
 };
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
@@ -852,6 +853,7 @@ pub async fn post_messages(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    warn_structured_output_with_web_search(&payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -1201,7 +1203,10 @@ fn create_sse_stream(
                                                     return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
                                                 }
                                                 let generated = ctx.process_kiro_event(&event);
-                                                settlement.tracer.mark_first_content(&generated);
+                                                // 结构化模式下内容被缓冲，首字时间在流末真正发出时再记
+                                                if settlement.structured.is_none() {
+                                                    settlement.tracer.mark_first_content(&generated);
+                                                }
                                                 events.extend(generated);
                                             }
                                             Err(error) => {
@@ -1243,6 +1248,7 @@ fn create_sse_stream(
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             let final_events = ctx.generate_final_events();
+                            let final_events = settlement.finish_structured(final_events);
                             settlement.tracer.mark_first_content(&final_events);
                             settlement.update(&ctx, sent_bytes);
                             if let Some(message) = ctx.tool_json_error_message() {
@@ -1258,7 +1264,6 @@ fn create_sse_stream(
                             } else {
                                 settlement.finish("success", "success", None, None, None);
                             }
-                            let final_events = settlement.finish_structured(final_events);
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -2037,18 +2042,40 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     }
 }
 
+/// web_search 路径（纯 web_search 与混合工具循环）暂不支持结构化输出：请求按普通方式处理，
+/// 这里只记一条 warn，避免调用方拿到自由文本却无从排查。
+fn warn_structured_output_with_web_search(payload: &MessagesRequest) {
+    let wants_schema = payload
+        .output_config
+        .as_ref()
+        .and_then(|config| config.json_schema())
+        .is_some();
+    if wants_schema
+        && (websearch::has_web_search_tool(payload)
+            || websearch::has_web_search_among_tools(payload))
+    {
+        tracing::warn!(
+            model = %payload.model,
+            "structured output: output_config.format is not supported together with web_search; the reply is returned unchanged"
+        );
+    }
+}
+
 /// POST /v1/messages/count_tokens
 ///
 /// 计算消息的 token 数量
 pub async fn count_tokens(
     Extension(_key_ctx): Extension<KeyContext>,
-    JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
+    JsonExtractor(mut payload): JsonExtractor<CountTokensRequest>,
 ) -> impl IntoResponse {
     tracing::info!(
         model = %payload.model,
         message_count = %payload.messages.len(),
         "Received POST /v1/messages/count_tokens request"
     );
+
+    // 与 /v1/messages 一致：结构化输出注入的 schema 指令也要计入
+    append_schema_instruction(payload.output_config.as_ref(), &mut payload.system);
 
     let total_tokens = token::count_all_tokens(
         payload.model,
@@ -2103,6 +2130,7 @@ pub async fn post_messages_cc(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    warn_structured_output_with_web_search(&payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -2338,6 +2366,30 @@ async fn handle_cc_stream_request(
 mod tests {
     use super::*;
     use crate::model::config::ToolCompatibilityMode;
+
+    #[test]
+    fn count_tokens_includes_structured_output_instruction() {
+        let request = |output_config: serde_json::Value| -> CountTokensRequest {
+            serde_json::from_value(json!({
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "Is the goal done?"}],
+                "output_config": output_config
+            }))
+            .unwrap()
+        };
+        let schema = json!({"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]});
+        let mut with_format = request(json!({"format": {"type": "json_schema", "schema": schema}}));
+        assert!(append_schema_instruction(with_format.output_config.as_ref(), &mut with_format.system).is_some());
+        let system = with_format.system.as_ref().unwrap();
+        assert_eq!(system.len(), 1);
+        assert!(system[0].text.contains("\"ok\""));
+        // 不带 format：不注入
+        let mut plain = request(json!({"effort": "high"}));
+        assert!(append_schema_instruction(plain.output_config.as_ref(), &mut plain.system).is_none());
+        assert!(plain.system.is_none());
+        // output_config 不会被转发给外部 count_tokens API
+        assert!(serde_json::to_value(&with_format).unwrap().get("output_config").is_none());
+    }
 
     #[test]
     fn opus_4_6_thinking_override_keeps_output_format() {

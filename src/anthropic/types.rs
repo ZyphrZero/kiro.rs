@@ -360,6 +360,9 @@ pub struct CountTokensRequest {
     pub system: Option<Vec<SystemMessage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
+    /// 只用于把结构化输出注入的 schema 指令计入估算；不转发给外部 count_tokens API。
+    #[serde(default, skip_serializing)]
+    pub output_config: Option<OutputConfig>,
 }
 
 /// Token 计数响应

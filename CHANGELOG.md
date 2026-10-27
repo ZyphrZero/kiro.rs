@@ -8,7 +8,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Features
 
-- Support `output_config.format = {"type":"json_schema","schema":{...}}` on `/v1/messages` and `/cc/v1/messages`. Kiro has no native structured-output field, so the schema is appended to the system prompt and the reply is rewritten to the first schema-conforming JSON value (non-stream: single text block; stream: buffered, then one compliant text block). Replies without conforming JSON are returned unchanged with a single warning. `format` is never forwarded upstream; requests without it behave as before.
+- Support `output_config.format = {"type":"json_schema","schema":{...}}` on `/v1/messages` and `/cc/v1/messages`. Kiro has no native structured-output field, so the schema is appended to the system prompt and the reply is rewritten to the last schema-conforming JSON value (non-stream: single text block; stream: buffered, then one compliant text block). Replies without conforming JSON are returned unchanged with a single warning. `format` is never forwarded upstream; requests without it behave as before.
 
 ## [0.9.3] - 2026-10-26
 

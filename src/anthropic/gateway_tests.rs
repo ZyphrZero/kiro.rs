@@ -855,7 +855,8 @@ fn goal_cases() -> Vec<(&'static [&'static str], serde_json::Value)> {
         (OPENING_CHECKING, json!({"ok": true, "reason": "all tests pass", "impossible": false})),
         (OPENING_CORE, json!({"ok": true, "reason": "done"})),
         (PURE_JSON, json!({"ok": true, "reason": "fine"})),
-        (NONCONFORMING_THEN_OK, json!({"ok": false, "reason": "second"})),
+        // 多个合规值时取最后一个（结论通常在理由之后）
+        (NONCONFORMING_THEN_OK, json!({"ok": true, "reason": "third"})),
     ]
 }
 
@@ -1267,4 +1268,27 @@ async fn structured_output_stream_failure_keeps_buffered_events_in_order() {
     assert!(shape.contains(&"content_block_delta#0".to_owned()), "{shape:?}");
     assert_eq!(shape.last().map(String::as_str), Some("error"), "{shape:?}");
     assert!(!shape.contains(&"message_stop".to_owned()));
+}
+
+/// 结构化流式会缓冲到流末才发出内容：trace 首字时间应记在真正发出时，
+/// 而不是上游内容到达时；不带 format 的请求照旧按到达时间记。
+#[tokio::test]
+async fn structured_output_stream_first_token_trace_is_emit_time() {
+    let mut first_token = HashMap::new();
+    for (name, output_config) in [("structured", Some(goal_output_config())), ("plain", None)] {
+        let mut f = fixture(Mode::Normal(Duration::from_millis(300))).await;
+        let store = Arc::new(TraceStore::open_in_memory().unwrap());
+        f.state = f.state.clone().with_trace_store(Some(store.clone()));
+        let response = goal_request(f.state.clone(), "messages", true, false, output_config).await;
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        let _ = body_string(response).await;
+        let (records, count) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(count, 1, "{name}");
+        first_token.insert(name, records[0].first_token_ms.unwrap());
+    }
+    assert!(first_token["structured"] >= 300, "{first_token:?}");
+    assert!(first_token["plain"] < 300, "{first_token:?}");
 }
