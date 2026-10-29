@@ -100,11 +100,11 @@ struct RoundOutcome {
     /// Upstream body-read error, if any. Content decoded before this error is
     /// partial and must not be treated as a successful round.
     stream_error: Option<String>,
-    /// Tool names declared to the upstream this round (original + shortened),
-    /// taken from `ConversionResult::known_tool_names`. Used by the shared
-    /// `<invoke>` text-leak fault tolerance so a leaked `<invoke name=...>` is only
-    /// reclaimed when its name is a real declared tool.
-    known_tool_names: std::collections::HashSet<String>,
+    /// Tools declared to the upstream this round with their input_schema (Kiro-side names).
+    /// Used by the shared `<invoke>` text fault tolerance (H2): a text `<invoke name=...>`
+    /// is only turned into a tool call when its name is declared here and its parameters
+    /// parse against that schema.
+    invoke_tool_schemas: super::stream::InvokeToolSchemas,
     /// Short-name -> original-name map for this round, taken from
     /// `ConversionResult::tool_name_map`. Used to restore the original tool name when a
     /// leaked `<invoke>` carries a shortened (>63 char) tool name.
@@ -290,7 +290,7 @@ async fn decode_round(
     let mut stop_reason_override: Option<String> = None;
     let mut stream_error = None;
 
-    while let Some(chunk) = body_stream.next().await {
+    'read: while let Some(chunk) = body_stream.next().await {
         let chunk = match chunk {
             Ok(c) => {
                 tracer.mark_first_token();
@@ -303,19 +303,24 @@ async fn decode_round(
             }
         };
         if let Err(e) = decoder.feed(&chunk) {
-            tracing::warn!("buffer overflow: {}", e);
+            // L10：帧损坏说明本轮流不完整，不能当成正常结束。
+            stream_error = Some(format!("malformed event frame: {e}"));
+            break 'read;
         }
         for result in decoder.decode_iter() {
             let frame = match result {
                 Ok(f) => f,
                 Err(e) => {
-                    tracing::warn!("failed to decode event: {}", e);
-                    continue;
+                    stream_error = Some(format!("malformed event frame: {e}"));
+                    break 'read;
                 }
             };
             let event = match Event::from_frame(frame) {
                 Ok(ev) => ev,
-                Err(_) => continue,
+                Err(e) => {
+                    stream_error = Some(format!("malformed event: {e}"));
+                    break 'read;
+                }
             };
             match event {
                 Event::AssistantResponse(resp) => text.push_str(&resp.content),
@@ -356,12 +361,26 @@ async fn decode_round(
                     credits += m.usage;
                     last_metering = Some(m.clone());
                 }
-                Event::Exception { exception_type, .. } => {
-                    if exception_type == "ContentLengthExceededException"
-                        && !is_refusal(&stop_reason_override)
-                    {
-                        stop_reason_override = Some("max_tokens".to_string());
+                Event::Exception {
+                    exception_type,
+                    message,
+                } => {
+                    if exception_type == "ContentLengthExceededException" {
+                        if !is_refusal(&stop_reason_override) {
+                            stop_reason_override = Some("max_tokens".to_string());
+                        }
+                    } else {
+                        // L10：与普通流式路径一致，上游异常让本轮失败，不当成正常结束。
+                        stream_error = Some(format!("upstream exception {exception_type}: {message}"));
+                        break 'read;
                     }
+                }
+                Event::Error {
+                    error_code,
+                    error_message,
+                } => {
+                    stream_error = Some(format!("upstream error {error_code}: {error_message}"));
+                    break 'read;
                 }
                 _ => {}
             }
@@ -374,10 +393,17 @@ async fn decode_round(
             let input: Value = if buf.is_empty() {
                 json!({})
             } else {
-                serde_json::from_str(&buf).unwrap_or_else(|e| {
-                    tracing::warn!("failed to parse tool input JSON: {}", e);
-                    json!({})
-                })
+                match serde_json::from_str(&buf) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // L10：半截参数不能以 `{}` 交给客户端执行。拒答时上游本来就可能
+                        // 截断工具调用，此时丢弃该调用、保留拒答终态。
+                        if stream_error.is_none() && !is_refusal(&stop_reason_override) {
+                            stream_error = Some(format!("invalid tool input JSON for {name}: {e}"));
+                        }
+                        continue;
+                    }
+                }
             };
             // 统一还原入口（名字 + 入参），与流式 / 非流式路径同口径。
             tool_uses.push(CompletedToolUse::from_kiro(id, &name, input, tool_name_map));
@@ -386,6 +412,10 @@ async fn decode_round(
 
     // 剥离混入文本的字面 <tool_use> XML 泄漏（与非流式同口径）。
     let text = crate::kiro::model::events::strip_tool_use_xml_leaks(&text);
+    // L5：stray token 复读洪泛会在 flush 时被截断，本轮输出不完整，必须以错误让客户端可见。
+    if stream_error.is_none() && super::stream::stray_token_flood_detected(&text) {
+        stream_error = Some(super::stream::REPEAT_GUARD_ERROR_MESSAGE.to_string());
+    }
 
     RoundOutcome {
         text,
@@ -397,8 +427,8 @@ async fn decode_round(
         last_metering,
         stop_reason_override,
         stream_error,
-        // Populated by the caller (run_round), which holds ConversionResult::known_tool_names.
-        known_tool_names: std::collections::HashSet::new(),
+        // Populated by the caller (run_round) from the conversation state sent upstream.
+        invoke_tool_schemas: super::stream::InvokeToolSchemas::new(),
         // Populated by the caller (run_round), which holds ConversionResult::tool_name_map.
         tool_name_map: std::collections::HashMap::new(),
     }
@@ -462,6 +492,11 @@ async fn run_round(
         }
     };
 
+    // H2: schemas of the tools declared upstream, taken before conversation_state is moved.
+    let invoke_tool_schemas = super::stream::invoke_tool_schemas_from_state(
+        &conversion.conversation_state,
+        &conversion.known_tool_names,
+    );
     let kiro_request = KiroRequest {
         conversation_state: conversion.conversation_state,
         profile_arn: None,
@@ -518,9 +553,9 @@ async fn run_round(
         tracer,
     )
     .await;
-    // Carry the declared tool names (original + shortened) so the flush step can run the
-    // shared `<invoke>` text-leak fault tolerance with a correct tool-table guard.
-    outcome.known_tool_names = conversion.known_tool_names;
+    // Carry the declared tool schemas so the flush step runs the shared `<invoke>` text
+    // fault tolerance with the same rules as the streaming path (H2).
+    outcome.invoke_tool_schemas = invoke_tool_schemas;
     // Carry the short->original tool name map so reclaimed <invoke> names get restored.
     outcome.tool_name_map = conversion.tool_name_map;
     if let Some(error_message) = outcome.stream_error.take() {
@@ -699,78 +734,40 @@ fn is_refusal(override_reason: &Option<String>) -> bool {
 /// we reclaim it into a structured `tool_use` instead of passing the raw XML through.
 /// The web_search loop builds its own SSE/content and historically bypassed that
 /// fault tolerance entirely — this is the fix.
-/// Canonical, order-independent key for a tool_use `input` JSON value, used to
-/// detect that a reclaimed-from-text tool_use is identical to a structured one.
-/// `serde_json::Value`'s `Map` is a BTreeMap (or preserves order when the
-/// `preserve_order` feature is on); to be robust we serialize via a BTreeMap so
-/// key order never affects equality.
-fn canonical_input_key(input: &Value) -> String {
-    match input {
-        Value::Object(map) => {
-            let sorted: std::collections::BTreeMap<&String, &Value> = map.iter().collect();
-            serde_json::to_string(&sorted).unwrap_or_else(|_| input.to_string())
-        }
-        _ => input.to_string(),
-    }
-}
-
 fn build_flush_content(
     presentation: Vec<Value>,
     text: &str,
     tool_uses: &[CompletedToolUse],
     searched: &[Option<WebSearchResults>],
-    known_tool_names: &std::collections::HashSet<String>,
+    invoke_tool_schemas: &super::stream::InvokeToolSchemas,
     tool_name_map: &std::collections::HashMap<String, String>,
 ) -> Vec<Value> {
     let mut content: Vec<Value> = presentation;
     if !text.is_empty() {
-        // Run the shared one-shot `<invoke>` sniffer: splits `text` into a sequence of
-        // text blocks + reclaimed structured tool_use blocks (same safety gates as the
-        // streaming fault tolerance). For clean text with no leaked `<invoke>`, this
-        // returns a single text block identical to the old behavior.
-        //
-        // INVARIANT GUARD: `web_search` must NEVER be reclaimed as a raw client `tool_use`
-        // — the Codex host has no web_search executor and rejects it with
-        // "unsupported call: web_search". `known_tool_names` is copied verbatim from
-        // req.tools and (since we are in the web_search loop) always contains "web_search",
-        // so we strip it from the reclamation tool-table here. A leaked
-        // `<invoke name="web_search">` then fails the tool-table gate and stays as plain
-        // text (ugly but protocol-safe), instead of being upgraded into a raw tool_use that
-        // breaks the loop's core invariant.
-        let reclaim_tools: std::collections::HashSet<String> = known_tool_names
-            .iter()
-            .filter(|n| n.as_str() != "web_search")
-            .cloned()
-            .collect();
-        // DEDUP GUARD: a degraded model can emit BOTH a leaked literal `<invoke>` in the
-        // text AND the matching structured tool_use in `tool_uses`. Emitting both would
-        // make the host execute the same command twice. Suppress any reclaimed-from-text
-        // tool_use whose (name + canonical input) already appears in the structured
-        // `tool_uses` for this round. Text blocks (and distinct tool_uses) are kept as-is.
-        let structured_keys: std::collections::HashSet<(String, String)> = tool_uses
-            .iter()
-            .filter(|t| t.name != "web_search")
-            .map(|t| (t.name.clone(), canonical_input_key(&t.input)))
-            .collect();
-        for block in
-            super::stream::extract_invoke_content_blocks(text, &reclaim_tools, tool_name_map)
-        {
-            if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let key = (
-                    name.to_string(),
-                    block
-                        .get("input")
-                        .map(canonical_input_key)
-                        .unwrap_or_default(),
-                );
-                if structured_keys.contains(&key) {
-                    // identical to a structured tool_use already emitted below -> drop the
-                    // reclaimed duplicate (avoid double execution).
-                    continue;
-                }
-            }
-            content.push(block);
+        if tool_uses.is_empty() {
+            // Shared one-shot `<invoke>` recognizer, same rules as the streaming path (H2):
+            // only a trailing, line-start, out-of-code block for a declared tool whose
+            // parameters parse against its schema becomes a tool_use.
+            //
+            // INVARIANT GUARD: `web_search` must NEVER be synthesized as a raw client
+            // `tool_use` — the host has no web_search executor and rejects it with
+            // "unsupported call: web_search". It is always declared on requests that enter
+            // this loop, so it is removed from the table here and a text
+            // `<invoke name="web_search">` stays plain text.
+            let reclaim: super::stream::InvokeToolSchemas = invoke_tool_schemas
+                .iter()
+                .filter(|(name, _)| name.as_str() != "web_search")
+                .map(|(name, schema)| (name.clone(), schema.clone()))
+                .collect();
+            content.extend(super::stream::extract_invoke_content_blocks(
+                text,
+                &reclaim,
+                tool_name_map,
+            ));
+        } else {
+            // H2: this round has native tool_use, so text is never turned into calls
+            // (this also rules out executing the same command twice).
+            content.push(json!({"type": "text", "text": text}));
         }
     }
     for (idx, tu) in tool_uses.iter().enumerate() {
@@ -1563,7 +1560,7 @@ async fn run_web_search_loop_inner(
             // Cancel this round's calls before either search path runs. Clearing
             // the recovery table also prevents text leaks from becoming calls.
             round.tool_uses.clear();
-            round.known_tool_names.clear();
+            round.invoke_tool_schemas.clear();
         }
 
         // 拒答是终态：即便本轮带了 web_search，也不再续跑搜索轮次，直接带 refusal 收尾。
@@ -1650,7 +1647,7 @@ async fn run_web_search_loop_inner(
             &round.text,
             &round.tool_uses,
             &searched,
-            &round.known_tool_names,
+            &round.invoke_tool_schemas,
             &round.tool_name_map,
         );
         // stop_reason must be computed from the FINAL flushed content, not just
@@ -2303,9 +2300,11 @@ mod tests {
         );
     }
 
-    /// Build a known-tool-names set for build_flush_content tests.
-    fn names(ns: &[&str]) -> std::collections::HashSet<String> {
-        ns.iter().map(|s| s.to_string()).collect()
+    /// Build a permissive declared-tool schema table for build_flush_content tests.
+    fn names(ns: &[&str]) -> super::super::stream::InvokeToolSchemas {
+        ns.iter()
+            .map(|s| (s.to_string(), json!({"type": "object"})))
+            .collect()
     }
 
     /// Empty short->original tool name map for build_flush_content tests.
@@ -2351,7 +2350,7 @@ mod tests {
             last_metering: None,
             stop_reason_override: None,
             stream_error: None,
-            known_tool_names: std::collections::HashSet::new(),
+            invoke_tool_schemas: super::super::stream::InvokeToolSchemas::new(),
             tool_name_map: std::collections::HashMap::new(),
         }
     }
@@ -2869,7 +2868,8 @@ mod tests {
         // Reviewer (v3) #2: stripping web_search from the reclamation table must NOT hurt
         // other tools. A text with BOTH a leaked exec_command and a leaked web_search:
         // exec_command MUST be reclaimed; web_search MUST stay text (never raw tool_use).
-        let leaked = "<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n</invoke>\n<invoke name=\"web_search\">\n<parameter name=\"query\">news</parameter>\n</invoke>";
+        // H2: only the trailing block can become a call, so the leaked web_search comes first.
+        let leaked = "<invoke name=\"web_search\">\n<parameter name=\"query\">news</parameter>\n</invoke>\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n</invoke>";
         let content = build_flush_content(
             Vec::new(),
             leaked,
@@ -3112,9 +3112,9 @@ mod tests {
     }
 
     #[test]
-    fn flush_content_keeps_distinct_reclaimed_and_structured() {
-        // Dedup must only collapse TRUE duplicates: a reclaimed tool_use with a
-        // different input than the structured one is a distinct action and must be kept.
+    fn flush_content_native_tool_use_disables_text_reclaim() {
+        // H2: once the round has a native tool_use, a text `<invoke>` (even one with a
+        // different input) is kept as text and never becomes a second tool call.
         let leaked = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n</invoke>";
         let structured = vec![CompletedToolUse {
             id: "toolu_other".to_string(),
@@ -3134,8 +3134,14 @@ mod tests {
             .filter(|c| c["type"] == "tool_use" && c["name"] == "exec_command")
             .count();
         assert_eq!(
-            exec_calls, 2,
-            "distinct inputs must both be kept. content={:?}",
+            exec_calls, 1,
+            "only the native tool_use may be emitted. content={:?}",
+            content
+        );
+        assert!(
+            content.iter().any(|c| c["type"] == "text"
+                && c["text"].as_str().is_some_and(|t| t.contains("<invoke"))),
+            "text invoke must stay as text. content={:?}",
             content
         );
     }

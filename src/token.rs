@@ -184,6 +184,39 @@ async fn call_remote_count_tokens(
 }
 
 /// 本地计算请求的输入 tokens
+/// 本地估算时单张图片的 token 数：取 Anthropic 文档给出的单图上限（约 1600）。
+const IMAGE_TOKEN_ESTIMATE: u64 = 1600;
+
+/// 本地估算单个内容块的 token（M4）：text、thinking、tool_use 名称和入参、
+/// tool_result 内容（字符串或块数组，递归）、图片。
+fn count_content_block_tokens(item: &serde_json::Value) -> u64 {
+    match item.get("type").and_then(|v| v.as_str()) {
+        Some("tool_use") => {
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+            let input = item.get("input").map(|v| v.to_string()).unwrap_or_default();
+            count_tokens(name) + count_tokens(&input)
+        }
+        Some("tool_result") => match item.get("content") {
+            Some(serde_json::Value::String(s)) => count_tokens(s),
+            Some(serde_json::Value::Array(blocks)) => {
+                blocks.iter().map(count_content_block_tokens).sum()
+            }
+            _ => 0,
+        },
+        Some("thinking") => item
+            .get("thinking")
+            .and_then(|v| v.as_str())
+            .map(count_tokens)
+            .unwrap_or(0),
+        Some("image") => IMAGE_TOKEN_ESTIMATE,
+        _ => item
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(count_tokens)
+            .unwrap_or(0),
+    }
+}
+
 fn count_all_tokens_local(
     system: Option<Vec<SystemMessage>>,
     messages: Vec<Message>,
@@ -204,9 +237,7 @@ fn count_all_tokens_local(
             total += count_tokens(s);
         } else if let serde_json::Value::Array(arr) = &msg.content {
             for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    total += count_tokens(text);
-                }
+                total += count_content_block_tokens(item);
             }
         }
     }
@@ -327,5 +358,26 @@ mod tests {
         assert_eq!(input_tokens_excluding_output(Some(10), 25, -5), 10);
         // 负的 context_total 也 clamp 到 0。
         assert_eq!(input_tokens_excluding_output(Some(-7), 25, 0), 0);
+    }
+
+    #[test]
+    fn fixresp_m4_local_count_includes_tool_blocks_and_images() {
+        let code = "import os\n".repeat(200);
+        let output = "line of tool output\n".repeat(300);
+        let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "plan the work", "signature": "s"},
+                {"type": "tool_use", "id": "t1", "name": "run_code", "input": {"code": code}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [{"type": "text", "text": output}]},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+            ]}
+        ]))
+        .unwrap();
+        let total = count_all_tokens_local(None, messages, None);
+        let floor = count_tokens("hi") + count_tokens(&code) + count_tokens(&output) + IMAGE_TOKEN_ESTIMATE;
+        assert!(total >= floor, "total={total} floor={floor}");
     }
 }

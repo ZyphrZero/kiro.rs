@@ -11,7 +11,7 @@ mod reasoning;
 mod tool_use;
 
 pub use assistant::AssistantResponseEvent;
-pub(crate) use assistant::strip_tool_use_xml_leaks;
+pub(crate) use assistant::{MarkdownCodeTracker, ToolUseXmlLeakFilter, strip_tool_use_xml_leaks};
 pub use base::Event;
 pub use context_usage::ContextUsageEvent;
 pub use metadata::{MetadataEvent, TokenUsage};
