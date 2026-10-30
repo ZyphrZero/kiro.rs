@@ -28,7 +28,8 @@ use super::{
         SetGlobalProxyRequest,
         SetCacheMeteringConfigRequest, SetSessionAffinityConfigRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetModelApiRetryConfigRequest, SetQuotaResetRecoveryConfigRequest,
+        SetModelApiRetryConfigRequest, SetProxyFailoverConfigRequest,
+        SetQuotaResetRecoveryConfigRequest,
         SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
@@ -531,9 +532,33 @@ pub async fn check_proxy(
 }
 
 /// POST /api/admin/proxy-pool/check-all
-/// 触发全部代理的健康检查
+/// 触发一轮完整巡检：自动检测在用代理 → 健康探测 → 凭据代理自动轮换
 pub async fn check_all_proxies(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.check_all_proxies().await)
+}
+
+/// POST /api/admin/proxy-pool/rotate
+/// 按当前代理池状态立即执行一次凭据代理轮换（不重新探测）
+pub async fn rotate_credential_proxies(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.rotate_credential_proxies())
+}
+
+/// GET /api/admin/config/proxy-failover
+/// 获取代理故障转移配置
+pub async fn get_proxy_failover_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_proxy_failover_config())
+}
+
+/// PUT /api/admin/config/proxy-failover
+/// 更新代理故障转移配置
+pub async fn set_proxy_failover_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetProxyFailoverConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_proxy_failover_config(payload) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// POST /api/admin/proxy-pool/assign-round-robin

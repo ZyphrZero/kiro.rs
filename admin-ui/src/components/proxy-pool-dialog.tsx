@@ -12,6 +12,9 @@ import {
   CheckCircle2,
   XCircle,
   HelpCircle,
+  ShieldAlert,
+  RefreshCw,
+  Radar,
 } from 'lucide-react'
 import {
   Dialog,
@@ -22,6 +25,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
+import { Switch } from '@/components/ui/switch'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   getProxyPool,
@@ -34,9 +38,26 @@ import {
   checkProxy,
   checkAllProxies,
   assignProxiesRoundRobin,
+  getProxyFailoverConfig,
+  setProxyFailoverConfig,
+  rotateCredentialProxies,
 } from '@/api/credentials'
 import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
-import type { ProxyPoolEntry } from '@/types/api'
+import type {
+  ProxyPoolEntry,
+  ProxyFailoverConfigPatch,
+  ProxyRotationResponse,
+} from '@/types/api'
+
+/** 把轮换结果汇总成一句可读文案；无任何改动时返回 null */
+function describeRotation(rotation: ProxyRotationResponse): string | null {
+  const parts: string[] = []
+  if (rotation.rotated > 0) parts.push(`轮换 ${rotation.rotated} 个凭据`)
+  if (rotation.restoredToProxy > 0) parts.push(`${rotation.restoredToProxy} 个凭据改回代理`)
+  if (rotation.switchedToDirect > 0) parts.push(`${rotation.switchedToDirect} 个凭据回退直连`)
+  if (rotation.unresolved > 0) parts.push(`${rotation.unresolved} 个凭据无可用代理`)
+  return parts.length > 0 ? parts.join('，') : null
+}
 
 interface ProxyPoolDialogProps {
   open: boolean
@@ -64,6 +85,35 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
     queryKey: ['global-proxy'],
     queryFn: getGlobalProxy,
     enabled: open,
+  })
+
+  const { data: failoverConfig } = useQuery({
+    queryKey: ['proxy-failover-config'],
+    queryFn: getProxyFailoverConfig,
+    enabled: open,
+  })
+
+  const setFailoverMutation = useMutation({
+    mutationFn: (patch: ProxyFailoverConfigPatch) => setProxyFailoverConfig(patch),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxy-failover-config'] })
+    },
+    onError: (err) => toast.error(`配置更新失败: ${extractErrorMessage(err)}`),
+  })
+
+  const rotateMutation = useMutation({
+    mutationFn: () => rotateCredentialProxies(),
+    onSuccess: (res) => {
+      const summary = describeRotation(res)
+      if (summary) {
+        toast.success(`轮换完成：${summary}`)
+      } else {
+        toast.info('轮换完成：当前无需调整的凭据')
+      }
+      queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+    onError: (err) => toast.error(`轮换失败: ${extractErrorMessage(err)}`),
   })
 
   const setGlobalProxyMutation = useMutation({
@@ -142,10 +192,23 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
   const checkAllMutation = useMutation({
     mutationFn: () => checkAllProxies(),
     onSuccess: (res) => {
-      toast.success(
-        `健康检查完成：健康 ${res.healthy}，异常 ${res.unhealthy}，自动禁用 ${res.autoDisabled}`
-      )
+      const detail = [
+        `健康 ${res.healthy}`,
+        `异常 ${res.unhealthy}`,
+        `自动禁用 ${res.autoDisabled}`,
+        `自动恢复 ${res.autoRecovered}`,
+      ]
+      if (res.detected > 0) {
+        detail.push(`新检测 ${res.detected}`)
+      }
+      toast.success(`巡检完成：${detail.join('，')}`)
+
+      const rotationSummary = describeRotation(res.rotation)
+      if (rotationSummary) {
+        toast.info(`凭据代理轮换：${rotationSummary}`)
+      }
       queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
     onError: (err) => toast.error(`检查失败: ${extractErrorMessage(err)}`),
   })
@@ -294,6 +357,73 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
             </div>
           </div>
 
+          {/* 代理故障转移配置 */}
+          <div className="rounded-md border p-3 space-y-3">
+            <div className="flex items-center gap-2">
+              <ShieldAlert className="h-4 w-4 text-muted-foreground" />
+              <span className="text-sm font-medium">代理故障转移</span>
+            </div>
+
+            <label className="flex items-start justify-between gap-3">
+              <div className="space-y-0.5">
+                <div className="text-xs font-medium">自动检测与轮换</div>
+                <div className="text-xs text-muted-foreground">
+                  将凭据实际在用的代理纳入健康检查；判定不可用时自动标记，并把受影响的
+                  凭据轮换到其它可用代理。
+                </div>
+              </div>
+              <Switch
+                checked={!!failoverConfig?.autoRotateEnabled}
+                disabled={!failoverConfig || setFailoverMutation.isPending}
+                onCheckedChange={(checked) =>
+                  setFailoverMutation.mutate({ autoRotateEnabled: checked })
+                }
+              />
+            </label>
+
+            <label
+              className={`flex items-start justify-between gap-3 ${
+                failoverConfig?.autoRotateEnabled ? '' : 'opacity-60'
+              }`}
+            >
+              <div className="space-y-0.5">
+                <div className="text-xs font-medium">无可用代理时回退直连</div>
+                <div className="text-xs text-muted-foreground">
+                  关闭时保持原代理配置，请求持续失败直至代理恢复，避免出口 IP 暴露；
+                  开启时临时改为直连，并在出现可用代理后自动改回。
+                </div>
+              </div>
+              <Switch
+                checked={!!failoverConfig?.directFallbackEnabled}
+                disabled={
+                  !failoverConfig ||
+                  !failoverConfig.autoRotateEnabled ||
+                  setFailoverMutation.isPending
+                }
+                onCheckedChange={(checked) =>
+                  setFailoverMutation.mutate({ directFallbackEnabled: checked })
+                }
+              />
+            </label>
+
+            <div className="flex items-center justify-between gap-2 pt-1">
+              <span className="text-xs text-muted-foreground">
+                巡检每 5 分钟自动执行一次
+              </span>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 text-xs"
+                onClick={() => rotateMutation.mutate()}
+                disabled={rotateMutation.isPending || !failoverConfig?.autoRotateEnabled}
+                title="按当前代理池状态立即轮换凭据代理，不重新探测"
+              >
+                <RefreshCw className="h-3 w-3 mr-1" />
+                {rotateMutation.isPending ? '轮换中...' : '立即轮换'}
+              </Button>
+            </div>
+          </div>
+
           {/* 代理列表 */}
           <div className="space-y-1">
             <div className="flex items-center justify-between">
@@ -308,10 +438,10 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                     className="h-7 text-xs"
                     onClick={() => checkAllMutation.mutate()}
                     disabled={checkAllMutation.isPending}
-                    title="对所有已启用代理执行健康检查"
+                    title="检测凭据在用代理、执行健康探测并按结果轮换凭据代理"
                   >
                     <Activity className="h-3 w-3 mr-1" />
-                    {checkAllMutation.isPending ? '检测中...' : '全部检测'}
+                    {checkAllMutation.isPending ? '巡检中...' : '全部检测'}
                   </Button>
                   <Button
                     size="sm"
@@ -350,6 +480,16 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                         <Badge variant="secondary" className="text-xs">{proxy.label}</Badge>
                       )}
                       {renderHealthBadge(proxy)}
+                      {proxy.autoDetected && (
+                        <Badge
+                          variant="outline"
+                          className="text-xs gap-1 text-muted-foreground"
+                          title="凭据或全局配置在用、由自动检测登记进池"
+                        >
+                          <Radar className="h-3 w-3" />
+                          自动检测
+                        </Badge>
+                      )}
                       {!proxy.enabled && (
                         <Badge variant="outline" className="text-xs text-muted-foreground">
                           {proxy.autoDisabled ? '自动禁用' : '已禁用'}

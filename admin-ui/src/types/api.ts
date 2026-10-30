@@ -250,6 +250,8 @@ export interface ProxyPoolEntry {
   lastCheckedAt?: string
   consecutiveFailures: number
   autoDisabled: boolean
+  /** 由自动检测登记（凭据或全局配置在用、但此前未登记到池内） */
+  autoDetected: boolean
 }
 
 // 代理池列表响应
@@ -292,11 +294,43 @@ export interface ProxyCheckResponse {
   autoDisabled: boolean
 }
 
+// 凭据代理自动轮换结果
+export interface ProxyRotationResponse {
+  /** 从不可用代理轮换到其它可用代理的凭据数 */
+  rotated: number
+  /** 因无可用代理而回退直连的凭据数 */
+  switchedToDirect: number
+  /** 已恢复可用代理、从直连改回代理的凭据数 */
+  restoredToProxy: number
+  /** 代理不可用但无处可换、保持原配置的凭据数 */
+  unresolved: number
+}
+
 // 全量健康检查响应
 export interface ProxyCheckAllResponse {
   healthy: number
   unhealthy: number
   autoDisabled: number
+  /** 从自动禁用状态恢复启用的代理数 */
+  autoRecovered: number
+  /** 本轮自动检测新登记进池的代理数 */
+  detected: number
+  /** 本轮代理自动轮换结果 */
+  rotation: ProxyRotationResponse
+}
+
+// 代理故障转移配置
+export interface ProxyFailoverConfig {
+  /** 是否启用凭据代理的自动检测与轮换 */
+  autoRotateEnabled: boolean
+  /** 无可用代理时是否允许凭据回退直连 */
+  directFallbackEnabled: boolean
+}
+
+// 代理故障转移配置更新请求
+export interface ProxyFailoverConfigPatch {
+  autoRotateEnabled?: boolean
+  directFallbackEnabled?: boolean
 }
 
 // 轮询批量分配请求
