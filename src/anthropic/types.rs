@@ -284,11 +284,16 @@ pub struct ContentBlock {
 }
 
 /// 图片数据源
+///
+/// 字段都有默认值：url / file 来源没有 media_type 和 data，缺省时整块反序列化失败、
+/// 被静默丢掉；有默认值后由转换器识别出 data 为空，留一句占位文字。
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ImageSource {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub source_type: String,
+    #[serde(default)]
     pub media_type: String,
+    #[serde(default)]
     pub data: String,
 }
 
