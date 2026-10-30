@@ -203,6 +203,10 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 优先级反转开关（默认 false：数字小的优先；true：数字大的优先）
+    #[serde(default = "default_invert_priority")]
+    pub invert_priority: bool,
+
     /// 会话粘性路由开关（默认 true）。
     ///
     /// 开启后同一 `conversationId` 的后续轮次优先沿用上一轮成功的凭据；该凭据不可用
@@ -439,6 +443,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_invert_priority() -> bool {
+    false
+}
+
 fn default_session_affinity_enabled() -> bool {
     true
 }
@@ -545,6 +553,7 @@ impl Default for Config {
             update_auto_apply: false,
             update_auto_apply_time: default_update_auto_apply_time(),
             load_balancing_mode: default_load_balancing_mode(),
+            invert_priority: default_invert_priority(),
             session_affinity_enabled: default_session_affinity_enabled(),
             session_affinity_ttl_secs: default_session_affinity_ttl_secs(),
             account_throttle_failover: default_account_throttle_failover(),
@@ -773,5 +782,18 @@ mod tests {
         .unwrap();
         assert!(config.account_rpm_limit_enabled);
         assert_eq!(config.account_rpm_limit, 120);
+    }
+
+    #[test]
+    fn invert_priority_defaults_and_explicit_values() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.invert_priority);
+
+        let default = Config::default();
+        assert!(!default.invert_priority);
+
+        let explicit: Config =
+            serde_json::from_str(r#"{"invertPriority": true}"#).unwrap();
+        assert!(explicit.invert_priority);
     }
 }

@@ -27,7 +27,8 @@ use super::{
         SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
         SetGlobalProxyRequest,
         SetCacheMeteringConfigRequest, SetSessionAffinityConfigRequest,
-        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
+        SetLoadBalancingModeRequest, SetLoadFactorRequest, SetLogGovernanceConfigRequest,
+        SetPriorityRequest,
         SetModelApiRetryConfigRequest, SetQuotaResetRecoveryConfigRequest,
         SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
@@ -121,6 +122,24 @@ pub async fn set_credential_priority(
         Ok(_) => Json(SuccessResponse::new(format!(
             "凭据 #{} 优先级已设置为 {}",
             id, payload.priority
+        )))
+        .into_response(),
+        Err(e) => e.into_http_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/load-factor
+/// 设置凭据负载因子（均衡模式下的调度权重）
+pub async fn set_credential_load_factor(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetLoadFactorRequest>,
+) -> impl IntoResponse {
+    match state.service.set_load_factor(id, payload.load_factor) {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 负载因子已设置为 {}",
+            id,
+            payload.load_factor.max(1)
         )))
         .into_response(),
         Err(e) => e.into_http_response(),
@@ -1710,6 +1729,8 @@ fn group_to_item(g: &super::groups::Group, state: &AdminState) -> super::types::
             .token_manager()
             .count_credentials_with_group(&g.name),
         client_key_count: state.client_keys.count_with_group(&g.name),
+        load_balancing_mode: g.load_balancing_mode.clone(),
+        invert_priority: g.invert_priority,
     }
 }
 
@@ -1729,7 +1750,12 @@ pub async fn create_group(
     State(state): State<AdminState>,
     Json(payload): Json<super::types::CreateGroupRequest>,
 ) -> impl IntoResponse {
-    match state.groups.create(payload.name, payload.description) {
+    match state.groups.create_with_dispatch(
+        payload.name,
+        payload.description,
+        payload.load_balancing_mode,
+        payload.invert_priority,
+    ) {
         Ok(g) => Json(group_to_item(&g, &state)).into_response(),
         Err(e) => {
             let msg = e.to_string();
@@ -1828,6 +1854,31 @@ pub async fn update_group(
             )
                 .into_response();
         }
+    }
+
+    // 3. 改调度策略（负载均衡模式与优先级反转）
+    let reset_lbm = payload.reset_load_balancing_mode.unwrap_or(false);
+    let reset_inv = payload.reset_invert_priority.unwrap_or(false);
+    let dispatch_changed = payload.load_balancing_mode.is_some()
+        || reset_lbm
+        || payload.invert_priority.is_some()
+        || reset_inv;
+    if dispatch_changed
+        && let Err(e) = state.groups.update_dispatch_mode(
+            &current_name,
+            payload.load_balancing_mode,
+            reset_lbm,
+            payload.invert_priority,
+            reset_inv,
+        )
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                e.to_string(),
+            )),
+        )
+            .into_response();
     }
 
     let group = match state.groups.get(&current_name) {

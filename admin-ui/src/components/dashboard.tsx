@@ -180,6 +180,7 @@ const PAGE_SIZE_OPTIONS = [12, 24, 48, 96] as const;
 const DEV_PREVIEW_CREDENTIAL: CredentialStatusItem = {
   id: -1,
   priority: 0,
+  loadFactor: 10,
   disabled: false,
   failureCount: 0,
   totalFailureCount: 0,
@@ -582,15 +583,17 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     //
     // 正确做法：只在这批被拖动的凭据**原本占据的那些全局槽位**里重新分配。
     // 隐藏的凭据一格都不动，可见的几个在自己已有的槽位之间换位。
-    const queue = [...(data?.credentials ?? [])].sort(
-      (a, b) => a.priority - b.priority || a.id - b.id,
-    );
+    const invertPriority = loadBalancingData?.invertPriority ?? false;
+    const queue = [...(data?.credentials ?? [])].sort((a, b) => {
+      const pDiff = invertPriority ? b.priority - a.priority : a.priority - b.priority;
+      return pDiff || a.id - b.id;
+    });
     const dragged = new Set(ids);
-    // 这些凭据当前占用的 priority 值，升序 —— 即可供重排的槽位
+    // 这些凭据当前占用的 priority 值（反转时降序，否则升序）—— 即可供重排的槽位
     const slots = queue
       .filter((c) => dragged.has(c.id))
       .map((c) => c.priority)
-      .sort((a, b) => a - b);
+      .sort((a, b) => (invertPriority ? b - a : a - b));
 
     const prevPriority = new Map(queue.map((c) => [c.id, c.priority]));
 
@@ -599,7 +602,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     // 这种情况下退回到"给整个队列重编号"：按当前全局顺序（已含本次拖动）写 0..n-1。
     // 写入量大一些，但只会在第一次拖拽时发生 —— 编号完成后各值互不相同，
     // 后续拖拽都走上面那条只动几格的轻路径。
-    const slotsUsable = slots.every((v, i) => i === 0 || v > slots[i - 1]);
+    const slotsUsable = invertPriority
+      ? slots.every((v, i) => i === 0 || v < slots[i - 1])
+      : slots.every((v, i) => i === 0 || v > slots[i - 1]);
 
     let updates: { id: number; priority: number }[];
     if (slotsUsable) {
@@ -610,7 +615,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       const globalOrder = queue.map((c) =>
         dragged.has(c.id) ? reordered.shift()! : c.id,
       );
-      updates = globalOrder.map((id, i) => ({ id, priority: i }));
+      updates = globalOrder.map((id, i) => ({
+        id,
+        priority: invertPriority ? globalOrder.length - 1 - i : i,
+      }));
     }
     updates = updates.filter(
       (u) => u.priority != null && prevPriority.get(u.id) !== u.priority,

@@ -26,6 +26,12 @@ pub struct Group {
     pub description: Option<String>,
     /// 创建时间（ISO8601）
     pub created_at: String,
+    /// 负载均衡模式（None 表示继承全局配置: "priority" 或 "balanced"）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_balancing_mode: Option<String>,
+    /// 优先级反转（None 表示继承全局配置；true 表示数字大优先，false 表示数字小优先）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invert_priority: Option<bool>,
 }
 
 /// 分组管理器（线程安全 + 自动持久化）
@@ -121,7 +127,19 @@ impl GroupManager {
     }
 
     /// 创建分组。重名直接报错，不会静默覆盖（避免误创建丢备注）
+    #[allow(dead_code)]
     pub fn create(&self, name: String, description: Option<String>) -> anyhow::Result<Group> {
+        self.create_with_dispatch(name, description, None, None)
+    }
+
+    /// 创建分组，同时可指定分组级调度策略（负载均衡模式与优先级反转）。
+    pub fn create_with_dispatch(
+        &self,
+        name: String,
+        description: Option<String>,
+        load_balancing_mode: Option<String>,
+        invert_priority: Option<bool>,
+    ) -> anyhow::Result<Group> {
         let trimmed = name.trim();
         if trimmed.is_empty() {
             anyhow::bail!("分组名不能为空");
@@ -129,6 +147,16 @@ impl GroupManager {
         if trimmed.chars().count() > 64 {
             anyhow::bail!("分组名过长（最多 64 字符）");
         }
+        let valid_mode = match load_balancing_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some("priority") => Some("priority".to_string()),
+            Some("balanced") => Some("balanced".to_string()),
+            Some(other) => anyhow::bail!("不支持的负载均衡模式: {}", other),
+            None => None,
+        };
         let mut inner = self.inner.write();
         if inner.entries.contains_key(trimmed) {
             anyhow::bail!("分组已存在: {}", trimmed);
@@ -137,10 +165,63 @@ impl GroupManager {
             name: trimmed.to_string(),
             description: description.map(|d| d.trim().to_string()).filter(|d| !d.is_empty()),
             created_at: Utc::now().to_rfc3339(),
+            load_balancing_mode: valid_mode,
+            invert_priority,
         };
         inner.entries.insert(group.name.clone(), group.clone());
         self.save_locked(&inner);
         Ok(group)
+    }
+
+    /// 更新分组的调度模式（负载均衡模式与优先级反转）。
+    ///
+    /// `reset_*` 为 true 时清空对应覆盖，回退到全局配置。
+    pub fn update_dispatch_mode(
+        &self,
+        name: &str,
+        load_balancing_mode: Option<String>,
+        reset_load_balancing_mode: bool,
+        invert_priority: Option<bool>,
+        reset_invert_priority: bool,
+    ) -> anyhow::Result<Group> {
+        let mut inner = self.inner.write();
+        let entry = inner
+            .entries
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("分组不存在: {}", name))?;
+
+        if reset_load_balancing_mode {
+            entry.load_balancing_mode = None;
+        } else if let Some(m) = load_balancing_mode {
+            let m_trim = m.trim();
+            if m_trim.is_empty() {
+                entry.load_balancing_mode = None;
+            } else if m_trim == "priority" || m_trim == "balanced" {
+                entry.load_balancing_mode = Some(m_trim.to_string());
+            } else {
+                anyhow::bail!("不支持的负载均衡模式: {}", m_trim);
+            }
+        }
+
+        if reset_invert_priority {
+            entry.invert_priority = None;
+        } else if invert_priority.is_some() {
+            entry.invert_priority = invert_priority;
+        }
+
+        let cloned = entry.clone();
+        self.save_locked(&inner);
+        Ok(cloned)
+    }
+
+    /// 查询指定分组的调度模式与优先级反转配置（None 表示继承全局）。
+    pub fn resolve_load_balancing(&self, group: &str) -> (Option<String>, Option<bool>) {
+        let inner = self.inner.read();
+        inner
+            .entries
+            .get(group)
+            .map(|g| (g.load_balancing_mode.clone(), g.invert_priority))
+            .unwrap_or((None, None))
     }
 
     /// 更新备注（不改名字）
@@ -217,6 +298,8 @@ impl GroupManager {
                         name: trimmed.to_string(),
                         description: None,
                         created_at: now.clone(),
+                        load_balancing_mode: None,
+                        invert_priority: None,
                     },
                 );
                 added += 1;
@@ -372,5 +455,51 @@ mod tests {
         assert_eq!(list[1].name, "beta");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_group_dispatch_mode_and_resolve() {
+        let mgr = GroupManager::new();
+        // 创建带调度模式的分组
+        let g1 = mgr
+            .create_with_dispatch(
+                "g1".into(),
+                None,
+                Some("balanced".into()),
+                Some(true),
+            )
+            .unwrap();
+        assert_eq!(g1.load_balancing_mode.as_deref(), Some("balanced"));
+        assert_eq!(g1.invert_priority, Some(true));
+
+        let (mode, invert) = mgr.resolve_load_balancing("g1");
+        assert_eq!(mode.as_deref(), Some("balanced"));
+        assert_eq!(invert, Some(true));
+
+        // 更新调度模式
+        let updated = mgr
+            .update_dispatch_mode("g1", Some("priority".into()), false, Some(false), false)
+            .unwrap();
+        assert_eq!(updated.load_balancing_mode.as_deref(), Some("priority"));
+        assert_eq!(updated.invert_priority, Some(false));
+
+        // 重置为跟随全局
+        let reset = mgr
+            .update_dispatch_mode("g1", None, true, None, true)
+            .unwrap();
+        assert_eq!(reset.load_balancing_mode, None);
+        assert_eq!(reset.invert_priority, None);
+
+        let (mode_reset, invert_reset) = mgr.resolve_load_balancing("g1");
+        assert_eq!(mode_reset, None);
+        assert_eq!(invert_reset, None);
+
+        // 不支持的模式报错
+        assert!(mgr
+            .update_dispatch_mode("g1", Some("invalid_mode".into()), false, None, false)
+            .is_err());
+        assert!(mgr
+            .create_with_dispatch("g2".into(), None, Some("invalid_mode".into()), None)
+            .is_err());
     }
 }

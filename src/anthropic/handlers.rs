@@ -1083,6 +1083,7 @@ async fn handle_stream_request(
     tracer.mark_upstream_headers_received();
     let response = call_result.response;
     let credential_id = call_result.credential_id;
+    let in_flight = call_result._in_flight;
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(
@@ -1098,7 +1099,15 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events, hook, credential_id, tracer);
+    let stream = create_sse_stream(
+        response,
+        ctx,
+        initial_events,
+        hook,
+        credential_id,
+        tracer,
+        in_flight,
+    );
 
     // 返回 SSE 响应
     // `x-accel-buffering: no` 让前置 nginx 对本次响应关闭 proxy_buffering。
@@ -1130,6 +1139,7 @@ fn create_sse_stream(
     hook: UsageRecordHook,
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
+    in_flight: Option<std::sync::Arc<crate::kiro::token_manager::InFlightGuard>>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -1140,7 +1150,7 @@ fn create_sse_stream(
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
-    let settlement = StreamSettlement::new(hook, credential_id, tracer, &ctx);
+    let settlement = StreamSettlement::new(hook, credential_id, tracer, &ctx, in_flight);
 
     let processing_stream = stream::unfold(
         (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), settlement, 0u64),
@@ -1264,6 +1274,8 @@ struct StreamSettlement {
     usage: TraceUsage,
     sent_bytes: u64,
     settled: bool,
+    /// 在途请求守卫：随流处理上下文存活，流结束 / 中断后自动递减并发计数
+    _in_flight: Option<std::sync::Arc<crate::kiro::token_manager::InFlightGuard>>,
 }
 
 impl StreamSettlement {
@@ -1297,6 +1309,7 @@ impl StreamSettlement {
         credential_id: u64,
         tracer: std::sync::Arc<RequestTracer>,
         ctx: &StreamContext,
+        in_flight: Option<std::sync::Arc<crate::kiro::token_manager::InFlightGuard>>,
     ) -> Self {
         Self {
             hook,
@@ -1305,6 +1318,7 @@ impl StreamSettlement {
             usage: stream_trace_usage(ctx),
             sent_bytes: 0,
             settled: false,
+            _in_flight: in_flight,
         }
     }
 
@@ -2294,7 +2308,7 @@ mod tests {
         ctx.output_tokens = 7;
         ctx.credits = 0.5;
 
-        let mut settlement = StreamSettlement::new(hook, 42, tracer, &ctx);
+        let mut settlement = StreamSettlement::new(hook, 42, tracer, &ctx, None);
         settlement.update(&ctx, 123);
         drop(settlement);
 
@@ -2340,7 +2354,7 @@ mod tests {
         );
         ctx.cache_usage = super::super::cache_metering::CacheUsage::default();
 
-        let mut settlement = StreamSettlement::new(hook, 42, tracer, &ctx);
+        let mut settlement = StreamSettlement::new(hook, 42, tracer, &ctx, None);
         settlement.update(&ctx, 456);
         drop(settlement);
 
