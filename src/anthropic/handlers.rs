@@ -1944,23 +1944,42 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 = model_lower.contains("opus")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let mapped = super::converter::map_model(&payload.model)
+        .unwrap_or_else(|| payload.model.clone())
+        .to_ascii_lowercase();
+    let supports_adaptive = matches!(
+        mapped.as_str(),
+        "claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8" | "claude-sonnet-4.6"
+    ) || mapped.contains("fable-5")
+        || mapped.contains("mythos-5")
+        || mapped.contains("sonnet-5")
+        || mapped.contains("opus-5")
+        || mapped.contains("haiku-5")
+        || mapped.contains("claude-5")
+        || (model_lower.contains("opus")
+            && (model_lower.contains("4-6") || model_lower.contains("4.6")));
 
-    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
+    let thinking_type = if supports_adaptive { "adaptive" } else { "enabled" };
+    let budget_tokens = payload
+        .thinking
+        .as_ref()
+        .map(|t| t.budget_tokens)
+        .filter(|b| *b > 0)
+        .unwrap_or(20000);
 
     tracing::info!(
         model = %payload.model,
+        mapped_model = %mapped,
         thinking_type = thinking_type,
         "模型名包含 thinking 后缀，覆写 thinking 配置"
     );
 
     payload.thinking = Some(Thinking {
         thinking_type: thinking_type.to_string(),
-        budget_tokens: 20000,
+        budget_tokens,
     });
 
-    if is_opus_4_6 {
+    if supports_adaptive && payload.output_config.is_none() {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
         });
