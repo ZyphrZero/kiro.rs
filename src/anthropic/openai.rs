@@ -70,6 +70,10 @@ pub(super) fn resolve_session_metadata(
         headers
             .get("x-session-affinity")
             .and_then(|value| value.to_str().ok()),
+        // pi-ai 在 compat.sessionAffinityFormat = "openrouter" 时改用 x-session-id
+        headers
+            .get("x-session-id")
+            .and_then(|value| value.to_str().ok()),
         headers
             .get("x-client-request-id")
             .and_then(|value| value.to_str().ok()),
@@ -79,7 +83,11 @@ pub(super) fn resolve_session_metadata(
     ];
 
     candidates.into_iter().flatten().find_map(|candidate| {
-        let raw_uuid = candidate.strip_prefix("session_").unwrap_or(candidate);
+        // Claude Code/Codex 写 "session_<uuid>"；pi-ai 系客户端（x-session-affinity / x-session-id）写 "session-<uuid>"
+        let raw_uuid = candidate
+            .strip_prefix("session_")
+            .or_else(|| candidate.strip_prefix("session-"))
+            .unwrap_or(candidate);
         let uuid = Uuid::parse_str(raw_uuid).ok()?;
         Some(Metadata {
             user_id: Some(format!("session_{uuid}")),
@@ -963,6 +971,29 @@ mod tests {
         assert_eq!(
             metadata_user_id(resolve_session_metadata(None, &headers)).as_deref(),
             Some("session_123e4567-e89b-12d3-a456-426614174001")
+        );
+    }
+
+    #[test]
+    fn session_metadata_accepts_openrouter_style_x_session_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", format!("session-{UUID_B}").parse().unwrap());
+        assert_eq!(
+            metadata_user_id(resolve_session_metadata(None, &headers)).as_deref(),
+            Some("session_67e55044-10b1-426f-9247-bb680e5fe0c8")
+        );
+    }
+
+    #[test]
+    fn session_metadata_accepts_dsh_hyphen_prefix() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-session-affinity",
+            format!("session-{UUID_B}").parse().unwrap(),
+        );
+        assert_eq!(
+            metadata_user_id(resolve_session_metadata(None, &headers)).as_deref(),
+            Some("session_67e55044-10b1-426f-9247-bb680e5fe0c8")
         );
     }
 

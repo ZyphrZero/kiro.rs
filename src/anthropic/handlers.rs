@@ -21,7 +21,7 @@ use axum::{
     Json as JsonExtractor,
     body::Body,
     extract::{Extension, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
@@ -2257,9 +2257,99 @@ async fn handle_cc_stream_request(
     .await
 }
 
+/// 请求体没带 metadata.user_id 时，用会话亲和请求头（x-session-affinity 等）补上。
+/// pi-ai 系客户端（例如 DeepSeek Harness）不发 metadata.user_id，只在请求头里带会话 id。不补的话：缓存计量拿不到
+/// 会话隔离种子，缓存读写恒为 0；conversationId 每次随机，按会话固定账号的路由不命中。
+/// 客户端自己带了 user_id 时不覆盖。
+fn fill_session_metadata_from_headers(payload: &mut MessagesRequest, headers: &HeaderMap) {
+    let has_user_id = payload
+        .metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_deref())
+        .is_some_and(|s| !s.trim().is_empty());
+    if has_user_id {
+        return;
+    }
+    if let Some(metadata) = super::openai::resolve_session_metadata(None, headers) {
+        payload.metadata = Some(metadata);
+    }
+}
+
+/// `POST /v1/messages` 路由入口：先按请求头补会话 metadata，再交给 post_messages。
+pub async fn post_messages_route(
+    State(state): State<AppState>,
+    Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
+    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+) -> Response {
+    fill_session_metadata_from_headers(&mut payload, &headers);
+    post_messages(State(state), Extension(key_ctx), JsonExtractor(payload)).await
+}
+
+/// `POST /cc/v1/messages` 路由入口：先按请求头补会话 metadata，再交给 post_messages_cc。
+pub async fn post_messages_cc_route(
+    State(state): State<AppState>,
+    Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
+    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+) -> Response {
+    fill_session_metadata_from_headers(&mut payload, &headers);
+    post_messages_cc(State(state), Extension(key_ctx), JsonExtractor(payload)).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_affinity_header_scopes_cache_metering() {
+        use crate::anthropic::cache_metering::{CacheMeter, compute_cache_usage_sync};
+        use crate::anthropic::types::{CacheControl, Message as AMessage, Metadata};
+        let body = "conversation prefix that stays stable ".repeat(20);
+        let make = |headers: &HeaderMap| {
+            let mut req = MessagesRequest {
+                model: "claude-opus-4-8".to_string(),
+                max_tokens: 64,
+                messages: vec![
+                    AMessage { role: "user".into(), content: serde_json::json!([{"type": "text", "text": body}]) },
+                    AMessage { role: "assistant".into(), content: serde_json::json!([{"type": "text", "text": body}]) },
+                    AMessage { role: "user".into(), content: serde_json::json!([{"type": "text", "text": body}]) },
+                ],
+                stream: false,
+                system: None,
+                tools: None,
+                tool_choice: None,
+                thinking: None,
+                output_config: None,
+                metadata: None,
+                cache_control: Some(CacheControl { cache_type: "ephemeral".to_string(), ttl: None }),
+            };
+            fill_session_metadata_from_headers(&mut req, headers);
+            req
+        };
+        let dsh = |uuid: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("x-session-affinity", format!("session-{uuid}").parse().unwrap());
+            h
+        };
+        let a = dsh("0b4445e1-f5be-49e1-87ce-62bbc28ad705");
+        let b = dsh("67e55044-10b1-426f-9247-bb680e5fe0c8");
+        let none = HeaderMap::new();
+        let cache = CacheMeter::new(None);
+        assert_eq!(compute_cache_usage_sync(&cache, &make(&a), 0).cache_read, 0, "首轮只写不读");
+        assert_eq!(compute_cache_usage_sync(&cache, &make(&b), 0).cache_read, 0, "不同会话不串");
+        assert!(compute_cache_usage_sync(&cache, &make(&a), 0).cache_read > 0, "同一会话第二轮应如实上报命中");
+        assert_eq!(compute_cache_usage_sync(&cache, &make(&none), 0).cache_read, 0, "没有会话头时仍不模拟跨用户命中");
+
+        let mut own = make(&none);
+        own.metadata = Some(Metadata { user_id: Some("user_x_account__session_123e4567-e89b-12d3-a456-426614174000".into()) });
+        fill_session_metadata_from_headers(&mut own, &a);
+        assert_eq!(
+            own.metadata.unwrap().user_id.as_deref(),
+            Some("user_x_account__session_123e4567-e89b-12d3-a456-426614174000"),
+            "客户端自带的 user_id 不被请求头覆盖"
+        );
+    }
     use crate::model::config::ToolCompatibilityMode;
 
     #[test]
