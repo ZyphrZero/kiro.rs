@@ -1119,6 +1119,8 @@ pub struct CredentialProxySnapshot {
     pub explicit_direct: bool,
     /// 当前 `proxy_url` 是否由自动轮换写入
     pub auto_assigned: bool,
+    /// 凭据是否已禁用（禁用的凭据不参与调度，也就无需轮换代理）
+    pub disabled: bool,
 }
 
 /// 凭据条目快照（用于 Admin API 读取）
@@ -5014,6 +5016,7 @@ impl MultiTokenManager {
                     .in_use_proxy_url(global_proxy_url.as_deref()),
                 explicit_direct: entry.credentials.is_explicit_direct(),
                 auto_assigned: entry.credentials.proxy_auto_assigned,
+                disabled: entry.disabled,
             })
             .collect()
     }

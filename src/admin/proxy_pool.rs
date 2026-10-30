@@ -373,10 +373,10 @@ impl ProxyPoolManager {
             }
         }
 
-        if added > 0 {
-            if let Err(e) = self.persist() {
-                tracing::warn!("自动登记代理后持久化失败: {}", e);
-            }
+        if added > 0
+            && let Err(e) = self.persist()
+        {
+            tracing::warn!("自动登记代理后持久化失败: {}", e);
         }
         added
     }

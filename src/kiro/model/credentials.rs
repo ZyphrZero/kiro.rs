@@ -598,6 +598,7 @@ fn is_zero_u64(value: &u64) -> bool {
 fn is_false(value: &bool) -> bool {
     !*value
 }
+
 /// 仅显示长度，不暴露明文。例如 `Some(42 chars)` 或 `None`。
 fn fmt_redacted(value: &Option<String>) -> String {
     match value {

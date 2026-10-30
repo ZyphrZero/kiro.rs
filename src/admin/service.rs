@@ -3168,10 +3168,10 @@ impl AdminService {
             in_use.push(url);
         }
         for cred in self.token_manager.credential_proxy_snapshot() {
-            if let Some(url) = cred.in_use_proxy_url {
-                if !in_use.contains(&url) {
-                    in_use.push(url);
-                }
+            if let Some(url) = cred.in_use_proxy_url
+                && !in_use.contains(&url)
+            {
+                in_use.push(url);
             }
         }
 
@@ -3201,8 +3201,16 @@ impl AdminService {
         let mut updates: Vec<(u64, Option<String>)> = Vec::new();
         // 轮换目标在可用代理间轮转，避免所有凭据挤到同一个代理上
         let mut cursor = 0usize;
+        // 无可用代理的凭据汇总后只记一条日志：这类凭据可能成批出现（例如整批账号
+        // 共用一个失效代理），逐条打 ERROR 会把日志刷满
+        let mut unresolved_ids: Vec<u64> = Vec::new();
 
         for cred in &credentials {
+            // 已禁用的凭据不参与调度，轮换它的代理没有意义，也不该产生告警
+            if cred.disabled {
+                continue;
+            }
+
             let current_url = match &cred.in_use_proxy_url {
                 Some(url) => url.clone(),
                 None => {
@@ -3259,24 +3267,41 @@ impl AdminService {
                     result.switched_to_direct += 1;
                 }
                 None => {
-                    tracing::error!(
-                        "凭据 #{} 在用代理 {} 不可用且无其它可用代理；直连回退未开启，保持原配置",
-                        cred.id,
-                        mask_proxy_url(&current_url)
-                    );
+                    unresolved_ids.push(cred.id);
                     result.unresolved += 1;
                 }
             }
         }
 
-        if !updates.is_empty() {
-            if let Err(e) = self.token_manager.apply_proxy_rotation(&updates) {
-                tracing::error!("代理自动轮换结果持久化失败: {}", e);
-                return ProxyRotationResponse {
-                    unresolved: result.unresolved + updates.len(),
-                    ..ProxyRotationResponse::default()
-                };
-            }
+        if !unresolved_ids.is_empty() {
+            // 只列前若干个 id，避免单行日志过长
+            const MAX_LISTED: usize = 10;
+            let listed: Vec<String> = unresolved_ids
+                .iter()
+                .take(MAX_LISTED)
+                .map(u64::to_string)
+                .collect();
+            let suffix = if unresolved_ids.len() > MAX_LISTED {
+                format!(" 等 {} 个", unresolved_ids.len())
+            } else {
+                String::new()
+            };
+            tracing::error!(
+                "{} 个启用中的凭据在用代理不可用且无其它可用代理；直连回退未开启，保持原配置（凭据 #{}{}）",
+                unresolved_ids.len(),
+                listed.join(", #"),
+                suffix
+            );
+        }
+
+        if !updates.is_empty()
+            && let Err(e) = self.token_manager.apply_proxy_rotation(&updates)
+        {
+            tracing::error!("代理自动轮换结果持久化失败: {}", e);
+            return ProxyRotationResponse {
+                unresolved: result.unresolved + updates.len(),
+                ..ProxyRotationResponse::default()
+            };
         }
 
         result
@@ -4287,6 +4312,29 @@ mod tests {
 
         // 再次检测不重复登记
         assert_eq!(service.detect_credential_proxies(), 0);
+    }
+
+    #[tokio::test]
+    async fn rotation_skips_disabled_credentials() {
+        // 已禁用的凭据不参与调度，代理不可用也不该被轮换或计入告警
+        let enabled = KiroCredentials {
+            proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+            ..KiroCredentials::default()
+        };
+        let disabled = KiroCredentials {
+            proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+            disabled: true,
+            ..KiroCredentials::default()
+        };
+        let service = proxy_rotation_service(vec![enabled, disabled], None, true, false);
+        service.detect_credential_proxies();
+        mark_proxy_unhealthy(&service, "socks5://10.0.0.2:1080");
+
+        let result = service.rotate_unavailable_credential_proxies();
+
+        // 只有启用中的那个凭据计入 unresolved
+        assert_eq!(result.unresolved, 1);
+        assert_eq!(result.rotated, 0);
     }
 
     #[tokio::test]
