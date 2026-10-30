@@ -1194,7 +1194,10 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
             (m_idx + 1 == total_messages) && msg.role == "user" && !is_tool_result;
         match &msg.content {
             serde_json::Value::String(s) => {
-                let content = serde_json::Value::String(s.clone());
+                // 纯字符串与「一个 text 块」是同一段提示（Anthropic 也这么渲染），签名必须一致：
+                // pi-ai 第一轮把首条 user 发成带 cache_control 的块数组，之后几轮发成字符串，
+                // 签名不一致会让后续每轮的消息断点都算不中。
+                let content = serde_json::json!({"type": "text", "text": s});
                 blocks.push(PromptBlock {
                     signature: prompt_block_signature("message", Some(&msg.role), &content),
                     tokens: estimate_tokens(s).max(0) as u32,
@@ -1602,7 +1605,12 @@ fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
         };
     }
     if key_id == 0 {
-        return None;
+        // 主 Key 被多个客户端共用，不能按 key 隔离（会把别人的前缀记成命中）。
+        // pi-ai 系客户端（如 DeepSeek Harness）既不发 metadata.user_id，也发不出会话请求头，
+        // 这里退回到与粘性路由同一个按内容派生的会话 id（系统提示 + 第一条 user 消息）：
+        // 同一会话每轮得到同一个种子，不同会话互不命中。
+        let derived = super::converter::derive_conversation_id(req);
+        return Some(format!("derived:{derived}"));
     }
     Some(format!("key:{key_id}"))
 }
@@ -3244,17 +3252,17 @@ mod tests {
     }
 
     #[test]
-    fn master_key_without_session_does_not_simulate_cross_user_cache_hit() {
+    fn master_key_without_session_scopes_cache_by_derived_conversation() {
         use super::super::types::{CacheControl, Message, MessagesRequest};
         let cache = CacheMeter::new(None);
         let body = "shared master-key prompt without any session ".repeat(20);
-        let make_req = || MessagesRequest {
+        let make_req = |first: &str| MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 32,
             messages: vec![
                 Message {
                     role: "user".to_string(),
-                    content: serde_json::Value::String(body.clone()),
+                    content: serde_json::Value::String(format!("{first} {body}")),
                 },
                 Message {
                     role: "assistant".to_string(),
@@ -3278,13 +3286,17 @@ mod tests {
             }),
         };
 
-        let a = compute_cache_usage_sync(&cache, &make_req(), 0);
-        assert_eq!(a.cache_read, 0);
-        assert_eq!(a.cache_covered_est, 0, "主 Key 无 session 不应产生缓存覆盖");
+        // 同一会话：首轮写入，次轮命中
+        let a1 = compute_cache_usage_sync(&cache, &make_req("conversation-a"), 0);
+        assert_eq!(a1.cache_read, 0);
+        assert!(a1.cache_covered_est > 0, "主 Key 无 session 时应按派生会话 id 模拟缓存");
+        let a2 = compute_cache_usage_sync(&cache, &make_req("conversation-a"), 0);
+        assert!(a2.cache_read > 0, "同一派生会话的第二个请求应命中");
 
-        let b = compute_cache_usage_sync(&cache, &make_req(), 0);
-        assert_eq!(b.cache_read, 0);
-        assert_eq!(b.cache_covered_est, 0);
+        // 不同会话（第一条 user 消息不同）：互不命中
+        let b1 = compute_cache_usage_sync(&cache, &make_req("conversation-b"), 0);
+        assert_eq!(b1.cache_read, 0, "不同派生会话不应命中");
+        assert_eq!(cache.stats_total().miss_no_seed, 0);
     }
 
     #[test]
@@ -4198,16 +4210,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compute_cache_usage_counts_miss_no_seed() {
-        // 有断点但 key_id == 0 且没有 metadata.user_id → isolation_seed 返回 None
+    async fn string_and_single_text_block_message_share_cache_prefix() {
+        use super::super::types::{Message, MessagesRequest};
+        let cache = CacheMeter::new(None);
+        let first = "first user message that stays the same in every round ".repeat(20);
+        let make = |messages: Vec<Message>| MessagesRequest {
+            model: "claude-opus-5.5".to_string(),
+            max_tokens: 32,
+            messages,
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+        };
+        // 第一轮：首条消息是带断点的块数组
+        let round1 = make(vec![Message {
+            role: "user".to_string(),
+            content: serde_json::json!([{"type": "text", "text": first, "cache_control": {"type": "ephemeral"}}]),
+        }]);
+        assert_eq!(compute_cache_usage(&cache, &round1, 0).await.cache_read, 0);
+        // 第二轮：同一条消息变成纯字符串，断点挪到新的最后一条 user
+        let round2 = make(vec![
+            Message { role: "user".to_string(), content: serde_json::Value::String(first.clone()) },
+            Message { role: "assistant".to_string(), content: serde_json::Value::String("ok".to_string()) },
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!([{"type": "text", "text": "next", "cache_control": {"type": "ephemeral"}}]),
+            },
+        ]);
+        assert!(compute_cache_usage(&cache, &round2, 0).await.cache_read > 0, "字符串写法应命中块数组写入的前缀");
+    }
+
+    #[tokio::test]
+    async fn compute_cache_usage_master_key_without_session_uses_derived_seed() {
+        // 有断点、key_id == 0、没有 metadata.user_id → 退回派生会话 id，不再记 no_seed
         let cache = CacheMeter::new(None);
         let req = build_request_with_system_breakpoint();
-        let usage = compute_cache_usage(&cache, &req, 0).await;
-        assert_eq!(usage.cache_read, 0);
+        let first = compute_cache_usage(&cache, &req, 0).await;
+        assert_eq!(first.cache_read, 0);
+        assert!(first.cache_covered_est > 0);
+        let second = compute_cache_usage(&cache, &req, 0).await;
+        assert!(second.cache_read > 0);
         let stats = cache.stats_total();
-        assert_eq!(stats.miss_no_seed, 1);
+        assert_eq!(stats.miss_no_seed, 0);
         assert_eq!(stats.miss_no_breakpoint, 0);
-        assert_eq!(stats.misses, 1);
     }
 
     /// Review Focus 3：远端命中走 remote 路径，必须记成 hit，不能记成 miss。
