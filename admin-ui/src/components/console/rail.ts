@@ -102,6 +102,7 @@ export function outcomeTone(outcome: string): RailTone {
     case 'abandoned_before_headers':
       return 'warn'
     case 'account_throttled':
+    case 'local_rate_limited':
       return 'cool'
     case 'auth_failed':
     case 'network_error':
