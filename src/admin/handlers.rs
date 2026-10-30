@@ -21,8 +21,9 @@ use super::{
     types::{
         AddCredentialRequest, AddProxyRequest, ApiDomainConfig, AssignProxyRequest,
         AssignRoundRobinRequest, BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
-        ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
-        CreateClientKeyResponse, ModelTestRequest,
+        ClientKeyItem, ClientKeysQuery, ClientKeysResponse, CompleteSocialLoginRequest,
+        CreateClientKeyRequest, CreateClientKeyResponse, CredentialsQuery, GroupsQuery,
+        ModelTestRequest,
         CredentialMetadataSchemaConfig,
         SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
         SetGlobalProxyRequest,
@@ -42,9 +43,12 @@ use super::{
 type CredSessionPath = (u64, String);
 
 /// GET /api/admin/credentials
-/// 获取所有凭据状态
-pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
-    let response = state.service.get_all_credentials();
+/// 获取凭据状态（支持分页、搜索、分组、状态、排序）
+pub async fn get_all_credentials(
+    State(state): State<AdminState>,
+    Query(query): Query<CredentialsQuery>,
+) -> impl IntoResponse {
+    let response = state.service.get_credentials_paged(&query);
     Json(response)
 }
 
@@ -1034,12 +1038,118 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
 }
 
 /// GET /api/admin/client-keys
-pub async fn list_client_keys(State(state): State<AdminState>) -> impl IntoResponse {
+/// 获取客户端 Key 列表（支持分页、搜索、状态筛选、分组筛选、排序）
+pub async fn list_client_keys(
+    State(state): State<AdminState>,
+    Query(query): Query<ClientKeysQuery>,
+) -> impl IntoResponse {
     let keys = state.client_keys.list();
-    let items: Vec<ClientKeyItem> = keys.iter().map(key_to_item).collect();
+    let total = keys.len();
+
+    // 1. 过滤
+    let mut filtered: Vec<ClientKeyItem> = keys
+        .into_iter()
+        .map(|k| key_to_item(&k))
+        .filter(|k| {
+            if let Some(search) = query.effective_search() {
+                let q = search.to_lowercase();
+                let match_name = k.name.to_lowercase().contains(&q);
+                let match_id = k.id.to_string().contains(&q);
+                let match_group = k
+                    .group
+                    .as_deref()
+                    .map(|g| g.to_lowercase().contains(&q))
+                    .unwrap_or(false);
+                let match_desc = k
+                    .description
+                    .as_deref()
+                    .map(|d| d.to_lowercase().contains(&q))
+                    .unwrap_or(false);
+                if !match_name && !match_id && !match_group && !match_desc {
+                    return false;
+                }
+            }
+
+            if let Some(status) = query.effective_status() {
+                match status {
+                    "enabled" | "active" if k.disabled => return false,
+                    "disabled" if !k.disabled => return false,
+                    _ => {}
+                }
+            }
+
+            if let Some(group) = query.effective_group() {
+                if group == "__none__" {
+                    if k.group.is_some() {
+                        return false;
+                    }
+                } else if k.group.as_deref() != Some(group) {
+                    return false;
+                }
+            }
+
+            true
+        })
+        .collect();
+
+    let filtered_total = filtered.len();
+
+    // 2. 排序
+    let sort_dir_asc = query.effective_sort_dir().eq_ignore_ascii_case("asc");
+    if let Some(sort_by) = query.effective_sort_by() {
+        filtered.sort_by(|a, b| {
+            let cmp = match sort_by {
+                "id" => a.id.cmp(&b.id),
+                "name" => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                "totalCalls" | "total_calls" => a.total_calls.cmp(&b.total_calls),
+                "totalCredits" | "total_credits" => a
+                    .total_credits
+                    .partial_cmp(&b.total_credits)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                "lastUsedAt" | "last_used_at" => match (&a.last_used_at, &b.last_used_at) {
+                    (None, None) => std::cmp::Ordering::Equal,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (Some(ta), Some(tb)) => ta.cmp(tb),
+                },
+                "createdAt" | "created_at" => a.created_at.cmp(&b.created_at),
+                _ => a.id.cmp(&b.id),
+            };
+            let ordered = if sort_dir_asc { cmp } else { cmp.reverse() };
+            if ordered == std::cmp::Ordering::Equal {
+                a.id.cmp(&b.id)
+            } else {
+                ordered
+            }
+        });
+    }
+
+    // 3. 分页
+    let page_size = query.effective_page_size();
+    let (page, page_size_opt, paged_keys) = if page_size > 0 {
+        let page = query.effective_page();
+        let start = (page - 1) * page_size;
+        let items = filtered.into_iter().skip(start).take(page_size).collect();
+        (Some(page), Some(page_size), items)
+    } else {
+        (None, None, filtered)
+    };
+
     Json(ClientKeysResponse {
-        total: items.len(),
-        keys: items,
+        total,
+        filtered_total: if page_size > 0
+            || query.effective_search().is_some()
+            || query.effective_status().is_some()
+            || query.effective_group().is_some()
+            || query.effective_sort_by().is_some()
+        {
+            Some(filtered_total)
+        } else {
+            None
+        },
+        page,
+        page_size: page_size_opt,
+        keys: paged_keys,
     })
 }
 
@@ -1714,13 +1824,53 @@ fn group_to_item(g: &super::groups::Group, state: &AdminState) -> super::types::
 }
 
 /// GET /api/admin/groups
-pub async fn list_groups(State(state): State<AdminState>) -> impl IntoResponse {
+/// 获取分组列表（支持搜索、分页）
+pub async fn list_groups(
+    State(state): State<AdminState>,
+    Query(query): Query<GroupsQuery>,
+) -> impl IntoResponse {
     let groups = state.groups.list();
-    let items: Vec<super::types::GroupItem> =
+    let total = groups.len();
+    let mut items: Vec<super::types::GroupItem> =
         groups.iter().map(|g| group_to_item(g, &state)).collect();
+
+    if let Some(search) = query
+        .search
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let q = search.to_lowercase();
+        items.retain(|g| {
+            g.name.to_lowercase().contains(&q)
+                || g.description
+                    .as_deref()
+                    .map(|d| d.to_lowercase().contains(&q))
+                    .unwrap_or(false)
+        });
+    }
+
+    let filtered_total = items.len();
+    let page_size = query.page_size.unwrap_or(0);
+    let (page, page_size_opt, paged_groups) = if page_size > 0 {
+        let page = query.page.unwrap_or(1).max(1);
+        let start = (page - 1) * page_size;
+        let paged = items.into_iter().skip(start).take(page_size).collect();
+        (Some(page), Some(page_size), paged)
+    } else {
+        (None, None, items)
+    };
+
     Json(super::types::GroupsResponse {
-        total: items.len(),
-        groups: items,
+        total,
+        filtered_total: if page_size > 0 || query.search.is_some() {
+            Some(filtered_total)
+        } else {
+            None
+        },
+        page,
+        page_size: page_size_opt,
+        groups: paged_groups,
     })
 }
 

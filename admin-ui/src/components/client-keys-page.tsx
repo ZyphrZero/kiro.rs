@@ -1,11 +1,15 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect, useDeferredValue } from 'react'
 import { toast } from 'sonner'
 import {
   Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw, Loader2,
+  Search, X, ArrowUp, ArrowDown, ChevronLeft, ChevronRight,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from '@/components/ui/select'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
 } from '@/components/ui/dropdown-menu'
@@ -19,7 +23,7 @@ import {
 } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { GroupSingleSelect } from '@/components/group-select'
-import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
+import type { ClientKeyItem, CreateClientKeyResponse, ClientKeyQueryParams, SortDir } from '@/types/api'
 import { extractErrorMessage, formatCredits } from '@/lib/utils'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 import { ConsoleTable, type ConsoleColumn } from '@/components/console/data-table'
@@ -76,7 +80,31 @@ function formatRelative(ts?: string): string {
 }
 
 export function ClientKeysPage() {
-  const { data, isLoading, isFetching, refetch } = useClientKeys()
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState<number>(10)
+  const [searchQuery, setSearchQuery] = useState('')
+  const deferredSearch = useDeferredValue(searchQuery)
+  const [statusFilter, setStatusFilter] = useState<'all' | 'enabled' | 'disabled'>('all')
+  const [groupFilter, setGroupFilter] = useState<string>('')
+  const [sortBy, setSortBy] = useState<string>('id')
+  const [sortDir, setSortDir] = useState<SortDir>('desc')
+
+  // 搜索、筛选或排序改变时重置到第 1 页
+  useEffect(() => {
+    setPage(1)
+  }, [deferredSearch, statusFilter, groupFilter, sortBy, sortDir])
+
+  const clientKeyQueryParams = useMemo<ClientKeyQueryParams>(() => ({
+    page,
+    pageSize: pageSize === 0 ? 0 : pageSize,
+    search: deferredSearch.trim() || undefined,
+    status: statusFilter === 'all' ? undefined : statusFilter,
+    group: groupFilter || undefined,
+    sortBy,
+    sortDir,
+  }), [page, pageSize, deferredSearch, statusFilter, groupFilter, sortBy, sortDir])
+
+  const { data, isLoading, isFetching, refetch } = useClientKeys(clientKeyQueryParams)
   // 已注册分组列表（来自 groups.json 注册表，与凭据的 groups 字段解耦）
   const groupOptions = useGroupOptions()
   const createKey = useCreateClientKey()
@@ -251,7 +279,70 @@ export function ClientKeysPage() {
   const [batchActionPending, setBatchActionPending] = useState(false)
   const [batchProgress, setBatchProgress] = useState<{ current: number; total: number; action: 'delete' | 'toggle' } | null>(null)
 
-  const keys: ClientKeyItem[] = useMemo(() => data?.keys ?? [], [data?.keys])
+  const isServerPaginated = data?.filteredTotal !== undefined
+
+  const clientFilteredKeys = useMemo(() => {
+    if (isServerPaginated) return data?.keys ?? []
+    let list = data?.keys ?? []
+    const q = deferredSearch.trim().toLowerCase()
+    if (q) {
+      list = list.filter((k) =>
+        k.name.toLowerCase().includes(q) ||
+        k.id.toString().includes(q) ||
+        (k.group?.toLowerCase().includes(q) ?? false) ||
+        (k.description?.toLowerCase().includes(q) ?? false)
+      )
+    }
+    if (statusFilter === 'enabled') {
+      list = list.filter((k) => !k.disabled)
+    } else if (statusFilter === 'disabled') {
+      list = list.filter((k) => k.disabled)
+    }
+    if (groupFilter) {
+      if (groupFilter === '__none__') {
+        list = list.filter((k) => !k.group)
+      } else {
+        list = list.filter((k) => k.group === groupFilter)
+      }
+    }
+    const dir = sortDir === 'asc' ? 1 : -1
+    return [...list].sort((a, b) => {
+      let cmp = 0
+      switch (sortBy) {
+        case 'name':
+          cmp = a.name.localeCompare(b.name)
+          break
+        case 'totalCalls':
+          cmp = a.totalCalls - b.totalCalls
+          break
+        case 'totalCredits':
+          cmp = a.totalCredits - b.totalCredits
+          break
+        case 'lastUsedAt':
+          cmp = (a.lastUsedAt ? Date.parse(a.lastUsedAt) : 0) - (b.lastUsedAt ? Date.parse(b.lastUsedAt) : 0)
+          break
+        case 'createdAt':
+          cmp = Date.parse(a.createdAt) - Date.parse(b.createdAt)
+          break
+        default:
+          cmp = a.id - b.id
+      }
+      return cmp !== 0 ? cmp * dir : a.id - b.id
+    })
+  }, [isServerPaginated, data?.keys, deferredSearch, statusFilter, groupFilter, sortBy, sortDir])
+
+  const totalFilteredCount = isServerPaginated
+    ? (data?.filteredTotal ?? data?.keys?.length ?? 0)
+    : clientFilteredKeys.length
+
+  const effectivePageSize = pageSize === 0 ? Math.max(totalFilteredCount, 1) : pageSize
+  const totalPages = Math.max(1, Math.ceil(totalFilteredCount / effectivePageSize))
+
+  const keys: ClientKeyItem[] = useMemo(() => {
+    if (isServerPaginated) return data?.keys ?? []
+    const start = (page - 1) * effectivePageSize
+    return clientFilteredKeys.slice(start, start + effectivePageSize)
+  }, [isServerPaginated, data?.keys, clientFilteredKeys, page, effectivePageSize])
 
   const handleBatchDelete = async () => {
     if (selectedIds.size === 0) return
@@ -516,17 +607,156 @@ export function ClientKeysPage() {
         }
       />
 
-      <ConsoleTable
-        rows={keys}
-        columns={columns}
-        rowKey={(k) => k.id}
-        selectable
-        selected={selectedIds}
-        onSelectedChange={setSelectedIds}
-        rowActions={rowActions}
-        loading={isLoading}
-        empty="还没有客户端 Key，点击右上角「新建 Key」开始。"
-      />
+      <div className="space-y-3">
+        {/* 搜索与过滤工具栏 */}
+        <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-lg border bg-card/50 p-2.5">
+          <div className="flex flex-1 flex-wrap items-center gap-2 min-w-[240px]">
+            {/* 搜索框 */}
+            <div className="relative flex-1 min-w-[180px] max-w-sm">
+              <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="搜索 Key 名称 / 描述 / 分组 / ID..."
+                className="h-8 pl-8 pr-8 text-xs"
+              />
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery('')}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
+
+            {/* 状态筛选 */}
+            <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as any)}>
+              <SelectTrigger className="h-8 w-[110px] text-xs">
+                <SelectValue placeholder="状态" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">全部状态</SelectItem>
+                <SelectItem value="enabled">启用</SelectItem>
+                <SelectItem value="disabled">已禁用</SelectItem>
+              </SelectContent>
+            </Select>
+
+            {/* 分组筛选 */}
+            <Select value={groupFilter} onValueChange={setGroupFilter}>
+              <SelectTrigger className="h-8 w-[120px] text-xs">
+                <SelectValue placeholder="分组" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="">全部分组</SelectItem>
+                <SelectItem value="__none__">未绑定分组</SelectItem>
+                {groupOptions.map((g) => (
+                  <SelectItem key={g} value={g}>{g}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          {/* 排序控件 */}
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs text-muted-foreground whitespace-nowrap">排序:</span>
+            <Select value={sortBy} onValueChange={setSortBy}>
+              <SelectTrigger className="h-8 w-[110px] text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="id">ID</SelectItem>
+                <SelectItem value="name">名称</SelectItem>
+                <SelectItem value="totalCalls">调用次数</SelectItem>
+                <SelectItem value="totalCredits">积分消耗</SelectItem>
+                <SelectItem value="lastUsedAt">最近活跃</SelectItem>
+                <SelectItem value="createdAt">创建时间</SelectItem>
+              </SelectContent>
+            </Select>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-8 w-8 p-0"
+              onClick={() => setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))}
+              title={sortDir === 'asc' ? '升序 (点击切换降序)' : '降序 (点击切换升序)'}
+            >
+              {sortDir === 'asc' ? <ArrowUp className="h-3.5 w-3.5" /> : <ArrowDown className="h-3.5 w-3.5" />}
+            </Button>
+          </div>
+        </div>
+
+        <ConsoleTable
+          rows={keys}
+          columns={columns}
+          rowKey={(k) => k.id}
+          selectable
+          selected={selectedIds}
+          onSelectedChange={setSelectedIds}
+          rowActions={rowActions}
+          loading={isLoading}
+          empty={
+            deferredSearch || statusFilter !== 'all' || groupFilter
+              ? '当前筛选条件下没有客户端 Key。'
+              : '还没有客户端 Key，点击右上角「新建 Key」开始。'
+          }
+        />
+
+        {/* 分页控制栏 */}
+        {totalFilteredCount > 0 && (
+          <div className="flex flex-col items-center justify-between gap-3 pt-2 sm:flex-row">
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <span>每页</span>
+              <Select
+                value={String(pageSize)}
+                onValueChange={(v) => {
+                  setPageSize(Number(v))
+                  setPage(1)
+                }}
+              >
+                <SelectTrigger className="h-7 w-[75px] text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="10">10</SelectItem>
+                  <SelectItem value="20">20</SelectItem>
+                  <SelectItem value="50">50</SelectItem>
+                  <SelectItem value="0">全部</SelectItem>
+                </SelectContent>
+              </Select>
+              <span>条 · 共 {totalFilteredCount} 把 Key</span>
+            </div>
+
+            {totalPages > 1 && (
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  disabled={page <= 1}
+                >
+                  <ChevronLeft className="h-3.5 w-3.5 mr-1" />
+                  上一页
+                </Button>
+                <span className="text-xs text-muted-foreground tabular-nums">
+                  第 {page} / {totalPages} 页
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                  disabled={page >= totalPages}
+                >
+                  下一页
+                  <ChevronRight className="h-3.5 w-3.5 ml-1" />
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* 吸底批量操作栏 */}
       <BulkBar

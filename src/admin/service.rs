@@ -38,17 +38,17 @@ use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
     AddCredentialResponse, ApiDomainConfig, AssignProxyRequest, AssignRoundRobinResponse,
-    AvailableModelItem,
-    AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
-    CacheMeteringConfigResponse, CacheMeteringStatsResponse, CheckRateLimitRequest,
-    CredentialMetadataDetail, CredentialMetadataSchemaConfig, CredentialStatusItem,
-    CredentialsExportResponse, CredentialsStatusResponse, CustomModelItem,
-    CustomModelsConfigResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
-    GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
-    LogGovernanceConfigResponse, ModelApiRetryConfigResponse, ModelSelectionMode, ModelTestRequest,
-    ModelTestResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
-    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, QuotaResetRecoveryConfigResponse,
-    SelfHealConfigResponse, SessionAffinityConfigResponse, SetAccountRpmLimitConfigRequest,
+    AvailableModelItem, AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest,
+    BatchImportEvent, CacheMeteringConfigResponse, CacheMeteringStatsResponse,
+    CheckRateLimitRequest, CredentialMetadataDetail, CredentialMetadataSchemaConfig,
+    CredentialStateCounts, CredentialStatusItem, CredentialsExportResponse, CredentialsQuery,
+    CredentialsStatusResponse, CustomModelItem, CustomModelsConfigResponse, EnableOverageAllResult,
+    ExportedAccount, ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse,
+    LoadBalancingModeResponse, LogGovernanceConfigResponse, ModelApiRetryConfigResponse,
+    ModelSelectionMode, ModelTestRequest, ModelTestResponse, PollIdcLoginResponse,
+    ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
+    QuotaExceededResult, QuotaResetRecoveryConfigResponse, SelfHealConfigResponse,
+    SessionAffinityConfigResponse, SetAccountRpmLimitConfigRequest,
     SetAccountThrottleConfigRequest, SetCacheMeteringConfigRequest, SetCustomModelsRequest,
     SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelApiRetryConfigRequest,
     SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest, SetSessionAffinityConfigRequest,
@@ -807,8 +807,13 @@ impl AdminService {
         Ok(self.get_cache_metering_config())
     }
 
-    /// 获取所有凭据状态
+    /// 获取所有凭据状态（兼容旧接口，不分页）
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
+        self.get_credentials_paged(&CredentialsQuery::default())
+    }
+
+    /// 分页、过滤、排序获取凭据状态
+    pub fn get_credentials_paged(&self, query: &CredentialsQuery) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
         let exposed_current_id = if self.token_manager.get_load_balancing_mode() == "balanced" {
             0
@@ -825,7 +830,10 @@ impl AdminService {
         };
         let now_ts = Utc::now().timestamp() as f64;
 
-        let mut credentials: Vec<CredentialStatusItem> = snapshot
+        let total = snapshot.total;
+        let available = snapshot.available;
+
+        let credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
             .map(|entry| {
@@ -859,6 +867,7 @@ impl AdminService {
                     proxy_url: entry.proxy_url,
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
+                    throttled_remaining_secs: entry.throttled_remaining_secs,
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
@@ -870,15 +879,257 @@ impl AdminService {
             })
             .collect();
 
-        // 与调度器保持一致：优先级越小越靠前，同优先级按 ID 升序。
-        credentials.sort_by_key(|c| (c.priority, c.id));
+        // 全量各状态统计（不受分页和筛选影响，供前端状态账条展示全局概览）
+        let mut healthy_count = 0;
+        let mut throttled_count = 0;
+        let mut quota_count = 0;
+        let mut dead_count = 0;
+        for c in &credentials {
+            let is_overage = c
+                .balance
+                .as_ref()
+                .map(|b| b.remaining <= 0.0 || b.usage_percentage >= 100.0)
+                .unwrap_or_else(|| {
+                    c.disabled_reason
+                        .as_deref()
+                        .map(|r| r.to_lowercase().contains("quota") || r.contains("额度"))
+                        .unwrap_or(false)
+                });
+            if c.disabled {
+                dead_count += 1;
+            } else if c.throttled_remaining_secs.unwrap_or(0) > 0 {
+                throttled_count += 1;
+            } else if is_overage {
+                quota_count += 1;
+            } else {
+                healthy_count += 1;
+            }
+        }
+        let state_counts = CredentialStateCounts {
+            healthy: healthy_count,
+            throttled: throttled_count,
+            quota: quota_count,
+            dead: dead_count,
+            total: credentials.len(),
+        };
+
+        // 1. 过滤
+        let mut filtered: Vec<CredentialStatusItem> = credentials
+            .into_iter()
+            .filter(|c| {
+                // 搜索过滤
+                if let Some(search) = query.effective_search() {
+                    let q = search.to_lowercase();
+                    let match_email = c
+                        .email
+                        .as_deref()
+                        .map(|s| s.to_lowercase().contains(&q))
+                        .unwrap_or(false);
+                    let match_channel = c
+                        .source_channel
+                        .as_deref()
+                        .map(|s| s.to_lowercase().contains(&q))
+                        .unwrap_or(false);
+                    let match_key = c
+                        .masked_api_key
+                        .as_deref()
+                        .map(|s| s.to_lowercase().contains(&q))
+                        .unwrap_or(false);
+                    let match_id = c.id.to_string().contains(&q);
+                    let match_endpoint = c.endpoint.to_lowercase().contains(&q);
+                    if !match_email && !match_channel && !match_key && !match_id && !match_endpoint
+                    {
+                        return false;
+                    }
+                }
+
+                // 分组过滤
+                if let Some(group) = query.effective_group() {
+                    if group == "__none__" {
+                        if !c.groups.is_empty() {
+                            return false;
+                        }
+                    } else if !c.groups.iter().any(|g| g == group) {
+                        return false;
+                    }
+                }
+
+                // 状态过滤 (healthy / available, cooling / throttled, disabled / dead, overage / quota)
+                if let Some(status) = query.effective_status() {
+                    let is_overage = c
+                        .balance
+                        .as_ref()
+                        .map(|b| b.remaining <= 0.0 || b.usage_percentage >= 100.0)
+                        .unwrap_or_else(|| {
+                            c.disabled_reason
+                                .as_deref()
+                                .map(|r| r.to_lowercase().contains("quota") || r.contains("额度"))
+                                .unwrap_or(false)
+                        });
+
+                    match status {
+                        "all" => {}
+                        "healthy" | "available"
+                            if c.disabled
+                                || c.throttled_remaining_secs.unwrap_or(0) > 0
+                                || is_overage =>
+                        {
+                            return false;
+                        }
+                        "cooling" | "throttled" if c.throttled_remaining_secs.unwrap_or(0) == 0 => {
+                            return false;
+                        }
+                        "disabled" | "dead" if !c.disabled => return false,
+                        "overage" | "quota" if !is_overage => return false,
+                        _ => {}
+                    }
+                }
+
+                // 等级过滤（与前端 detectTier 的取值保持一致）
+                if let Some(tier) = query.effective_tier() {
+                    let t = c.subscription_title.as_deref().unwrap_or("").to_lowercase();
+                    let is_pro_plus = t.contains("pro+") || t.contains("pro plus");
+                    let is_pro = t.contains("pro");
+                    let is_power = t.contains("power");
+                    let is_free = t.contains("free");
+                    let is_student = t.contains("student");
+                    match tier {
+                        "pro" if !is_pro || is_pro_plus => return false,
+                        "pro_plus" if !is_pro_plus => return false,
+                        "power" if !is_power => return false,
+                        "student" if !is_student => return false,
+                        "free" if !is_free => return false,
+                        "unknown" if is_pro || is_power || is_free || is_student => {
+                            return false;
+                        }
+                        _ => {}
+                    }
+                }
+
+                true
+            })
+            .collect();
+
+        let filtered_total = filtered.len();
+
+        // 2. 排序
+        let sort_dir_asc = query.effective_sort_dir().eq_ignore_ascii_case("asc");
+        let sort_field = query.effective_sort_field().unwrap_or("manual");
+
+        if sort_field == "manual" {
+            // 默认服务端调度顺序：优先级越小越靠前，同优先级按 ID 升序
+            filtered.sort_by_key(|c| (c.priority, c.id));
+        } else {
+            filtered.sort_by(|a, b| {
+                let cmp = match sort_field {
+                    "priority" => a.priority.cmp(&b.priority),
+                    "successCount" | "success_count" => a.success_count.cmp(&b.success_count),
+                    "totalFailureCount" | "total_failure_count" => {
+                        a.total_failure_count.cmp(&b.total_failure_count)
+                    }
+                    "id" => a.id.cmp(&b.id),
+                    "name" => {
+                        let na = a
+                            .email
+                            .as_deref()
+                            .or(a.source_channel.as_deref())
+                            .unwrap_or("");
+                        let nb = b
+                            .email
+                            .as_deref()
+                            .or(b.source_channel.as_deref())
+                            .unwrap_or("");
+                        na.to_lowercase().cmp(&nb.to_lowercase())
+                    }
+                    "status" => {
+                        let rank = |c: &CredentialStatusItem| -> u8 {
+                            if c.disabled {
+                                3
+                            } else if c.throttled_remaining_secs.unwrap_or(0) > 0 {
+                                2
+                            } else if c.is_current {
+                                0
+                            } else {
+                                1
+                            }
+                        };
+                        rank(a).cmp(&rank(b))
+                    }
+                    "lastUsedAt" | "last_used_at" => match (&a.last_used_at, &b.last_used_at) {
+                        (None, None) => std::cmp::Ordering::Equal,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (Some(ta), Some(tb)) => ta.cmp(tb),
+                    },
+                    "createdAt" | "created_at" => match (&a.created_at, &b.created_at) {
+                        (None, None) => std::cmp::Ordering::Equal,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (Some(ta), Some(tb)) => ta.cmp(tb),
+                    },
+                    "balance" => {
+                        let rem_a = a.balance.as_ref().map(|b| b.remaining);
+                        let rem_b = b.balance.as_ref().map(|b| b.remaining);
+                        match (rem_a, rem_b) {
+                            (Some(ra), Some(rb)) => {
+                                ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
+                            }
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => {
+                                let pct_a = a.balance.as_ref().map(|b| b.usage_percentage);
+                                let pct_b = b.balance.as_ref().map(|b| b.usage_percentage);
+                                match (pct_a, pct_b) {
+                                    (Some(pa), Some(pb)) => {
+                                        pb.partial_cmp(&pa).unwrap_or(std::cmp::Ordering::Equal)
+                                    }
+                                    _ => std::cmp::Ordering::Equal,
+                                }
+                            }
+                        }
+                    }
+                    _ => a.priority.cmp(&b.priority),
+                };
+
+                let ordered_cmp = if sort_dir_asc { cmp } else { cmp.reverse() };
+                if ordered_cmp == std::cmp::Ordering::Equal {
+                    a.id.cmp(&b.id)
+                } else {
+                    ordered_cmp
+                }
+            });
+        }
+
+        // 3. 分页
+        let page_size = query.effective_page_size();
+        let (page, page_size_opt, result_credentials) = if page_size > 0 {
+            let page = query.effective_page();
+            let start = (page - 1) * page_size;
+            let paged = filtered.into_iter().skip(start).take(page_size).collect();
+            (Some(page), Some(page_size), paged)
+        } else {
+            (None, None, filtered)
+        };
 
         CredentialsStatusResponse {
-            total: snapshot.total,
-            available: snapshot.available,
+            total,
+            filtered_total: if page_size > 0
+                || query.effective_search().is_some()
+                || query.effective_group().is_some()
+                || query.effective_status().is_some()
+                || query.effective_tier().is_some()
+            {
+                Some(filtered_total)
+            } else {
+                None
+            },
+            available,
+            page,
+            page_size: page_size_opt,
             current_id: exposed_current_id,
+            state_counts: Some(state_counts),
             metadata_schema,
-            credentials,
+            credentials: result_credentials,
         }
     }
 
@@ -4092,6 +4343,143 @@ mod tests {
         assert_eq!(response.current_id, 1);
         assert!(response.credentials[0].is_current);
         assert!(!response.credentials[1].is_current);
+    }
+
+    fn paged_credentials_service() -> AdminService {
+        let credentials = vec![
+            KiroCredentials {
+                priority: 0,
+                email: Some("alpha@example.com".to_string()),
+                groups: vec!["team-a".to_string()],
+                ..KiroCredentials::default()
+            },
+            KiroCredentials {
+                priority: 1,
+                email: Some("beta@example.com".to_string()),
+                groups: vec!["team-b".to_string()],
+                ..KiroCredentials::default()
+            },
+            KiroCredentials {
+                priority: 2,
+                email: Some("gamma@example.com".to_string()),
+                disabled: true,
+                disabled_reason: Some("Manual".to_string()),
+                ..KiroCredentials::default()
+            },
+        ];
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap(),
+        );
+        AdminService::new(manager, Vec::new())
+    }
+
+    #[tokio::test]
+    async fn credentials_without_query_params_keep_legacy_shape() {
+        let service = paged_credentials_service();
+        let response = service.get_all_credentials();
+
+        // 不传任何参数时行为与旧接口一致：全量、按 priority/id 排序、不返回分页字段
+        assert_eq!(response.total, 3);
+        assert_eq!(response.credentials.len(), 3);
+        assert!(response.filtered_total.is_none());
+        assert!(response.page.is_none());
+        assert!(response.page_size.is_none());
+        assert_eq!(
+            response
+                .credentials
+                .iter()
+                .map(|c| c.priority)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn credentials_pagination_returns_page_and_filtered_total() {
+        let service = paged_credentials_service();
+        let query = CredentialsQuery {
+            page: Some(2),
+            page_size: Some(2),
+            ..CredentialsQuery::default()
+        };
+        let response = service.get_credentials_paged(&query);
+
+        assert_eq!(response.total, 3);
+        assert_eq!(response.filtered_total, Some(3));
+        assert_eq!(response.page, Some(2));
+        assert_eq!(response.page_size, Some(2));
+        assert_eq!(response.credentials.len(), 1);
+        assert_eq!(response.credentials[0].priority, 2);
+    }
+
+    #[tokio::test]
+    async fn credentials_search_and_status_filters_are_applied() {
+        let service = paged_credentials_service();
+
+        let search = service.get_credentials_paged(&CredentialsQuery {
+            search: Some("ALPHA".to_string()),
+            ..CredentialsQuery::default()
+        });
+        assert_eq!(search.filtered_total, Some(1));
+        assert_eq!(search.credentials.len(), 1);
+        assert_eq!(
+            search.credentials[0].email.as_deref(),
+            Some("alpha@example.com")
+        );
+
+        // dead 是 disabled 的别名
+        let dead = service.get_credentials_paged(&CredentialsQuery {
+            status: Some("dead".to_string()),
+            ..CredentialsQuery::default()
+        });
+        assert_eq!(dead.filtered_total, Some(1));
+        assert!(dead.credentials[0].disabled);
+
+        // healthy 排除被禁用的凭据
+        let healthy = service.get_credentials_paged(&CredentialsQuery {
+            status: Some("healthy".to_string()),
+            ..CredentialsQuery::default()
+        });
+        assert_eq!(healthy.filtered_total, Some(2));
+        assert!(healthy.credentials.iter().all(|c| !c.disabled));
+
+        // 状态统计始终基于全量
+        let counts = healthy.state_counts.expect("应返回全量状态统计");
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.dead, 1);
+    }
+
+    #[tokio::test]
+    async fn credentials_group_and_tier_filters_are_applied() {
+        let service = paged_credentials_service();
+
+        let team_a = service.get_credentials_paged(&CredentialsQuery {
+            group: Some("team-a".to_string()),
+            ..CredentialsQuery::default()
+        });
+        assert_eq!(team_a.filtered_total, Some(1));
+        assert_eq!(
+            team_a.credentials[0].email.as_deref(),
+            Some("alpha@example.com")
+        );
+
+        // 未分组：只有第三条（gamma）没有绑定分组
+        let ungrouped = service.get_credentials_paged(&CredentialsQuery {
+            group: Some("__none__".to_string()),
+            ..CredentialsQuery::default()
+        });
+        assert_eq!(ungrouped.filtered_total, Some(1));
+        assert_eq!(
+            ungrouped.credentials[0].email.as_deref(),
+            Some("gamma@example.com")
+        );
+
+        // 没有订阅等级时归入 unknown
+        let unknown = service.get_credentials_paged(&CredentialsQuery {
+            tier: Some("unknown".to_string()),
+            ..CredentialsQuery::default()
+        });
+        assert_eq!(unknown.filtered_total, Some(3));
     }
 
     #[test]

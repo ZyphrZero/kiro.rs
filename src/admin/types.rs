@@ -10,16 +10,106 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialsStatusResponse {
-    /// 凭据总数
+    /// 凭据总数（无筛选时的全量总数）
     pub total: usize,
+    /// 经过搜索/分组/状态筛选后的条目总数（用于前端分页计算）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filtered_total: Option<usize>,
     /// 可用凭据数量（未禁用）
     pub available: usize,
+    /// 当前页码（1-based）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<usize>,
+    /// 每页数量（0 或未传表示不分页）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<usize>,
     /// 优先级模式下的当前优先凭据 ID；均衡模式固定为 0
     pub current_id: u64,
+    /// 各状态凭据统计（全量）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_counts: Option<CredentialStateCounts>,
     /// 凭据 metadata 的 JSON Schema
     pub metadata_schema: serde_json::Value,
-    /// 各凭据状态列表
+    /// 各凭据状态列表（当前页数据）
     pub credentials: Vec<CredentialStatusItem>,
+}
+
+/// 凭据状态统计
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialStateCounts {
+    pub healthy: usize,
+    pub throttled: usize,
+    pub quota: usize,
+    pub dead: usize,
+    pub total: usize,
+}
+
+/// 凭据列表查询参数（支持分页、搜索、分组、状态、排序）
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialsQuery {
+    pub page: Option<usize>,
+    #[serde(alias = "page_size", alias = "limit")]
+    pub page_size: Option<usize>,
+    #[serde(alias = "q")]
+    pub search: Option<String>,
+    pub group: Option<String>,
+    pub status: Option<String>,
+    pub tier: Option<String>,
+    #[serde(alias = "sort_field", alias = "sort_by", alias = "sortBy")]
+    pub sort_field: Option<String>,
+    #[serde(alias = "sort_dir", alias = "sort_order", alias = "sortOrder")]
+    pub sort_dir: Option<String>,
+}
+
+impl CredentialsQuery {
+    pub fn effective_page(&self) -> usize {
+        self.page.unwrap_or(1).max(1)
+    }
+
+    pub fn effective_page_size(&self) -> usize {
+        self.page_size.unwrap_or(0)
+    }
+
+    pub fn effective_search(&self) -> Option<&str> {
+        self.search
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn effective_group(&self) -> Option<&str> {
+        self.group
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn effective_status(&self) -> Option<&str> {
+        self.status
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn effective_tier(&self) -> Option<&str> {
+        self.tier
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn effective_sort_field(&self) -> Option<&str> {
+        self.sort_field
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn effective_sort_dir(&self) -> &str {
+        self.sort_dir.as_deref().unwrap_or("desc")
+    }
 }
 
 /// 单个凭据的状态信息
@@ -76,6 +166,9 @@ pub struct CredentialStatusItem {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 账号级限流冷却剩余秒数；冷却中且 `> 0` 时返回
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throttled_remaining_secs: Option<u64>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
     /// 账号所属分组（可属于多个分组）
@@ -1021,7 +1114,72 @@ pub struct ClientKeyItem {
 #[serde(rename_all = "camelCase")]
 pub struct ClientKeysResponse {
     pub total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filtered_total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<usize>,
     pub keys: Vec<ClientKeyItem>,
+}
+
+/// 客户端 Key 列表查询参数
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientKeysQuery {
+    pub page: Option<usize>,
+    #[serde(alias = "page_size", alias = "limit")]
+    pub page_size: Option<usize>,
+    #[serde(alias = "q")]
+    pub search: Option<String>,
+    pub status: Option<String>,
+    pub group: Option<String>,
+    #[serde(alias = "sortBy", alias = "sort_field", alias = "sortField")]
+    pub sort_by: Option<String>,
+    #[serde(alias = "sortDir", alias = "sortOrder", alias = "sort_order")]
+    pub sort_dir: Option<String>,
+}
+
+impl ClientKeysQuery {
+    pub fn effective_page(&self) -> usize {
+        self.page.unwrap_or(1).max(1)
+    }
+
+    pub fn effective_page_size(&self) -> usize {
+        self.page_size.unwrap_or(0)
+    }
+
+    pub fn effective_search(&self) -> Option<&str> {
+        self.search
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn effective_status(&self) -> Option<&str> {
+        self.status
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn effective_group(&self) -> Option<&str> {
+        self.group
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn effective_sort_by(&self) -> Option<&str> {
+        self.sort_by
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn effective_sort_dir(&self) -> &str {
+        self.sort_dir.as_deref().unwrap_or("desc")
+    }
 }
 
 /// 创建客户端 Key 请求
@@ -1326,7 +1484,24 @@ pub struct GroupItem {
 #[serde(rename_all = "camelCase")]
 pub struct GroupsResponse {
     pub total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filtered_total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<usize>,
     pub groups: Vec<GroupItem>,
+}
+
+/// 分组列表查询参数
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupsQuery {
+    pub page: Option<usize>,
+    #[serde(alias = "page_size", alias = "limit")]
+    pub page_size: Option<usize>,
+    #[serde(alias = "q")]
+    pub search: Option<String>,
 }
 
 /// 创建分组请求
@@ -1398,4 +1573,57 @@ pub struct CustomModelItem {
 #[serde(rename_all = "camelCase")]
 pub struct SetCustomModelsRequest {
     pub models: Vec<CustomModelItem>,
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    #[test]
+    fn credentials_query_accepts_camel_and_snake_params() {
+        let camel: CredentialsQuery = serde_json::from_value(serde_json::json!({
+            "page": 2,
+            "pageSize": 20,
+            "search": "abc",
+            "sortField": "priority",
+            "sortDir": "asc"
+        }))
+        .unwrap();
+        assert_eq!(camel.effective_page(), 2);
+        assert_eq!(camel.effective_page_size(), 20);
+        assert_eq!(camel.effective_search(), Some("abc"));
+        assert_eq!(camel.effective_sort_field(), Some("priority"));
+        assert_eq!(camel.effective_sort_dir(), "asc");
+
+        let snake: CredentialsQuery = serde_json::from_value(serde_json::json!({
+            "page_size": 10,
+            "q": "xyz",
+            "sort_by": "id",
+            "sort_order": "desc"
+        }))
+        .unwrap();
+        assert_eq!(snake.effective_page_size(), 10);
+        assert_eq!(snake.effective_search(), Some("xyz"));
+        assert_eq!(snake.effective_sort_field(), Some("id"));
+        assert_eq!(snake.effective_sort_dir(), "desc");
+    }
+
+    #[test]
+    fn client_keys_query_accepts_sort_aliases() {
+        let camel: ClientKeysQuery = serde_json::from_value(serde_json::json!({
+            "sortBy": "name",
+            "sortDir": "asc"
+        }))
+        .unwrap();
+        assert_eq!(camel.effective_sort_by(), Some("name"));
+        assert_eq!(camel.effective_sort_dir(), "asc");
+
+        let snake: ClientKeysQuery = serde_json::from_value(serde_json::json!({
+            "sort_field": "createdAt",
+            "sort_order": "desc"
+        }))
+        .unwrap();
+        assert_eq!(snake.effective_sort_by(), Some("createdAt"));
+        assert_eq!(snake.effective_sort_dir(), "desc");
+    }
 }

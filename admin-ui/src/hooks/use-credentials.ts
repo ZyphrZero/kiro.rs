@@ -1,4 +1,4 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query'
 import {
   getCredentials,
   setCredentialDisabled,
@@ -53,13 +53,15 @@ import type {
   UpdateCredentialRequest,
   UpdateRefreshTokenRequest,
   CredentialMetadataSchemaConfig,
+  CredentialQueryParams,
 } from '@/types/api'
 
-// 查询凭据列表
-export function useCredentials() {
+// 查询凭据列表（支持分页、搜索、过滤、排序）
+export function useCredentials(params?: CredentialQueryParams) {
   return useQuery({
-    queryKey: ['credentials'],
-    queryFn: getCredentials,
+    queryKey: ['credentials', params],
+    queryFn: () => getCredentials(params),
+    placeholderData: keepPreviousData,
     refetchInterval: 30000, // 每 30 秒刷新一次
   })
 }
