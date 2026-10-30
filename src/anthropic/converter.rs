@@ -690,7 +690,12 @@ fn derive_conversation_id(req: &MessagesRequest) -> String {
     hasher.update(b"\x01");
     if let Some(first) = req.messages.iter().find(|m| m.role == "user") {
         match &first.content {
-            serde_json::Value::String(s) => hasher.update(s.as_bytes()),
+            // 纯字符串按「一个 text 块」计：pi-ai 等客户端第一轮把首条消息转成带 cache_control
+            // 的块数组，之后几轮又发成字符串，两种写法必须得到同一个 id。
+            serde_json::Value::String(s) => {
+                hasher.update(s.as_bytes());
+                hasher.update(b"\0");
+            }
             serde_json::Value::Array(blocks) => {
                 for block in blocks {
                     if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
@@ -5160,6 +5165,31 @@ mod tests {
                 "user_id": "user_x_account__session_a0662283-7fd3-4399-a7eb-52b9a717ae88"
             });
             assert_eq!(id(with_session), "a0662283-7fd3-4399-a7eb-52b9a717ae88");
+        }
+
+        #[test]
+        fn fixreq_l12_string_and_single_text_block_first_message_share_id() {
+            // pi-ai 第一轮：首条 user 是带 cache_control 的块数组；第二轮起：同一条消息是纯字符串。
+            let as_block = json!({
+                "model": "claude-opus-5.5",
+                "max_tokens": 1024,
+                "system": "agent system prompt",
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "build the parser", "cache_control": {"type": "ephemeral"}}
+                ]}]
+            });
+            let as_string = json!({
+                "model": "claude-opus-5.5",
+                "max_tokens": 1024,
+                "system": "agent system prompt",
+                "messages": [
+                    {"role": "user", "content": "build the parser"},
+                    {"role": "assistant", "content": "parsed"},
+                    {"role": "user", "content": [{"type": "text", "text": "now tests", "cache_control": {"type": "ephemeral"}}]}
+                ]
+            });
+            let id = |v: serde_json::Value| convert(v).conversation_state.conversation_id;
+            assert_eq!(id(as_block), id(as_string));
         }
 
         #[test]
