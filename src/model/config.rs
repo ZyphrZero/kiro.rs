@@ -291,6 +291,22 @@ pub struct Config {
     #[serde(default)]
     pub quota_reset_recovery_enabled: bool,
 
+    /// 是否启用凭据代理的自动检测与轮换（默认 true）。
+    ///
+    /// 开启后，代理池健康检查会把凭据实际在用的代理（含全局代理、凭据级代理中
+    /// 未登记到池内的地址）纳入探测范围；探测判定不可用的代理会被标记，使用该
+    /// 代理的凭据自动轮换到池内其它可用代理。
+    #[serde(default = "default_proxy_auto_rotate_enabled")]
+    pub proxy_auto_rotate_enabled: bool,
+
+    /// 无可用代理时是否允许凭据回退直连（默认 false）。
+    ///
+    /// 关闭时，代理全部不可用的凭据保持原代理配置不变，请求继续失败直至代理恢复，
+    /// 避免真实出口 IP 意外暴露；开启时这些凭据临时改为 `direct`，并在池内重新出现
+    /// 可用代理后自动改回代理。
+    #[serde(default)]
+    pub proxy_direct_fallback_enabled: bool,
+
     /// 按凭据缓存上游可用模型列表的 TTL（秒，默认 3600）。
     #[serde(default = "default_model_cache_ttl_secs")]
     pub model_cache_ttl_secs: u64,
@@ -483,6 +499,10 @@ fn default_self_heal_max_consecutive_rounds() -> u32 {
     5
 }
 
+fn default_proxy_auto_rotate_enabled() -> bool {
+    true
+}
+
 fn default_model_cache_ttl_secs() -> u64 {
     60 * 60
 }
@@ -557,6 +577,8 @@ impl Default for Config {
             self_heal_min_interval_secs: default_self_heal_min_interval_secs(),
             self_heal_max_consecutive_rounds: default_self_heal_max_consecutive_rounds(),
             quota_reset_recovery_enabled: false,
+            proxy_auto_rotate_enabled: default_proxy_auto_rotate_enabled(),
+            proxy_direct_fallback_enabled: false,
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),

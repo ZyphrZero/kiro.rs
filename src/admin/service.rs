@@ -34,7 +34,7 @@ use crate::kiro::token_manager::{
 use crate::model::config::Config;
 
 use super::error::AdminServiceError;
-use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
+use super::proxy_pool::{mask_proxy_url, GetUrlResult, ProxyAvailability, ProxyPoolManager};
 use super::types::{
     AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
     AddCredentialResponse, ApiDomainConfig, AssignProxyRequest, AssignRoundRobinResponse,
@@ -47,10 +47,12 @@ use super::types::{
     GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
     LogGovernanceConfigResponse, ModelApiRetryConfigResponse, ModelSelectionMode, ModelTestRequest,
     ModelTestResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
-    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, QuotaResetRecoveryConfigResponse,
+    ProxyFailoverConfigResponse, ProxyPoolEntry, ProxyPoolResponse, ProxyRotationResponse,
+    QuotaExceededResult, QuotaResetRecoveryConfigResponse,
     SelfHealConfigResponse, SessionAffinityConfigResponse, SetAccountRpmLimitConfigRequest,
     SetAccountThrottleConfigRequest, SetCacheMeteringConfigRequest, SetCustomModelsRequest,
     SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelApiRetryConfigRequest,
+    SetProxyFailoverConfigRequest,
     SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest, SetSessionAffinityConfigRequest,
     SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
     StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
@@ -1361,8 +1363,9 @@ impl AdminService {
     /// 启动代理池后台健康检查调度器
     ///
     /// - 启动后稍等片刻再执行首次探测
-    /// - 之后按 `interval` 周期循环，对所有已启用代理并发探测
-    /// - 连续探测失败达阈值的代理由 `check_all` 内部自动禁用
+    /// - 之后按 `interval` 周期循环，执行「自动检测 → 探测 → 自动轮换」完整巡检
+    /// - 连续探测失败达阈值的代理自动禁用，恢复连通后自动重新启用
+    /// - 使用不可用代理的凭据按配置自动轮换或回退直连
     pub fn start_proxy_health_checker(self: &Arc<Self>, interval: std::time::Duration) {
         let svc = Arc::clone(self);
         tokio::spawn(async move {
@@ -1370,14 +1373,30 @@ impl AdminService {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             loop {
                 let started = std::time::Instant::now();
-                let summary = svc.proxy_pool.check_all().await;
+                let result = svc.check_all_proxies().await;
                 tracing::info!(
-                    "代理池健康检查完成：健康 {}，异常 {}，本轮自动禁用 {}，耗时 {:.1}s",
-                    summary.healthy,
-                    summary.unhealthy,
-                    summary.auto_disabled,
+                    "代理池巡检完成：健康 {}，异常 {}，自动禁用 {}，自动恢复 {}，新检测 {}，耗时 {:.1}s",
+                    result.healthy,
+                    result.unhealthy,
+                    result.auto_disabled,
+                    result.auto_recovered,
+                    result.detected,
                     started.elapsed().as_secs_f32()
                 );
+                let rotation = &result.rotation;
+                if rotation.rotated > 0
+                    || rotation.switched_to_direct > 0
+                    || rotation.restored_to_proxy > 0
+                    || rotation.unresolved > 0
+                {
+                    tracing::info!(
+                        "凭据代理自动轮换：轮换 {}，回退直连 {}，改回代理 {}，无可用代理 {}",
+                        rotation.rotated,
+                        rotation.switched_to_direct,
+                        rotation.restored_to_proxy,
+                        rotation.unresolved
+                    );
+                }
                 tokio::time::sleep(interval).await;
             }
         });
@@ -1565,6 +1584,7 @@ impl AdminService {
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
+            proxy_auto_assigned: false,
             disabled: false, // 新添加的凭据默认启用
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,
@@ -2972,6 +2992,7 @@ impl AdminService {
                     last_checked_at: p.last_checked_at,
                     consecutive_failures: p.consecutive_failures,
                     auto_disabled: p.auto_disabled,
+                    auto_detected: p.auto_detected,
                 }
             })
             .collect();
@@ -3003,6 +3024,7 @@ impl AdminService {
             last_checked_at: entry.last_checked_at,
             consecutive_failures: entry.consecutive_failures,
             auto_disabled: entry.auto_disabled,
+            auto_detected: entry.auto_detected,
         })
     }
 
@@ -3025,6 +3047,7 @@ impl AdminService {
                 last_checked_at: e.last_checked_at,
                 consecutive_failures: e.consecutive_failures,
                 auto_disabled: e.auto_disabled,
+                auto_detected: e.auto_detected,
             })
             .collect();
         (result, errors)
@@ -3112,14 +3135,184 @@ impl AdminService {
         })
     }
 
-    /// 触发全部代理的健康检查
+    /// 执行一轮完整的代理健康巡检：自动检测 → 探测 → 自动轮换。
+    ///
+    /// 三步顺序固定，缺一步会让后续判定失去依据：
+    /// 1. 把凭据实际在用、但未登记到池内的代理（含全局代理）登记进池，否则这些
+    ///    地址永远没有探测记录，不可用也无从发现；
+    /// 2. 全量探测（含此前自动禁用的条目，用于自动恢复），刷新可用性判定；
+    /// 3. 按最新判定轮换凭据代理。
     pub async fn check_all_proxies(&self) -> ProxyCheckAllResponse {
+        let detected = self.detect_credential_proxies();
         let summary = self.proxy_pool.check_all().await;
+        let rotation = self.rotate_unavailable_credential_proxies();
         ProxyCheckAllResponse {
             healthy: summary.healthy,
             unhealthy: summary.unhealthy,
             auto_disabled: summary.auto_disabled,
+            auto_recovered: summary.auto_recovered,
+            detected,
+            rotation,
         }
+    }
+
+    /// 把凭据实际在用、但尚未登记到代理池的代理登记进池，纳入健康检查范围。
+    ///
+    /// 覆盖全局代理与凭据级代理；显式直连（`proxy_url == "direct"`）的凭据不产生
+    /// 待检测地址。返回新登记的条目数。
+    fn detect_credential_proxies(&self) -> usize {
+        let mut in_use: Vec<String> = Vec::new();
+
+        // 全局代理即使当前没有凭据回退到它，也纳入检测：它是新增凭据的默认出口
+        if let Some(url) = self.token_manager.proxy().map(|p| p.url) {
+            in_use.push(url);
+        }
+        for cred in self.token_manager.credential_proxy_snapshot() {
+            if let Some(url) = cred.in_use_proxy_url {
+                if !in_use.contains(&url) {
+                    in_use.push(url);
+                }
+            }
+        }
+
+        self.proxy_pool.register_detected(&in_use)
+    }
+
+    /// 按代理池最新可用性判定轮换凭据代理。
+    ///
+    /// 处理三类凭据：
+    /// - 在用代理被判定不可用：改为池内其它可用代理；无可用代理时，按
+    ///   `proxy_direct_fallback_enabled` 决定回退直连或保持原配置；
+    /// - 此前被自动回退直连、当前池内已有可用代理：改回代理；
+    /// - 其余凭据（代理可用、未登记、或用户显式直连）不做改动。
+    ///
+    /// `proxy_auto_rotate_enabled` 关闭时直接返回空结果，不做任何改写。
+    fn rotate_unavailable_credential_proxies(&self) -> ProxyRotationResponse {
+        let (auto_rotate_enabled, direct_fallback_enabled) =
+            self.token_manager.get_proxy_failover_config();
+        if !auto_rotate_enabled {
+            return ProxyRotationResponse::default();
+        }
+
+        let available = self.proxy_pool.assignable_urls();
+        let credentials = self.token_manager.credential_proxy_snapshot();
+
+        let mut result = ProxyRotationResponse::default();
+        let mut updates: Vec<(u64, Option<String>)> = Vec::new();
+        // 轮换目标在可用代理间轮转，避免所有凭据挤到同一个代理上
+        let mut cursor = 0usize;
+
+        for cred in &credentials {
+            let current_url = match &cred.in_use_proxy_url {
+                Some(url) => url.clone(),
+                None => {
+                    // 当前直连。仅回收「自动回退直连」的凭据，用户显式配置的直连不动
+                    if cred.explicit_direct && cred.auto_assigned && !available.is_empty() {
+                        let target = available[cursor % available.len()].clone();
+                        cursor += 1;
+                        tracing::info!(
+                            "凭据 #{} 此前因无可用代理回退直连，现已改回代理: {}",
+                            cred.id,
+                            mask_proxy_url(&target)
+                        );
+                        updates.push((cred.id, Some(target)));
+                        result.restored_to_proxy += 1;
+                    }
+                    continue;
+                }
+            };
+
+            // 未登记的代理没有探测记录，不做可用性推断
+            if self.proxy_pool.availability(&current_url) != ProxyAvailability::Unavailable {
+                continue;
+            }
+
+            // 从 cursor 起找第一个不等于当前地址的可用代理；命中后把 cursor 推到它之后，
+            // 让后续凭据继续往下轮转，避免都落到同一个代理上
+            let target = (0..available.len()).find_map(|offset| {
+                let index = (cursor + offset) % available.len();
+                (available[index] != current_url).then(|| (index, available[index].clone()))
+            });
+
+            match target {
+                Some((index, url)) => {
+                    cursor = index + 1;
+                    tracing::warn!(
+                        "凭据 #{} 在用代理不可用，已轮换: {} -> {}",
+                        cred.id,
+                        mask_proxy_url(&current_url),
+                        mask_proxy_url(&url)
+                    );
+                    updates.push((cred.id, Some(url)));
+                    result.rotated += 1;
+                }
+                None if direct_fallback_enabled => {
+                    tracing::warn!(
+                        "凭据 #{} 在用代理 {} 不可用且无其它可用代理，已按配置回退直连",
+                        cred.id,
+                        mask_proxy_url(&current_url)
+                    );
+                    updates.push((
+                        cred.id,
+                        Some(KiroCredentials::PROXY_DIRECT.to_string()),
+                    ));
+                    result.switched_to_direct += 1;
+                }
+                None => {
+                    tracing::error!(
+                        "凭据 #{} 在用代理 {} 不可用且无其它可用代理；直连回退未开启，保持原配置",
+                        cred.id,
+                        mask_proxy_url(&current_url)
+                    );
+                    result.unresolved += 1;
+                }
+            }
+        }
+
+        if !updates.is_empty() {
+            if let Err(e) = self.token_manager.apply_proxy_rotation(&updates) {
+                tracing::error!("代理自动轮换结果持久化失败: {}", e);
+                return ProxyRotationResponse {
+                    unresolved: result.unresolved + updates.len(),
+                    ..ProxyRotationResponse::default()
+                };
+            }
+        }
+
+        result
+    }
+
+    /// 读取代理故障转移配置
+    pub fn get_proxy_failover_config(&self) -> ProxyFailoverConfigResponse {
+        let (auto_rotate_enabled, direct_fallback_enabled) =
+            self.token_manager.get_proxy_failover_config();
+        ProxyFailoverConfigResponse {
+            auto_rotate_enabled,
+            direct_fallback_enabled,
+        }
+    }
+
+    /// 更新代理故障转移配置
+    pub fn set_proxy_failover_config(
+        &self,
+        req: SetProxyFailoverConfigRequest,
+    ) -> Result<ProxyFailoverConfigResponse, AdminServiceError> {
+        if req.auto_rotate_enabled.is_none() && req.direct_fallback_enabled.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 autoRotateEnabled / directFallbackEnabled 一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_proxy_failover_config(req.auto_rotate_enabled, req.direct_fallback_enabled)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_proxy_failover_config())
+    }
+
+    /// 按当前代理池状态立即执行一次凭据代理轮换（不重新探测）
+    pub fn rotate_credential_proxies(&self) -> ProxyRotationResponse {
+        self.rotate_unavailable_credential_proxies()
     }
 
     /// 将可用代理（已启用且非 Unhealthy）按轮询方式批量分配给凭据
@@ -4026,6 +4219,344 @@ mod tests {
         assert_eq!(region.title, "区域");
         assert_eq!(region.description.as_deref(), Some("凭据所属区域"));
         assert_eq!(region.value, serde_json::json!("us-east-1"));
+    }
+
+    /// 构造一个带代理池、可控开关的测试 service。
+    ///
+    /// `credentials` 的 `proxy_url` 决定各凭据在用代理；`global_proxy` 为未显式配置
+    /// 代理的凭据提供回退出口。
+    fn proxy_rotation_service(
+        credentials: Vec<KiroCredentials>,
+        global_proxy: Option<&str>,
+        auto_rotate: bool,
+        direct_fallback: bool,
+    ) -> AdminService {
+        let mut config = Config::default();
+        config.proxy_auto_rotate_enabled = auto_rotate;
+        config.proxy_direct_fallback_enabled = direct_fallback;
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                credentials,
+                global_proxy.map(ProxyConfig::new),
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        AdminService::new(manager, Vec::new())
+    }
+
+    /// 把代理池内指定 URL 置为「探测失败」状态（模拟健康检查判定不可用）。
+    fn mark_proxy_unhealthy(service: &AdminService, url: &str) {
+        let entry = service
+            .proxy_pool
+            .list()
+            .into_iter()
+            .find(|e| e.url == url)
+            .expect("代理应已登记在池内");
+        service.proxy_pool.set_enabled(entry.id, false).unwrap();
+    }
+
+    fn credential_proxy_url(service: &AdminService, id: u64) -> Option<String> {
+        service
+            .token_manager
+            .credential_proxy_snapshot()
+            .into_iter()
+            .find(|c| c.id == id)
+            .expect("凭据应存在")
+            .in_use_proxy_url
+    }
+
+    #[tokio::test]
+    async fn detect_registers_global_and_credential_proxies() {
+        let cred = KiroCredentials {
+            proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+            ..KiroCredentials::default()
+        };
+        let service =
+            proxy_rotation_service(vec![cred], Some("http://10.0.0.1:8080"), true, false);
+
+        let detected = service.detect_credential_proxies();
+
+        assert_eq!(detected, 2);
+        let urls: Vec<String> = service.proxy_pool.list().into_iter().map(|e| e.url).collect();
+        assert!(urls.contains(&"http://10.0.0.1:8080".to_string()));
+        assert!(urls.contains(&"socks5://10.0.0.2:1080".to_string()));
+        assert!(service.proxy_pool.list().iter().all(|e| e.auto_detected));
+
+        // 再次检测不重复登记
+        assert_eq!(service.detect_credential_proxies(), 0);
+    }
+
+    #[tokio::test]
+    async fn rotation_spreads_credentials_across_available_proxies() {
+        let creds: Vec<KiroCredentials> = (0..4)
+            .map(|_| KiroCredentials {
+                proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+                ..KiroCredentials::default()
+            })
+            .collect();
+        let service = proxy_rotation_service(creds, None, true, false);
+        for port in [3, 4] {
+            service
+                .proxy_pool
+                .add(format!("socks5://10.0.0.{port}:1080"), None)
+                .unwrap();
+        }
+        service.detect_credential_proxies();
+        mark_proxy_unhealthy(&service, "socks5://10.0.0.2:1080");
+
+        assert_eq!(service.rotate_unavailable_credential_proxies().rotated, 4);
+
+        // 4 个凭据应均摊到 2 个可用代理上，而非全部挤在同一个
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for cred in service.token_manager.credential_proxy_snapshot() {
+            *counts.entry(cred.in_use_proxy_url.unwrap()).or_default() += 1;
+        }
+        assert_eq!(counts.len(), 2);
+        assert!(counts.values().all(|&c| c == 2), "分布不均: {counts:?}");
+    }
+
+    #[tokio::test]
+    async fn rotation_clears_stale_credential_proxy_auth() {
+        // 轮换前的认证信息属于旧代理，套到新代理上只会认证失败
+        let cred = KiroCredentials {
+            proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+            proxy_username: Some("old-user".to_string()),
+            proxy_password: Some("old-pass".to_string()),
+            ..KiroCredentials::default()
+        };
+        let service = proxy_rotation_service(vec![cred], None, true, false);
+        service
+            .proxy_pool
+            .add("socks5://10.0.0.3:1080".to_string(), None)
+            .unwrap();
+        service.detect_credential_proxies();
+        mark_proxy_unhealthy(&service, "socks5://10.0.0.2:1080");
+
+        assert_eq!(service.rotate_unavailable_credential_proxies().rotated, 1);
+
+        let creds = service.token_manager.clone_all_credentials();
+        assert_eq!(
+            creds[0].proxy_url.as_deref(),
+            Some("socks5://10.0.0.3:1080")
+        );
+        assert!(creds[0].proxy_username.is_none());
+        assert!(creds[0].proxy_password.is_none());
+    }
+
+    #[tokio::test]
+    async fn rotation_moves_credential_off_unavailable_proxy() {
+        let cred = KiroCredentials {
+            proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+            ..KiroCredentials::default()
+        };
+        let service = proxy_rotation_service(vec![cred], None, true, false);
+        service
+            .proxy_pool
+            .add("socks5://10.0.0.3:1080".to_string(), None)
+            .unwrap();
+        service.detect_credential_proxies();
+        mark_proxy_unhealthy(&service, "socks5://10.0.0.2:1080");
+
+        let result = service.rotate_unavailable_credential_proxies();
+
+        assert_eq!(result.rotated, 1);
+        assert_eq!(result.switched_to_direct, 0);
+        assert_eq!(result.unresolved, 0);
+        assert_eq!(
+            credential_proxy_url(&service, 1),
+            Some("socks5://10.0.0.3:1080".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_falls_back_to_direct_only_when_enabled() {
+        let make = |direct_fallback: bool| {
+            let cred = KiroCredentials {
+                proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+                ..KiroCredentials::default()
+            };
+            let service = proxy_rotation_service(vec![cred], None, true, direct_fallback);
+            service.detect_credential_proxies();
+            mark_proxy_unhealthy(&service, "socks5://10.0.0.2:1080");
+            service
+        };
+
+        // 关闭直连回退：保持原代理，计入 unresolved
+        let service = make(false);
+        let result = service.rotate_unavailable_credential_proxies();
+        assert_eq!(result.unresolved, 1);
+        assert_eq!(result.switched_to_direct, 0);
+        assert_eq!(
+            credential_proxy_url(&service, 1),
+            Some("socks5://10.0.0.2:1080".to_string())
+        );
+
+        // 开启直连回退：改为 direct
+        let service = make(true);
+        let result = service.rotate_unavailable_credential_proxies();
+        assert_eq!(result.switched_to_direct, 1);
+        assert_eq!(result.unresolved, 0);
+        assert_eq!(credential_proxy_url(&service, 1), None);
+    }
+
+    #[tokio::test]
+    async fn rotation_restores_auto_direct_credential_when_proxy_recovers() {
+        let cred = KiroCredentials {
+            proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+            ..KiroCredentials::default()
+        };
+        let service = proxy_rotation_service(vec![cred], None, true, true);
+        service.detect_credential_proxies();
+        mark_proxy_unhealthy(&service, "socks5://10.0.0.2:1080");
+        assert_eq!(
+            service.rotate_unavailable_credential_proxies().switched_to_direct,
+            1
+        );
+
+        // 池内重新出现可用代理后，自动回退直连的凭据改回代理
+        service
+            .proxy_pool
+            .add("socks5://10.0.0.9:1080".to_string(), None)
+            .unwrap();
+        let result = service.rotate_unavailable_credential_proxies();
+
+        assert_eq!(result.restored_to_proxy, 1);
+        assert_eq!(
+            credential_proxy_url(&service, 1),
+            Some("socks5://10.0.0.9:1080".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_leaves_user_configured_direct_credential_untouched() {
+        let cred = KiroCredentials {
+            proxy_url: Some(KiroCredentials::PROXY_DIRECT.to_string()),
+            ..KiroCredentials::default()
+        };
+        let service = proxy_rotation_service(vec![cred], None, true, true);
+        service
+            .proxy_pool
+            .add("socks5://10.0.0.3:1080".to_string(), None)
+            .unwrap();
+
+        let result = service.rotate_unavailable_credential_proxies();
+
+        assert_eq!(result.restored_to_proxy, 0);
+        assert_eq!(credential_proxy_url(&service, 1), None);
+    }
+
+    #[tokio::test]
+    async fn rotation_skips_untracked_proxy_without_probe_record() {
+        let cred = KiroCredentials {
+            proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+            ..KiroCredentials::default()
+        };
+        // 不调用 detect：该代理没有任何探测记录
+        let service = proxy_rotation_service(vec![cred], None, true, true);
+        service
+            .proxy_pool
+            .add("socks5://10.0.0.3:1080".to_string(), None)
+            .unwrap();
+
+        let result = service.rotate_unavailable_credential_proxies();
+
+        assert_eq!(result.rotated, 0);
+        assert_eq!(result.unresolved, 0);
+        assert_eq!(
+            credential_proxy_url(&service, 1),
+            Some("socks5://10.0.0.2:1080".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_disabled_switch_makes_no_change() {
+        let cred = KiroCredentials {
+            proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+            ..KiroCredentials::default()
+        };
+        let service = proxy_rotation_service(vec![cred], None, false, true);
+        service
+            .proxy_pool
+            .add("socks5://10.0.0.3:1080".to_string(), None)
+            .unwrap();
+        service.detect_credential_proxies();
+        mark_proxy_unhealthy(&service, "socks5://10.0.0.2:1080");
+
+        let result = service.rotate_unavailable_credential_proxies();
+
+        assert_eq!(result.rotated, 0);
+        assert_eq!(result.unresolved, 0);
+        assert_eq!(
+            credential_proxy_url(&service, 1),
+            Some("socks5://10.0.0.2:1080".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_rewrites_credential_relying_on_unavailable_global_proxy() {
+        // 凭据未配置代理，实际走全局代理；全局代理不可用时也应被轮换
+        let service = proxy_rotation_service(
+            vec![KiroCredentials::default()],
+            Some("http://10.0.0.1:8080"),
+            true,
+            false,
+        );
+        service
+            .proxy_pool
+            .add("socks5://10.0.0.3:1080".to_string(), None)
+            .unwrap();
+        service.detect_credential_proxies();
+        mark_proxy_unhealthy(&service, "http://10.0.0.1:8080");
+
+        let result = service.rotate_unavailable_credential_proxies();
+
+        assert_eq!(result.rotated, 1);
+        assert_eq!(
+            credential_proxy_url(&service, 1),
+            Some("socks5://10.0.0.3:1080".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_proxy_edit_clears_auto_assigned_flag() {
+        let cred = KiroCredentials {
+            proxy_url: Some("socks5://10.0.0.2:1080".to_string()),
+            ..KiroCredentials::default()
+        };
+        let service = proxy_rotation_service(vec![cred], None, true, true);
+        service.detect_credential_proxies();
+        mark_proxy_unhealthy(&service, "socks5://10.0.0.2:1080");
+        service.rotate_unavailable_credential_proxies();
+
+        let snapshot = service.token_manager.credential_proxy_snapshot();
+        assert!(snapshot[0].auto_assigned);
+
+        // 用户手动改为直连后，自动轮换不再把它改回代理
+        service
+            .token_manager
+            .update_credential(
+                1,
+                None,
+                Some(Some(KiroCredentials::PROXY_DIRECT.to_string())),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(!service.token_manager.credential_proxy_snapshot()[0].auto_assigned);
+
+        service
+            .proxy_pool
+            .add("socks5://10.0.0.7:1080".to_string(), None)
+            .unwrap();
+        let result = service.rotate_unavailable_credential_proxies();
+        assert_eq!(result.restored_to_proxy, 0);
+        assert_eq!(credential_proxy_url(&service, 1), None);
     }
 
     #[tokio::test]

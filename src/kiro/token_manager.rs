@@ -1108,6 +1108,19 @@ struct StatsEntry {
 // Admin API 公开结构
 // ============================================================================
 
+/// 单个凭据的代理使用状态，供代理自动检测与轮换使用。
+#[derive(Debug, Clone)]
+pub struct CredentialProxySnapshot {
+    /// 凭据唯一 ID
+    pub id: u64,
+    /// 实际在用的代理 URL；`None` 表示当前直连
+    pub in_use_proxy_url: Option<String>,
+    /// 是否显式配置为直连（`proxy_url == "direct"`）
+    pub explicit_direct: bool,
+    /// 当前 `proxy_url` 是否由自动轮换写入
+    pub auto_assigned: bool,
+}
+
 /// 凭据条目快照（用于 Admin API 读取）
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1266,6 +1279,10 @@ pub struct MultiTokenManager {
     self_heal_max_consecutive_rounds: AtomicU32,
     /// 月度额度重置后自动恢复 QuotaExceeded 凭据（运行时可修改）
     quota_reset_recovery_enabled: AtomicBool,
+    /// 凭据代理自动检测与轮换开关（运行时可修改）
+    proxy_auto_rotate_enabled: AtomicBool,
+    /// 无可用代理时是否回退直连（运行时可修改）
+    proxy_direct_fallback_enabled: AtomicBool,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -1503,6 +1520,8 @@ impl MultiTokenManager {
         let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
         let self_heal_max_consecutive_rounds = config.self_heal_max_consecutive_rounds;
         let quota_reset_recovery_enabled = config.quota_reset_recovery_enabled;
+        let proxy_auto_rotate_enabled = config.proxy_auto_rotate_enabled;
+        let proxy_direct_fallback_enabled = config.proxy_direct_fallback_enabled;
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1528,6 +1547,8 @@ impl MultiTokenManager {
             self_heal_min_interval_secs: AtomicU64::new(self_heal_min_interval_secs),
             self_heal_max_consecutive_rounds: AtomicU32::new(self_heal_max_consecutive_rounds),
             quota_reset_recovery_enabled: AtomicBool::new(quota_reset_recovery_enabled),
+            proxy_auto_rotate_enabled: AtomicBool::new(proxy_auto_rotate_enabled),
+            proxy_direct_fallback_enabled: AtomicBool::new(proxy_direct_fallback_enabled),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             model_cache: Mutex::new(HashMap::new()),
@@ -4202,6 +4223,9 @@ impl MultiTokenManager {
             }
             if let Some(v) = proxy_url {
                 entry.credentials.proxy_url = v.filter(|s| !s.is_empty());
+                // 手动改代理视为用户接管：清除自动轮换标记，避免后续自动轮换
+                // 把该凭据当成「自己写进去的」而回收改写
+                entry.credentials.proxy_auto_assigned = false;
             }
             if let Some(v) = proxy_username {
                 entry.credentials.proxy_username = v.filter(|s| !s.is_empty());
@@ -4920,6 +4944,128 @@ impl MultiTokenManager {
             config.self_heal_min_interval_secs = self_heal_min_interval_secs;
             config.self_heal_max_consecutive_rounds = self_heal_max_consecutive_rounds;
         })
+    }
+
+    /// 读取代理故障转移配置（Admin API）。
+    ///
+    /// 返回：(自动检测与轮换开关, 无可用代理时回退直连开关)。
+    pub fn get_proxy_failover_config(&self) -> (bool, bool) {
+        (
+            self.proxy_auto_rotate_enabled.load(Ordering::Relaxed),
+            self.proxy_direct_fallback_enabled.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 更新代理故障转移配置（Admin API）。任一参数传 `None` 表示不修改该字段。
+    ///
+    /// 运行时立即生效并持久化到 config.json。持久化失败时回滚内存值。
+    pub fn set_proxy_failover_config(
+        &self,
+        auto_rotate_enabled: Option<bool>,
+        direct_fallback_enabled: Option<bool>,
+    ) -> anyhow::Result<()> {
+        let _update_guard = self.runtime_config_update_lock.lock();
+
+        let (prev_rotate, prev_fallback) = self.get_proxy_failover_config();
+        let new_rotate = auto_rotate_enabled.unwrap_or(prev_rotate);
+        let new_fallback = direct_fallback_enabled.unwrap_or(prev_fallback);
+
+        if new_rotate == prev_rotate && new_fallback == prev_fallback {
+            return Ok(());
+        }
+
+        self.proxy_auto_rotate_enabled
+            .store(new_rotate, Ordering::Relaxed);
+        self.proxy_direct_fallback_enabled
+            .store(new_fallback, Ordering::Relaxed);
+
+        if let Err(err) = self.update_config_file(move |config| {
+            config.proxy_auto_rotate_enabled = new_rotate;
+            config.proxy_direct_fallback_enabled = new_fallback;
+        }) {
+            self.proxy_auto_rotate_enabled
+                .store(prev_rotate, Ordering::Relaxed);
+            self.proxy_direct_fallback_enabled
+                .store(prev_fallback, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        tracing::info!(
+            "代理故障转移配置已更新: auto_rotate_enabled={}, direct_fallback_enabled={}",
+            new_rotate,
+            new_fallback
+        );
+        Ok(())
+    }
+
+    /// 导出各凭据的代理使用状态（代理自动检测与轮换专用）。
+    ///
+    /// `in_use_proxy_url` 已按「凭据代理 > 全局代理 > 直连」的优先级折算，调用方
+    /// 无需再关心回退规则。
+    pub fn credential_proxy_snapshot(&self) -> Vec<CredentialProxySnapshot> {
+        let global_proxy_url = self.proxy().map(|p| p.url);
+        self.entries
+            .lock()
+            .iter()
+            .map(|entry| CredentialProxySnapshot {
+                id: entry.id,
+                in_use_proxy_url: entry
+                    .credentials
+                    .in_use_proxy_url(global_proxy_url.as_deref()),
+                explicit_direct: entry.credentials.is_explicit_direct(),
+                auto_assigned: entry.credentials.proxy_auto_assigned,
+            })
+            .collect()
+    }
+
+    /// 批量改写凭据的 `proxy_url` 并置位 `proxy_auto_assigned`（代理自动轮换专用）。
+    ///
+    /// 在单次加锁内完成全部改写，最后统一持久化一次，避免逐条写盘。传入的
+    /// `Some(url)` 设置代理（`"direct"` 表示直连），`None` 清除凭据级代理以回退全局配置。
+    /// 返回实际改写的凭据数；不存在的凭据 id 被忽略。
+    ///
+    /// 同时清除凭据级 `proxy_username` / `proxy_password`：这对认证信息属于轮换前的
+    /// 那个代理，套用到新代理上只会认证失败。代理池条目的认证信息写在 URL 里
+    /// （`socks5://user:pass@host:port`），轮换后随 URL 一起生效。
+    pub fn apply_proxy_rotation(&self, updates: &[(u64, Option<String>)]) -> anyhow::Result<usize> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+
+        let mut changed_ids = Vec::new();
+        {
+            let mut entries = self.entries.lock();
+            for (id, proxy_url) in updates {
+                let entry = match entries.iter_mut().find(|e| e.id == *id) {
+                    Some(entry) => entry,
+                    None => continue,
+                };
+                let normalized = proxy_url.clone().filter(|s| !s.is_empty());
+                let unchanged = entry.credentials.proxy_url == normalized
+                    && entry.credentials.proxy_auto_assigned
+                    && entry.credentials.proxy_username.is_none()
+                    && entry.credentials.proxy_password.is_none();
+                if unchanged {
+                    continue;
+                }
+                entry.credentials.proxy_url = normalized;
+                entry.credentials.proxy_username = None;
+                entry.credentials.proxy_password = None;
+                entry.credentials.proxy_auto_assigned = true;
+                changed_ids.push(*id);
+            }
+        }
+
+        if changed_ids.is_empty() {
+            return Ok(0);
+        }
+
+        // 代理变化会影响上游可用模型列表，逐个作废对应缓存
+        for id in &changed_ids {
+            self.invalidate_model_cache(*id);
+        }
+        self.persist_credentials()?;
+        Ok(changed_ids.len())
     }
 }
 

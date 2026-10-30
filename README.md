@@ -60,7 +60,7 @@ Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
 - **请求链路追踪**：SQLite `traces.db`，记录成功 / 失败请求、尝试链路和错误类型。
 - 客户端 Key 分发：Admin 面板生成 `sk-...` Key，支持独立启停、轮换、分组和统计；鉴权不强制 Key 前缀。
 - **Admin UI**：概览、凭据管理、客户端 Key、请求日志四个主视图。
-- 代理能力：全局代理、凭据级代理、代理池、健康检查、轮询分配。
+- 代理能力：全局代理、凭据级代理、代理池、健康检查、轮询分配、在用代理自动检测与不可用时自动轮换。
 - **在线更新**：从 GitHub Release / Docker Hub 拉取新版本，支持镜像定时自动更新与手动回退。
 - **多平台发布**：GitHub Release 构建 Windows、Linux、macOS 和 Docker Hub 多架构镜像。
 
@@ -323,6 +323,9 @@ codex
 | `/api/admin/stats/*` | 用量统计 |
 | `/api/admin/traces` | 请求链路追踪查询 |
 | `/api/admin/proxy-pool` | 代理池 |
+| `/api/admin/proxy-pool/check-all` | 一轮完整巡检：检测在用代理、健康探测、凭据代理轮换 |
+| `/api/admin/proxy-pool/rotate` | 按当前代理池状态立即轮换凭据代理（不重新探测） |
+| `/api/admin/config/proxy-failover` | 代理自动轮换与直连回退开关 |
 | `/api/admin/config/*` | 运行时配置（含 `GET/PUT /api/admin/config/api-domain` 上游域名） |
 | `/api/admin/auth/*` | Social / IdC 登录流程 |
 | `/api/admin/system/update/*` | 在线更新、回退、版本检查 |
@@ -367,6 +370,8 @@ Admin API 鉴权同样支持：
 | `tlsBackend` | `rustls` | `rustls` 或 `native-tls` |
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
+| `proxyAutoRotateEnabled` | `true` | 是否自动检测凭据在用代理，并在代理不可用时轮换受影响的凭据 |
+| `proxyDirectFallbackEnabled` | `false` | 无可用代理时是否允许凭据临时回退直连 |
 | `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
 | `accountThrottleFailover` | `true` | 账号级 429 是否冷却并切换凭据；覆盖 USER/CREDIT 请求限流和 suspicious activity |
 | `accountThrottleCooldownSecs` | `1800` | 账号级 429 限流冷却秒数 |
@@ -519,6 +524,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 | `email` / `subscriptionTitle` | Admin 查询后回填的展示信息 |
 | `proxyUrl` | 凭据级代理；填 `direct` 表示绕过全局代理 |
 | `proxyUsername` / `proxyPassword` | 凭据级代理认证 |
+| `proxyAutoAssigned` | 当前 `proxyUrl` 是否由自动轮换写入；由程序维护，手动改代理时清除 |
 | `disabled` | 是否禁用 |
 | `kiroApiKey` | `ksk_*` Kiro API Key |
 | `endpoint` | `ide` 或 `cli`，未填使用 `config.defaultEndpoint` |
@@ -859,6 +865,27 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - `http://host:port`
 - `https://host:port`
 - `socks5://host:port`
+
+### 代理自动检测与轮换
+
+代理池巡检每 5 分钟执行一轮，也可在代理池弹窗点「全部检测」手动触发。一轮巡检包含三步：
+
+1. **自动检测**：把凭据实际在用、但未登记到代理池的代理（含全局代理）登记进池，标记为
+   `autoDetected`，纳入后续探测范围。未登记的代理没有探测记录，不会被判定为不可用。
+2. **健康探测**：并发探测所有已启用条目，以及此前被自动禁用的条目。连续失败达 3 次的
+   代理自动禁用；自动禁用的代理恢复连通后自动重新启用。手动禁用的条目不参与探测，
+   也不会被自动启用。
+3. **自动轮换**：使用被判定不可用代理的凭据改用池内其它可用代理。
+
+`proxyAutoRotateEnabled` 关闭时只做探测，不改写任何凭据。
+
+无可用代理时的行为由 `proxyDirectFallbackEnabled` 决定：
+
+- `false`（默认）：凭据保持原代理配置，请求继续失败直至代理恢复，避免真实出口 IP 意外暴露。
+- `true`：凭据临时改为 `direct`；池内重新出现可用代理后自动改回代理。
+
+手动修改某个凭据的代理会清除自动轮换标记，此后自动轮换不再回收改写该凭据，直到它的
+代理再次被判定不可用。
 
 如果 `rustls` 环境下代理或证书行为异常，可以在 `config.json` 中切到：
 

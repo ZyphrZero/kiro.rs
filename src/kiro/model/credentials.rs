@@ -513,6 +513,14 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
 
+    /// 当前 `proxy_url` 是否由代理自动轮换写入。
+    ///
+    /// 仅在代理不可用触发自动轮换时置位：轮换到其它代理或回退直连都会标记，
+    /// 便于池内恢复出可用代理后把凭据改回代理。用户手动改代理会清除该标记，
+    /// 此后自动轮换不再覆盖该凭据的手动配置，直到其代理再次被判定不可用。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub proxy_auto_assigned: bool,
+
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,
@@ -587,6 +595,9 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 /// 仅显示长度，不暴露明文。例如 `Some(42 chars)` 或 `None`。
 fn fmt_redacted(value: &Option<String>) -> String {
     match value {
@@ -623,6 +634,7 @@ impl std::fmt::Debug for KiroCredentials {
             .field("proxy_url", &self.proxy_url)
             .field("proxy_username", &self.proxy_username)
             .field("proxy_password", &fmt_redacted(&self.proxy_password))
+            .field("proxy_auto_assigned", &self.proxy_auto_assigned)
             .field("disabled", &self.disabled)
             .field("disabled_reason", &self.disabled_reason)
             .field(
@@ -873,6 +885,27 @@ impl KiroCredentials {
                 Some(proxy)
             }
             None => global_proxy.cloned(),
+        }
+    }
+
+    /// 判断凭据是否显式配置为直连（`proxy_url == "direct"`）。
+    pub fn is_explicit_direct(&self) -> bool {
+        self.proxy_url
+            .as_deref()
+            .map(|url| url.eq_ignore_ascii_case(Self::PROXY_DIRECT))
+            .unwrap_or(false)
+    }
+
+    /// 返回该凭据实际在用的代理 URL。
+    ///
+    /// 与 [`Self::effective_proxy`] 同一套优先级，但只取 URL：显式直连或无代理可用时
+    /// 返回 `None`。代理健康检测用它来确定「哪些地址真的在承载流量」。
+    pub fn in_use_proxy_url(&self, global_proxy_url: Option<&str>) -> Option<String> {
+        match self.proxy_url.as_deref() {
+            Some(url) if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => None,
+            Some(url) if url.trim().is_empty() => global_proxy_url.map(str::to_string),
+            Some(url) => Some(url.to_string()),
+            None => global_proxy_url.map(str::to_string),
         }
     }
 
@@ -1230,6 +1263,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_auto_assigned: false,
             disabled: false,
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,
@@ -1507,6 +1541,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_auto_assigned: false,
             disabled: false,
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,
@@ -1552,6 +1587,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_auto_assigned: false,
             disabled: false,
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,
@@ -1680,6 +1716,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_auto_assigned: false,
             disabled: false,
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,
