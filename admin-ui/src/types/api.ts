@@ -67,6 +67,8 @@ export interface CredentialMetadataSchemaConfig {
 export interface CredentialStatusItem {
   id: number
   priority: number
+  /** 负载因子（均衡模式下的调度权重，数值越大调度频次越高，默认为 10） */
+  loadFactor: number
   disabled: boolean
   failureCount: number
   /** 累计失败次数（所有失败类型，只增不减，仅手动重置归零） */
@@ -174,6 +176,10 @@ export interface SetPriorityRequest {
   priority: number
 }
 
+export interface SetLoadFactorRequest {
+  loadFactor: number
+}
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string
@@ -192,6 +198,8 @@ export interface AddCredentialRequest {
   /** 企业 SSO 授予的 scopes（空格分隔，可选） */
   scopes?: string
   priority?: number
+  /** 负载因子（均衡模式下的调度权重，数值越大调度频次越高，默认为 10） */
+  loadFactor?: number
   authRegion?: string
   apiRegion?: string
   machineId?: string
@@ -224,6 +232,8 @@ export interface UpdateCredentialRequest {
   groups?: string[]
   /** 账号来源渠道（undefined 表示不修改，空串表示清除） */
   sourceChannel?: string
+  /** 负载因子（均衡模式下的调度权重，>= 1，undefined 表示不修改） */
+  loadFactor?: number
   /** 整体更新 metadata；调用方应保留不认识的扩展字段 */
   metadata?: CredentialMetadata
 }
@@ -700,7 +710,14 @@ export interface GroupItem {
   credentialCount: number
   /** 引用计数：有多少把客户端 Key 绑定这个分组 */
   clientKeyCount: number
+  /** 分组级负载均衡模式（null/undefined 表示继承全局） */
+  loadBalancingMode?: LoadBalancingMode | null
+  /** 分组级优先级反转（null/undefined 表示继承全局） */
+  invertPriority?: boolean | null
 }
+
+/** 负载均衡模式：priority = 按优先级顺序耗尽，balanced = 加权平滑轮询 */
+export type LoadBalancingMode = 'priority' | 'balanced'
 
 export interface GroupsResponse {
   total: number
@@ -710,6 +727,10 @@ export interface GroupsResponse {
 export interface CreateGroupRequest {
   name: string
   description?: string
+  /** 分组级负载均衡模式（undefined 表示继承全局） */
+  loadBalancingMode?: LoadBalancingMode
+  /** 分组级优先级反转（undefined 表示继承全局） */
+  invertPriority?: boolean
 }
 
 export interface UpdateGroupRequest {
@@ -717,4 +738,12 @@ export interface UpdateGroupRequest {
   newName?: string
   /** 新备注；空字符串清除；undefined 保留原值 */
   description?: string
+  /** 分组级负载均衡模式 */
+  loadBalancingMode?: LoadBalancingMode
+  /** 重置负载均衡模式为继承全局 */
+  resetLoadBalancingMode?: boolean
+  /** 分组级优先级反转 */
+  invertPriority?: boolean
+  /** 重置优先级反转为继承全局 */
+  resetInvertPriority?: boolean
 }

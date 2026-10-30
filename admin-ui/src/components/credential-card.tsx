@@ -62,6 +62,7 @@ import {
   useForceRefreshToken,
   useResetSuccessCount,
   useClearThrottle,
+  useLoadBalancingMode,
 } from "@/hooks/use-credentials";
 import { setCredentialOverage, getProxyPool } from "@/api/credentials";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -407,6 +408,10 @@ function CredentialCardImpl({
   const [showBalanceDialog, setShowBalanceDialog] = useState(false);
   const [connectionExpanded, setConnectionExpanded] = useState(false);
 
+  const { data: lbData } = useLoadBalancingMode();
+  const balanced = lbData?.mode === "balanced";
+  const invertPriority = lbData?.invertPriority ?? false;
+
   const setDisabled = useSetDisabled();
   const setPriority = useSetPriority();
   const resetFailure = useResetFailure();
@@ -514,7 +519,11 @@ function CredentialCardImpl({
   const handlePriorityChange = () => {
     const np = parseInt(priorityValue, 10);
     if (isNaN(np) || np < 0) {
-      toast.error("优先级要填 0 或更大的整数，0 最先被使用");
+      toast.error(
+        invertPriority
+          ? "优先级要填 0 或更大的整数，数值大的最先被使用"
+          : "优先级要填 0 或更大的整数，0 最先被使用",
+      );
       return;
     }
     setPriority.mutate(
@@ -885,12 +894,25 @@ function CredentialCardImpl({
         <div className="relative w-16 shrink-0 text-center">
           <div
             className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/80"
-            title="优先级：数字越小越先被使用，0 最先"
+            title={
+              balanced
+                ? "均衡负载权重：数值越大被调度频次越高"
+                : invertPriority
+                  ? "优先级：数字越大越先被使用"
+                  : "优先级：数字越小越先被使用，0 最先"
+            }
           >
-            优先级 ↑
+            {balanced ? "权重" : "优先级 ↑"}
           </div>
           <div className="mt-0.5 flex h-[26px] items-center justify-center">
-            {editingPriority ? (
+            {balanced ? (
+              <span
+                className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 font-mono text-xs font-semibold tabular-nums"
+                title="均衡负载权重（可在编辑凭据中修改）"
+              >
+                ×{credential.loadFactor}
+              </span>
+            ) : editingPriority ? (
               <div className="absolute left-1/2 top-1/2 z-30 -translate-x-1/2 -translate-y-1/2 rounded-md border border-border bg-popover p-1.5 shadow-md">
                 <div className="inline-flex items-center gap-1">
                   <Input
@@ -1176,9 +1198,16 @@ function CredentialCardImpl({
               {/* Priority */}
               <div className="flex flex-col items-center justify-center px-1">
                 <span className="text-[10px] font-semibold text-muted-foreground/80 uppercase tracking-wider">
-                  优先级
+                  {balanced ? "权重" : "优先级"}
                 </span>
-                {editingPriority ? (
+                {balanced ? (
+                  <span
+                    className="mt-0.5 inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-xs font-semibold"
+                    title="均衡负载权重（可在编辑凭据中修改）"
+                  >
+                    ×{credential.loadFactor}
+                  </span>
+                ) : editingPriority ? (
                   <div className="mt-1 flex items-center justify-center gap-0.5">
                     <Input
                       type="number"

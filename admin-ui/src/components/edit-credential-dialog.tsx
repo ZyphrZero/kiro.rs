@@ -63,6 +63,7 @@ export function EditCredentialDialog({
   const [proxyPassword, setProxyPassword] = useState('')
   const [groups, setGroups] = useState<string[]>(credential.groups ?? [])
   const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
+  const [loadFactor, setLoadFactor] = useState<number>(credential.loadFactor ?? 10)
   const [metadata, setMetadata] = useState<CredentialMetadata>(
     { ...metadataDefaults(metadataSchema), ...metadataValues(credential.metadata) },
   )
@@ -86,6 +87,7 @@ export function EditCredentialDialog({
       setProxyPassword('')
       setGroups(credential.groups ?? [])
       setSourceChannel(credential.sourceChannel ?? '')
+      setLoadFactor(credential.loadFactor ?? 10)
       setMetadata({
         ...metadataDefaults(metadataSchema),
         ...metadataValues(credential.metadata),
@@ -109,6 +111,8 @@ export function EditCredentialDialog({
           proxyPassword: proxyPassword || undefined,
           groups: groups,
           sourceChannel: sourceChannel,
+          loadFactor:
+            Number.isFinite(loadFactor) && loadFactor >= 1 ? loadFactor : 10,
           metadata,
         },
       },
@@ -218,6 +222,27 @@ export function EditCredentialDialog({
                   />
                   <p className="text-xs text-muted-foreground">
                     纯备注，标记此账号的购买来源/渠道，便于追踪。留空表示清除。
+                  </p>
+                </div>
+
+                {/* 负载因子（均衡模式下的调度权重） */}
+                <div className="space-y-2">
+                  <label htmlFor="loadFactor" className="text-sm font-medium">
+                    负载因子（调度权重）
+                  </label>
+                  <Input
+                    id="loadFactor"
+                    type="number"
+                    min="1"
+                    placeholder="默认 10"
+                    value={loadFactor}
+                    onChange={(e) =>
+                      setLoadFactor(Math.max(1, parseInt(e.target.value, 10) || 10))
+                    }
+                    disabled={isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    均衡负载模式下按该权重平滑轮询，数值越大被调度频次越高，默认为 10。
                   </p>
                 </div>
 

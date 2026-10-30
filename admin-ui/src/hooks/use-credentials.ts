@@ -3,6 +3,7 @@ import {
   getCredentials,
   setCredentialDisabled,
   setCredentialPriority,
+  setCredentialLoadFactor,
   resetCredentialFailure,
   forceRefreshToken,
   clearThrottle,
@@ -140,6 +141,18 @@ export function useSetPriority() {
   return useMutation({
     mutationFn: ({ id, priority }: { id: number; priority: number }) =>
       setCredentialPriority(id, priority),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 设置负载因子（均衡模式下的调度权重）
+export function useSetLoadFactor() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, loadFactor }: { id: number; loadFactor: number }) =>
+      setCredentialLoadFactor(id, loadFactor),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
