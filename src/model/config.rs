@@ -250,16 +250,25 @@ pub struct Config {
     #[serde(default = "default_account_rpm_limit")]
     pub account_rpm_limit: u32,
 
-    /// 是否识别 403 账号封禁文案并立即禁用凭据（默认 true）。
+    /// 是否识别账号封禁响应并立即禁用凭据（默认 true）。
     ///
-    /// 开启后：某凭据收到 403 且响应体命中明确封禁文案（同时含 "suspended" 与
-    /// "locked your account"）时，立即标记为 `Suspended` 并禁用。这类凭据**不参与
-    /// 自愈**，需人工联系客服核实后手动重置，从根上打断持续 403 死循环（issue #51）。
+    /// 开启后：某凭据收到的响应体命中内置封禁检测（JSON `reason` 为
+    /// `TEMPORARILY_SUSPENDED`，或同时含 "suspended" 与 "locked" 等文案）
+    /// 或命中 `suspended_ban_keywords` 中任一自定义关键词时，立即标记为
+    /// `Suspended` 并禁用。**不限 HTTP 状态码**（403、429 等均可触发）。
+    /// 被封禁的凭据**不参与自愈**，需人工核实后手动重置。
     ///
-    /// 只匹配这两个高特异短语同时出现的情形，不影响普通 403（权限/WAF/区域抖动），
-    /// 后者仍按既有 `report_failure` 累计路径处理。关闭后：完全回退旧行为。
+    /// 关闭后：完全回退旧行为，封禁响应按普通错误处理。
     #[serde(default = "default_suspended_detection_enabled")]
     pub suspended_detection_enabled: bool,
+
+    /// 自定义封禁文案关键词列表（默认空）。
+    ///
+    /// 响应体中包含列表中任一关键词（大小写不敏感）时，视为账号被封禁，
+    /// 立即禁用凭据。与内置检测（`TEMPORARILY_SUSPENDED` reason 等）叠加生效。
+    /// 例如 `["temporarily suspended", "account has been locked"]`。
+    #[serde(default)]
+    pub suspended_ban_keywords: Vec<String>,
 
     /// 是否启用凭据自愈（默认 true）。
     ///
@@ -553,6 +562,7 @@ impl Default for Config {
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
             account_rpm_limit: default_account_rpm_limit(),
             suspended_detection_enabled: default_suspended_detection_enabled(),
+            suspended_ban_keywords: Vec::new(),
             self_heal_enabled: default_self_heal_enabled(),
             self_heal_min_interval_secs: default_self_heal_min_interval_secs(),
             self_heal_max_consecutive_rounds: default_self_heal_max_consecutive_rounds(),

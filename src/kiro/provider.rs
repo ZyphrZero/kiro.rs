@@ -603,33 +603,35 @@ impl KiroProvider {
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
+            // 账号封禁检测（不限状态码，优先于 401/403/429 分支）
+            // 内置检测：JSON reason=TEMPORARILY_SUSPENDED / 文案交叉匹配
+            // 自定义检测：suspended_ban_keywords 中任一关键词命中
+            if self.token_manager.get_suspended_detection_enabled()
+                && (endpoint.is_account_suspended(&body)
+                    || self.token_manager.matches_suspended_ban_keywords(&body))
+            {
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::ACCOUNT_SUSPENDED,
+                    Some(&body),
+                    attempt_start,
+                );
+                let has_available = self
+                    .token_manager
+                    .report_suspended_for_request(ctx.id, None, group);
+                if !has_available {
+                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                }
+                last_error = Some(anyhow::anyhow!("MCP 请求失败（账号封禁）: {} {}", status, body));
+                continue;
+            }
+
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
-                // 403 + 明确封禁文案：账号被封禁，立即禁用且不参与自愈（受配置开关控制）
-                if status.as_u16() == 403
-                    && self.token_manager.get_suspended_detection_enabled()
-                    && endpoint.is_account_suspended(&body)
-                {
-                    Self::emit_attempt(
-                        sink,
-                        attempt,
-                        ctx.id,
-                        endpoint_name,
-                        Some(status.as_u16()),
-                        outcome::ACCOUNT_SUSPENDED,
-                        Some(&body),
-                        attempt_start,
-                    );
-                    let has_available = self
-                        .token_manager
-                        .report_suspended_for_request(ctx.id, None, group);
-                    if !has_available {
-                        anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
-                    }
-                    last_error = Some(anyhow::anyhow!("MCP 请求失败（账号封禁）: {} {}", status, body));
-                    continue;
-                }
-
                 Self::emit_attempt(
                     sink,
                     attempt,
@@ -1020,48 +1022,48 @@ impl KiroProvider {
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
-            // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
-            if matches!(status.as_u16(), 401 | 403) {
-                // 403 + 明确封禁文案：账号被封禁，立即禁用且不参与自愈（受配置开关控制）
-                if status.as_u16() == 403
-                    && self.token_manager.get_suspended_detection_enabled()
-                    && endpoint.is_account_suspended(&body)
-                {
-                    tracing::error!(
-                        "API 请求失败（账号被封禁，禁用凭据 #{} 并切换，尝试 {}/{}）: {} {}",
-                        ctx.id,
-                        attempt + 1,
-                        max_retries,
-                        status,
-                        body
-                    );
-                    Self::emit_attempt(
-                        sink, attempt, ctx.id, endpoint_name, Some(403),
-                        outcome::ACCOUNT_SUSPENDED, Some(&body), attempt_start,
-                    );
+            // 账号封禁检测（不限状态码，优先于 401/403/429 分支）
+            if self.token_manager.get_suspended_detection_enabled()
+                && (endpoint.is_account_suspended(&body)
+                    || self.token_manager.matches_suspended_ban_keywords(&body))
+            {
+                tracing::error!(
+                    "API 请求失败（账号被封禁，禁用凭据 #{} 并切换，尝试 {}/{}）: {} {}",
+                    ctx.id,
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                    outcome::ACCOUNT_SUSPENDED, Some(&body), attempt_start,
+                );
 
-                    let has_available = self.token_manager.report_suspended_for_request(
-                        ctx.id,
-                        model.as_deref(),
-                        group,
-                    );
-                    if !has_available {
-                        anyhow::bail!(
-                            "{} API 请求失败（所有凭据已用尽）: {} {}",
-                            api_type,
-                            status,
-                            body
-                        );
-                    }
-                    last_error = Some(anyhow::anyhow!(
-                        "{} API 请求失败（账号封禁）: {} {}",
+                let has_available = self.token_manager.report_suspended_for_request(
+                    ctx.id,
+                    model.as_deref(),
+                    group,
+                );
+                if !has_available {
+                    anyhow::bail!(
+                        "{} API 请求失败（所有凭据已用尽）: {} {}",
                         api_type,
                         status,
                         body
-                    ));
-                    continue;
+                    );
                 }
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败（账号封禁）: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                continue;
+            }
 
+            // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
+            if matches!(status.as_u16(), 401 | 403) {
                 tracing::warn!(
                     "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
                     attempt + 1,

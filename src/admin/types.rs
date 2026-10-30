@@ -478,6 +478,37 @@ pub struct EnableOverageAllResult {
     pub failure_messages: Vec<String>,
 }
 
+// ============ 封号治理排查 ============
+
+/// 历史日志封号排查请求
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditSuspendedRequest {
+    /// 是否仅排查已禁用的凭据（默认为 true，若为 false 则排查全量凭据）
+    #[serde(default)]
+    pub only_disabled: Option<bool>,
+    /// 指定排查的凭据 ID 列表（可选，空则根据 only_disabled 规则排查）
+    #[serde(default)]
+    pub credential_ids: Option<Vec<u64>>,
+}
+
+/// 历史日志封号排查结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditSuspendedResponse {
+    /// 扫描的凭据总数
+    pub scanned_count: usize,
+    /// 匹配到封号特征的凭据数
+    pub banned_count: usize,
+    /// 本次新更新为「账号封禁」的凭据数
+    pub updated_count: usize,
+    /// 本次新更新的凭据 ID 列表
+    pub updated_ids: Vec<u64>,
+    /// 匹配到封号特征的全部凭据 ID 列表
+    #[serde(default)]
+    pub banned_ids: Vec<u64>,
+}
+
 // ============ 负载均衡配置 ============
 
 /// 负载均衡模式响应
@@ -583,8 +614,10 @@ pub struct SetQuotaResetRecoveryConfigRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SelfHealConfigResponse {
-    /// 是否识别 403 封禁文案并立即禁用凭据
+    /// 是否识别封禁文案并立即禁用凭据
     pub suspended_detection_enabled: bool,
+    /// 自定义封禁文案关键词（大小写不敏感匹配）
+    pub suspended_ban_keywords: Vec<String>,
     /// 是否启用全账号自愈
     pub enabled: bool,
     /// 两次自愈的最小冷却间隔（秒）
@@ -601,9 +634,12 @@ pub struct SelfHealConfigResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetSelfHealConfigRequest {
-    /// 是否识别 403 封禁文案；缺省表示不修改
+    /// 是否识别封禁文案；缺省表示不修改
     #[serde(default)]
     pub suspended_detection_enabled: Option<bool>,
+    /// 自定义封禁关键词；缺省表示不修改，传空数组清空
+    #[serde(default)]
+    pub suspended_ban_keywords: Option<Vec<String>>,
     /// 是否启用自愈；缺省表示不修改
     #[serde(default)]
     pub enabled: Option<bool>,
