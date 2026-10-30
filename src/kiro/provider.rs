@@ -20,7 +20,7 @@ use crate::kiro::error::{
 };
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{InFlightGuard, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -110,6 +110,8 @@ impl ClientCache {
 pub struct KiroCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
+    /// 在途请求守卫，随响应流一起存活，流结束后自动递减并发计数
+    pub _in_flight: Option<Arc<InFlightGuard>>,
 }
 
 /// A successful MCP HTTP response whose trace attempt is finalized after body validation.
@@ -664,6 +666,44 @@ impl KiroProvider {
                 continue;
             }
 
+            // 429 账号级限流：冷却当前凭据并故障转移到其它可用账号。
+            // 与模型 API 路径一致，仅处理账号级限流；容量类 429 走下方瞬态重试。
+            if status.as_u16() == 429
+                && self.token_manager.get_account_throttle_failover()
+                && endpoint.is_account_rate_limited(&body)
+            {
+                let cooldown_secs = self
+                    .token_manager
+                    .get_account_throttle_cooldown_secs()
+                    .max(1);
+                let cooldown = std::time::Duration::from_secs(cooldown_secs);
+                tracing::warn!(
+                    "MCP 请求失败（账号级限流，凭据 #{} 冷却 {}s 并切换，尝试 {}/{}）: {}",
+                    ctx.id,
+                    cooldown_secs,
+                    attempt + 1,
+                    max_retries,
+                    body
+                );
+                let remaining = self.token_manager.report_account_throttled_for_request(
+                    ctx.id,
+                    cooldown,
+                    None,
+                    group,
+                );
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, endpoint_name, Some(429),
+                    outcome::ACCOUNT_THROTTLED, Some(&body), attempt_start,
+                );
+                let rate_limit_error =
+                    account_rate_limit_with_fallback(rate_limit_error, cooldown_secs);
+                if remaining == 0 {
+                    return Err(rate_limit_error.into());
+                }
+                last_error = Some(rate_limit_error.into());
+                continue;
+            }
+
             // 瞬态错误
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 tracing::warn!(
@@ -924,6 +964,7 @@ impl KiroProvider {
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
+                    _in_flight: ctx._in_flight.clone(),
                 });
             }
 

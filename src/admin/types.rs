@@ -30,6 +30,8 @@ pub struct CredentialStatusItem {
     pub id: u64,
     /// 优先级（数字越小优先级越高）
     pub priority: u32,
+    /// 负载因子（均衡模式下的调度权重，数值越大调度频次越高，默认为 10）
+    pub load_factor: u32,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -132,6 +134,15 @@ pub struct SetPriorityRequest {
     pub priority: u32,
 }
 
+/// 修改负载因子请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetLoadFactorRequest {
+    /// 新负载因子值（>= 1）
+    #[serde(alias = "weight")]
+    pub load_factor: u32,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -185,6 +196,11 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub priority: u32,
 
+    /// 负载因子（均衡模式下的调度权重，可选，默认 10）
+    #[serde(default = "default_load_factor")]
+    #[serde(alias = "weight")]
+    pub load_factor: u32,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     pub region: Option<String>,
@@ -235,6 +251,10 @@ fn default_auth_method() -> String {
     "social".to_string()
 }
 
+fn default_load_factor() -> u32 {
+    10
+}
+
 /// 更新 refreshToken 请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -270,6 +290,10 @@ pub struct UpdateCredentialRequest {
     /// 凭据扩展元数据（None 表示不修改）
     #[serde(default)]
     pub metadata: Option<CredentialMetadata>,
+    /// 负载因子（均衡模式下的调度权重，>= 1，None 表示不修改）
+    #[serde(default)]
+    #[serde(alias = "weight")]
+    pub load_factor: Option<u32>,
 }
 
 /// 添加凭据成功响应
@@ -481,19 +505,26 @@ pub struct EnableOverageAllResult {
 // ============ 负载均衡配置 ============
 
 /// 负载均衡模式响应
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadBalancingModeResponse {
     /// 当前模式（"priority" 或 "balanced"）
     pub mode: String,
+    /// 优先级反转开关（默认 false：数字小的优先；true：数字大的优先）
+    #[serde(default)]
+    pub invert_priority: bool,
 }
 
 /// 设置负载均衡模式请求
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetLoadBalancingModeRequest {
-    /// 模式（"priority" 或 "balanced"）
-    pub mode: String,
+    /// 模式（"priority" 或 "balanced"，可选）
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// 优先级反转开关（可选）
+    #[serde(default)]
+    pub invert_priority: Option<bool>,
 }
 
 /// 上游域名配置（GET 响应 / PUT 请求共用）
@@ -1319,6 +1350,12 @@ pub struct GroupItem {
     pub credential_count: usize,
     /// 引用计数：有多少把客户端 Key 绑定这个分组
     pub client_key_count: usize,
+    /// 负载均衡模式（None 表示继承全局配置）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_balancing_mode: Option<String>,
+    /// 优先级反转（None 表示继承全局配置）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invert_priority: Option<bool>,
 }
 
 /// 分组列表响应
@@ -1336,6 +1373,12 @@ pub struct CreateGroupRequest {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// 负载均衡模式（priority / balanced；None 表示继承全局）
+    #[serde(default)]
+    pub load_balancing_mode: Option<String>,
+    /// 优先级反转（None 表示继承全局）
+    #[serde(default)]
+    pub invert_priority: Option<bool>,
 }
 
 /// 更新分组请求（改名 / 改备注；两者都可选）
@@ -1348,6 +1391,18 @@ pub struct UpdateGroupRequest {
     /// 新备注；传空字符串清除备注；不传字段则保留
     #[serde(default)]
     pub description: Option<String>,
+    /// 负载均衡模式（priority / balanced）
+    #[serde(default)]
+    pub load_balancing_mode: Option<String>,
+    /// 是否重置负载均衡模式为继承全局
+    #[serde(default)]
+    pub reset_load_balancing_mode: Option<bool>,
+    /// 优先级反转开关（true: 数字大优先, false: 数字小优先）
+    #[serde(default)]
+    pub invert_priority: Option<bool>,
+    /// 是否重置优先级反转为继承全局
+    #[serde(default)]
+    pub reset_invert_priority: Option<bool>,
 }
 
 /// 删除分组的可选查询参数

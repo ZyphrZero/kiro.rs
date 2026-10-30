@@ -511,6 +511,8 @@ async fn run_round(
     // 读取 body 前标记，确保该窗口取消时不会被 RequestTracer::Drop 误归为等头中断。
     tracer.mark_upstream_headers_received();
     let credential_id = call_result.credential_id;
+    // 在途守卫需覆盖本轮响应体的完整读取；绑定到局部变量避免提前释放。
+    let _in_flight = call_result._in_flight;
     let mut outcome = decode_round(
         call_result.response,
         &payload.model,

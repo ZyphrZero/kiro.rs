@@ -5,7 +5,7 @@
 
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
@@ -998,6 +998,10 @@ struct CredentialEntry {
     last_self_heal_at: Option<DateTime<Utc>>,
     /// 当前连续自愈轮次对应的模型；None 表示 MCP/无模型请求。
     self_heal_model: Option<String>,
+    /// 当前在途处理中的请求数（用于负载均衡并发避让）
+    in_flight: Arc<AtomicU32>,
+    /// SWRR 平滑加权轮询的当前动态权重
+    current_weight: i64,
 }
 
 impl CredentialEntry {
@@ -1010,7 +1014,9 @@ impl CredentialEntry {
         self.disabled_reason = None;
         self.throttled_until = None;
         self.rpm_window.clear();
+        self.in_flight.store(0, Ordering::Relaxed);
         self.clear_self_heal_streak();
+        self.current_weight = 0;
     }
 }
 
@@ -1116,6 +1122,8 @@ pub struct CredentialEntrySnapshot {
     pub id: u64,
     /// 优先级
     pub priority: u32,
+    /// 负载因子（均衡模式下的调度权重，数值越大调度频次越高，默认为 10）
+    pub load_factor: u32,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -1242,6 +1250,10 @@ pub struct MultiTokenManager {
     is_multiple_format: AtomicBool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// 优先级反转开关：默认 false（数值小的优先）；true 时数值大的优先
+    invert_priority: AtomicBool,
+    /// 分组注册表（用于解析分组级负载均衡覆盖）；未注入时回退全局配置
+    group_manager: RwLock<Option<crate::admin::SharedGroupManager>>,
     /// 对话 / MCP 上游域名（运行时可修改）
     api_domain: Mutex<ApiDomain>,
     /// 会话粘性路由：会话 → 上一轮成功凭据 的绑定表（运行时可开关 / 改 TTL）
@@ -1300,6 +1312,28 @@ const RPM_WINDOW_SECS: u64 = 60;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
+/// 在途请求引用计数守卫
+///
+/// 当凭据被调度选中发起请求时持有该守卫，Drop 时自动递减 `in_flight` 并发计数。
+/// 配合 `Arc<InFlightGuard>` 放入 [`CallContext`] 内，可在多次克隆时共享同一生命周期，
+/// 直到该次请求的所有上下文副本均被释放（包括流式响应全部 chunk 发送完毕）。
+pub struct InFlightGuard {
+    counter: Arc<AtomicU32>,
+}
+
+impl InFlightGuard {
+    pub fn new(counter: Arc<AtomicU32>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// API 调用上下文
 ///
 /// 绑定特定凭据的调用上下文，确保 token、credentials 和 id 的一致性
@@ -1312,6 +1346,8 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+    /// 在途请求守卫（Drop 时自动递减凭据的 in_flight 并发计数）
+    pub _in_flight: Option<Arc<InFlightGuard>>,
 }
 
 pub struct IdcReloginCredentials {
@@ -1333,6 +1369,20 @@ fn group_matches(cred_groups: &[String], group: Option<&str>) -> bool {
     match group {
         None => true,
         Some(g) => cred_groups.iter().any(|cg| cg == g),
+    }
+}
+
+/// 计算用于 `min_by_key` 的优先级排序键
+///
+/// 当 invert 为 false 时返回 priority 原值（数值越小越优先）；为 true 时返回
+/// `u32::MAX - priority`（数值越大，计算值越小，因而越优先）。次级比较键（如 id）
+/// 不受影响。
+#[inline]
+pub fn priority_key(priority: u32, invert: bool) -> u32 {
+    if invert {
+        u32::MAX - priority
+    } else {
+        priority
     }
 }
 
@@ -1443,6 +1493,8 @@ impl MultiTokenManager {
                     self_heal_total_count: cred.self_heal_total_count,
                     last_self_heal_at,
                     self_heal_model: cred.self_heal_model.clone(),
+                    in_flight: Arc::new(AtomicU32::new(0)),
+                    current_weight: 0,
                 }
             })
             .collect();
@@ -1479,11 +1531,12 @@ impl MultiTokenManager {
             anyhow::bail!("检测到重复的凭据 ID: {:?}", duplicate_ids);
         }
 
-        // 选择初始凭据：优先级最高（priority 最小）的可用凭据，无可用凭据时为 0
+        let invert_priority = config.invert_priority;
+        // 选择初始凭据：根据 invert_priority 选择优先级最高（priority 最小或最大）的可用凭据
         let initial_id = entries
             .iter()
             .filter(|e| !e.disabled)
-            .min_by_key(|e| (e.credentials.priority, e.id))
+            .min_by_key(|e| (priority_key(e.credentials.priority, invert_priority), e.id))
             .map(|e| e.id)
             .unwrap_or(0);
 
@@ -1516,6 +1569,8 @@ impl MultiTokenManager {
             runtime_config_update_lock: Mutex::new(()),
             is_multiple_format: AtomicBool::new(is_multiple_format),
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            invert_priority: AtomicBool::new(invert_priority),
+            group_manager: RwLock::new(None),
             api_domain: Mutex::new(api_domain),
             session_affinity,
             account_throttle_failover: AtomicBool::new(throttle_failover),
@@ -2049,57 +2104,131 @@ impl MultiTokenManager {
             .any(|entry| self.entry_available_for_request(entry, model, group, now))
     }
 
+    /// 获取指定凭据的在途并发计数（测试 / 诊断用）
+    #[allow(dead_code)]
+    pub fn get_in_flight(&self, id: u64) -> u32 {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.in_flight.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// 为指定凭据创建在途请求守卫（成功拿到调用上下文后调用）。
+    fn acquire_in_flight_guard(&self, id: u64) -> Option<InFlightGuard> {
+        let entries = self.entries.lock();
+        let entry = entries.iter().find(|e| e.id == id)?;
+        Some(InFlightGuard::new(Arc::clone(&entry.in_flight)))
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
-    /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：在可用凭据中均匀随机选择一个
+    /// - priority 模式：选择优先级最高（`priority_key` 最小）的可用凭据
+    /// - balanced 模式：在途并发避让 + SWRR 平滑加权轮询（按 `load_factor` 分配流量）
     ///
     /// 会话粘性由调用方在此之前处理（见 [`Self::sticky_candidate`]），这里只负责
     /// 粘性未命中 / 无会话时的选号。
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(
+    #[cfg(test)]
+    pub fn select_next_credential(
         &self,
         model: Option<&str>,
         group: Option<&str>,
     ) -> Option<(u64, KiroCredentials)> {
-        let entries = self.entries.lock();
+        self.select_next_credential_impl(model, group, true)
+    }
+
+    fn select_next_credential_impl(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        update_state: bool,
+    ) -> Option<(u64, KiroCredentials)> {
+        let mut entries = self.entries.lock();
         let now = Instant::now();
 
-        // 过滤可用凭据（已排除模型缓存明确不支持的凭据）
-        let available: Vec<&CredentialEntry> = entries
-            .iter()
-            .filter(|e| self.entry_available_for_request(e, model, group, now))
-            .collect();
-
-        if available.is_empty() {
-            return None;
-        }
-
-        let mode = self.load_balancing_mode.lock().clone();
-        let mode = mode.as_str();
-
-        let entry = match mode {
+        let (mode, invert) = self.resolve_load_balancing_for_group(group);
+        match mode.as_str() {
             "balanced" => {
-                // 均匀随机，不按历史 success_count / 模型缓存状态排序：
-                // - 按 success_count 取最小会让新加入的凭据（计数为 0）独占流量，
-                //   直到追平老凭据的累计值；
-                // - 优先模型缓存 Confirmed 会让缓存为 Unknown 的凭据（运行时新增、
-                //   缓存被清空后）在有 Confirmed 凭据可用时永远选不到，缓存也就永远
-                //   不会因为被使用而变成 Confirmed。
-                available[fastrand::usize(..available.len())]
+                // SWRR（平滑加权轮询）策略：
+                // 1. 先按在途并发避让，只在并发最少的候选集中选号
+                // 2. 在候选集中按凭据负载因子 (load_factor) 执行平滑加权轮询
+                // 3. 平局时优先选择已确认支持该模型的凭据与高优先级凭据
+                let mut candidates: Vec<(usize, CachedModelSupport)> = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| {
+                        self.entry_available_for_request(e, model, group, now)
+                    })
+                    .map(|(idx, e)| (idx, self.cached_model_support(e.id, model)))
+                    .collect();
+
+                if candidates.is_empty() {
+                    return None;
+                }
+
+                // 过滤到最小 in_flight（并发避让优先）
+                let min_in_flight = candidates
+                    .iter()
+                    .map(|(idx, _)| entries[*idx].in_flight.load(Ordering::Relaxed))
+                    .min()
+                    .unwrap();
+                candidates.retain(|(idx, _)| {
+                    entries[*idx].in_flight.load(Ordering::Relaxed) == min_in_flight
+                });
+
+                let total_weight: i64 = candidates
+                    .iter()
+                    .map(|(idx, _)| {
+                        entries[*idx].credentials.effective_load_factor() as i64
+                    })
+                    .sum();
+
+                // SWRR 步进：每个候选的 current_weight += effective_load_factor
+                if update_state {
+                    for (idx, _) in &candidates {
+                        let weight = entries[*idx].credentials.effective_load_factor() as i64;
+                        entries[*idx].current_weight += weight;
+                    }
+                }
+
+                let best_candidate = candidates.iter().max_by_key(|(idx, support)| {
+                    let e = &entries[*idx];
+                    let weight = e.credentials.effective_load_factor() as i64;
+                    let current_weight = if update_state {
+                        e.current_weight
+                    } else {
+                        e.current_weight + weight
+                    };
+                    let discovery_rank = usize::from(*support != CachedModelSupport::Confirmed);
+                    (
+                        current_weight,
+                        std::cmp::Reverse(discovery_rank),
+                        std::cmp::Reverse(priority_key(e.credentials.priority, invert)),
+                        std::cmp::Reverse(e.id),
+                    )
+                });
+
+                let &(best_idx, _) = best_candidate?;
+                if update_state {
+                    entries[best_idx].current_weight -= total_weight;
+                }
+                let best_id = entries[best_idx].id;
+                let best_creds = entries[best_idx].credentials.clone();
+                Some((best_id, best_creds))
             }
             _ => {
-                // priority 模式（默认）：严格选择数字最小的有效凭据。
-                // 同优先级按 ID 升序固定顺序，保证后端调度与前端预览一致。
-                available
+                // priority 模式（默认）：严格按 (priority_key, id) 升序固定顺序选择。
+                entries
                     .iter()
-                    .copied()
-                    .min_by_key(|e| (e.credentials.priority, e.id))?
+                    .filter(|e| self.entry_available_for_request(e, model, group, now))
+                    .min_by_key(|e| (priority_key(e.credentials.priority, invert), e.id))
+                    .map(|e| (e.id, e.credentials.clone()))
             }
-        };
-        Some((entry.id, entry.credentials.clone()))
+        }
     }
 
     /// 获取 API 调用上下文
@@ -2221,18 +2350,20 @@ impl MultiTokenManager {
             }
 
             let (id, credentials, is_balanced, route) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+                let (mode, _invert) = self.resolve_load_balancing_for_group(group);
+                let is_balanced = mode.as_str() == "balanced";
 
                 // 会话粘性优先：绑定凭据仍可用就沿用，保住上游按账号隔离的 prompt cache。
                 // 粘性未命中时两种模式都按当前请求重新选择。priority 模式不能复用 current_id，
                 // 否则高优先级凭据从 RPM/冷却恢复后无法在下一次请求立即回切。
                 let (sticky_pick, route) = self.sticky_candidate(session, model, group);
-                let mut best = sticky_pick.or_else(|| self.select_next_credential(model, group));
+                let mut best = sticky_pick
+                    .or_else(|| self.select_next_credential_impl(model, group, update_current));
 
                 // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
                 // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
                 if best.is_none() && self.try_self_heal(model, group) {
-                    best = self.select_next_credential(model, group);
+                    best = self.select_next_credential_impl(model, group, update_current);
                 }
 
                 let (id, credentials) = if let Some((new_id, new_creds)) = best {
@@ -2264,11 +2395,16 @@ impl MultiTokenManager {
 
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
-                Ok(ctx) => {
+                Ok(mut ctx) => {
                     // 仅真实业务请求计入 RPM 窗口；Admin 只读模型发现不消耗额度。
                     if update_current && !self.record_request(id) {
                         // Token 获取期间额度可能被其它并发请求抢先占用；重新选号。
                         continue;
+                    }
+                    if update_current
+                        && let Some(guard) = self.acquire_in_flight_guard(id)
+                    {
+                        ctx._in_flight = Some(Arc::new(guard));
                     }
                     return Ok((ctx, is_balanced, route));
                 }
@@ -2325,7 +2461,15 @@ impl MultiTokenManager {
         if let Some(best) = entries
             .iter()
             .filter(|e| !e.disabled)
-            .min_by_key(|e| (e.credentials.priority, e.id))
+            .min_by_key(|e| {
+                (
+                    priority_key(
+                        e.credentials.priority,
+                        self.invert_priority.load(Ordering::Relaxed),
+                    ),
+                    e.id,
+                )
+            })
         {
             if best.id != *current_id {
                 tracing::info!(
@@ -2361,6 +2505,7 @@ impl MultiTokenManager {
                 id,
                 credentials: credentials.clone(),
                 token,
+                _in_flight: None,
             });
         }
 
@@ -2431,6 +2576,7 @@ impl MultiTokenManager {
             id,
             credentials: creds,
             token,
+            _in_flight: None,
         })
     }
 
@@ -2813,7 +2959,15 @@ impl MultiTokenManager {
                     .filter(|entry| {
                         self.entry_available_for_request(entry, model, group, Instant::now())
                     })
-                    .min_by_key(|e| (e.credentials.priority, e.id))
+                    .min_by_key(|e| {
+                (
+                    priority_key(
+                        e.credentials.priority,
+                        self.invert_priority.load(Ordering::Relaxed),
+                    ),
+                    e.id,
+                )
+            })
                 {
                     *current_id = next.id;
                     tracing::info!(
@@ -2888,7 +3042,15 @@ impl MultiTokenManager {
                 .filter(|entry| {
                     self.entry_available_for_request(entry, model, group, Instant::now())
                 })
-                .min_by_key(|e| (e.credentials.priority, e.id))
+                .min_by_key(|e| {
+                (
+                    priority_key(
+                        e.credentials.priority,
+                        self.invert_priority.load(Ordering::Relaxed),
+                    ),
+                    e.id,
+                )
+            })
             {
                 *current_id = next.id;
                 tracing::info!(
@@ -3056,7 +3218,15 @@ impl MultiTokenManager {
                 .filter(|entry| {
                     self.entry_available_for_request(entry, model, group, Instant::now())
                 })
-                .min_by_key(|e| (e.credentials.priority, e.id))
+                .min_by_key(|e| {
+                (
+                    priority_key(
+                        e.credentials.priority,
+                        self.invert_priority.load(Ordering::Relaxed),
+                    ),
+                    e.id,
+                )
+            })
             {
                 *current_id = next.id;
                 tracing::info!(
@@ -3122,7 +3292,15 @@ impl MultiTokenManager {
                 let has_available = if let Some(next) = entries
                     .iter()
                     .filter(|e| !e.disabled)
-                    .min_by_key(|e| (e.credentials.priority, e.id))
+                    .min_by_key(|e| {
+                (
+                    priority_key(
+                        e.credentials.priority,
+                        self.invert_priority.load(Ordering::Relaxed),
+                    ),
+                    e.id,
+                )
+            })
                 {
                     *current_id = next.id;
                     tracing::info!(
@@ -3178,7 +3356,15 @@ impl MultiTokenManager {
             if let Some(next) = entries
                 .iter()
                 .filter(|e| !e.disabled)
-                .min_by_key(|e| (e.credentials.priority, e.id))
+                .min_by_key(|e| {
+                (
+                    priority_key(
+                        e.credentials.priority,
+                        self.invert_priority.load(Ordering::Relaxed),
+                    ),
+                    e.id,
+                )
+            })
             {
                 *current_id = next.id;
                 tracing::info!(
@@ -3210,7 +3396,15 @@ impl MultiTokenManager {
         if let Some(next) = entries
             .iter()
             .filter(|e| !e.disabled && e.id != *current_id)
-            .min_by_key(|e| (e.credentials.priority, e.id))
+            .min_by_key(|e| {
+                (
+                    priority_key(
+                        e.credentials.priority,
+                        self.invert_priority.load(Ordering::Relaxed),
+                    ),
+                    e.id,
+                )
+            })
         {
             *current_id = next.id;
             tracing::info!(
@@ -3268,6 +3462,7 @@ impl MultiTokenManager {
                 .map(|e| CredentialEntrySnapshot {
                     id: e.id,
                     priority: e.credentials.priority,
+                    load_factor: e.credentials.effective_load_factor(),
                     disabled: e.disabled,
                     failure_count: e.failure_count,
                     total_failure_count: e.total_failure_count,
@@ -3542,11 +3737,13 @@ impl MultiTokenManager {
                         .find(|e| e.id == target_id)
                         .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", target_id))?;
                     entry.success_count = 0;
+                    entry.current_weight = 0;
                     count = 1;
                 }
                 None => {
                     for entry in entries.iter_mut() {
                         entry.success_count = 0;
+                        entry.current_weight = 0;
                         count += 1;
                     }
                 }
@@ -4153,6 +4350,8 @@ impl MultiTokenManager {
                 self_heal_total_count: 0,
                 last_self_heal_at: None,
                 self_heal_model: None,
+                in_flight: Arc::new(AtomicU32::new(0)),
+                current_weight: 0,
             });
         }
 
@@ -4187,6 +4386,7 @@ impl MultiTokenManager {
         groups: Option<Vec<String>>,
         source_channel: Option<Option<String>>,
         metadata: Option<crate::kiro::model::credentials::CredentialMetadata>,
+        load_factor: Option<u32>,
     ) -> anyhow::Result<()> {
         let invalidate_models =
             proxy_url.is_some() || proxy_username.is_some() || proxy_password.is_some();
@@ -4222,6 +4422,10 @@ impl MultiTokenManager {
             }
             if let Some(v) = metadata {
                 entry.credentials.metadata = v;
+            }
+            if let Some(lf) = load_factor {
+                entry.credentials.load_factor = lf.max(1);
+                entry.current_weight = 0;
             }
         }
         if invalidate_models {
@@ -4562,35 +4766,107 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
-        let mode = mode.to_string();
-        self.update_config_file(move |config| config.load_balancing_mode = mode)
+    /// 注入分组注册表，用于解析分组级负载均衡覆盖。
+    pub fn set_group_manager(&self, group_manager: crate::admin::SharedGroupManager) {
+        let mut gm = self.group_manager.write();
+        *gm = Some(group_manager);
+    }
+
+    /// 解析指定请求分组的负载均衡模式与优先级反转配置。
+    ///
+    /// 分组有独立配置则使用分组级覆盖，否则回退到全局配置。
+    pub fn resolve_load_balancing_for_group(&self, group: Option<&str>) -> (String, bool) {
+        let global_mode = self.load_balancing_mode.lock().clone();
+        let global_invert = self.invert_priority.load(Ordering::Relaxed);
+        let Some(g) = group else {
+            return (global_mode, global_invert);
+        };
+        if let Some(mgr) = self.group_manager.read().as_ref() {
+            let (group_mode, group_invert) = mgr.resolve_load_balancing(g);
+            let mode = group_mode.unwrap_or(global_mode);
+            let invert = group_invert.unwrap_or(global_invert);
+            (mode, invert)
+        } else {
+            (global_mode, global_invert)
+        }
+    }
+
+    /// 获取优先级反转设置（Admin API）
+    pub fn get_invert_priority(&self) -> bool {
+        self.invert_priority.load(Ordering::Relaxed)
     }
 
     /// 设置负载均衡模式（Admin API）
+    #[allow(dead_code)]
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
-        // 验证模式值
-        if mode != "priority" && mode != "balanced" {
-            anyhow::bail!("无效的负载均衡模式: {}", mode);
-        }
+        self.update_load_balancing_settings(Some(&mode), None)
+    }
 
-        let previous_mode = self.get_load_balancing_mode();
-        if previous_mode == mode {
+    /// 设置优先级反转（Admin API）
+    #[allow(dead_code)]
+    pub fn set_invert_priority(&self, invert: bool) -> anyhow::Result<()> {
+        self.update_load_balancing_settings(None, Some(invert))
+    }
+
+    /// 统一更新负载均衡设置（模式与优先级反转），运行时生效并持久化。
+    pub fn update_load_balancing_settings(
+        &self,
+        mode: Option<&str>,
+        invert_priority: Option<bool>,
+    ) -> anyhow::Result<()> {
+        let _update_guard = self.runtime_config_update_lock.lock();
+
+        let prev_mode = self.get_load_balancing_mode();
+        let prev_invert = self.get_invert_priority();
+
+        let new_mode = mode
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| prev_mode.clone());
+        if new_mode != "priority" && new_mode != "balanced" {
+            anyhow::bail!("无效的负载均衡模式: {}", new_mode);
+        }
+        let new_invert = invert_priority.unwrap_or(prev_invert);
+
+        if new_mode == prev_mode && new_invert == prev_invert {
             return Ok(());
         }
 
-        *self.load_balancing_mode.lock() = mode.clone();
+        *self.load_balancing_mode.lock() = new_mode.clone();
+        self.invert_priority.store(new_invert, Ordering::Relaxed);
 
-        if let Err(err) = self.persist_load_balancing_mode(&mode) {
-            *self.load_balancing_mode.lock() = previous_mode;
+        let nm = new_mode.clone();
+        if let Err(err) = self.update_config_file(move |config| {
+            config.load_balancing_mode = nm;
+            config.invert_priority = new_invert;
+        }) {
+            *self.load_balancing_mode.lock() = prev_mode;
+            self.invert_priority.store(prev_invert, Ordering::Relaxed);
             return Err(err);
         }
 
-        if mode == "priority" {
-            self.select_highest_priority();
-        }
+        self.select_highest_priority();
 
-        tracing::info!("负载均衡模式已设置为: {}", mode);
+        tracing::info!(
+            "负载均衡配置已更新: mode={}, invert_priority={}",
+            new_mode,
+            new_invert
+        );
+        Ok(())
+    }
+
+    /// 设置凭据负载因子（均衡模式下的调度权重，>= 1，Admin API）
+    pub fn set_load_factor(&self, id: u64, load_factor: u32) -> anyhow::Result<()> {
+        let val = load_factor.max(1);
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.load_factor = val;
+            entry.current_weight = 0;
+        }
+        self.persist_credentials()?;
         Ok(())
     }
 
@@ -6381,6 +6657,8 @@ mod tests {
             access_token: Some("second-token".to_string()),
             expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
             priority: 1,
+            // 更高负载因子：只读选择（不推进 SWRR 状态）会选中 #2
+            load_factor: 20,
             ..KiroCredentials::default()
         };
         let manager =
@@ -6388,7 +6666,7 @@ mod tests {
 
         assert_eq!(manager.snapshot().current_id, 1);
 
-        // balanced 随机选号：多次只读选择，其中必然会选到 #2，但 current_id 始终不动
+        // balanced 只读选号可选中 #2，但 current_id 始终不动
         let mut picked_other = false;
         for _ in 0..64 {
             let (context, is_balanced, _) = manager
@@ -7489,6 +7767,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -7518,7 +7797,7 @@ mod tests {
         };
 
         manager
-            .update_credential(1, None, None, None, None, None, None, Some(metadata))
+            .update_credential(1, None, None, None, None, None, None, Some(metadata), None)
             .unwrap();
 
         let snapshot = manager.snapshot();
@@ -8219,5 +8498,361 @@ mod tests {
 
         // 但 g2 仍可用
         assert!(manager.acquire_context(None, Some("g2")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_balanced_mode_avoids_in_flight_busy_credential() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut first = KiroCredentials::default();
+        first.access_token = Some("first-token".to_string());
+        first.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        first.priority = 0;
+
+        let mut second = KiroCredentials::default();
+        second.access_token = Some("second-token".to_string());
+        second.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        second.priority = 0;
+
+        let manager =
+            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+
+        assert_eq!(manager.get_in_flight(1), 0);
+        assert_eq!(manager.get_in_flight(2), 0);
+
+        // 第一个请求选中凭据 #1 并在途处理
+        let ctx1 = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(ctx1.id, 1);
+        assert_eq!(manager.get_in_flight(1), 1);
+        assert_eq!(manager.get_in_flight(2), 0);
+
+        // 并发第二个请求到达：应避让在途的 #1，选择空闲的 #2
+        let ctx2 = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(ctx2.id, 2);
+        assert_eq!(manager.get_in_flight(1), 1);
+        assert_eq!(manager.get_in_flight(2), 1);
+
+        // 克隆 ctx1（模拟流式传输处理）：在途计数不应重复递增
+        let ctx1_clone = ctx1.clone();
+        assert_eq!(manager.get_in_flight(1), 1);
+
+        // 释放 ctx1 主体，但仍持有 ctx1_clone：在途计数仍为 1
+        drop(ctx1);
+        assert_eq!(manager.get_in_flight(1), 1);
+
+        // 释放 ctx1_clone：在途计数归 0
+        drop(ctx1_clone);
+        assert_eq!(manager.get_in_flight(1), 0);
+
+        drop(ctx2);
+        assert_eq!(manager.get_in_flight(2), 0);
+    }
+
+    #[test]
+    fn test_swrr_load_factor_distribution_and_ratio() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred1 = grouped_cred("token-1", &[]);
+        cred1.id = Some(1);
+        cred1.load_factor = 3;
+
+        let mut cred2 = grouped_cred("token-2", &[]);
+        cred2.id = Some(2);
+        cred2.load_factor = 1;
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // 连续调度 40 次，比例应严格为 3:1 (30:10)
+        let mut count1 = 0;
+        let mut count2 = 0;
+        for _ in 0..40 {
+            let pick = manager.select_next_credential(None, None).unwrap();
+            if pick.0 == 1 {
+                count1 += 1;
+            } else if pick.0 == 2 {
+                count2 += 1;
+            }
+        }
+
+        assert_eq!(count1, 30, "负载因子为 3 的账号应获得 3/4 流量");
+        assert_eq!(count2, 10, "负载因子为 1 的账号应获得 1/4 流量");
+    }
+
+    #[test]
+    fn test_swrr_smooth_interleaving_and_no_catchup_starvation() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut old_cred = grouped_cred("token-old", &[]);
+        old_cred.id = Some(1);
+        old_cred.load_factor = 2;
+
+        let mut new_cred1 = grouped_cred("token-new1", &[]);
+        new_cred1.id = Some(2);
+        new_cred1.load_factor = 1;
+
+        let mut new_cred2 = grouped_cred("token-new2", &[]);
+        new_cred2.id = Some(3);
+        new_cred2.load_factor = 1;
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![old_cred, new_cred1, new_cred2],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 老号有大量历史成功调用，但 SWRR 不依赖 success_count，新号不会被饿死
+        for _ in 0..800 {
+            manager.report_success(1);
+        }
+
+        let picks: Vec<u64> = (0..4)
+            .map(|_| manager.select_next_credential(None, None).unwrap().0)
+            .collect();
+        assert_eq!(picks, vec![1, 2, 3, 1], "老号与新号应立即平滑按权重交替调度");
+    }
+
+    #[test]
+    fn test_set_load_factor_updates_behavior() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred1 = grouped_cred("token-1", &[]);
+        cred1.id = Some(1);
+        cred1.load_factor = 1;
+
+        let mut cred2 = grouped_cred("token-2", &[]);
+        cred2.id = Some(2);
+        cred2.load_factor = 1;
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        manager.set_load_factor(2, 3).unwrap();
+
+        let mut count1 = 0;
+        let mut count2 = 0;
+        for _ in 0..40 {
+            let pick = manager.select_next_credential(None, None).unwrap();
+            if pick.0 == 1 {
+                count1 += 1;
+            } else if pick.0 == 2 {
+                count2 += 1;
+            }
+        }
+        assert_eq!(count1, 10);
+        assert_eq!(count2, 30);
+    }
+
+    #[test]
+    fn test_priority_key_calculation() {
+        assert_eq!(priority_key(0, false), 0);
+        assert_eq!(priority_key(10, false), 10);
+        assert_eq!(priority_key(100, false), 100);
+
+        assert_eq!(priority_key(0, true), u32::MAX);
+        assert_eq!(priority_key(10, true), u32::MAX - 10);
+        assert_eq!(priority_key(100, true), u32::MAX - 100);
+
+        assert!(priority_key(100, true) < priority_key(10, true));
+        assert!(priority_key(10, true) < priority_key(0, true));
+    }
+
+    #[test]
+    fn test_set_invert_priority_persists_and_switches_credential() {
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-invert-priority-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &config_path,
+            r#"{"loadBalancingMode":"priority","invertPriority":false}"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let mut cred1 = grouped_cred("c1", &[]);
+        cred1.priority = 0;
+        let mut cred2 = grouped_cred("c2", &[]);
+        cred2.priority = 100;
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        assert_eq!(manager.snapshot().current_id, 1);
+        assert!(!manager.get_invert_priority());
+
+        manager.set_invert_priority(true).unwrap();
+        assert_eq!(manager.snapshot().current_id, 2);
+        assert!(manager.get_invert_priority());
+
+        let persisted = Config::load(&config_path).unwrap();
+        assert!(persisted.invert_priority);
+
+        manager.set_invert_priority(false).unwrap();
+        assert_eq!(manager.snapshot().current_id, 1);
+        assert!(!manager.get_invert_priority());
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn test_update_load_balancing_settings() {
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-lb-settings-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &config_path,
+            r#"{"loadBalancingMode":"priority","invertPriority":false}"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let mut cred1 = grouped_cred("c1", &[]);
+        cred1.priority = 10;
+        let mut cred2 = grouped_cred("c2", &[]);
+        cred2.priority = 50;
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        assert_eq!(manager.snapshot().current_id, 1);
+
+        manager
+            .update_load_balancing_settings(Some("balanced"), Some(true))
+            .unwrap();
+
+        assert_eq!(manager.get_load_balancing_mode(), "balanced");
+        assert!(manager.get_invert_priority());
+        assert_eq!(manager.snapshot().current_id, 2);
+
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.load_balancing_mode, "balanced");
+        assert!(persisted.invert_priority);
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_with_invert_priority_selects_largest() {
+        let mut config = Config::default();
+        config.invert_priority = true;
+
+        let mut low = grouped_cred("low", &[]);
+        low.priority = 10;
+        let mut mid = grouped_cred("mid", &[]);
+        mid.priority = 50;
+        let mut high = grouped_cred("high", &[]);
+        high.priority = 100;
+
+        let manager =
+            MultiTokenManager::new(config, vec![low, mid, high], None, None, false).unwrap();
+
+        assert_eq!(manager.snapshot().current_id, 3);
+        let ctx = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(ctx.id, 3);
+
+        manager.set_disabled(3, true).unwrap();
+        let ctx2 = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(ctx2.id, 2);
+
+        manager.set_disabled(3, false).unwrap();
+        let ctx3 = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(ctx3.id, 3);
+
+        manager.set_invert_priority(false).unwrap();
+        assert_eq!(manager.snapshot().current_id, 1);
+        let ctx4 = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(ctx4.id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_group_level_load_balancing_and_invert_priority() {
+        let group_mgr = Arc::new(crate::admin::GroupManager::new());
+        group_mgr
+            .create_with_dispatch("group_inherit".into(), None, None, None)
+            .unwrap();
+        group_mgr
+            .create_with_dispatch("group_inverted".into(), None, None, Some(true))
+            .unwrap();
+        group_mgr
+            .create_with_dispatch(
+                "group_normal".into(),
+                None,
+                Some("priority".into()),
+                Some(false),
+            )
+            .unwrap();
+        group_mgr
+            .create_with_dispatch("group_balanced".into(), None, Some("balanced".into()), None)
+            .unwrap();
+
+        let mut c1 = grouped_cred(
+            "c1",
+            &[
+                "group_inherit",
+                "group_inverted",
+                "group_normal",
+                "group_balanced",
+            ],
+        );
+        c1.priority = 10;
+        let mut c2 = grouped_cred(
+            "c2",
+            &[
+                "group_inherit",
+                "group_inverted",
+                "group_normal",
+                "group_balanced",
+            ],
+        );
+        c2.priority = 80;
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![c1, c2], None, None, false).unwrap();
+        manager.set_group_manager(group_mgr);
+
+        // 继承全局 (invert_priority = false) -> 数字小的 c1
+        let ctx = manager
+            .acquire_context(None, Some("group_inherit"))
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1);
+
+        // 分组独立配置 invert_priority = true -> 数字大的 c2
+        let ctx = manager
+            .acquire_context(None, Some("group_inverted"))
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2);
+
+        // 将全局 invert_priority 改为 true
+        manager.set_invert_priority(true).unwrap();
+
+        // group_inherit 继承全局 true -> c2
+        let ctx = manager
+            .acquire_context(None, Some("group_inherit"))
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2);
+
+        // group_normal 独立配置 false -> 仍选 c1
+        let ctx = manager
+            .acquire_context(None, Some("group_normal"))
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1);
+
+        // group_balanced 独立配置 balanced 模式，优先级反转继承全局 true
+        let (mode, invert) = manager.resolve_load_balancing_for_group(Some("group_balanced"));
+        assert_eq!(mode, "balanced");
+        assert!(invert);
     }
 }

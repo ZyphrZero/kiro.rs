@@ -29,7 +29,7 @@ use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{
-    IdcReloginCredentials, MultiTokenManager, RefreshTokenInvalidError,
+    priority_key, IdcReloginCredentials, MultiTokenManager, RefreshTokenInvalidError,
 };
 use crate::model::config::Config;
 
@@ -839,6 +839,7 @@ impl AdminService {
                 CredentialStatusItem {
                     id: entry.id,
                     priority: entry.priority,
+                    load_factor: entry.load_factor,
                     disabled: entry.disabled,
                     failure_count: entry.failure_count,
                     total_failure_count: entry.total_failure_count,
@@ -871,7 +872,8 @@ impl AdminService {
             .collect();
 
         // 与调度器保持一致：优先级越小越靠前，同优先级按 ID 升序。
-        credentials.sort_by_key(|c| (c.priority, c.id));
+        let invert = self.token_manager.get_invert_priority();
+        credentials.sort_by_key(|c| (priority_key(c.priority, invert), c.id));
 
         CredentialsStatusResponse {
             total: snapshot.total,
@@ -917,7 +919,13 @@ impl AdminService {
         if let Some(filter) = id_filter {
             credentials.retain(|c| c.id.map(|id| filter.contains(&id)).unwrap_or(false));
         }
-        credentials.sort_by_key(|c| (c.priority, c.id.unwrap_or(u64::MAX)));
+        let invert = self.token_manager.get_invert_priority();
+        credentials.sort_by_key(|c| {
+            (
+                priority_key(c.priority, invert),
+                c.id.unwrap_or(u64::MAX),
+            )
+        });
 
         let accounts = credentials
             .into_iter()
@@ -1008,6 +1016,13 @@ impl AdminService {
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据负载因子（均衡模式下的调度权重）
+    pub fn set_load_factor(&self, id: u64, load_factor: u32) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_load_factor(id, load_factor)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -1556,6 +1571,7 @@ impl AdminService {
             issuer_url: req.issuer_url,
             scopes: req.scopes,
             priority: req.priority,
+            load_factor: req.load_factor.max(1),
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,
@@ -1707,6 +1723,7 @@ impl AdminService {
                 req.source_channel
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
                 req.metadata,
+                req.load_factor,
             )
             .map_err(|e| self.classify_error(e, id))
     }
@@ -2444,30 +2461,39 @@ impl AdminService {
             .map(|s| s.to_string())
     }
 
-    /// 获取负载均衡模式
+    /// 获取负载均衡模式与优先级反转
     pub fn get_load_balancing_mode(&self) -> LoadBalancingModeResponse {
         LoadBalancingModeResponse {
             mode: self.token_manager.get_load_balancing_mode(),
+            invert_priority: self.token_manager.get_invert_priority(),
         }
     }
 
-    /// 设置负载均衡模式
+    /// 设置负载均衡模式与优先级反转
     pub fn set_load_balancing_mode(
         &self,
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
-        // 验证模式值
-        if req.mode != "priority" && req.mode != "balanced" {
+        if req.mode.is_none() && req.invert_priority.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少需要提供 mode 或 invertPriority 之一".to_string(),
+            ));
+        }
+
+        if let Some(ref mode) = req.mode
+            && mode != "priority"
+            && mode != "balanced"
+        {
             return Err(AdminServiceError::InvalidCredential(
                 "mode 必须是 'priority' 或 'balanced'".to_string(),
             ));
         }
 
         self.token_manager
-            .set_load_balancing_mode(req.mode.clone())
+            .update_load_balancing_settings(req.mode.as_deref(), req.invert_priority)
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
-        Ok(LoadBalancingModeResponse { mode: req.mode })
+        Ok(self.get_load_balancing_mode())
     }
 
     /// 获取对话 / MCP 上游域名
@@ -3084,6 +3110,7 @@ impl AdminService {
                 None,            // groups 不修改
                 None,            // source_channel 不修改
                 None,            // metadata 不修改
+                None,            // load_factor 不修改
             )
             .map_err(|e| {
                 let msg = e.to_string();
@@ -3157,6 +3184,7 @@ impl AdminService {
                     *cred_id,
                     None,
                     Some(Some(url)),
+                    None,
                     None,
                     None,
                     None,
@@ -4292,5 +4320,65 @@ mod cache_metering_config_tests {
         ] {
             assert_eq!(after[key], before[key], "{key} 是只读字段，PUT 不得改动");
         }
+    }
+
+    #[tokio::test]
+    async fn test_admin_service_load_balancing_and_invert_priority() {
+        let first = KiroCredentials {
+            priority: 10,
+            refresh_token: Some("rt1".to_string()),
+            ..KiroCredentials::default()
+        };
+        let second = KiroCredentials {
+            priority: 90,
+            refresh_token: Some("rt2".to_string()),
+            ..KiroCredentials::default()
+        };
+        let manager = std::sync::Arc::new(
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::new());
+
+        // 默认状态
+        let initial_lb = service.get_load_balancing_mode();
+        assert_eq!(initial_lb.mode, "priority");
+        assert!(!initial_lb.invert_priority);
+
+        // 默认排序：priority=10 在前，priority=90 在后
+        let list1 = service.get_all_credentials();
+        assert_eq!(list1.credentials[0].priority, 10);
+        assert_eq!(list1.credentials[1].priority, 90);
+
+        // 切换 invert_priority = true
+        let updated = service
+            .set_load_balancing_mode(SetLoadBalancingModeRequest {
+                mode: None,
+                invert_priority: Some(true),
+            })
+            .unwrap();
+        assert_eq!(updated.mode, "priority");
+        assert!(updated.invert_priority);
+
+        // 导出顺序反转：数值大的（rt2）排在前面
+        let exported = service.export_credentials(None);
+        assert_eq!(
+            exported.accounts[0].credentials.refresh_token.as_deref(),
+            Some("rt2")
+        );
+        assert_eq!(
+            exported.accounts[1].credentials.refresh_token.as_deref(),
+            Some("rt1")
+        );
+
+        // 只改 mode 不影响 invert_priority
+        let updated_mode = service
+            .set_load_balancing_mode(SetLoadBalancingModeRequest {
+                mode: Some("balanced".to_string()),
+                invert_priority: None,
+            })
+            .unwrap();
+        assert_eq!(updated_mode.mode, "balanced");
+        assert!(updated_mode.invert_priority);
     }
 }
