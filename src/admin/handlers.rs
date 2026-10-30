@@ -207,6 +207,19 @@ pub async fn disable_quota_exceeded(State(state): State<AdminState>) -> impl Int
     Json(result).into_response()
 }
 
+/// POST /api/admin/credentials/audit-suspended
+/// 通过历史请求日志排查封号账号并标记为 Suspended
+pub async fn audit_suspended_credentials(
+    State(state): State<AdminState>,
+    payload: Option<Json<super::types::AuditSuspendedRequest>>,
+) -> impl IntoResponse {
+    let req = payload.map(|Json(p)| p);
+    match state.service.audit_suspended_credentials(req) {
+        Ok(result) => Json(result).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials/:id/overage
 /// 开启或关闭指定凭据的超额能力
 pub async fn set_credential_overage(

@@ -10,6 +10,7 @@ use axum::{
 use super::{
     handlers::{
         add_credential, add_proxy, apply_image_update, assign_proxies_round_robin,
+        audit_suspended_credentials,
         assign_proxy_to_credential, batch_add_proxies, batch_import_credentials, check_all_proxies,
         check_proxy, check_rate_limit, check_update, clear_throttle, complete_social_login,
         complete_social_relogin, create_client_key, create_group, delete_client_key,
@@ -88,6 +89,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/credentials/disable-quota-exceeded",
             post(disable_quota_exceeded),
+        )
+        .route(
+            "/credentials/audit-suspended",
+            post(audit_suspended_credentials),
         )
         .route("/credentials/overage/enable-all", post(enable_overage_all))
         .route("/credentials/{id}/overage", post(set_credential_overage))

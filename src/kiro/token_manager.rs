@@ -5,7 +5,7 @@
 
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
@@ -1256,8 +1256,10 @@ pub struct MultiTokenManager {
     account_rpm_limit_enabled: AtomicBool,
     /// 单账号每分钟请求次数上限（运行时可修改）
     account_rpm_limit: AtomicU32,
-    /// 是否识别 403 封禁文案并立即禁用（运行时可修改）
+    /// 是否识别封禁文案并立即禁用（运行时可修改）
     suspended_detection_enabled: AtomicBool,
+    /// 自定义封禁文案关键词（运行时可修改，大小写不敏感匹配）
+    suspended_ban_keywords: RwLock<Vec<String>>,
     /// 全账号自愈总开关（运行时可修改）
     self_heal_enabled: AtomicBool,
     /// 两次自愈的最小冷却间隔（秒，运行时可修改）
@@ -1357,6 +1359,19 @@ fn normalize_self_heal_model(model: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_lowercase())
+}
+
+/// 规范化自定义封禁关键词：去首尾空白、丢弃空串、去重。
+/// 空串会让 `contains` 恒为真，把每个失败请求都判成封号。
+fn normalize_ban_keywords(keywords: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(keywords.len());
+    for kw in keywords {
+        let kw = kw.trim();
+        if !kw.is_empty() && !out.iter().any(|k| k.eq_ignore_ascii_case(kw)) {
+            out.push(kw.to_string());
+        }
+    }
+    out
 }
 
 impl MultiTokenManager {
@@ -1499,6 +1514,7 @@ impl MultiTokenManager {
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
         let rpm_limit = config.account_rpm_limit;
         let suspended_detection_enabled = config.suspended_detection_enabled;
+        let suspended_ban_keywords = normalize_ban_keywords(config.suspended_ban_keywords.clone());
         let self_heal_enabled = config.self_heal_enabled;
         let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
         let self_heal_max_consecutive_rounds = config.self_heal_max_consecutive_rounds;
@@ -1524,6 +1540,7 @@ impl MultiTokenManager {
             account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
             account_rpm_limit: AtomicU32::new(rpm_limit),
             suspended_detection_enabled: AtomicBool::new(suspended_detection_enabled),
+            suspended_ban_keywords: RwLock::new(suspended_ban_keywords),
             self_heal_enabled: AtomicBool::new(self_heal_enabled),
             self_heal_min_interval_secs: AtomicU64::new(self_heal_min_interval_secs),
             self_heal_max_consecutive_rounds: AtomicU32::new(self_heal_max_consecutive_rounds),
@@ -2909,9 +2926,80 @@ impl MultiTokenManager {
         result
     }
 
-    /// 是否启用 403 封禁文案识别（provider 调用，决定 403 是否走 report_suspended）。
+    /// 批量将指定凭据标记为封禁（Suspended）
+    ///
+    /// 遍历指定凭据列表，将其 disabled 置为 true，disabled_reason 置为 Suspended，
+    /// 清空自愈连击并设 failure_count 为最大值。
+    /// 若当前选中的凭据被标记，自动切换到下一个可用凭据。
+    /// 最后持久化保存凭据到磁盘。
+    /// 返回本次实际被变更（此前不是 Suspended）的凭据 ID 列表。
+    pub fn batch_mark_suspended(&self, ids: &[u64]) -> anyhow::Result<Vec<u64>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut updated = Vec::new();
+        let mut switch_needed = false;
+        {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+            for &id in ids {
+                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                    if entry.disabled && entry.disabled_reason == Some(DisabledReason::Suspended) {
+                        continue;
+                    }
+                    entry.disabled = true;
+                    entry.disabled_reason = Some(DisabledReason::Suspended);
+                    entry.clear_self_heal_streak();
+                    entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+                    entry.last_used_at = Some(Utc::now().to_rfc3339());
+                    updated.push(id);
+                    if *current_id == id {
+                        switch_needed = true;
+                    }
+                }
+            }
+            if switch_needed {
+                let now = Instant::now();
+                if let Some(next) = entries
+                    .iter()
+                    .filter(|entry| {
+                        self.entry_available_for_request(entry, None, None, now)
+                    })
+                    .min_by_key(|e| (e.credentials.priority, e.id))
+                {
+                    *current_id = next.id;
+                    tracing::info!("封号排查：当前凭据已被封禁，已切换到凭据 #{}", next.id);
+                }
+            }
+        }
+        if !updated.is_empty() {
+            self.persist_credentials()?;
+            self.save_stats_debounced();
+        }
+        Ok(updated)
+    }
+
+    /// 是否启用封禁文案识别（provider 调用，决定是否走 report_suspended）。
     pub fn get_suspended_detection_enabled(&self) -> bool {
         self.suspended_detection_enabled.load(Ordering::Relaxed)
+    }
+
+    /// 获取自定义封禁关键词列表（Admin API 读取用）。
+    pub fn get_suspended_ban_keywords(&self) -> Vec<String> {
+        self.suspended_ban_keywords.read().clone()
+    }
+
+    /// 检查响应体是否命中任一自定义封禁关键词（大小写不敏感）。
+    pub fn matches_suspended_ban_keywords(&self, body: &str) -> bool {
+        let keywords = self.suspended_ban_keywords.read();
+        if keywords.is_empty() {
+            return false;
+        }
+        let lower = body.to_ascii_lowercase();
+        keywords
+            .iter()
+            .filter(|kw| !kw.is_empty())
+            .any(|kw| lower.contains(&kw.to_ascii_lowercase()))
     }
 
     /// 受控的凭据自愈。
@@ -4839,6 +4927,7 @@ impl MultiTokenManager {
     pub fn set_self_heal_config(
         &self,
         suspended_detection_enabled: Option<bool>,
+        suspended_ban_keywords: Option<Vec<String>>,
         self_heal_enabled: Option<bool>,
         self_heal_min_interval_secs: Option<u64>,
         self_heal_max_consecutive_rounds: Option<u32>,
@@ -4859,12 +4948,17 @@ impl MultiTokenManager {
         let _update_guard = self.runtime_config_update_lock.lock();
 
         let prev = self.get_self_heal_config();
+        let prev_keywords = self.get_suspended_ban_keywords();
         let new_suspend_detect = suspended_detection_enabled.unwrap_or(prev.0);
+        let new_keywords = suspended_ban_keywords
+            .map(normalize_ban_keywords)
+            .unwrap_or_else(|| prev_keywords.clone());
         let new_enabled = self_heal_enabled.unwrap_or(prev.1);
         let new_interval = self_heal_min_interval_secs.unwrap_or(prev.2);
         let new_max_rounds = self_heal_max_consecutive_rounds.unwrap_or(prev.3);
 
         if new_suspend_detect == prev.0
+            && new_keywords == prev_keywords
             && new_enabled == prev.1
             && new_interval == prev.2
             && new_max_rounds == prev.3
@@ -4874,6 +4968,7 @@ impl MultiTokenManager {
 
         self.suspended_detection_enabled
             .store(new_suspend_detect, Ordering::Relaxed);
+        *self.suspended_ban_keywords.write() = new_keywords.clone();
         self.self_heal_enabled.store(new_enabled, Ordering::Relaxed);
         self.self_heal_min_interval_secs
             .store(new_interval, Ordering::Relaxed);
@@ -4882,6 +4977,7 @@ impl MultiTokenManager {
 
         if let Err(err) = self.persist_self_heal_config(
             new_suspend_detect,
+            new_keywords.clone(),
             new_enabled,
             new_interval,
             new_max_rounds,
@@ -4889,6 +4985,7 @@ impl MultiTokenManager {
             // 回滚内存值
             self.suspended_detection_enabled
                 .store(prev.0, Ordering::Relaxed);
+            *self.suspended_ban_keywords.write() = prev_keywords;
             self.self_heal_enabled.store(prev.1, Ordering::Relaxed);
             self.self_heal_min_interval_secs
                 .store(prev.2, Ordering::Relaxed);
@@ -4898,8 +4995,9 @@ impl MultiTokenManager {
         }
 
         tracing::info!(
-            "自愈治理配置已更新: suspended_detection_enabled={}, self_heal_enabled={}, min_interval_secs={}, max_rounds={}",
+            "自愈治理配置已更新: suspended_detection_enabled={}, suspended_ban_keywords={:?}, self_heal_enabled={}, min_interval_secs={}, max_rounds={}",
             new_suspend_detect,
+            new_keywords,
             new_enabled,
             new_interval,
             new_max_rounds
@@ -4910,12 +5008,14 @@ impl MultiTokenManager {
     fn persist_self_heal_config(
         &self,
         suspended_detection_enabled: bool,
+        suspended_ban_keywords: Vec<String>,
         self_heal_enabled: bool,
         self_heal_min_interval_secs: u64,
         self_heal_max_consecutive_rounds: u32,
     ) -> anyhow::Result<()> {
         self.update_config_file(move |config| {
             config.suspended_detection_enabled = suspended_detection_enabled;
+            config.suspended_ban_keywords = suspended_ban_keywords;
             config.self_heal_enabled = self_heal_enabled;
             config.self_heal_min_interval_secs = self_heal_min_interval_secs;
             config.self_heal_max_consecutive_rounds = self_heal_max_consecutive_rounds;
@@ -6083,7 +6183,7 @@ mod tests {
         let enabled = std::thread::spawn(move || {
             enabled_barrier.wait();
             enabled_manager
-                .set_self_heal_config(None, Some(false), None, None)
+                .set_self_heal_config(None, None, Some(false), None, None)
                 .unwrap();
         });
         let interval_manager = Arc::clone(&manager);
@@ -6091,7 +6191,7 @@ mod tests {
         let interval = std::thread::spawn(move || {
             interval_barrier.wait();
             interval_manager
-                .set_self_heal_config(None, None, Some(123), None)
+                .set_self_heal_config(None, None, None, Some(123), None)
                 .unwrap();
         });
         barrier.wait();
@@ -8219,5 +8319,101 @@ mod tests {
 
         // 但 g2 仍可用
         assert!(manager.acquire_context(None, Some("g2")).await.is_ok());
+    }
+
+    #[test]
+    fn test_suspended_custom_ban_keywords() {
+        let mut config = Config::default();
+        config.suspended_ban_keywords =
+            vec!["custom locked".to_string(), "banned account".to_string()];
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(manager.matches_suspended_ban_keywords("Your CUSTOM LOCKED message"));
+        assert!(manager.matches_suspended_ban_keywords("prefix banned account suffix"));
+        assert!(!manager.matches_suspended_ban_keywords("unrelated error"));
+
+        // 动态更新关键词
+        manager
+            .set_self_heal_config(
+                None,
+                Some(vec!["new ban phrase".to_string()]),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(!manager.matches_suspended_ban_keywords("Your CUSTOM LOCKED message"));
+        assert!(manager.matches_suspended_ban_keywords("error: new ban phrase"));
+
+        // 空白关键词会被丢弃，不能让任意响应命中
+        manager
+            .set_self_heal_config(
+                None,
+                Some(vec!["".to_string(), "   ".to_string()]),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(manager.get_suspended_ban_keywords().is_empty());
+        assert!(!manager.matches_suspended_ban_keywords("unrelated error"));
+    }
+
+    #[test]
+    fn test_batch_mark_suspended() {
+        let cred1 = KiroCredentials {
+            id: Some(1),
+            disabled: false,
+            disabled_reason: None,
+            ..Default::default()
+        };
+
+        let cred2 = KiroCredentials {
+            id: Some(2),
+            disabled: true,
+            disabled_reason: Some("TooManyFailures".to_string()),
+            ..Default::default()
+        };
+
+        let cred3 = KiroCredentials {
+            id: Some(3),
+            disabled: true,
+            disabled_reason: Some("Suspended".to_string()),
+            ..Default::default()
+        };
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred1, cred2, cred3],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 批量将 1, 2, 3 标记为 Suspended
+        let updated = manager.batch_mark_suspended(&[1, 2, 3]).unwrap();
+        // 3 原本就是 Suspended，因此只有 1 和 2 会被新更新
+        assert_eq!(updated, vec![1, 2]);
+
+        let entries = manager.entries.lock();
+        let e1 = entries.iter().find(|e| e.id == 1).unwrap();
+        let e2 = entries.iter().find(|e| e.id == 2).unwrap();
+        let e3 = entries.iter().find(|e| e.id == 3).unwrap();
+
+        assert!(e1.disabled);
+        assert_eq!(e1.disabled_reason, Some(DisabledReason::Suspended));
+        assert!(e2.disabled);
+        assert_eq!(e2.disabled_reason, Some(DisabledReason::Suspended));
+        assert!(e3.disabled);
+        assert_eq!(e3.disabled_reason, Some(DisabledReason::Suspended));
     }
 }

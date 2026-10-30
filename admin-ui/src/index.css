@@ -38,6 +38,8 @@
     --rail-warn: 38 92% 50%;
     --rail-cool: 199 89% 48%;
     --rail-dead: 0 84% 60%;
+    --rail-disabled: 215 16% 50%;
+    --rail-banned: 350 89% 60%;
   }
 
   .dark,
@@ -65,6 +67,8 @@
     --rail-warn: 38 92% 55%;
     --rail-cool: 199 89% 55%;
     --rail-dead: 0 84% 60%;
+    --rail-disabled: 215 14% 56%;
+    --rail-banned: 350 89% 60%;
   }
 
   /* Full surface palettes, shared by the app and the picker previews. */
@@ -295,6 +299,12 @@
   .rail-dead {
     --rail: hsl(var(--rail-dead));
   }
+  .rail-disabled {
+    --rail: hsl(var(--rail-disabled));
+  }
+  .rail-banned {
+    --rail: hsl(var(--rail-banned));
+  }
 
   /* 吸底批量栏 */
   .console-bulkbar {
@@ -326,9 +336,48 @@
     }
   }
 
+  /* 侧边菜单跳转目标卡片高亮特效边框 */
+  .target-card-highlight {
+    animation: target-card-pulse 2.2s cubic-bezier(0.16, 1, 0.3, 1) forwards !important;
+  }
+
+  @keyframes target-card-pulse {
+    0% {
+      box-shadow:
+        0 0 0 0 hsl(var(--primary) / 0),
+        0 0 0 0 hsl(var(--primary) / 0),
+        0 0 0 transparent;
+    }
+    15% {
+      box-shadow:
+        0 0 0 2px hsl(var(--primary)),
+        0 0 0 6px hsl(var(--primary) / 0.35),
+        0 0 24px 2px hsl(var(--primary) / 0.4);
+    }
+    40% {
+      box-shadow:
+        0 0 0 2px hsl(var(--primary) / 0.85),
+        0 0 0 5px hsl(var(--primary) / 0.22),
+        0 0 18px 1px hsl(var(--primary) / 0.22);
+    }
+    70% {
+      box-shadow:
+        0 0 0 1.5px hsl(var(--primary) / 0.4),
+        0 0 0 3px hsl(var(--primary) / 0.1),
+        0 0 12px 0 hsl(var(--primary) / 0.1);
+    }
+    100% {
+      box-shadow:
+        0 0 0 0 transparent,
+        0 0 0 0 transparent,
+        0 0 0 transparent;
+    }
+  }
+
   @media (prefers-reduced-motion: reduce) {
     .console-bulkbar,
-    .console-drawer {
+    .console-drawer,
+    .target-card-highlight {
       animation: none;
     }
   }
