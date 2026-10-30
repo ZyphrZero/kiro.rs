@@ -333,15 +333,15 @@ function getDisabledReasonStyle(reason?: string | null): {
     case "QuotaExceeded":
       return { label: "已超额", variant: "warning" };
     case "TooManyFailures":
-      return { label: "失败过多", variant: "destructive" };
+      return { label: "失败过多", variant: "secondary" };
     case "Suspended":
       return { label: "账号封禁", variant: "destructive" };
     case "TooManyRefreshFailures":
-      return { label: "刷新失败过多", variant: "destructive" };
+      return { label: "刷新失败过多", variant: "secondary" };
     case "InvalidRefreshToken":
-      return { label: "Token 失效", variant: "destructive" };
+      return { label: "Token 失效", variant: "secondary" };
     case "InvalidConfig":
-      return { label: "配置无效", variant: "destructive" };
+      return { label: "配置无效", variant: "secondary" };
     case "Manual":
       return { label: "手动禁用", variant: "secondary" };
     default:
@@ -641,7 +641,9 @@ function CredentialCardImpl({
     isThrottled
       ? "ring-1 ring-orange-500/60 bg-orange-50/40 dark:bg-orange-500/[0.04]"
       : "",
-    credential.disabled && !disabledByQuota ? "opacity-75" : "",
+    credential.disabled && credential.disabledReason === "Suspended"
+      ? "hover:border-rose-500/40"
+      : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -650,12 +652,21 @@ function CredentialCardImpl({
   const statusBadges = (
     <>
       {credential.disabled && reasonStyle && (
-        <Badge variant={reasonStyle.variant} className="text-[11px]">
-          已禁用 · {reasonStyle.label}
+        <Badge
+          variant={reasonStyle.variant}
+          className={cn(
+            "text-[11px]",
+            credential.disabledReason === "Suspended" &&
+              "border-rose-500/40 bg-rose-500/15 text-rose-700 dark:text-rose-400 font-semibold shadow-xs"
+          )}
+        >
+          {credential.disabledReason === "Suspended"
+            ? "已封禁 · 账号锁定"
+            : `已禁用 · ${reasonStyle.label}`}
         </Badge>
       )}
       {credential.disabled && !reasonStyle && (
-        <Badge variant="destructive" className="text-[11px]">已禁用</Badge>
+        <Badge variant="secondary" className="text-[11px]">已禁用</Badge>
       )}
       {!credential.disabled && isQuotaExceeded && (
         <Badge variant="warning" className="text-[11px]">已超额</Badge>

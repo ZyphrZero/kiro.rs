@@ -337,6 +337,27 @@ export async function disableQuotaExceeded(): Promise<QuotaExceededResult> {
   return data
 }
 
+// 历史日志封号排查
+export interface AuditSuspendedRequest {
+  onlyDisabled?: boolean
+  credentialIds?: number[]
+}
+
+export interface AuditSuspendedResult {
+  scannedCount: number
+  bannedCount: number
+  updatedCount: number
+  updatedIds: number[]
+  bannedIds?: number[]
+}
+
+export async function auditSuspendedCredentials(
+  req?: AuditSuspendedRequest
+): Promise<AuditSuspendedResult> {
+  const { data } = await api.post<AuditSuspendedResult>('/credentials/audit-suspended', req || {})
+  return data
+}
+
 // 设置单个凭据的超额开关
 export async function setCredentialOverage(id: number, enabled: boolean): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/overage`, { enabled })
@@ -538,6 +559,7 @@ export async function setQuotaResetRecoveryConfig(
 // 可写；consecutiveRounds 为凭据最大连续轮数，totalCount 为累计恢复凭据次数。
 export interface SelfHealConfig {
   suspendedDetectionEnabled: boolean
+  suspendedBanKeywords: string[]
   enabled: boolean
   minIntervalSecs: number
   maxConsecutiveRounds: number
@@ -549,7 +571,11 @@ export interface SelfHealConfig {
 export type SelfHealConfigPatch = Partial<
   Pick<
     SelfHealConfig,
-    'suspendedDetectionEnabled' | 'enabled' | 'minIntervalSecs' | 'maxConsecutiveRounds'
+    | 'suspendedDetectionEnabled'
+    | 'suspendedBanKeywords'
+    | 'enabled'
+    | 'minIntervalSecs'
+    | 'maxConsecutiveRounds'
   >
 >
 
