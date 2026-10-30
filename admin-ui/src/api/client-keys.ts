@@ -2,6 +2,7 @@ import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
   ClientKeysResponse,
+  ClientKeyQueryParams,
   CreateClientKeyRequest,
   CreateClientKeyResponse,
   UpdateClientKeyRequest,
@@ -20,8 +21,12 @@ api.interceptors.request.use((config) => {
   return config
 })
 
-export async function listClientKeys(): Promise<ClientKeysResponse> {
-  const { data } = await api.get<ClientKeysResponse>('/client-keys')
+export async function listClientKeys(
+  params?: ClientKeyQueryParams,
+): Promise<ClientKeysResponse> {
+  const { data } = await api.get<ClientKeysResponse>('/client-keys', {
+    params,
+  })
   return data
 }
 

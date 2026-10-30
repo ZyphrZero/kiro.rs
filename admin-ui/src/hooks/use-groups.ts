@@ -5,12 +5,16 @@ import {
   deleteGroup,
   updateGroup,
 } from '@/api/groups'
-import type { CreateGroupRequest, UpdateGroupRequest } from '@/types/api'
+import type {
+  CreateGroupRequest,
+  UpdateGroupRequest,
+  GroupQueryParams,
+} from '@/types/api'
 
-export function useGroups() {
+export function useGroups(params?: GroupQueryParams) {
   return useQuery({
-    queryKey: ['groups'],
-    queryFn: listGroups,
+    queryKey: ['groups', params],
+    queryFn: () => listGroups(params),
     // 分组变更频率低（人工操作），15s 自动刷新足够
     refetchInterval: 15000,
     staleTime: 5000,

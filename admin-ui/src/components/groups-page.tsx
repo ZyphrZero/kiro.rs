@@ -1,11 +1,15 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useState, useEffect, useDeferredValue } from 'react'
 import { toast } from 'sonner'
 import {
   Plus, FolderTree, Trash2, Pencil, Users, KeyRound, RefreshCw, Loader2,
+  Search, X, ChevronLeft, ChevronRight,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from '@/components/ui/select'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription,
 } from '@/components/ui/dialog'
@@ -14,7 +18,7 @@ import {
 } from '@/hooks/use-groups'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 import { extractErrorMessage } from '@/lib/utils'
-import type { GroupItem } from '@/types/api'
+import type { GroupItem, GroupQueryParams } from '@/types/api'
 import { ConsoleTable, type ConsoleColumn } from '@/components/console/data-table'
 import { BulkBar } from '@/components/console/bulk-bar'
 import { PageHeader } from '@/components/console/page-header'
@@ -29,7 +33,22 @@ import { PageHeader } from '@/components/console/page-header'
  * - 单项删除与批量删除均做引用前置检查
  */
 export function GroupsPage() {
-  const { data, isLoading, isFetching, refetch } = useGroups()
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState<number>(10)
+  const [searchQuery, setSearchQuery] = useState('')
+  const deferredSearch = useDeferredValue(searchQuery)
+
+  useEffect(() => {
+    setPage(1)
+  }, [deferredSearch])
+
+  const groupQueryParams = useMemo<GroupQueryParams>(() => ({
+    page,
+    pageSize: pageSize === 0 ? 0 : pageSize,
+    search: deferredSearch.trim() || undefined,
+  }), [page, pageSize, deferredSearch])
+
+  const { data, isLoading, isFetching, refetch } = useGroups(groupQueryParams)
   const createGroup = useCreateGroup()
   const updateGroup = useUpdateGroup()
   const deleteGroup = useDeleteGroup()
@@ -47,7 +66,33 @@ export function GroupsPage() {
   const [batchDeleting, setBatchDeleting] = useState(false)
   const [deleteProgress, setDeleteProgress] = useState<{ current: number; total: number } | null>(null)
 
-  const groups = useMemo(() => data?.groups ?? [], [data?.groups])
+  const isServerPaginated = data?.filteredTotal !== undefined
+
+  const clientFilteredGroups = useMemo(() => {
+    if (isServerPaginated) return data?.groups ?? []
+    let list = data?.groups ?? []
+    const q = deferredSearch.trim().toLowerCase()
+    if (q) {
+      list = list.filter((g) =>
+        g.name.toLowerCase().includes(q) ||
+        (g.description?.toLowerCase().includes(q) ?? false)
+      )
+    }
+    return list
+  }, [isServerPaginated, data?.groups, deferredSearch])
+
+  const totalFilteredCount = isServerPaginated
+    ? (data?.filteredTotal ?? data?.groups?.length ?? 0)
+    : clientFilteredGroups.length
+
+  const effectivePageSize = pageSize === 0 ? Math.max(totalFilteredCount, 1) : pageSize
+  const totalPages = Math.max(1, Math.ceil(totalFilteredCount / effectivePageSize))
+
+  const groups = useMemo(() => {
+    if (isServerPaginated) return data?.groups ?? []
+    const start = (page - 1) * effectivePageSize
+    return clientFilteredGroups.slice(start, start + effectivePageSize)
+  }, [isServerPaginated, data?.groups, clientFilteredGroups, page, effectivePageSize])
 
   const openCreate = () => {
     setCreateName('')
@@ -314,17 +359,100 @@ export function GroupsPage() {
         }
       />
 
-      <ConsoleTable
-        rows={groups}
-        columns={columns}
-        rowKey={(g) => g.name}
-        selectable
-        selected={selectedNames}
-        onSelectedChange={setSelectedNames}
-        rowActions={rowActions}
-        loading={isLoading}
-        empty="暂无分组。点击右上角「新建分组」开始。"
-      />
+      <div className="space-y-3">
+        {/* 搜索工具栏 */}
+        <div className="flex items-center justify-between gap-2.5 rounded-lg border bg-card/50 p-2.5">
+          <div className="relative flex-1 max-w-sm">
+            <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="搜索分组名称 / 备注..."
+              className="h-8 pl-8 pr-8 text-xs"
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => setSearchQuery('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+        </div>
+
+        <ConsoleTable
+          rows={groups}
+          columns={columns}
+          rowKey={(g) => g.name}
+          selectable
+          selected={selectedNames}
+          onSelectedChange={setSelectedNames}
+          rowActions={rowActions}
+          loading={isLoading}
+          empty={
+            deferredSearch
+              ? '当前筛选条件下没有分组。'
+              : '暂无分组。点击右上角「新建分组」开始。'
+          }
+        />
+
+        {/* 分页控制栏 */}
+        {totalFilteredCount > 0 && (
+          <div className="flex flex-col items-center justify-between gap-3 pt-2 sm:flex-row">
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <span>每页</span>
+              <Select
+                value={String(pageSize)}
+                onValueChange={(v) => {
+                  setPageSize(Number(v))
+                  setPage(1)
+                }}
+              >
+                <SelectTrigger className="h-7 w-[75px] text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="10">10</SelectItem>
+                  <SelectItem value="20">20</SelectItem>
+                  <SelectItem value="50">50</SelectItem>
+                  <SelectItem value="0">全部</SelectItem>
+                </SelectContent>
+              </Select>
+              <span>条 · 共 {totalFilteredCount} 个分组</span>
+            </div>
+
+            {totalPages > 1 && (
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  disabled={page <= 1}
+                >
+                  <ChevronLeft className="h-3.5 w-3.5 mr-1" />
+                  上一页
+                </Button>
+                <span className="text-xs text-muted-foreground tabular-nums">
+                  第 {page} / {totalPages} 页
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                  disabled={page >= totalPages}
+                >
+                  下一页
+                  <ChevronRight className="h-3.5 w-3.5 ml-1" />
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* 吸底批量操作栏 */}
       <BulkBar

@@ -9,12 +9,16 @@ import {
   rotateClientKey,
   setClientKeyMaxCredits,
 } from '@/api/client-keys'
-import type { CreateClientKeyRequest, UpdateClientKeyRequest } from '@/types/api'
+import type {
+  CreateClientKeyRequest,
+  UpdateClientKeyRequest,
+  ClientKeyQueryParams,
+} from '@/types/api'
 
-export function useClientKeys() {
+export function useClientKeys(params?: ClientKeyQueryParams) {
   return useQuery({
-    queryKey: ['client-keys'],
-    queryFn: listClientKeys,
+    queryKey: ['client-keys', params],
+    queryFn: () => listClientKeys(params),
     refetchInterval: 30000,
   })
 }

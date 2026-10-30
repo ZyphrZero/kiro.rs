@@ -2,6 +2,7 @@ import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
   CredentialsStatusResponse,
+  CredentialQueryParams,
   BalanceResponse,
   AvailableModelsResponse,
   ModelTestResponse,
@@ -58,9 +59,13 @@ api.interceptors.request.use((config) => {
   return config
 })
 
-// 获取所有凭据状态
-export async function getCredentials(): Promise<CredentialsStatusResponse> {
-  const { data } = await api.get<CredentialsStatusResponse>('/credentials')
+// 获取凭据状态列表（支持分页、搜索、过滤、排序）
+export async function getCredentials(
+  params?: CredentialQueryParams,
+): Promise<CredentialsStatusResponse> {
+  const { data } = await api.get<CredentialsStatusResponse>('/credentials', {
+    params,
+  })
   return data
 }
 
