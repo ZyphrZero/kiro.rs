@@ -1361,6 +1361,19 @@ fn normalize_self_heal_model(model: Option<&str>) -> Option<String> {
         .map(|value| value.to_ascii_lowercase())
 }
 
+/// 规范化自定义封禁关键词：去首尾空白、丢弃空串、去重。
+/// 空串会让 `contains` 恒为真，把每个失败请求都判成封号。
+fn normalize_ban_keywords(keywords: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(keywords.len());
+    for kw in keywords {
+        let kw = kw.trim();
+        if !kw.is_empty() && !out.iter().any(|k| k.eq_ignore_ascii_case(kw)) {
+            out.push(kw.to_string());
+        }
+    }
+    out
+}
+
 impl MultiTokenManager {
     /// 创建多凭据 Token 管理器
     ///
@@ -1501,7 +1514,7 @@ impl MultiTokenManager {
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
         let rpm_limit = config.account_rpm_limit;
         let suspended_detection_enabled = config.suspended_detection_enabled;
-        let suspended_ban_keywords = config.suspended_ban_keywords.clone();
+        let suspended_ban_keywords = normalize_ban_keywords(config.suspended_ban_keywords.clone());
         let self_heal_enabled = config.self_heal_enabled;
         let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
         let self_heal_max_consecutive_rounds = config.self_heal_max_consecutive_rounds;
@@ -2985,6 +2998,7 @@ impl MultiTokenManager {
         let lower = body.to_ascii_lowercase();
         keywords
             .iter()
+            .filter(|kw| !kw.is_empty())
             .any(|kw| lower.contains(&kw.to_ascii_lowercase()))
     }
 
@@ -4936,7 +4950,9 @@ impl MultiTokenManager {
         let prev = self.get_self_heal_config();
         let prev_keywords = self.get_suspended_ban_keywords();
         let new_suspend_detect = suspended_detection_enabled.unwrap_or(prev.0);
-        let new_keywords = suspended_ban_keywords.unwrap_or_else(|| prev_keywords.clone());
+        let new_keywords = suspended_ban_keywords
+            .map(normalize_ban_keywords)
+            .unwrap_or_else(|| prev_keywords.clone());
         let new_enabled = self_heal_enabled.unwrap_or(prev.1);
         let new_interval = self_heal_min_interval_secs.unwrap_or(prev.2);
         let new_max_rounds = self_heal_max_consecutive_rounds.unwrap_or(prev.3);
@@ -8336,6 +8352,19 @@ mod tests {
 
         assert!(!manager.matches_suspended_ban_keywords("Your CUSTOM LOCKED message"));
         assert!(manager.matches_suspended_ban_keywords("error: new ban phrase"));
+
+        // 空白关键词会被丢弃，不能让任意响应命中
+        manager
+            .set_self_heal_config(
+                None,
+                Some(vec!["".to_string(), "   ".to_string()]),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(manager.get_suspended_ban_keywords().is_empty());
+        assert!(!manager.matches_suspended_ban_keywords("unrelated error"));
     }
 
     #[test]
