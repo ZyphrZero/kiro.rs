@@ -690,6 +690,23 @@ export interface CustomModelItem {
   ownedBy?: string
 }
 
+// ============ 自定义响应头 ============
+
+/** 单条自定义响应头规则（与 config.json customHeaders 数组一一对应） */
+export interface CustomHeaderItem {
+  key: string
+  value: string
+  enabled: boolean
+}
+
+export interface CustomHeadersConfigResponse {
+  headers: CustomHeaderItem[]
+}
+
+export interface SetCustomHeadersRequest {
+  headers: CustomHeaderItem[]
+}
+
 // ============ 账号分组（独立实体）============
 
 export interface GroupItem {

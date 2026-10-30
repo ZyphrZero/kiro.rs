@@ -317,7 +317,7 @@ async fn run_attempt(
         None => super::super::cache_metering::CacheUsage::default(),
     };
     let tracer = new_non_stream_request_tracer(&state, key_ctx.clone(), model.to_string());
-    let anthropic = execute_non_stream_request(
+    let (anthropic, _credential_id) = execute_non_stream_request(
         provider,
         &request_body,
         model,

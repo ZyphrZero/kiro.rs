@@ -1361,20 +1361,27 @@ pub(super) async fn run_web_search_loop(
     tool_compatibility_mode: ToolCompatibilityMode,
     cache_meter: Option<SharedCacheMeter>,
     key_id: u64,
+    custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
 ) -> Response {
     if !stream_client {
-        return run_web_search_loop_inner(
+        let mut resp = run_web_search_loop_inner(
             provider,
             payload,
             hook,
-            tracer,
-            group,
+            tracer.clone(),
+            group.clone(),
             tool_compatibility_mode,
             cache_meter,
             key_id,
             None,
         )
         .await;
+        super::handlers::attach_custom_headers(
+            &mut resp,
+            custom_headers.as_ref(),
+            &tracer.header_context(None, group.as_deref()),
+        );
+        return resp;
     }
 
     let initial_input_tokens = token::count_all_tokens(
@@ -1385,6 +1392,8 @@ pub(super) async fn run_web_search_loop(
     ) as i32;
     let initial_event = initial_stream_event(&payload.model, initial_input_tokens);
     let (sender, receiver) = mpsc::channel(WEB_SEARCH_PROGRESS_CAPACITY);
+    let tracer_inner = tracer.clone();
+    let group_inner = group.clone();
     tokio::spawn(async move {
         let receiver_guard = sender.clone();
         let mut emitter = WebSearchSseEmitter::new(sender);
@@ -1398,8 +1407,8 @@ pub(super) async fn run_web_search_loop(
                 provider,
                 payload,
                 hook,
-                tracer,
-                group,
+                tracer_inner,
+                group_inner,
                 tool_compatibility_mode,
                 cache_meter,
                 key_id,
@@ -1433,7 +1442,13 @@ pub(super) async fn run_web_search_loop(
         }
     });
 
-    render_channel_sse(initial_event, receiver)
+    let mut resp = render_channel_sse(initial_event, receiver);
+    super::handlers::attach_custom_headers(
+        &mut resp,
+        custom_headers.as_ref(),
+        &tracer.header_context(None, group.as_deref()),
+    );
+    resp
 }
 
 async fn run_web_search_loop_inner(

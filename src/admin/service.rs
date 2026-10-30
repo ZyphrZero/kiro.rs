@@ -42,15 +42,17 @@ use super::types::{
     AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
     CacheMeteringConfigResponse, CacheMeteringStatsResponse, CheckRateLimitRequest,
     CredentialMetadataDetail, CredentialMetadataSchemaConfig, CredentialStatusItem,
-    CredentialsExportResponse, CredentialsStatusResponse, CustomModelItem,
-    CustomModelsConfigResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
+    CredentialsExportResponse, CredentialsStatusResponse, CustomHeadersConfigResponse,
+    CustomModelItem, CustomModelsConfigResponse, EnableOverageAllResult, ExportedAccount,
+    ExportedCredentials,
     GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
     LogGovernanceConfigResponse, ModelApiRetryConfigResponse, ModelSelectionMode, ModelTestRequest,
     ModelTestResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
     ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, QuotaResetRecoveryConfigResponse,
     SelfHealConfigResponse, SessionAffinityConfigResponse, SetAccountRpmLimitConfigRequest,
-    SetAccountThrottleConfigRequest, SetCacheMeteringConfigRequest, SetCustomModelsRequest,
-    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelApiRetryConfigRequest,
+    SetAccountThrottleConfigRequest, SetCacheMeteringConfigRequest, SetCustomHeadersRequest,
+    SetCustomModelsRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+    SetModelApiRetryConfigRequest,
     SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest, SetSessionAffinityConfigRequest,
     SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
     StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
@@ -323,6 +325,8 @@ pub struct AdminService {
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
     /// prompt cache 本地计量模拟句柄（开关运行时可改）
     cache_meter: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
+    /// 自定义响应头管理器（热重载）
+    custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
 }
 
 /// Social 登录会话状态
@@ -676,6 +680,7 @@ impl AdminService {
             trace_store: None,
             usage_recorder: None,
             cache_meter: None,
+            custom_headers: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -723,6 +728,15 @@ impl AdminService {
         cache_meter: crate::anthropic::cache_metering::SharedCacheMeter,
     ) -> Self {
         self.cache_meter = Some(cache_meter);
+        self
+    }
+
+    /// 注入自定义响应头管理器
+    pub fn with_custom_headers(
+        mut self,
+        custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
+    ) -> Self {
+        self.custom_headers = custom_headers;
         self
     }
 
@@ -1899,6 +1913,97 @@ impl AdminService {
         self.token_manager.invalidate_all_model_caches();
 
         Ok(self.get_custom_models())
+    }
+
+    /// 获取当前配置的自定义响应头列表
+    pub fn get_custom_headers(&self) -> CustomHeadersConfigResponse {
+        let headers = if let Some(mgr) = &self.custom_headers {
+            mgr.get_rules().into_iter().map(Into::into).collect()
+        } else {
+            crate::model::custom_headers::default_custom_headers()
+                .into_iter()
+                .map(Into::into)
+                .collect()
+        };
+        CustomHeadersConfigResponse { headers }
+    }
+
+    /// 批量替换自定义响应头配置（校验 → 持久化 config.json → 热更新内存规则）
+    pub fn set_custom_headers(
+        &self,
+        req: SetCustomHeadersRequest,
+    ) -> Result<CustomHeadersConfigResponse, AdminServiceError> {
+        if req.headers.len() > 50 {
+            return Err(AdminServiceError::InvalidCredential(
+                "自定义响应头最多支持配置 50 条".to_string(),
+            ));
+        }
+
+        let mut seen_keys = HashSet::new();
+        for (i, h) in req.headers.iter().enumerate() {
+            let key = h.key.trim();
+            if key.is_empty() || key.len() > 128 {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "第 {} 条响应头的 Header Name 必须为 1-128 个字符",
+                    i + 1
+                )));
+            }
+
+            // 严格校验是否符合标准 HTTP Header 名称规范
+            if axum::http::header::HeaderName::from_bytes(key.as_bytes()).is_err() {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "第 {} 条响应头的 Header Name（{}）不符合标准 HTTP 规范",
+                    i + 1,
+                    key
+                )));
+            }
+
+            // 校验 Value 不含换行符，防止 HTTP Header 注入
+            if h.value.contains('\r') || h.value.contains('\n') {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "第 {} 条响应头的 Header Value 不能包含回车或换行符",
+                    i + 1
+                )));
+            }
+
+            if h.value.len() > 1024 {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "第 {} 条响应头的 Header Value 长度不能超过 1024 个字符",
+                    i + 1
+                )));
+            }
+
+            let lower_key = key.to_ascii_lowercase();
+            if !seen_keys.insert(lower_key) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "自定义响应头 Header Name 不能重复（不区分大小写）: {}",
+                    key
+                )));
+            }
+        }
+
+        let rules: Vec<crate::model::custom_headers::CustomHeaderRule> = req
+            .headers
+            .into_iter()
+            .map(|item| crate::model::custom_headers::CustomHeaderRule {
+                key: item.key.trim().to_string(),
+                value: item.value.trim().to_string(),
+                enabled: item.enabled,
+            })
+            .collect();
+
+        let rules_for_config = rules.clone();
+        self.token_manager
+            .update_config_file(move |c| {
+                c.custom_headers = rules_for_config;
+            })
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+
+        if let Some(mgr) = &self.custom_headers {
+            mgr.set_rules(rules);
+        }
+
+        Ok(self.get_custom_headers())
     }
 
     /// 持久化新的登录API密钥（adminApiKey）到配置文件（内存中的 key 由 handler 层负责更新）
@@ -4292,5 +4397,89 @@ mod cache_metering_config_tests {
         ] {
             assert_eq!(after[key], before[key], "{key} 是只读字段，PUT 不得改动");
         }
+    }
+
+    #[tokio::test]
+    async fn test_admin_service_custom_headers() {
+        use crate::admin::types::CustomHeaderItem;
+
+        let custom_headers = crate::model::custom_headers::CustomHeadersManager::new(
+            crate::model::custom_headers::default_custom_headers(),
+        );
+        let service =
+            service_with(Config::default()).with_custom_headers(Some(custom_headers.clone()));
+
+        // 默认配置
+        let res = service.get_custom_headers();
+        assert_eq!(res.headers.len(), 2);
+        assert_eq!(res.headers[0].key, "X-Oneapi-Request-Id");
+        assert_eq!(res.headers[0].value, "{trace_id}");
+
+        // 校验非法 key
+        let invalid_key_req = SetCustomHeadersRequest {
+            headers: vec![CustomHeaderItem {
+                key: "Invalid Header Name With Space".to_string(),
+                value: "val".to_string(),
+                enabled: true,
+            }],
+        };
+        assert!(service.set_custom_headers(invalid_key_req).is_err());
+
+        // 校验 CRLF 注入
+        let crlf_req = SetCustomHeadersRequest {
+            headers: vec![CustomHeaderItem {
+                key: "X-Trace-Id".to_string(),
+                value: "abc\r\nInjected-Header: bad".to_string(),
+                enabled: true,
+            }],
+        };
+        assert!(service.set_custom_headers(crlf_req).is_err());
+
+        // 校验重复 Header Name
+        let dup_req = SetCustomHeadersRequest {
+            headers: vec![
+                CustomHeaderItem {
+                    key: "x-custom-key".to_string(),
+                    value: "1".to_string(),
+                    enabled: true,
+                },
+                CustomHeaderItem {
+                    key: "X-CUSTOM-KEY".to_string(),
+                    value: "2".to_string(),
+                    enabled: true,
+                },
+            ],
+        };
+        assert!(service.set_custom_headers(dup_req).is_err());
+
+        // 合法配置与热更新
+        let valid_req = SetCustomHeadersRequest {
+            headers: vec![
+                CustomHeaderItem {
+                    key: "X-Oneapi-Request-Id".to_string(),
+                    value: "{trace_id}".to_string(),
+                    enabled: true,
+                },
+                CustomHeaderItem {
+                    key: "X-Upstream-Model".to_string(),
+                    value: "{model}".to_string(),
+                    enabled: true,
+                },
+                CustomHeaderItem {
+                    key: "X-Custom-Group".to_string(),
+                    value: "{group}".to_string(),
+                    enabled: false,
+                },
+            ],
+        };
+        let updated = service.set_custom_headers(valid_req).unwrap();
+        assert_eq!(updated.headers.len(), 3);
+        assert_eq!(updated.headers[1].key, "X-Upstream-Model");
+        assert_eq!(updated.headers[1].value, "{model}");
+        assert!(!updated.headers[2].enabled);
+
+        // 验证内存规则也同步热更新
+        let active_names = custom_headers.get_active_header_names();
+        assert_eq!(active_names.len(), 2);
     }
 }

@@ -38,6 +38,8 @@ import {
   setGlobalProxy,
   getCustomModels,
   setCustomModels,
+  getCustomHeaders,
+  setCustomHeaders,
   getUpdateConfig,
   setUpdateConfig,
   resetSuccessCount,
@@ -48,6 +50,7 @@ import {
 import type {
   AddCredentialRequest,
   CustomModelItem,
+  SetCustomHeadersRequest,
   SetGlobalProxyRequest,
   SetUpdateConfigRequest,
   UpdateCredentialRequest,
@@ -472,6 +475,24 @@ export function useSetCustomModels() {
       setCustomModels(req),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['custom-models'] })
+    },
+  })
+}
+
+// 自定义响应头配置
+export function useCustomHeaders() {
+  return useQuery({
+    queryKey: ['custom-headers'],
+    queryFn: getCustomHeaders,
+  })
+}
+
+export function useSetCustomHeaders() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: SetCustomHeadersRequest) => setCustomHeaders(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['custom-headers'] })
     },
   })
 }
