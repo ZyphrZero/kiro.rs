@@ -941,6 +941,11 @@ pub async fn post_messages(
 
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
     // credentials; additional_model_request_fields is already filtered by converter model support.
+    // H2：发给上游的工具 schema，用于 `<invoke>` 文本合成校验（conversation_state 随后被移走）。
+    let invoke_tool_schemas = super::stream::invoke_tool_schemas_from_state(
+        &conversion_result.conversation_state,
+        &conversion_result.known_tool_names,
+    );
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
@@ -1007,9 +1012,11 @@ pub async fn post_messages(
             &request_body,
             &payload.model,
             total_input_tokens,
-            thinking_enabled,
+            // L7：流式与非流式一致，遵守 extractThinking 配置。
+            (state.extract_thinking || payload.output_config.is_some()) && thinking_enabled,
             tool_name_map,
             known_tool_names,
+            invoke_tool_schemas,
             hook,
             cache_usage,
             tracer,
@@ -1038,6 +1045,7 @@ pub async fn post_messages(
             extract_thinking,
             tool_name_map,
             known_tool_names,
+            invoke_tool_schemas,
             hook,
             cache_usage,
             tracer,
@@ -1056,6 +1064,7 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
+    invoke_tool_schemas: super::stream::InvokeToolSchemas,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
@@ -1092,6 +1101,7 @@ async fn handle_stream_request(
         tool_name_map,
         known_tool_names,
     );
+    ctx.set_invoke_tool_schemas(invoke_tool_schemas);
     ctx.cache_usage = cache_usage;
 
     // 生成初始事件
@@ -1158,7 +1168,7 @@ fn create_sse_stream(
                             sent_bytes += chunk.len() as u64;
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
-                                let bytes = settlement.interrupt(&mut ctx, Vec::new(), &e.to_string(), sent_bytes);
+                                let bytes = settlement.interrupt(&mut ctx, Vec::new(), &StreamFailure::interrupted("malformed event frame from upstream"), &e.to_string(), sent_bytes);
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
                             }
 
@@ -1168,8 +1178,8 @@ fn create_sse_stream(
                                     Ok(frame) => {
                                         match Event::from_frame(frame) {
                                             Ok(event) => {
-                                                if let Some(error) = upstream_event_error(&event) {
-                                                    let bytes = settlement.interrupt(&mut ctx, events, &error, sent_bytes);
+                                                if let Some((error, failure)) = upstream_event_error(&event) {
+                                                    let bytes = settlement.interrupt(&mut ctx, events, &failure, &error, sent_bytes);
                                                     return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
                                                 }
                                                 let generated = ctx.process_kiro_event(&event);
@@ -1177,13 +1187,13 @@ fn create_sse_stream(
                                                 events.extend(generated);
                                             }
                                             Err(error) => {
-                                                let bytes = settlement.interrupt(&mut ctx, events, &error.to_string(), sent_bytes);
+                                                let bytes = settlement.interrupt(&mut ctx, events, &StreamFailure::interrupted("malformed event frame from upstream"), &error.to_string(), sent_bytes);
                                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        let bytes = settlement.interrupt(&mut ctx, events, &e.to_string(), sent_bytes);
+                                        let bytes = settlement.interrupt(&mut ctx, events, &StreamFailure::interrupted("malformed event frame from upstream"), &e.to_string(), sent_bytes);
                                         return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
                                     }
                                 }
@@ -1199,16 +1209,17 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes)))
                         }
                         Some(Err(e)) => {
-                            let bytes = settlement.interrupt(&mut ctx, Vec::new(), &format!("{:#}", anyhow::Error::new(e)), sent_bytes);
+                            let failure = body_read_failure(&e);
+                            let bytes = settlement.interrupt(&mut ctx, Vec::new(), &failure, &format!("{:#}", anyhow::Error::new(e)), sent_bytes);
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)))
                         }
                         None => {
                             if sent_bytes == 0 {
-                                let bytes = settlement.interrupt(&mut ctx, Vec::new(), "Upstream returned an empty event stream", sent_bytes);
+                                let bytes = settlement.interrupt(&mut ctx, Vec::new(), &StreamFailure::interrupted("upstream returned an empty event stream"), "Upstream returned an empty event stream", sent_bytes);
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
                             }
                             if decoder.has_pending_data() {
-                                let bytes = settlement.interrupt(&mut ctx, Vec::new(), "Upstream ended with an incomplete event frame", sent_bytes);
+                                let bytes = settlement.interrupt(&mut ctx, Vec::new(), &StreamFailure::interrupted("upstream ended with an incomplete event frame"), "Upstream ended with an incomplete event frame", sent_bytes);
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
                             }
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
@@ -1271,13 +1282,13 @@ impl StreamSettlement {
         &mut self,
         ctx: &mut StreamContext,
         mut events: Vec<SseEvent>,
+        failure: &StreamFailure,
         error: &str,
         bytes: u64,
     ) -> Vec<Result<Bytes, Infallible>> {
-        tracing::error!(error, "Upstream response stream was interrupted");
-        events.extend(
-            ctx.generate_error_events("api_error", "Upstream response stream was interrupted"),
-        );
+        tracing::error!(error, error_type = failure.error_type, "Upstream response stream was interrupted");
+        // M3：把上游原因归类后告诉客户端（限流 / 过载 / 输入过长 / 权限 / 可重试中断）。
+        events.extend(ctx.generate_error_events(failure.error_type, &failure.message));
         self.update(ctx, bytes);
         self.finish(
             "error",
@@ -1413,11 +1424,14 @@ async fn handle_non_stream_request(
     // 非流式路径直接处理结构化 Event::ToolUse，不经过 <invoke> 文本嗅探，
     // 因此这里不需要工具表校验；保留参数以对齐调用方签名。
     _known_tool_names: std::collections::HashSet<String>,
+    invoke_tool_schemas: super::stream::InvokeToolSchemas,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
+    // L11：与流式同一套 `<invoke>` 文本识别规则（H2）。
+    let reclaim_name_map = tool_name_map.clone();
     match execute_non_stream_request(
         provider,
         request_body,
@@ -1432,24 +1446,146 @@ async fn handle_non_stream_request(
     )
     .await
     {
-        Ok(response_body) => (StatusCode::OK, Json(response_body)).into_response(),
+        Ok(mut response_body) => {
+            reclaim_trailing_invoke_text(&mut response_body, &invoke_tool_schemas, &reclaim_name_map);
+            (StatusCode::OK, Json(response_body)).into_response()
+        }
         Err(NonStreamExecutionError::Provider(error)) => map_provider_error(error),
         Err(NonStreamExecutionError::Response(response)) => response,
     }
 }
 
-fn upstream_event_error(event: &Event) -> Option<String> {
+/// 非流式响应：本轮没有原生 tool_use 时，把末尾文本块里合格的 `<invoke>` 合成为 tool_use（H2 / L11）。
+/// 规则与流式完全相同（见 `stream::InvokeSniffer`）；拒答等非正常终止不处理。
+fn reclaim_trailing_invoke_text(
+    response_body: &mut serde_json::Value,
+    schemas: &super::stream::InvokeToolSchemas,
+    tool_name_map: &std::collections::HashMap<String, String>,
+) {
+    if schemas.is_empty() {
+        return;
+    }
+    let stop_reason = response_body.get("stop_reason").and_then(|v| v.as_str());
+    if stop_reason != Some("end_turn") {
+        return;
+    }
+    let Some(content) = response_body.get_mut("content").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    if content.iter().any(|b| b["type"] == "tool_use") {
+        return;
+    }
+    let Some(text) = content
+        .last()
+        .filter(|b| b["type"] == "text")
+        .and_then(|b| b["text"].as_str())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let blocks = super::stream::extract_invoke_content_blocks(&text, schemas, tool_name_map);
+    if !blocks.iter().any(|b| b["type"] == "tool_use") {
+        return;
+    }
+    content.pop();
+    content.extend(
+        blocks
+            .into_iter()
+            .filter(|b| b["type"] != "text" || b["text"].as_str().is_some_and(|t| !t.trim().is_empty())),
+    );
+    response_body["stop_reason"] = json!("tool_use");
+}
+
+/// 上游流中断时返回给客户端的错误（M3）：Anthropic 错误类型 + 脱敏后的原因。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamFailure {
+    error_type: &'static str,
+    message: String,
+}
+
+impl StreamFailure {
+    /// 传输或帧层面的中断：可重试。
+    fn interrupted(reason: &str) -> Self {
+        Self {
+            error_type: "api_error",
+            message: format!("Upstream response stream was interrupted: {reason}. Retry the request."),
+        }
+    }
+
+    /// 非流式路径的 HTTP 状态码，与 Anthropic 错误类型对应。
+    fn status(&self) -> StatusCode {
+        match self.error_type {
+            "rate_limit_error" => StatusCode::TOO_MANY_REQUESTS,
+            "overloaded_error" => StatusCode::SERVICE_UNAVAILABLE,
+            "invalid_request_error" => StatusCode::BAD_REQUEST,
+            "permission_error" => StatusCode::FORBIDDEN,
+            _ => StatusCode::BAD_GATEWAY,
+        }
+    }
+}
+
+/// 只保留异常类型名（去掉 `com.amazon...#` 之类前缀，限制字符和长度），不回传上游原文。
+fn sanitize_upstream_code(code: &str) -> String {
+    let short = code.rsplit(['#', '.', ':']).next().unwrap_or(code);
+    short
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .take(64)
+        .collect()
+}
+
+/// 按上游 error / exception 帧的类型和说明归类（M3）。说明只用于归类，不出现在返回给客户端的消息里。
+fn classify_upstream_failure(code: &str, message: &str) -> StreamFailure {
+    let name = sanitize_upstream_code(code);
+    let label = if name.is_empty() { "unknown upstream error".to_string() } else { name };
+    let code_lower = code.to_ascii_lowercase();
+    let lower = format!("{code_lower} {}", message.to_ascii_lowercase());
+    let has = |needles: &[&str]| needles.iter().any(|n| lower.contains(n));
+    let failure = |error_type: &'static str, message: String| StreamFailure { error_type, message };
+    if has(&["throttl", "rate exceeded", "rate limit", "too many requests", "toomanyrequests"]) {
+        return failure("rate_limit_error", format!("Upstream rate limit reached ({label}). Retry after a short wait."));
+    }
+    if has(&["serviceunavailable", "service unavailable", "overloaded", "high load", "insufficient capacity", "temporarily unavailable", "temporarily_unavailable"]) {
+        return failure("overloaded_error", format!("Upstream model is overloaded ({label}). Retry later."));
+    }
+    if has(&["input is too long", "prompt is too long", "too many tokens", "context window", "context length", "exceeds the maximum"]) {
+        return failure("invalid_request_error", format!("prompt is too long: the upstream rejected the input as exceeding the model context ({label})."));
+    }
+    if has(&["accessdenied", "access denied", "unauthorized", "forbidden"]) {
+        return failure("permission_error", format!("Upstream denied access ({label})."));
+    }
+    if code_lower.contains("validation") {
+        return failure("invalid_request_error", format!("Upstream rejected the request ({label})."));
+    }
+    StreamFailure::interrupted(&format!("upstream reported {label}"))
+}
+
+/// body 读取失败（连接断开或读超时）。
+fn body_read_failure(error: &reqwest::Error) -> StreamFailure {
+    if error.is_timeout() {
+        StreamFailure::interrupted("no data arrived from upstream before the read deadline")
+    } else {
+        StreamFailure::interrupted("the connection to upstream was lost")
+    }
+}
+
+/// 上游 error / exception 帧：返回 (日志用的完整原因, 返回给客户端的分类错误)。
+fn upstream_event_error(event: &Event) -> Option<(String, StreamFailure)> {
     match event {
         Event::Error {
             error_code,
             error_message,
-        } => Some(format!("{error_code}: {error_message}")),
+        } => Some((
+            format!("{error_code}: {error_message}"),
+            classify_upstream_failure(error_code, error_message),
+        )),
         Event::Exception {
             exception_type,
             message,
-        } if exception_type != "ContentLengthExceededException" => {
-            Some(format!("{exception_type}: {message}"))
-        }
+        } if exception_type != "ContentLengthExceededException" => Some((
+            format!("{exception_type}: {message}"),
+            classify_upstream_failure(exception_type, message),
+        )),
         _ => None,
     }
 }
@@ -1460,6 +1596,7 @@ fn non_stream_read_failure(
     credential_id: u64,
     input_tokens: i32,
     error: &str,
+    failure: StreamFailure,
 ) -> NonStreamExecutionError {
     hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
     tracer.finalize(
@@ -1471,11 +1608,8 @@ fn non_stream_read_failure(
     );
     NonStreamExecutionError::Response(
         (
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new(
-                "api_error",
-                "Invalid or interrupted upstream response stream",
-            )),
+            failure.status(),
+            Json(ErrorResponse::new(failure.error_type, failure.message)),
         )
             .into_response(),
     )
@@ -1550,12 +1684,14 @@ pub(crate) async fn execute_non_stream_request(
         let body_bytes = match chunk {
             Ok(bytes) => bytes,
             Err(e) => {
+                let failure = body_read_failure(&e);
                 return Err(non_stream_read_failure(
                     &hook,
                     &tracer,
                     credential_id,
                     input_tokens,
                     &format!("{:#}", anyhow::Error::new(e)),
+                    failure,
                 ));
             }
         };
@@ -1567,6 +1703,7 @@ pub(crate) async fn execute_non_stream_request(
                 credential_id,
                 input_tokens,
                 &e.to_string(),
+                StreamFailure::interrupted("malformed event frame from upstream"),
             ));
         }
         for result in decoder.decode_iter() {
@@ -1581,16 +1718,18 @@ pub(crate) async fn execute_non_stream_request(
                                 credential_id,
                                 input_tokens,
                                 &e.to_string(),
+                                StreamFailure::interrupted("malformed event frame from upstream"),
                             ));
                         }
                     };
-                    if let Some(error) = upstream_event_error(&event) {
+                    if let Some((error, failure)) = upstream_event_error(&event) {
                         return Err(non_stream_read_failure(
                             &hook,
                             &tracer,
                             credential_id,
                             input_tokens,
                             &error,
+                            failure,
                         ));
                     }
                     {
@@ -1690,6 +1829,7 @@ pub(crate) async fn execute_non_stream_request(
                         credential_id,
                         input_tokens,
                         &e.to_string(),
+                        StreamFailure::interrupted("malformed event frame from upstream"),
                     ));
                 }
             }
@@ -1703,6 +1843,7 @@ pub(crate) async fn execute_non_stream_request(
             credential_id,
             input_tokens,
             if received_data { "Upstream ended with an incomplete event frame" } else { "Upstream returned an empty event stream" },
+            StreamFailure::interrupted(if received_data { "upstream ended with an incomplete event frame" } else { "upstream returned an empty event stream" }),
         ));
     }
 
@@ -1898,7 +2039,7 @@ fn build_non_stream_content(
                 }));
             }
 
-            if !remaining_text.is_empty() {
+            if !remaining_text.trim().is_empty() {
                 content.push(json!({
                     "type": "text",
                     "text": remaining_text
@@ -1913,13 +2054,13 @@ fn build_non_stream_content(
             }));
         }
 
-        if has_native_thinking && !text_content.is_empty() {
+        if has_native_thinking && !text_content.trim().is_empty() {
             content.push(json!({
                 "type": "text",
                 "text": text_content
             }));
         }
-    } else if !text_content.is_empty() {
+    } else if !text_content.trim().is_empty() {
         content.push(json!({
             "type": "text",
             "text": text_content
@@ -2124,6 +2265,11 @@ pub async fn post_messages_cc(
 
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
     // credentials; additional_model_request_fields is already filtered by converter model support.
+    // H2：发给上游的工具 schema，用于 `<invoke>` 文本合成校验（conversation_state 随后被移走）。
+    let invoke_tool_schemas = super::stream::invoke_tool_schemas_from_state(
+        &conversion_result.conversation_state,
+        &conversion_result.known_tool_names,
+    );
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
@@ -2188,9 +2334,11 @@ pub async fn post_messages_cc(
             provider,
             &request_body,
             &payload.model,
-            thinking_enabled,
+            // L7：流式与非流式一致，遵守 extractThinking 配置。
+            state.extract_thinking && thinking_enabled,
             tool_name_map,
             known_tool_names,
+            invoke_tool_schemas,
             hook,
             total_input_tokens,
             cache_usage,
@@ -2217,6 +2365,7 @@ pub async fn post_messages_cc(
             extract_thinking,
             tool_name_map,
             known_tool_names,
+            invoke_tool_schemas,
             hook,
             cache_usage,
             tracer,
@@ -2235,6 +2384,7 @@ async fn handle_cc_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
+    invoke_tool_schemas: super::stream::InvokeToolSchemas,
     hook: UsageRecordHook,
     fallback_input_tokens: i32,
     cache_usage: super::cache_metering::CacheUsage,
@@ -2249,6 +2399,7 @@ async fn handle_cc_stream_request(
         thinking_enabled,
         tool_name_map,
         known_tool_names,
+        invoke_tool_schemas,
         hook,
         cache_usage,
         tracer,
@@ -3023,5 +3174,60 @@ mod tests {
             missing.is_empty(),
             "以下 SSE 响应缺少 `x-accel-buffering: no`：{missing:?}"
         );
+    }
+
+    #[test]
+    fn fixresp_l11_non_stream_reclaims_trailing_invoke_like_stream() {
+        let mut schemas = super::super::stream::InvokeToolSchemas::new();
+        schemas.insert(
+            "exec_command".to_string(),
+            json!({
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}, "yield_time_ms": {"type": "integer"}},
+                "required": ["cmd"]
+            }),
+        );
+        let text = "我来跑一下：\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n<parameter name=\"yield_time_ms\">500</parameter>\n</invoke>";
+        let mut body = json!({"type": "message", "stop_reason": "end_turn", "content": [{"type": "text", "text": text}]});
+        reclaim_trailing_invoke_text(&mut body, &schemas, &std::collections::HashMap::new());
+        assert_eq!(body["stop_reason"], json!("tool_use"));
+        let content = body["content"].as_array().unwrap();
+        assert_eq!(content[0], json!({"type": "text", "text": "我来跑一下：\n"}));
+        assert_eq!(content[1]["type"], json!("tool_use"));
+        assert_eq!(content[1]["input"], json!({"cmd": "ls", "yield_time_ms": 500}));
+
+        // 末尾还有正文：是示例，不合成。
+        let example = format!("{text}\n这是示例。");
+        let mut body = json!({"stop_reason": "end_turn", "content": [{"type": "text", "text": example}]});
+        let before = body.clone();
+        reclaim_trailing_invoke_text(&mut body, &schemas, &std::collections::HashMap::new());
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn fixresp_m3_upstream_failures_keep_classified_reason() {
+        let exc = |t: &str, m: &str| Event::Exception { exception_type: t.into(), message: m.into() };
+        let cases = [
+            (exc("ThrottlingException", "Rate exceeded for account 123456789012"), "rate_limit_error", StatusCode::TOO_MANY_REQUESTS),
+            (exc("com.amazon.aws.codewhisperer#ServiceUnavailableException", "Encountered unexpectedly high load"), "overloaded_error", StatusCode::SERVICE_UNAVAILABLE),
+            (Event::Error { error_code: "ValidationException".into(), error_message: "Input is too long for requested model.".into() }, "invalid_request_error", StatusCode::BAD_REQUEST),
+            (exc("AccessDeniedException", "User is not authorized for 123456789012"), "permission_error", StatusCode::FORBIDDEN),
+            (exc("InternalServerException", "secret-request-id abc"), "api_error", StatusCode::BAD_GATEWAY),
+        ];
+        for (event, ty, status) in cases {
+            let (detail, failure) = upstream_event_error(&event).expect("error event");
+            assert_eq!(failure.error_type, ty, "{detail}");
+            assert_eq!(failure.status(), status, "{detail}");
+            for secret in ["123456789012", "secret-request-id", "com.amazon"] {
+                assert!(!failure.message.contains(secret), "{}", failure.message);
+            }
+        }
+        let (_, too_long) = upstream_event_error(&Event::Error {
+            error_code: "ValidationException".into(),
+            error_message: "Input is too long for requested model.".into(),
+        })
+        .unwrap();
+        assert!(too_long.message.starts_with("prompt is too long"), "{}", too_long.message);
+        assert!(upstream_event_error(&exc("ContentLengthExceededException", "x")).is_none());
     }
 }
