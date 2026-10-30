@@ -188,6 +188,8 @@ pub mod outcome {
     pub const ACCOUNT_SUSPENDED: &str = "account_suspended";
     pub const AUTH_FAILED: &str = "auth_failed";
     pub const TRANSIENT: &str = "transient";
+    /// 网关自己的单账号 RPM 限流打满：请求没有发到上游，客户端照样收到 429 + Retry-After
+    pub const LOCAL_RATE_LIMITED: &str = "local_rate_limited";
     pub const NETWORK_ERROR: &str = "network_error";
     pub const BAD_REQUEST: &str = "bad_request";
     pub const UNKNOWN: &str = "unknown";

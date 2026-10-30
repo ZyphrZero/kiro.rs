@@ -574,7 +574,7 @@ export interface TraceAttempt {
   endpoint: string
   /** 上游 HTTP 状态码；null = 网络层失败 */
   httpStatus: number | null
-  /** success / quota_exhausted / account_throttled / auth_failed / transient / network_error / bad_request / unknown */
+  /** success / quota_exhausted / account_throttled / local_rate_limited / auth_failed / transient / network_error / bad_request / unknown */
   outcome: string
   /** 上游错误体片段（已截断） */
   errorSnippet: string | null

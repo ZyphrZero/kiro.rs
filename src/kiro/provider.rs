@@ -788,8 +788,15 @@ impl KiroProvider {
                 }
                 Err(e) => {
                     if is_rate_limit_error(&e) {
+                        // 选号阶段的限流：本地 RPM 打满时没有请求发到上游，单独归类；
+                        // 其余（如 Token 刷新被上游 429）仍按瞬态错误记。
+                        let kind = if is_local_rate_limit(&e) {
+                            outcome::LOCAL_RATE_LIMITED
+                        } else {
+                            outcome::TRANSIENT
+                        };
                         Self::emit_attempt(
-                            sink, attempt, 0, "", None, outcome::TRANSIENT,
+                            sink, attempt, 0, "", None, kind,
                             Some(&e.to_string()), attempt_start,
                         );
                         return Err(e);
@@ -1391,6 +1398,12 @@ impl KiroProvider {
 
 fn is_rate_limit_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<UpstreamRateLimitError>().is_some()
+}
+
+fn is_local_rate_limit(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<UpstreamRateLimitError>()
+        .is_some_and(UpstreamRateLimitError::is_local)
 }
 
 fn take_rate_limit_error(last_error: &mut Option<anyhow::Error>) -> Option<anyhow::Error> {

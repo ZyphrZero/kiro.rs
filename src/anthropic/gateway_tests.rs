@@ -654,6 +654,56 @@ async fn gateway_first_token_trace_ignores_metadata() {
 }
 
 #[tokio::test]
+async fn gateway_local_rpm_limit_is_traced_apart_from_upstream_429() {
+    // 2026-10-30 线上：单账号 RPM 打满后网关自己回的 429 记成 transient / "upstream rate limited"、
+    // 凭据 0，看起来像上游限流（8 小时 1101 次，同期上游真正的 429 只有 38 次）。
+    let config: Config =
+        serde_json::from_value(json!({"accountRpmLimitEnabled": true, "accountRpmLimit": 1}))
+            .unwrap();
+    let mut f = fixture_with_config(Mode::Normal(Duration::ZERO), config).await;
+    let store = Arc::new(TraceStore::open_in_memory().unwrap());
+    f.state = f.state.clone().with_trace_store(Some(store.clone()));
+
+    let first = request(f.state.clone(), "messages", false).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    to_bytes(first.into_body(), 1024 * 1024).await.unwrap();
+
+    let second = request(f.state.clone(), "messages", false).await;
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(second.headers().get("retry-after").is_some());
+    let body = to_bytes(second.into_body(), 1024 * 1024).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("Gateway per-account rate limit"));
+    assert_eq!(f.calls.load(Ordering::Relaxed), 1, "被本地限流的请求不应发到上游");
+
+    let mut rejected = Vec::new();
+    for _ in 0..50 {
+        let (records, _) = store.query_paged(&TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        rejected = records
+            .into_iter()
+            .filter(|r| r.final_status != "success")
+            .collect();
+        if !rejected.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0].error_type.as_deref(), Some("local_rate_limited"));
+    assert!(
+        rejected[0]
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("local per-account RPM limit"),
+        "{:?}",
+        rejected[0].error_message
+    );
+}
+
+#[tokio::test]
 async fn gateway_active_stream_can_exceed_idle_deadline() {
     let config: Config = serde_json::from_value(json!({"upstreamReadTimeoutSecs":1})).unwrap();
     let f = fixture_with_config(Mode::Active, config).await;

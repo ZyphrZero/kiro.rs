@@ -2244,13 +2244,11 @@ impl MultiTokenManager {
                 } else {
                     let entries = self.entries.lock();
                     // RPM 打满（而非全部禁用）时回 429 并带 Retry-After，
-                    // 让调用方知道这是限流而不是凭据耗尽。
+                    // 让调用方知道这是限流而不是凭据耗尽；标成本地限流，trace 和日志里不算上游 429。
                     if let Some(retry_after) =
                         self.rpm_retry_after_secs(&entries, model, group, Instant::now())
                     {
-                        return Err(
-                            UpstreamRateLimitError::new(Some(retry_after.to_string())).into()
-                        );
+                        return Err(UpstreamRateLimitError::local_rpm_limit(retry_after).into());
                     }
                     // 注意：必须在 bail! 之前计算 available_count，
                     // 因为 available_count() 会尝试获取 entries 锁，
@@ -5037,6 +5035,7 @@ mod tests {
             .downcast_ref::<UpstreamRateLimitError>()
             .expect("RPM 已耗尽应返回类型化限流错误，以便 HTTP 层映射为 429");
         assert!(rate_limit.retry_after().is_some());
+        assert!(rate_limit.is_local(), "网关自己的 RPM 限流不能记成上游限流");
     }
 
     #[test]

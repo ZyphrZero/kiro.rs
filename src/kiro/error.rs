@@ -1,11 +1,27 @@
 //! Shared typed errors for Kiro upstream calls.
 
-/// The upstream still returned HTTP 429 after any applicable failover/retry.
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("upstream rate limited")]
+/// HTTP 429 for the client, with an optional Retry-After.
+///
+/// Usually the upstream still returned 429 after any applicable failover/retry. The same type also
+/// carries the gateway's own per-account RPM rejection (no request reached Kiro), so every caller
+/// keeps mapping it to 429; `is_local` only changes how it is labelled in traces and logs.
+#[derive(Debug, Clone)]
 pub struct UpstreamRateLimitError {
     retry_after: Option<String>,
+    local: bool,
 }
+
+impl std::fmt::Display for UpstreamRateLimitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.local {
+            "local per-account RPM limit reached"
+        } else {
+            "upstream rate limited"
+        })
+    }
+}
+
+impl std::error::Error for UpstreamRateLimitError {}
 
 /// Kiro rejected the serialized conversation because it exceeded the model's
 /// context limit. Keeping this typed at the provider boundary lets compact
@@ -32,7 +48,21 @@ impl UpstreamRateLimitError {
     pub(crate) fn new(retry_after: Option<String>) -> Self {
         Self {
             retry_after: retry_after.and_then(normalize_retry_after),
+            local: false,
         }
+    }
+
+    /// The gateway's own per-account RPM limit is full: rejected before any upstream call.
+    pub(crate) fn local_rpm_limit(retry_after_secs: u64) -> Self {
+        Self {
+            retry_after: Some(retry_after_secs.to_string()),
+            local: true,
+        }
+    }
+
+    /// True when the gateway rejected the request itself instead of Kiro returning 429.
+    pub fn is_local(&self) -> bool {
+        self.local
     }
 
     pub(crate) fn from_headers(headers: &http::HeaderMap) -> Self {
@@ -87,5 +117,18 @@ mod tests {
         let error = UpstreamRateLimitError::new(Some("not-a-retry-delay".to_string()));
         assert_eq!(error.retry_after(), None);
         assert!(error.should_retry_locally());
+    }
+
+    #[test]
+    fn local_rpm_limit_is_labelled_apart_from_upstream_429() {
+        let local = UpstreamRateLimitError::local_rpm_limit(42);
+        assert!(local.is_local());
+        assert_eq!(local.retry_after(), Some("42"));
+        assert!(!local.should_retry_locally());
+        assert_eq!(local.to_string(), "local per-account RPM limit reached");
+
+        let upstream = UpstreamRateLimitError::new(Some("42".to_string()));
+        assert!(!upstream.is_local());
+        assert_eq!(upstream.to_string(), "upstream rate limited");
     }
 }

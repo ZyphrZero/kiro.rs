@@ -390,6 +390,7 @@ fn canonical_attempt_outcome(value: &str) -> &'static str {
         outcome::ACCOUNT_SUSPENDED => outcome::ACCOUNT_SUSPENDED,
         outcome::AUTH_FAILED => outcome::AUTH_FAILED,
         outcome::TRANSIENT => outcome::TRANSIENT,
+        outcome::LOCAL_RATE_LIMITED => outcome::LOCAL_RATE_LIMITED,
         outcome::NETWORK_ERROR => outcome::NETWORK_ERROR,
         outcome::BAD_REQUEST => outcome::BAD_REQUEST,
         _ => outcome::UNKNOWN,
@@ -494,13 +495,16 @@ pub(super) fn map_provider_error(err: Error) -> Response {
     }
 
     if let Some(rate_limit) = err.downcast_ref::<crate::kiro::error::UpstreamRateLimitError>() {
-        tracing::warn!(error = %err, "上游限流（映射为 429）");
+        let message = if rate_limit.is_local() {
+            tracing::warn!(error = %err, "本地单账号 RPM 限流（映射为 429）");
+            "Gateway per-account rate limit reached. Retry later."
+        } else {
+            tracing::warn!(error = %err, "上游限流（映射为 429）");
+            "Upstream rate limit exceeded. Retry later."
+        };
         let mut response = (
             StatusCode::TOO_MANY_REQUESTS,
-            Json(ErrorResponse::new(
-                "rate_limit_error",
-                "Upstream rate limit exceeded. Retry later.",
-            )),
+            Json(ErrorResponse::new("rate_limit_error", message)),
         )
             .into_response();
         if let Some(value) = rate_limit
