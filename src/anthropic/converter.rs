@@ -349,7 +349,7 @@ fn model_uses_gpt_reasoning_effort(model_id: &str) -> bool {
 }
 
 /// 是否为已确认接受原生 reasoning effort 字段的模型。
-fn model_supports_native_reasoning(model_id: &str) -> bool {
+pub(crate) fn model_supports_native_reasoning(model_id: &str) -> bool {
     if model_uses_gpt_reasoning_effort(model_id) {
         return true;
     }
@@ -393,7 +393,7 @@ fn native_reasoning_requested(req: &MessagesRequest, model_id: &str) -> bool {
 /// 当客户端只发标准 `thinking:{type:"enabled",budget_tokens:N}`、不带 `output_config`
 /// 时，用它把「思考预算」映射到 Kiro 的 effort。（本项目 budget_tokens 上限 24576，
 /// 故经此推导实际最高到 `high`；`xhigh` 仍需客户端显式 `output_config.effort`。）
-fn effort_from_budget_tokens(tokens: i32) -> &'static str {
+pub(crate) fn effort_from_budget_tokens(tokens: i32) -> &'static str {
     match tokens {
         i32::MIN..=4_000 => "low",
         4_001..=16_000 => "medium",
@@ -1739,25 +1739,24 @@ fn convert_tools(
 /// 生成thinking标签前缀
 fn generate_thinking_prefix(req: &MessagesRequest, model_id: &str) -> Option<String> {
     if let Some(t) = &req.thinking {
-        if t.thinking_type == "enabled" {
-            return Some(format!(
-                "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
-                t.budget_tokens
-            ));
-        } else if t.thinking_type == "adaptive" {
-            let effort = req
-                .output_config
-                .as_ref()
-                .and_then(|c| normalize_effort_for_model(model_id, &c.effort))
-                .unwrap_or_else(|| "high".to_string());
+        if t.thinking_type == "adaptive"
+            || (t.thinking_type == "enabled" && model_supports_native_reasoning(model_id))
+        {
+            let effort = select_native_reasoning_effort(req, model_id);
             return Some(format!(
                 "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
                 effort
+            ));
+        } else if t.thinking_type == "enabled" {
+            return Some(format!(
+                "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
+                t.budget_tokens
             ));
         }
     }
     None
 }
+
 
 /// 检查内容是否已包含thinking标签
 fn has_thinking_tags(content: &str) -> bool {
