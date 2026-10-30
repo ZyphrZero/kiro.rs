@@ -388,6 +388,13 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_metadata_schema: Option<serde_json::Value>,
 
+    /// 自定义响应头规则列表。
+    ///
+    /// 允许用户在 UI / config.json 配置下发给客户端的自定义响应头。
+    /// 键（header name）完全自定义；值（header value）支持变量插值（如 `{trace_id}`, `{model}` 等）。
+    #[serde(default = "crate::model::custom_headers::default_custom_headers")]
+    pub custom_headers: Vec<crate::model::custom_headers::CustomHeaderRule>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -573,6 +580,7 @@ impl Default for Config {
             endpoints: HashMap::new(),
             custom_models: Vec::new(),
             credential_metadata_schema: None,
+            custom_headers: crate::model::custom_headers::default_custom_headers(),
             config_path: None,
         }
     }

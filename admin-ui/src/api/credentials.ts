@@ -11,6 +11,8 @@ import type {
   AddCredentialRequest,
   AddCredentialResponse,
   CustomModelItem,
+  CustomHeadersConfigResponse,
+  SetCustomHeadersRequest,
   UpdateCredentialRequest,
   UpdateRefreshTokenRequest,
   ProxyPoolEntry,
@@ -666,6 +668,23 @@ export async function setCustomModels(
 ): Promise<{ models: CustomModelItem[] }> {
   const { data } = await api.put<{ models: CustomModelItem[] }>(
     '/config/custom-models',
+    req,
+  )
+  return data
+}
+
+// 获取自定义响应头配置
+export async function getCustomHeaders(): Promise<CustomHeadersConfigResponse> {
+  const { data } = await api.get<CustomHeadersConfigResponse>('/config/custom-headers')
+  return data
+}
+
+// 批量替换自定义响应头配置
+export async function setCustomHeaders(
+  req: SetCustomHeadersRequest,
+): Promise<CustomHeadersConfigResponse> {
+  const { data } = await api.put<CustomHeadersConfigResponse>(
+    '/config/custom-headers',
     req,
   )
   return data

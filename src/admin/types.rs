@@ -1399,3 +1399,48 @@ pub struct CustomModelItem {
 pub struct SetCustomModelsRequest {
     pub models: Vec<CustomModelItem>,
 }
+
+// ============ 自定义响应头 ============
+
+/// 自定义响应头配置响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomHeadersConfigResponse {
+    pub headers: Vec<CustomHeaderItem>,
+}
+
+/// 单条自定义响应头条目
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomHeaderItem {
+    pub key: String,
+    pub value: String,
+    pub enabled: bool,
+}
+
+impl From<crate::model::custom_headers::CustomHeaderRule> for CustomHeaderItem {
+    fn from(r: crate::model::custom_headers::CustomHeaderRule) -> Self {
+        Self {
+            key: r.key,
+            value: r.value,
+            enabled: r.enabled,
+        }
+    }
+}
+
+impl From<CustomHeaderItem> for crate::model::custom_headers::CustomHeaderRule {
+    fn from(item: CustomHeaderItem) -> Self {
+        Self {
+            key: item.key,
+            value: item.value,
+            enabled: item.enabled,
+        }
+    }
+}
+
+/// 批量设置自定义响应头请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCustomHeadersRequest {
+    pub headers: Vec<CustomHeaderItem>,
+}

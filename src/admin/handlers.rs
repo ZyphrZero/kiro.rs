@@ -33,6 +33,7 @@ use super::{
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
+        SetCustomHeadersRequest,
         SetCustomModelsRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
@@ -837,6 +838,24 @@ pub async fn set_custom_models(
     Json(payload): Json<SetCustomModelsRequest>,
 ) -> impl IntoResponse {
     match state.service.set_custom_models(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/custom-headers
+/// 获取自定义响应头规则配置
+pub async fn get_custom_headers(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_custom_headers())
+}
+
+/// PUT /api/admin/config/custom-headers
+/// 批量替换自定义响应头规则配置（运行时热更新 + 持久化 config.json）
+pub async fn set_custom_headers(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetCustomHeadersRequest>,
+) -> impl IntoResponse {
+    match state.service.set_custom_headers(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

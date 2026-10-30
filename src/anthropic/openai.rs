@@ -116,21 +116,47 @@ pub async fn post_chat_completions(
     };
 
     // 2. Reuse the Anthropic chain with the client's streaming preference.
-    let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
+    let inner = post_messages(State(state.clone()), Extension(key_ctx), Json(anthropic_req)).await;
+
+    // 把内层 Anthropic 响应上的自定义响应头透传到 OpenAI 响应。
+    let mut configured_names = state
+        .custom_headers
+        .as_ref()
+        .map(|mgr| mgr.get_active_header_names())
+        .unwrap_or_default();
+    configured_names.push(header::HeaderName::from_static("x-oneapi-request-id"));
+    configured_names.push(header::HeaderName::from_static("x-request-id"));
+
+    let trace_headers: Vec<(header::HeaderName, header::HeaderValue)> = inner
+        .headers()
+        .iter()
+        .filter(|(name, _)| configured_names.iter().any(|cfg| cfg == *name))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    let attach_trace = |resp: &mut Response| {
+        for (name, val) in &trace_headers {
+            resp.headers_mut().insert(name.clone(), val.clone());
+        }
+    };
 
     let status = inner.status();
     let retry_after = inner.headers().get(header::RETRY_AFTER).cloned();
     if status.is_success() && want_stream {
-        return chat_streaming_response(inner.into_body(), model);
+        let mut resp = chat_streaming_response(inner.into_body(), model);
+        attach_trace(&mut resp);
+        return resp;
     }
     let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {
         Ok(b) => b,
         Err(e) => {
-            return openai_error(
+            let mut resp = openai_error(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
                 &format!("failed to read upstream response: {e}"),
             );
+            attach_trace(&mut resp);
+            return resp;
         }
     };
 
@@ -144,17 +170,20 @@ pub async fn post_chat_completions(
         if let Some(value) = retry_after {
             response.headers_mut().insert(header::RETRY_AFTER, value);
         }
+        attach_trace(&mut response);
         return response;
     }
 
     let anthropic: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
-            return openai_error(
+            let mut resp = openai_error(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
                 &format!("failed to parse upstream response: {e}"),
             );
+            attach_trace(&mut resp);
+            return resp;
         }
     };
 
@@ -162,7 +191,9 @@ pub async fn post_chat_completions(
     let parsed = parse_anthropic_message(&anthropic, &model);
 
     let body = build_completion_json(&parsed);
-    (StatusCode::OK, Json(body)).into_response()
+    let mut resp = (StatusCode::OK, Json(body)).into_response();
+    attach_trace(&mut resp);
+    resp
 }
 
 // ============================ 请求翻译 ============================
