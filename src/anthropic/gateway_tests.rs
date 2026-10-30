@@ -62,6 +62,9 @@ enum Mode {
     RefusedWithInvalidTool,
     RefusedWithEmptyTool,
     RefusedBare,
+    /// 只有正文、没有 metadataEvent.tokenUsage：线上 Kiro 对 claude-opus/sonnet-5.5 的实际形态
+    /// （traces.db 里 usage_source 全是 none），缓存用量只能来自本地 CacheMeter。
+    NoProviderUsage,
 }
 
 struct Fixture {
@@ -169,6 +172,9 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                     frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})),
                 ] { bytes.extend_from_slice(&part); }
                 return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::NoProviderUsage) {
+                return Response::new(Body::from(frame("assistantResponseEvent", json!({"content": "ok"}))));
             }
             if matches!(mode, Mode::Refused | Mode::RefusedWithSearch | Mode::RefusedWithPartialTool | Mode::RefusedWithInvalidTool | Mode::RefusedWithEmptyTool | Mode::RefusedBare) {
                 let mut bytes = Vec::new();
@@ -697,4 +703,70 @@ async fn gateway_latency_measurement() {
             f.calls.load(Ordering::Relaxed)
         );
     }
+}
+
+/// 读流式响应里最后一份 usage（message_start 先给占位，message_delta 给最终值）。
+async fn streamed_cache_usage(response: Response) -> (u64, u64) {
+    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024).await.unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    let (mut read, mut create) = (0, 0);
+    for line in text.lines().filter_map(|l| l.strip_prefix("data: ")) {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let usage = event.get("usage").or_else(|| event.pointer("/message/usage"));
+        if let Some(u) = usage {
+            if let Some(v) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) { read = v; }
+            if let Some(v) = u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()) { create = v; }
+        }
+    }
+    (read, create)
+}
+
+#[tokio::test]
+async fn gateway_dsh_master_key_reports_cache_hits_without_session_header() {
+    // 回归：DSH（pi-ai）用主 Key、不带 metadata.user_id，也发不出会话请求头。
+    // 以前 isolation_seed 返回 None → 每个请求都是 miss_no_seed，DSH 永远显示缓存命中 0%。
+    // 请求体是 pi-ai 1.4.0 真实生成的三轮（见 fixtures/dsh-pi-ai-1.4.0/README.md），不手造。
+    let turns: Vec<serde_json::Value> = [
+        include_str!("fixtures/dsh-pi-ai-1.4.0/turn1.json"),
+        include_str!("fixtures/dsh-pi-ai-1.4.0/turn2.json"),
+        include_str!("fixtures/dsh-pi-ai-1.4.0/turn3.json"),
+    ]
+    .iter()
+    .map(|s| serde_json::from_str(s).unwrap())
+    .collect();
+    let f = fixture(Mode::NoProviderUsage).await;
+    let state = f
+        .state
+        .clone()
+        .with_cache_meter(Some(Arc::new(crate::anthropic::cache_metering::CacheMeter::new(None))));
+    let send = |body: serde_json::Value| {
+        let state = state.clone();
+        async move {
+            let response = post_messages(
+                axum::extract::State(state),
+                Extension(key()),
+                Json(serde_json::from_value(body).unwrap()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            streamed_cache_usage(response).await
+        }
+    };
+
+    let (read1, create1) = send(turns[0].clone()).await;
+    assert_eq!(read1, 0, "首轮没有可读的缓存");
+    assert!(create1 > 0, "首轮应写入缓存，实际 create={create1}");
+
+    let (read2, _) = send(turns[1].clone()).await;
+    assert!(read2 > 0, "同一会话第二轮应读到缓存（DSH 0% 的 bug），实际 read={read2}");
+
+    let (read3, _) = send(turns[2].clone()).await;
+    assert!(read3 > read2, "第三轮应读到第二轮写入的更长前缀：read2={read2} read3={read3}");
+
+    // 另一个会话：第一条 user 消息不同 → 不应读到上一个会话的缓存
+    let mut other = turns[1].clone();
+    other["messages"][0]["content"] = json!("另一个会话的第一条消息。");
+    let (read_other, create_other) = send(other).await;
+    assert_eq!(read_other, 0, "不同会话不应命中");
+    assert!(create_other > 0);
 }
