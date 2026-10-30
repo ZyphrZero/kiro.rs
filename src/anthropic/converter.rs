@@ -768,6 +768,21 @@ pub(crate) fn convert_request_with_purpose(
         &req.messages
     };
 
+    // 2.6. 末尾连续多条 user（典型：tool_result 之后紧跟一条客户端提醒）合并成一条当前消息。
+    // 不合并时 build_history 会把倒数第二条 user 放进历史，再补一条假的 assistant "OK"；
+    // 模型把这条 "OK" 当成自己说过的话，会在工具结果之后学着只回 "OK"。
+    let merged_tail: Vec<super::types::Message>;
+    let messages: &[_] = match purpose {
+        ConversionPurpose::Generate => match merge_trailing_user_messages(messages) {
+            Some(merged) => {
+                merged_tail = merged;
+                &merged_tail
+            }
+            None => messages,
+        },
+        _ => messages,
+    };
+
     // 3. 生成会话 ID 和代理 ID
     // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
     let conversation_id = req
@@ -1764,6 +1779,44 @@ fn has_thinking_tags(content: &str) -> bool {
     content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
 }
 
+/// 请求里有没有带尺寸限制后缀的 Write/Edit/Bash 工具（按原始名匹配，与工具描述后缀的条件一致）
+fn has_chunked_tools(req: &MessagesRequest) -> bool {
+    req.tools.as_ref().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|t| matches!(t.name.as_str(), "Write" | "Edit" | "Bash"))
+    })
+}
+
+/// 把末尾连续的多条 user 消息按原顺序合并成一条；末尾只有一条 user 时返回 None。
+fn merge_trailing_user_messages(
+    messages: &[super::types::Message],
+) -> Option<Vec<super::types::Message>> {
+    let start = messages
+        .iter()
+        .rposition(|m| m.role != "user")
+        .map_or(0, |i| i + 1);
+    if messages.len().saturating_sub(start) < 2 {
+        return None;
+    }
+    let mut blocks = Vec::new();
+    for m in &messages[start..] {
+        match &m.content {
+            serde_json::Value::String(s) => {
+                blocks.push(serde_json::json!({"type": "text", "text": s}))
+            }
+            serde_json::Value::Array(arr) => blocks.extend(arr.iter().cloned()),
+            _ => {}
+        }
+    }
+    let mut out = messages[..start].to_vec();
+    out.push(super::types::Message {
+        role: "user".to_string(),
+        content: serde_json::Value::Array(blocks),
+    });
+    Some(out)
+}
+
 /// 构建历史消息
 ///
 /// # Arguments
@@ -1794,8 +1847,13 @@ fn build_history(
             .join("\n");
 
         if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息
-            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+            // 分块写入策略只对带 Write/Edit/Bash 工具（Claude Code 风格）的客户端追加：
+            // 它要求 "without commentary"，对别的客户端会压掉它们自己要求的进度说明。
+            let system_content = if has_chunked_tools(req) {
+                format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY)
+            } else {
+                system_content
+            };
 
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             let final_content = if let Some(ref prefix) = thinking_prefix {
@@ -2053,6 +2111,64 @@ fn merge_assistant_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request_from_json(v: serde_json::Value) -> MessagesRequest {
+        serde_json::from_value(v).expect("valid request json")
+    }
+
+    #[test]
+    fn test_trailing_user_messages_merge_without_fake_ok() {
+        let req = request_from_json(serde_json::json!({
+            "model": "claude-sonnet-4.5",
+            "max_tokens": 1024,
+            "system": "You are a test agent.",
+            "messages": [
+                {"role": "user", "content": "run the tool"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_ok1", "name": "run_code", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_ok1", "content": "tool output"}
+                ]},
+                {"role": "user", "content": "REMINDER_70c4 background job finished"}
+            ],
+            "tools": [{"name": "run_code", "description": "Run code",
+                       "input_schema": {"type": "object", "properties": {}}}]
+        }));
+        let result = convert_request(&req).unwrap();
+        let state = &result.conversation_state;
+        assert!(
+            !state.history.iter().any(|m| matches!(m,
+                Message::Assistant(a) if a.assistant_response_message.content == "OK")),
+            "trailing user messages must not produce a fake assistant OK in history"
+        );
+        assert!(matches!(state.history.last(), Some(Message::Assistant(_))));
+        let current = &state.current_message.user_input_message;
+        assert!(current.content.contains("REMINDER_70c4"));
+        assert_eq!(current.user_input_message_context.tool_results.len(), 1);
+    }
+
+    #[test]
+    fn test_chunked_policy_only_with_chunked_tools() {
+        let build = |tool: &str| {
+            request_from_json(serde_json::json!({
+                "model": "claude-sonnet-4.5",
+                "max_tokens": 1024,
+                "system": "sys",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": tool, "description": "d",
+                           "input_schema": {"type": "object", "properties": {}}}]
+            }))
+        };
+        let has_policy = |req: &MessagesRequest| {
+            convert_request(req).unwrap().conversation_state.history.iter().any(|m| {
+                matches!(m, Message::User(u)
+                    if u.user_input_message.content.contains("Complete all chunked operations"))
+            })
+        };
+        assert!(has_policy(&build("Write")));
+        assert!(!has_policy(&build("run_code")));
+    }
 
     #[test]
     fn test_map_model_sonnet() {
