@@ -252,6 +252,22 @@ impl RequestTracer {
         }
     }
 
+    /// 构造自定义响应头插值上下文。
+    pub fn header_context<'a>(
+        &'a self,
+        credential_id: Option<u64>,
+        group: Option<&'a str>,
+    ) -> crate::model::custom_headers::HeaderInterpolationContext<'a> {
+        crate::model::custom_headers::HeaderInterpolationContext {
+            trace_id: &self.trace_id,
+            model: &self.model,
+            key_id: Some(self.key_id),
+            group,
+            credential_id,
+            client_ip: self.client_ip.as_deref(),
+        }
+    }
+
     fn mark_first_content(&self, events: &[SseEvent]) {
         if events.iter().any(|event| match event.event.as_str() {
             "content_block_start" => {
@@ -478,6 +494,50 @@ fn request_has_no_credentials(
     super::converter::map_model(&payload.model).is_some_and(|model| {
         !provider.token_manager().has_available_credentials(Some(&model), group)
     })
+}
+
+/// 构造没有 `RequestTracer` 时的插值上下文（早退错误、WebSearch 等路径）。
+///
+/// 这些路径不会落 trace，`trace_id` 仅作为本次响应的请求 ID 下发。
+pub(crate) fn early_header_context<'a>(
+    trace_id: &'a str,
+    model: &'a str,
+    key_ctx: &'a KeyContext,
+    credential_id: Option<u64>,
+) -> crate::model::custom_headers::HeaderInterpolationContext<'a> {
+    crate::model::custom_headers::HeaderInterpolationContext {
+        trace_id,
+        model,
+        key_id: Some(key_ctx.key_id),
+        group: key_ctx.group.as_deref(),
+        credential_id,
+        client_ip: key_ctx.client_ip.as_deref(),
+    }
+}
+
+/// 向响应头追加自定义响应头（供下游 NewAPI / OneAPI 提取 upstream_request_id，及用户自定义头部）
+pub(crate) fn attach_custom_headers(
+    resp: &mut Response,
+    custom_headers: Option<&crate::model::custom_headers::CustomHeadersManager>,
+    ctx: &crate::model::custom_headers::HeaderInterpolationContext,
+) {
+    if let Some(mgr) = custom_headers {
+        mgr.attach_to_response(resp, ctx);
+    } else {
+        attach_trace_headers(resp, ctx.trace_id);
+    }
+}
+
+/// 向响应头追加 Trace ID 追踪头（供下游 NewAPI / OneAPI 提取 upstream_request_id）
+pub(crate) fn attach_trace_headers(resp: &mut Response, trace_id: &str) {
+    if let Ok(val) = header::HeaderValue::from_str(trace_id) {
+        resp.headers_mut().insert(
+            header::HeaderName::from_static("x-oneapi-request-id"),
+            val.clone(),
+        );
+        resp.headers_mut()
+            .insert(header::HeaderName::from_static("x-request-id"), val);
+    }
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -899,14 +959,16 @@ pub async fn post_messages(
             group = ?key_ctx.group,
             "无可用凭据，直接返回 401"
         );
-        return (
+        let mut resp = (
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse::new(
                 "authentication_error",
                 "No available credentials for this request",
             )),
-        )
-            .into_response();
+        ).into_response();
+        let trace_id = Uuid::new_v4().to_string();
+        attach_custom_headers(&mut resp, state.custom_headers.as_ref(), &early_header_context(&trace_id, &payload.model, &key_ctx, None));
+        return resp;
     }
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
@@ -925,7 +987,7 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        let resp = websearch::handle_websearch_request(
+        let mut resp = websearch::handle_websearch_request(
             provider,
             &payload,
             input_tokens,
@@ -939,6 +1001,12 @@ pub async fn post_messages(
             "error"
         };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
+        let trace_id = Uuid::new_v4().to_string();
+        attach_custom_headers(
+            &mut resp,
+            state.custom_headers.as_ref(),
+            &early_header_context(&trace_id, &payload.model, &key_ctx, None),
+        );
         return resp;
     }
 
@@ -967,6 +1035,7 @@ pub async fn post_messages(
             state.tool_compatibility_mode,
             state.cache_meter.clone(),
             key_ctx.key_id,
+            state.custom_headers.clone(),
         )
         .await;
     }
@@ -997,11 +1066,18 @@ pub async fn post_messages(
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
+            let mut resp = (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
             )
                 .into_response();
+            let trace_id = Uuid::new_v4().to_string();
+            attach_custom_headers(
+                &mut resp,
+                state.custom_headers.as_ref(),
+                &early_header_context(&trace_id, &payload.model, &key_ctx, None),
+            );
+            return resp;
         }
     };
 
@@ -1023,7 +1099,7 @@ pub async fn post_messages(
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
+            let mut resp = (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "internal_error",
@@ -1031,6 +1107,13 @@ pub async fn post_messages(
                 )),
             )
                 .into_response();
+            let trace_id = Uuid::new_v4().to_string();
+            attach_custom_headers(
+                &mut resp,
+                state.custom_headers.as_ref(),
+                &early_header_context(&trace_id, &payload.model, &key_ctx, None),
+            );
+            return resp;
         }
     };
 
@@ -1088,6 +1171,7 @@ pub async fn post_messages(
             tracer,
             key_ctx.group.clone(),
             structured_schema.clone(),
+            state.custom_headers.clone(),
         )
         .await
     } else {
@@ -1118,6 +1202,7 @@ pub async fn post_messages(
             tracer,
             key_ctx.group.clone(),
             structured_schema.clone(),
+            state.custom_headers.clone(),
         )
         .await
     }
@@ -1138,6 +1223,7 @@ async fn handle_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     structured_schema: Option<serde_json::Value>,
+    custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
@@ -1159,7 +1245,13 @@ async fn handle_stream_request(
                     TraceUsage::zero(),
                 );
             }
-            return map_provider_error(e);
+            let mut resp = map_provider_error(e);
+            attach_custom_headers(
+                &mut resp,
+                custom_headers.as_ref(),
+                &tracer.header_context(None, group.as_deref()),
+            );
+            return resp;
         }
     };
     tracer.mark_upstream_headers_received();
@@ -1187,7 +1279,7 @@ async fn handle_stream_request(
         initial_events,
         hook,
         credential_id,
-        tracer,
+        tracer.clone(),
         structured_schema.map(|schema| StructuredCollector::new(schema, model)),
     );
 
@@ -1195,14 +1287,20 @@ async fn handle_stream_request(
     // `x-accel-buffering: no` 让前置 nginx 对本次响应关闭 proxy_buffering。
     // 若反代开启了响应缓冲，SSE 分片会先攒在缓冲区再转发，拉长增量到达延迟；
     // 该头只作用于当前响应，无需在反代侧改全局配置。
-    Response::builder()
+    let mut resp = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header("x-accel-buffering", "no")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
-        .unwrap()
+        .unwrap();
+    attach_custom_headers(
+        &mut resp,
+        custom_headers.as_ref(),
+        &tracer.header_context(Some(credential_id), group.as_deref()),
+    );
+    resp
 }
 
 /// Ping 事件间隔（25秒）
@@ -1563,10 +1661,11 @@ async fn handle_non_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     structured_schema: Option<serde_json::Value>,
+    custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
 ) -> Response {
     // L11：与流式同一套 `<invoke>` 文本识别规则（H2）。
     let reclaim_name_map = tool_name_map.clone();
-    match execute_non_stream_request(
+    let (mut resp, credential_id) = match execute_non_stream_request(
         provider,
         request_body,
         model,
@@ -1575,21 +1674,27 @@ async fn handle_non_stream_request(
         tool_name_map,
         hook,
         cache_usage,
-        tracer,
-        group,
+        tracer.clone(),
+        group.clone(),
     )
     .await
     {
-        Ok(mut response_body) => {
+        Ok((mut response_body, credential_id)) => {
             reclaim_trailing_invoke_text(&mut response_body, &invoke_tool_schemas, &reclaim_name_map);
             if let Some(schema) = &structured_schema {
                 rewrite_message_json(&mut response_body, schema, model);
             }
-            (StatusCode::OK, Json(response_body)).into_response()
+            ((StatusCode::OK, Json(response_body)).into_response(), Some(credential_id))
         }
-        Err(NonStreamExecutionError::Provider(error)) => map_provider_error(error),
-        Err(NonStreamExecutionError::Response(response)) => response,
-    }
+        Err(NonStreamExecutionError::Provider(error)) => (map_provider_error(error), None),
+        Err(NonStreamExecutionError::Response(response)) => (response, None),
+    };
+    attach_custom_headers(
+        &mut resp,
+        custom_headers.as_ref(),
+        &tracer.header_context(credential_id, group.as_deref()),
+    );
+    resp
 }
 
 /// 非流式响应：本轮没有原生 tool_use 时，把末尾文本块里合格的 `<invoke>` 合成为 tool_use（H2 / L11）。
@@ -1763,7 +1868,7 @@ pub(crate) async fn execute_non_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
-) -> Result<serde_json::Value, NonStreamExecutionError> {
+) -> Result<(serde_json::Value, u64), NonStreamExecutionError> {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
         .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
@@ -2161,7 +2266,7 @@ pub(crate) async fn execute_non_stream_request(
             source: UsageSource::resolve(provider_token_usage.is_some(), &cache_usage),
         },
     );
-    Ok(response_body)
+    Ok((response_body, credential_id))
 }
 
 fn build_non_stream_content(
@@ -2363,14 +2468,16 @@ pub async fn post_messages_cc(
             group = ?key_ctx.group,
             "无可用凭据，直接返回 401"
         );
-        return (
+        let mut resp = (
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse::new(
                 "authentication_error",
                 "No available credentials for this request",
             )),
-        )
-            .into_response();
+        ).into_response();
+        let trace_id = Uuid::new_v4().to_string();
+        attach_custom_headers(&mut resp, state.custom_headers.as_ref(), &early_header_context(&trace_id, &payload.model, &key_ctx, None));
+        return resp;
     }
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
@@ -2389,7 +2496,7 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        let resp = websearch::handle_websearch_request(
+        let mut resp = websearch::handle_websearch_request(
             provider,
             &payload,
             input_tokens,
@@ -2402,6 +2509,8 @@ pub async fn post_messages_cc(
             "error"
         };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
+        let trace_id = Uuid::new_v4().to_string();
+        attach_custom_headers(&mut resp, state.custom_headers.as_ref(), &early_header_context(&trace_id, &payload.model, &key_ctx, None));
         return resp;
     }
 
@@ -2430,6 +2539,7 @@ pub async fn post_messages_cc(
             state.tool_compatibility_mode,
             state.cache_meter.clone(),
             key_ctx.key_id,
+            state.custom_headers.clone(),
         )
         .await;
     }
@@ -2460,11 +2570,18 @@ pub async fn post_messages_cc(
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
+            let mut resp = (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
             )
                 .into_response();
+            let trace_id = Uuid::new_v4().to_string();
+            attach_custom_headers(
+                &mut resp,
+                state.custom_headers.as_ref(),
+                &early_header_context(&trace_id, &payload.model, &key_ctx, None),
+            );
+            return resp;
         }
     };
 
@@ -2486,7 +2603,7 @@ pub async fn post_messages_cc(
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
+            let mut resp = (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
                     "internal_error",
@@ -2494,6 +2611,13 @@ pub async fn post_messages_cc(
                 )),
             )
                 .into_response();
+            let trace_id = Uuid::new_v4().to_string();
+            attach_custom_headers(
+                &mut resp,
+                state.custom_headers.as_ref(),
+                &early_header_context(&trace_id, &payload.model, &key_ctx, None),
+            );
+            return resp;
         }
     };
 
@@ -2550,6 +2674,7 @@ pub async fn post_messages_cc(
             tracer,
             key_ctx.group.clone(),
             structured_schema.clone(),
+            state.custom_headers.clone(),
         )
         .await
     } else {
@@ -2577,6 +2702,7 @@ pub async fn post_messages_cc(
             tracer,
             key_ctx.group.clone(),
             structured_schema.clone(),
+            state.custom_headers.clone(),
         )
         .await
     }
@@ -2598,6 +2724,7 @@ async fn handle_cc_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     structured_schema: Option<serde_json::Value>,
+    custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
 ) -> Response {
     handle_stream_request(
         provider,
@@ -2613,6 +2740,7 @@ async fn handle_cc_stream_request(
         tracer,
         group,
         structured_schema,
+        custom_headers,
     )
     .await
 }
@@ -3611,5 +3739,18 @@ mod tests {
             json["error"]["message"],
             "No available credentials for this request"
         );
+    }
+
+    #[test]
+    fn attach_trace_headers_sets_expected_headers() {
+        let mut resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .unwrap();
+        let trace_id = "0fc99995-b8cc-46b9-bf25-c44d0e3b1447";
+        attach_trace_headers(&mut resp, trace_id);
+
+        assert_eq!(resp.headers().get("x-oneapi-request-id").unwrap(), trace_id);
+        assert_eq!(resp.headers().get("x-request-id").unwrap(), trace_id);
     }
 }

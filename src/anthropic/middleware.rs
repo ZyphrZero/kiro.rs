@@ -52,6 +52,8 @@ pub struct AppState {
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
+    /// 自定义响应头管理器（热重载）
+    pub custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
 }
 
 impl AppState {
@@ -70,6 +72,7 @@ impl AppState {
             usage_aggregator: None,
             cache_meter: None,
             trace_store: None,
+            custom_headers: None,
         }
     }
 
@@ -101,6 +104,15 @@ impl AppState {
     /// 注入链路追踪存储
     pub fn with_trace_store(mut self, store: Option<SharedTraceStore>) -> Self {
         self.trace_store = store;
+        self
+    }
+
+    /// 注入自定义响应头管理器
+    pub fn with_custom_headers(
+        mut self,
+        custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
+    ) -> Self {
+        self.custom_headers = custom_headers;
         self
     }
 }

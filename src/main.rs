@@ -344,6 +344,10 @@ async fn main() {
         });
     }
 
+    let custom_headers_manager = model::custom_headers::CustomHeadersManager::new(
+        config.custom_headers.clone(),
+    );
+
     let anthropic_app = anthropic::create_router_with_shared_provider(
         Some(kiro_provider.clone()),
         config.extract_thinking,
@@ -353,6 +357,7 @@ async fn main() {
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
+        Some(custom_headers_manager.clone()),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
@@ -375,7 +380,8 @@ async fn main() {
                         Some(admin_trace_store.clone()),
                         Some(usage_recorder.clone()),
                     )
-                    .with_cache_meter(cache_meter.clone());
+                    .with_cache_meter(cache_meter.clone())
+                    .with_custom_headers(Some(custom_headers_manager.clone()));
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,

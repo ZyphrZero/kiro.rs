@@ -44,6 +44,7 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -58,6 +59,7 @@ pub fn create_router(
     usage_aggregator: Option<SharedAggregator>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
+    custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
 ) -> Router {
     create_router_with_shared_provider(
         kiro_provider.map(Arc::new),
@@ -68,6 +70,7 @@ pub fn create_router(
         usage_aggregator,
         cache_meter,
         trace_store,
+        custom_headers,
     )
 }
 
@@ -82,6 +85,7 @@ pub fn create_router_with_shared_provider(
     usage_aggregator: Option<SharedAggregator>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
+    custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
     if let Some(provider) = kiro_provider {
@@ -90,6 +94,7 @@ pub fn create_router_with_shared_provider(
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
+    state = state.with_custom_headers(custom_headers);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

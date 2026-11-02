@@ -115,6 +115,22 @@ async fn integration_native_end_turn_matches_streaming_and_non_streaming() {
         assert!(body.contains("\"stop_reason\":\"end_turn\""), "streaming={streaming}: {body}");
     }
 }
+
+#[tokio::test]
+async fn integration_cc_websearch_receives_custom_headers() {
+    use crate::model::custom_headers::{CustomHeaderRule, CustomHeadersManager};
+    let fixture = fixture(Mode::Normal(Duration::ZERO)).await;
+    let state = fixture.state.clone().with_custom_headers(Some(CustomHeadersManager::new(vec![
+        CustomHeaderRule { key: "X-Review-Trace".to_string(), value: "{trace_id}".to_string(), enabled: true },
+    ])));
+    for streaming in [true, false] {
+        let payload = json!({"model":"gpt-5.6-sol","max_tokens":64,"stream":streaming,
+            "messages":[{"role":"user","content":"search example"}],
+            "tools":[{"type":"web_search_20250305","name":"web_search"}]});
+        let response = post_messages_cc(axum::extract::State(state.clone()), Extension(key()), Json(serde_json::from_value(payload).unwrap())).await;
+        assert!(response.headers().get("x-review-trace").is_some());
+    }
+}
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.task.abort();
