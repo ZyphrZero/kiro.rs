@@ -291,6 +291,7 @@ fn openai_to_anthropic(
                         }
                     }
                     Some(Value::Array(parts)) => {
+                        let first_system_block = system.len();
                         for part in parts {
                             let text = match part {
                                 Value::String(s) => s.clone(),
@@ -302,13 +303,17 @@ fn openai_to_anthropic(
                                 _ => String::new(),
                             };
                             if !text.is_empty() {
-                                let block_cc = parse_cache_control(part.get("cache_control"))
-                                    .or_else(|| msg_cc.clone());
+                                let block_cc = parse_cache_control(part.get("cache_control"));
                                 system.push(SystemMessage {
                                     text,
                                     cache_control: block_cc,
                                 });
                             }
+                        }
+                        if let Some(last) = system[first_system_block..].last_mut()
+                            && last.cache_control.is_none()
+                        {
+                            last.cache_control = msg_cc;
                         }
                     }
                     _ => {}
@@ -321,7 +326,7 @@ fn openai_to_anthropic(
             }
             "assistant" => {
                 let msg_cc = parse_cache_control(m.get("cache_control"));
-                let mut blocks = content_blocks(m.get("content"), msg_cc);
+                let mut blocks = content_blocks(m.get("content"), None);
                 if let Some(calls) = m.get("tool_calls").and_then(|v| v.as_array()) {
                     for call in calls {
                         let id = call
@@ -349,6 +354,7 @@ fn openai_to_anthropic(
                         }));
                     }
                 }
+                apply_message_cache_control(&mut blocks, msg_cc);
                 push_merged(&mut merged, "assistant", blocks);
             }
             "tool" => {
@@ -438,13 +444,7 @@ fn content_blocks(content: Option<&Value>, msg_cache_control: Option<CacheContro
     match content {
         Some(Value::String(s)) => {
             if !s.is_empty() {
-                let mut block = json!({"type": "text", "text": s});
-                if let Some(cc) = &msg_cache_control {
-                    if let Ok(v) = serde_json::to_value(cc) {
-                        block["cache_control"] = v;
-                    }
-                }
-                out.push(block);
+                out.push(json!({"type": "text", "text": s}));
             }
         }
         Some(Value::Array(parts)) => {
@@ -476,19 +476,20 @@ fn content_blocks(content: Option<&Value>, msg_cache_control: Option<CacheContro
                     _ => {}
                 }
             }
-            if let Some(cc) = &msg_cache_control {
-                if let Some(last) = out.last_mut() {
-                    if last.get("cache_control").is_none() {
-                        if let Ok(v) = serde_json::to_value(cc) {
-                            last["cache_control"] = v;
-                        }
-                    }
-                }
-            }
         }
         _ => {}
     }
+    apply_message_cache_control(&mut out, msg_cache_control);
     out
+}
+
+fn apply_message_cache_control(blocks: &mut [Value], cache_control: Option<CacheControl>) {
+    if let Some(cache_control) = cache_control
+        && let Some(last) = blocks.last_mut()
+        && last.get("cache_control").is_none()
+    {
+        last["cache_control"] = json!(cache_control);
+    }
 }
 
 /// 仅收集纯文本（system / tool 内容用）
@@ -1445,6 +1446,140 @@ mod tests {
         let tools = anthropic.tools.unwrap();
         assert_eq!(tools[0].name, "lookup");
         assert!(tools[0].cache_control.is_some());
+    }
+
+    #[test]
+    fn system_message_cache_control_only_marks_last_text_block() {
+        for role in ["system", "developer"] {
+            let request = serde_json::from_value(json!({
+                "model": "claude-sonnet-5.5",
+                "cache_control": null,
+                "messages": [
+                    {
+                        "role": role,
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                        "content": [
+                            {"type": "text", "text": "first"},
+                            {"type": "text", "text": "second"},
+                            {"type": "text", "text": "third"},
+                            {"type": "text", "text": "fourth"},
+                            {"type": "text", "text": "fifth"},
+                            {"type": "text", "text": ""}
+                        ]
+                    },
+                    {"role": "user", "content": "hello"}
+                ]
+            }))
+            .unwrap();
+            let translated = openai_to_anthropic(request, None).unwrap();
+            assert!(translated.cache_control.is_none());
+            let system = translated.system.unwrap();
+            assert_eq!(system.len(), 5);
+            assert_eq!(
+                system.iter().filter(|block| block.cache_control.is_some()).count(),
+                1
+            );
+            assert_eq!(
+                system[4].cache_control.as_ref().unwrap().ttl.as_deref(),
+                Some("1h")
+            );
+        }
+    }
+
+    #[test]
+    fn system_message_cache_control_preserves_explicit_blocks_and_empty_boundaries() {
+        let request = serde_json::from_value(json!({
+            "model": "claude-sonnet-5.5",
+            "messages": [
+                {
+                    "role": "system",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                    "content": [
+                        {"type": "text", "text": "first", "cache_control": {"type": "ephemeral", "ttl": "5m"}},
+                        {"type": "text", "text": "second", "cache_control": {"type": "ephemeral", "ttl": "5m"}}
+                    ]
+                },
+                {"role": "developer", "content": "uncached"},
+                {"role": "system", "content": [], "cache_control": {"type": "ephemeral"}},
+                {"role": "user", "content": "hello"}
+            ]
+        }))
+        .unwrap();
+        let translated = openai_to_anthropic(request, None).unwrap();
+        let system = translated.system.unwrap();
+        assert_eq!(system.len(), 3);
+        assert_eq!(
+            system[0].cache_control.as_ref().unwrap().ttl.as_deref(),
+            Some("5m")
+        );
+        assert_eq!(
+            system[1].cache_control.as_ref().unwrap().ttl.as_deref(),
+            Some("5m")
+        );
+        assert!(system[2].cache_control.is_none());
+    }
+
+    #[test]
+    fn assistant_message_cache_control_includes_tool_calls() {
+        for content in [
+            Value::Null,
+            json!("checking"),
+            json!([{"type": "text", "text": "checking"}]),
+        ] {
+            let request = serde_json::from_value(json!({
+                "model": "claude-sonnet-5.5",
+                "cache_control": null,
+                "messages": [
+                    {"role": "user", "content": "look up the value"},
+                    {
+                        "role": "assistant",
+                        "content": content,
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                        "tool_calls": [
+                            {"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}},
+                            {"id": "call_2", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+                        ]
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "one"},
+                    {"role": "tool", "tool_call_id": "call_2", "content": "two"},
+                    {"role": "user", "content": "continue"}
+                ]
+            }))
+            .unwrap();
+            let translated = openai_to_anthropic(request, None).unwrap();
+            assert!(translated.cache_control.is_none());
+            let blocks = translated.messages[1].content.as_array().unwrap();
+            assert_eq!(
+                blocks.iter().filter(|block| block.get("cache_control").is_some()).count(),
+                1
+            );
+            let last = blocks.last().unwrap();
+            assert_eq!(last["id"], "call_2");
+            assert_eq!(last["cache_control"]["ttl"], "1h");
+        }
+    }
+
+    #[test]
+    fn assistant_message_cache_control_preserves_explicit_content_breakpoint() {
+        let request = serde_json::from_value(json!({
+            "model": "claude-sonnet-5.5",
+            "messages": [
+                {"role": "user", "content": "look up the value"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "checking", "cache_control": {"type": "ephemeral", "ttl": "5m"}}],
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                    "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "one"},
+                {"role": "user", "content": "continue"}
+            ]
+        }))
+        .unwrap();
+        let translated = openai_to_anthropic(request, None).unwrap();
+        let blocks = translated.messages[1].content.as_array().unwrap();
+        assert_eq!(blocks[0]["cache_control"]["ttl"], "5m");
+        assert_eq!(blocks[1]["cache_control"]["ttl"], "1h");
     }
 
     #[test]
