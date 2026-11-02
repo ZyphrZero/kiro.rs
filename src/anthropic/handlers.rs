@@ -10,6 +10,7 @@ use crate::admin::trace_db::{
     usage_source,
 };
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
+use crate::kiro::error::NoAvailableCredentialsError;
 use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
 use crate::kiro::model::events::{Event, TokenUsage};
 use crate::kiro::model::requests::kiro::KiroRequest;
@@ -269,6 +270,10 @@ impl RequestTracer {
         }
     }
 
+    fn discard(&self) {
+        self.finalized.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// 组装并落库一条完整链路。store 为 None 时不做任何事。
     pub fn finalize(
         &self,
@@ -451,8 +456,44 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
     }
 }
 
+pub(super) fn is_no_available_credentials_error(err: &Error) -> bool {
+    if err.downcast_ref::<NoAvailableCredentialsError>().is_some() {
+        return true;
+    }
+    let s = err.to_string();
+    s.contains("所有凭据均已禁用")
+        || s.contains("所有凭据均无法获取有效 Token")
+        || s.contains("所有凭据已用尽")
+        || s.contains("No available credentials")
+}
+
+fn request_has_no_credentials(
+    provider: &crate::kiro::provider::KiroProvider,
+    payload: &MessagesRequest,
+    group: Option<&str>,
+) -> bool {
+    if websearch::has_web_search_tool(payload) {
+        return !provider.token_manager().has_available_credentials(None, group);
+    }
+    super::converter::map_model(&payload.model).is_some_and(|model| {
+        !provider.token_manager().has_available_credentials(Some(&model), group)
+    })
+}
+
 /// 将 KiroProvider 错误映射为 HTTP 响应
 pub(super) fn map_provider_error(err: Error) -> Response {
+    if is_no_available_credentials_error(&err) {
+        tracing::warn!(error = %err, "无可用凭据（映射为 401）");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse::new(
+                "authentication_error",
+                "No available credentials for this request",
+            )),
+        )
+            .into_response();
+    }
+
     if err
         .downcast_ref::<crate::kiro::error::UpstreamTimeoutError>()
         .is_some()
@@ -773,9 +814,9 @@ pub async fn get_models(
         Ok(models) => models,
         Err(ModelDiscoveryError::NoAvailableCredentials) => {
             return (
-                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse::new(
-                    "service_unavailable",
+                    "authentication_error",
                     "No available credentials for this API key",
                 )),
             )
@@ -850,6 +891,23 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+
+    // 检查是否有可用凭据（无可用账号直接返回 401，避免创建 tracer 和写入日志）
+    if request_has_no_credentials(&provider, &payload, key_ctx.group.as_deref()) {
+        tracing::warn!(
+            model = %payload.model,
+            group = ?key_ctx.group,
+            "无可用凭据，直接返回 401"
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse::new(
+                "authentication_error",
+                "No available credentials for this request",
+            )),
+        )
+            .into_response();
+    }
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
@@ -1088,15 +1146,19 @@ async fn handle_stream_request(
     {
         Ok(resp) => resp,
         Err(e) => {
-            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-            // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&format!("{e:#}")),
-                None,
-                TraceUsage::zero(),
-            );
+            if is_no_available_credentials_error(&e) {
+                tracer.discard();
+            } else {
+                hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+                // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
+                tracer.finalize(
+                    "error",
+                    last_attempt_outcome(&tracer),
+                    Some(&format!("{e:#}")),
+                    None,
+                    TraceUsage::zero(),
+                );
+            }
             return map_provider_error(e);
         }
     };
@@ -1709,14 +1771,18 @@ pub(crate) async fn execute_non_stream_request(
     {
         Ok(resp) => resp,
         Err(e) => {
-            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&format!("{e:#}")),
-                None,
-                TraceUsage::zero(),
-            );
+            if is_no_available_credentials_error(&e) {
+                tracer.discard();
+            } else {
+                hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+                tracer.finalize(
+                    "error",
+                    last_attempt_outcome(&tracer),
+                    Some(&format!("{e:#}")),
+                    None,
+                    TraceUsage::zero(),
+                );
+            }
             return Err(NonStreamExecutionError::Provider(e));
         }
     };
@@ -2289,6 +2355,23 @@ pub async fn post_messages_cc(
                 .into_response();
         }
     };
+
+    // 检查是否有可用凭据（无可用账号直接返回 401，避免创建 tracer 和写入日志）
+    if request_has_no_credentials(&provider, &payload, key_ctx.group.as_deref()) {
+        tracing::warn!(
+            model = %payload.model,
+            group = ?key_ctx.group,
+            "无可用凭据，直接返回 401"
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse::new(
+                "authentication_error",
+                "No available credentials for this request",
+            )),
+        )
+            .into_response();
+    }
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
@@ -3050,6 +3133,33 @@ mod tests {
     }
 
     #[test]
+    fn discarded_tracer_does_not_record_cancellation() {
+        use crate::admin::trace_db::{TraceQuery, TraceStore};
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        {
+            let tracer = RequestTracer {
+                store: Some(store.clone()),
+                trace_id: "discarded-trace".to_string(),
+                ts: Utc::now().to_rfc3339(),
+                key_id: 0,
+                key_source: TraceKeySource::MasterApiKey,
+                client_ip: None,
+                model: "test".to_string(),
+                is_stream: false,
+                started_at: Instant::now(),
+                first_token_at: parking_lot::Mutex::new(None),
+                attempts: parking_lot::Mutex::new(Vec::new()),
+                route: parking_lot::Mutex::new(None),
+                finalized: std::sync::atomic::AtomicBool::new(false),
+                upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
+            };
+            tracer.discard();
+        }
+        let (_, total) = store.query_paged(&TraceQuery { limit: 10, ..Default::default() });
+        assert_eq!(total, 0);
+    }
+
+    #[test]
     fn account_suspended_attempt_is_preserved_as_request_error_type() {
         assert_eq!(
             canonical_attempt_outcome(outcome::ACCOUNT_SUSPENDED),
@@ -3484,5 +3594,22 @@ mod tests {
         .unwrap();
         assert!(too_long.message.starts_with("prompt is too long"), "{}", too_long.message);
         assert!(upstream_event_error(&exc("ContentLengthExceededException", "x")).is_none());
+    }
+
+    #[tokio::test]
+    async fn map_provider_error_returns_401_on_no_available_credentials() {
+        use axum::body::to_bytes;
+
+        let err = anyhow::Error::new(NoAvailableCredentialsError::new("所有凭据均已禁用（0/2）"));
+        let resp = map_provider_error(err);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "authentication_error");
+        assert_eq!(
+            json["error"]["message"],
+            "No available credentials for this request"
+        );
     }
 }

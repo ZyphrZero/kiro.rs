@@ -1,5 +1,16 @@
 //! Shared typed errors for Kiro upstream calls.
 
+/// The credential pool has no available credentials (or all disabled/suspended/quota) for this request.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("No available credentials: {0}")]
+pub struct NoAvailableCredentialsError(pub String);
+
+impl NoAvailableCredentialsError {
+    pub fn new(msg: impl Into<String>) -> Self {
+        Self(msg.into())
+    }
+}
+
 /// The upstream still returned HTTP 429 after any applicable failover/retry.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("upstream rate limited")]
