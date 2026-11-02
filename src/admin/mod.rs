@@ -19,6 +19,7 @@
 mod error;
 mod handlers;
 mod middleware;
+mod quota_alerts;
 pub mod proxy_pool;
 mod router;
 mod service;

@@ -19,6 +19,8 @@ pub enum AdminServiceError {
     /// 上游服务调用失败（网络、API 错误等）
     UpstreamError(String),
 
+    InvalidBalance { id: u64 },
+
     /// 上游明确返回限流，可选携带合法 Retry-After。
     RateLimited { retry_after: Option<String> },
 
@@ -36,6 +38,7 @@ impl fmt::Display for AdminServiceError {
                 write!(f, "凭据不存在: {}", id)
             }
             AdminServiceError::UpstreamError(_) => write!(f, "上游服务请求失败"),
+            AdminServiceError::InvalidBalance { id } => write!(f, "凭据 #{id} 的上游额度数据缺失或无效"),
             AdminServiceError::RateLimited { .. } => write!(f, "上游请求过于频繁，请稍后重试"),
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
@@ -51,6 +54,7 @@ impl AdminServiceError {
         match self {
             AdminServiceError::NotFound { .. } => StatusCode::NOT_FOUND,
             AdminServiceError::UpstreamError(_) => StatusCode::BAD_GATEWAY,
+            AdminServiceError::InvalidBalance { .. } => StatusCode::BAD_GATEWAY,
             AdminServiceError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
@@ -62,6 +66,7 @@ impl AdminServiceError {
         match &self {
             AdminServiceError::NotFound { .. } => AdminErrorResponse::not_found(self.to_string()),
             AdminServiceError::UpstreamError(_) => AdminErrorResponse::api_error(self.to_string()),
+            AdminServiceError::InvalidBalance { .. } => AdminErrorResponse::api_error(self.to_string()),
             AdminServiceError::RateLimited { .. } => {
                 AdminErrorResponse::rate_limit(self.to_string())
             }

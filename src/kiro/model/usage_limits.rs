@@ -70,13 +70,15 @@ pub struct OverageConfiguration {
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub struct UsageBreakdown {
+    #[serde(default)]
+    pub resource_type: Option<String>,
     /// 当前使用量
     #[serde(default)]
-    pub current_usage: i64,
+    pub current_usage: Option<i64>,
 
     /// 当前使用量（精确值）
     #[serde(default)]
-    pub current_usage_with_precision: f64,
+    pub current_usage_with_precision: Option<f64>,
 
     /// 奖励额度列表
     #[serde(default)]
@@ -92,11 +94,11 @@ pub struct UsageBreakdown {
 
     /// 使用限额
     #[serde(default)]
-    pub usage_limit: i64,
+    pub usage_limit: Option<i64>,
 
     /// 使用限额（精确值）
     #[serde(default)]
-    pub usage_limit_with_precision: f64,
+    pub usage_limit_with_precision: Option<f64>,
 }
 
 /// 奖励额度
@@ -105,24 +107,29 @@ pub struct UsageBreakdown {
 pub struct Bonus {
     /// 当前使用量
     #[serde(default)]
-    pub current_usage: f64,
+    pub current_usage: Option<f64>,
 
     /// 使用限额
     #[serde(default)]
-    pub usage_limit: f64,
+    pub usage_limit: Option<f64>,
 
     /// 状态 (ACTIVE / EXPIRED)
     #[serde(default)]
     pub status: Option<String>,
+    #[serde(default)]
+    pub expires_on: Option<f64>,
 }
 
 impl Bonus {
     /// 检查 bonus 是否处于激活状态
-    pub fn is_active(&self) -> bool {
+    pub fn is_active_at(&self, now: f64) -> bool {
         self.status
             .as_deref()
             .map(|s| s == "ACTIVE")
             .unwrap_or(false)
+            && self
+                .expires_on
+                .is_none_or(|expiry| expiry.is_finite() && expiry > now)
     }
 }
 
@@ -133,11 +140,11 @@ impl Bonus {
 pub struct FreeTrialInfo {
     /// 当前使用量
     #[serde(default)]
-    pub current_usage: i64,
+    pub current_usage: Option<i64>,
 
     /// 当前使用量（精确值）
     #[serde(default)]
-    pub current_usage_with_precision: f64,
+    pub current_usage_with_precision: Option<f64>,
 
     /// 免费试用过期时间 (Unix 时间戳)
     #[serde(default)]
@@ -149,22 +156,25 @@ pub struct FreeTrialInfo {
 
     /// 使用限额
     #[serde(default)]
-    pub usage_limit: i64,
+    pub usage_limit: Option<i64>,
 
     /// 使用限额（精确值）
     #[serde(default)]
-    pub usage_limit_with_precision: f64,
+    pub usage_limit_with_precision: Option<f64>,
 }
 
 // ============ 便捷方法实现 ============
 
 impl FreeTrialInfo {
     /// 检查免费试用是否处于激活状态
-    pub fn is_active(&self) -> bool {
+    pub fn is_active_at(&self, now: f64) -> bool {
         self.free_trial_status
             .as_deref()
             .map(|s| s == "ACTIVE")
             .unwrap_or(false)
+            && self
+                .free_trial_expiry
+                .is_none_or(|expiry| expiry.is_finite() && expiry > now)
     }
 }
 
@@ -190,9 +200,13 @@ impl UsageLimitsResponse {
         if let Some(enabled) = cfg.overage_enabled {
             return Some(enabled);
         }
-        cfg.overage_status
-            .as_deref()
-            .map(|s| s.eq_ignore_ascii_case("ENABLED"))
+        cfg.overage_status.as_deref().and_then(|status| {
+            match status.trim().to_ascii_uppercase().as_str() {
+                "ENABLED" => Some(true),
+                "DISABLED" => Some(false),
+                _ => None,
+            }
+        })
     }
 
     /// 账号是否"能"开启超额（基于 subscriptionInfo.overageCapability）
@@ -214,69 +228,147 @@ impl UsageLimitsResponse {
         None
     }
 
-    /// 获取第一个使用量明细
+    /// 优先选择 CREDIT 明细；仅在旧响应只有一项且未声明类型时兼容该项。
     fn primary_breakdown(&self) -> Option<&UsageBreakdown> {
-        self.usage_breakdown_list.first()
+        self.usage_breakdown_list
+            .iter()
+            .find(|item| {
+                item.resource_type
+                    .as_deref()
+                    .is_some_and(|resource| resource.eq_ignore_ascii_case("CREDIT"))
+            })
+            .or_else(|| {
+                self.usage_breakdown_list.first().filter(|item| {
+                    self.usage_breakdown_list.len() == 1 && item.resource_type.is_none()
+                })
+            })
     }
 
-    /// 获取总使用限额（精确值）
-    ///
-    /// 累加基础额度、激活的免费试用额度和激活的奖励额度
-    pub fn usage_limit(&self) -> f64 {
-        let Some(breakdown) = self.primary_breakdown() else {
-            return 0.0;
-        };
-
-        let mut total = breakdown.usage_limit_with_precision;
-
-        // 累加激活的 free trial 额度
-        if let Some(trial) = &breakdown.free_trial_info {
-            if trial.is_active() {
-                total += trial.usage_limit_with_precision;
-            }
-        }
-
-        // 累加激活的 bonus 额度
-        for bonus in &breakdown.bonuses {
-            if bonus.is_active() {
-                total += bonus.usage_limit;
-            }
-        }
-
-        total
+    pub fn next_reset_at(&self) -> Option<f64> {
+        self.next_date_reset.or_else(|| {
+            self.primary_breakdown()
+                .and_then(|item| item.next_date_reset)
+        })
     }
 
-    /// 获取总当前使用量（精确值）
-    ///
-    /// 累加基础使用量、激活的免费试用使用量和激活的奖励使用量
-    pub fn current_usage(&self) -> f64 {
-        let Some(breakdown) = self.primary_breakdown() else {
-            return 0.0;
+    /// 返回同一时刻的（已用、总额度）；缺失或无效的额度项不能当成零使用量。
+    pub fn credit_totals_at(&self, now: f64) -> Option<(f64, f64)> {
+        let breakdown = self.primary_breakdown()?;
+        let mut used = breakdown
+            .current_usage_with_precision
+            .or(breakdown.current_usage.map(|value| value as f64))?;
+        let mut limit = breakdown
+            .usage_limit_with_precision
+            .or(breakdown.usage_limit.map(|value| value as f64))?;
+        let valid = |used: f64, limit: f64| {
+            used.is_finite() && used >= 0.0 && limit.is_finite() && limit >= 0.0
         };
-
-        let mut total = breakdown.current_usage_with_precision;
-
-        // 累加激活的 free trial 使用量
+        if !valid(used, limit) {
+            return None;
+        }
         if let Some(trial) = &breakdown.free_trial_info {
-            if trial.is_active() {
-                total += trial.current_usage_with_precision;
+            if trial.is_active_at(now) {
+                let trial_used = trial
+                    .current_usage_with_precision
+                    .or(trial.current_usage.map(|value| value as f64))?;
+                let trial_limit = trial
+                    .usage_limit_with_precision
+                    .or(trial.usage_limit.map(|value| value as f64))?;
+                if !valid(trial_used, trial_limit) {
+                    return None;
+                }
+                used += trial_used;
+                limit += trial_limit;
             }
         }
-
-        // 累加激活的 bonus 使用量
         for bonus in &breakdown.bonuses {
-            if bonus.is_active() {
-                total += bonus.current_usage;
+            if bonus.is_active_at(now) {
+                let bonus_used = bonus.current_usage?;
+                let bonus_limit = bonus.usage_limit?;
+                if !valid(bonus_used, bonus_limit) {
+                    return None;
+                }
+                used += bonus_used;
+                limit += bonus_limit;
             }
         }
+        valid(used, limit).then_some((used, limit))
+    }
 
-        total
+    pub fn credit_expiry_at(&self, now: f64) -> Option<f64> {
+        let breakdown = self.primary_breakdown()?;
+        let trial_expiry = breakdown
+            .free_trial_info
+            .as_ref()
+            .filter(|trial| trial.is_active_at(now))
+            .and_then(|trial| trial.free_trial_expiry);
+        breakdown
+            .bonuses
+            .iter()
+            .filter(|bonus| bonus.is_active_at(now))
+            .filter_map(|bonus| bonus.expires_on)
+            .chain(trial_expiry)
+            .min_by(f64::total_cmp)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credit_totals_include_only_active_unexpired_credits_not_overage() {
+        let response: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
+            "usageBreakdownList": [
+                {"resourceType": "OTHER", "usageLimit": 999999, "currentUsage": 0},
+                {
+                    "resourceType": "CREDIT", "currentUsageWithPrecision": 50.5, "usageLimitWithPrecision": 100.0,
+                    "currentOveragesWithPrecision": 300.0, "overageLimit": 99999,
+                    "nextDateReset": 4000,
+                    "freeTrialInfo": {"freeTrialStatus": "ACTIVE", "freeTrialExpiry": 2000, "currentUsage": 20, "usageLimit": 50},
+                    "bonuses": [
+                        {"status": "ACTIVE", "expiresOn": 2000, "currentUsage": 10, "usageLimit": 25},
+                        {"status": "ACTIVE", "expiresOn": 900, "currentUsage": 100, "usageLimit": 500},
+                        {"status": "EXPIRED", "currentUsage": 100, "usageLimit": 500}
+                    ]
+                }
+            ]
+        })).unwrap();
+        assert_eq!(response.credit_totals_at(1000.0), Some((80.5, 175.0)));
+        assert_eq!(response.credit_totals_at(2000.0), Some((50.5, 100.0)));
+        assert_eq!(response.next_reset_at(), Some(4000.0));
+        assert_eq!(response.credit_expiry_at(1000.0), Some(2000.0));
+        assert_eq!(response.credit_expiry_at(2000.0), None);
+    }
+
+    #[test]
+    fn credit_totals_validate_missing_and_negative_components_and_preserve_zero_precision() {
+        for breakdown in [
+            serde_json::json!({"usageLimit": 100}),
+            serde_json::json!({"currentUsage": 20, "usageLimit": -1}),
+            serde_json::json!({"currentUsage": 20, "usageLimit": 100, "bonuses": [{"status": "ACTIVE", "currentUsage": -10, "usageLimit": 100}]}),
+        ] {
+            let response: UsageLimitsResponse =
+                serde_json::from_value(serde_json::json!({"usageBreakdownList": [breakdown]}))
+                    .unwrap();
+            assert_eq!(response.credit_totals_at(1000.0), None);
+        }
+        let response: UsageLimitsResponse =
+            serde_json::from_value(serde_json::json!({"usageBreakdownList": [{
+                "currentUsage": 10, "usageLimit": 100, "currentUsageWithPrecision": 0.0
+            }]}))
+            .unwrap();
+        assert_eq!(response.credit_totals_at(1000.0), Some((0.0, 100.0)));
+    }
+
+    #[test]
+    fn unknown_overage_status_stays_unknown() {
+        let response: UsageLimitsResponse = serde_json::from_value(serde_json::json!({
+            "overageConfiguration": {"overageStatus": "NEW_UNKNOWN_VALUE"}
+        }))
+        .unwrap();
+        assert_eq!(response.overage_enabled(), None);
+    }
 
     #[test]
     fn test_parse_email_from_user_info() {

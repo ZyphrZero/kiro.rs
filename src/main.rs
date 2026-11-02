@@ -383,6 +383,7 @@ async fn main() {
             });
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
+                    .with_quota_alerts(balance_refresh_interval)
                     .with_kiro_provider(kiro_provider.clone())
                     .with_log_governance(
                         Some(admin_trace_store.clone()),

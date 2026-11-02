@@ -42,6 +42,7 @@ use super::{
         update_refresh_token,
     },
     middleware::{AdminState, admin_auth_middleware},
+    quota_alerts::{get_alerts, test_alerts, update_alerts},
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -73,6 +74,8 @@ const MAX_ADMIN_BODY_SIZE: usize = 50 * 1024 * 1024;
 pub fn create_admin_router(state: AdminState) -> Router {
     // 需要登录API密钥认证的路由
     let authenticated = Router::new()
+        .route("/config/quota-alerts", get(get_alerts).put(update_alerts))
+        .route("/config/quota-alerts/test", post(test_alerts))
         .route(
             "/credentials",
             get(get_all_credentials).post(add_credential),

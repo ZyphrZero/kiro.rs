@@ -1,5 +1,6 @@
 import axios from 'axios'
 import { storage } from '@/lib/storage'
+import type { QuotaAlertsResponse, UpdateQuotaAlertsRequest } from '@/types/quota-alerts'
 import type {
   CredentialsStatusResponse,
   CredentialQueryParams,
@@ -647,6 +648,20 @@ export async function setSelfHealConfig(
 ): Promise<SelfHealConfig> {
   const { data } = await api.put<SelfHealConfig>('/config/self-heal', patch)
   return data
+}
+
+export async function getQuotaAlerts(): Promise<QuotaAlertsResponse> {
+  const { data } = await api.get<QuotaAlertsResponse>('/config/quota-alerts')
+  return data
+}
+
+export async function setQuotaAlerts(request: UpdateQuotaAlertsRequest): Promise<QuotaAlertsResponse> {
+  const { data } = await api.put<QuotaAlertsResponse>('/config/quota-alerts', request)
+  return data
+}
+
+export async function testQuotaAlerts(): Promise<void> {
+  await api.post('/config/quota-alerts/test')
 }
 
 export interface LogGovernanceConfig {

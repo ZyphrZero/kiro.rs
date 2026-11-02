@@ -34,6 +34,7 @@ use crate::kiro::token_manager::{
 use crate::model::config::Config;
 
 use super::error::AdminServiceError;
+use super::quota_alerts::{BalanceRound, BalanceSample, QuotaAlerts};
 use super::proxy_pool::{mask_proxy_url, GetUrlResult, ProxyAvailability, ProxyPoolManager};
 use super::types::{
     AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
@@ -326,6 +327,7 @@ pub struct AdminService {
     cache_meter: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
     /// 自定义响应头管理器（热重载）
     custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
+    quota_alerts: Result<Arc<QuotaAlerts>, String>,
 }
 
 /// Social 登录会话状态
@@ -680,6 +682,7 @@ impl AdminService {
             usage_recorder: None,
             cache_meter: None,
             custom_headers: None,
+            quota_alerts: Err("额度告警服务尚未初始化".into()),
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -703,6 +706,27 @@ impl AdminService {
     pub fn with_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
         self.kiro_provider = Some(provider);
         self
+    }
+
+    pub fn with_quota_alerts(mut self, interval: std::time::Duration) -> Self {
+        self.quota_alerts = match self.token_manager.cache_dir() {
+            Some(directory) => QuotaAlerts::start(
+                &directory.join("quota_alerts.db"),
+                self.token_manager.clone(),
+                interval,
+            ),
+            None => Err("额度告警需要可持久化的数据目录".into()),
+        };
+        if let Err(error) = &self.quota_alerts {
+            tracing::error!("额度告警不可用（代理服务不受影响）：{error}");
+        }
+        self
+    }
+
+    pub fn quota_alerts(&self) -> Result<&Arc<QuotaAlerts>, AdminServiceError> {
+        self.quota_alerts
+            .as_ref()
+            .map_err(|error| AdminServiceError::InternalError(error.clone()))
     }
 
     /// 暴露 TokenManager 给 handlers（分组管理需要 count / rename / remove 凭据 groups 字段）
@@ -1391,7 +1415,7 @@ impl AdminService {
         }
 
         // 缓存未命中或已过期，从上游获取
-        let balance = self.fetch_balance(id).await?;
+        let (balance, _) = self.fetch_balance(id).await?;
 
         // 更新缓存
         {
@@ -1410,15 +1434,17 @@ impl AdminService {
     }
 
     /// 从上游获取余额（无缓存）
-    async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
+    async fn fetch_balance(&self, id: u64) -> Result<(BalanceResponse, Option<f64>), AdminServiceError> {
         let usage = self
             .token_manager
             .get_usage_limits_for(id)
             .await
             .map_err(|e| self.classify_balance_error(e, id))?;
 
-        let current_usage = usage.current_usage();
-        let usage_limit = usage.usage_limit();
+        let now = Utc::now().timestamp() as f64;
+        let (current_usage, usage_limit) = usage
+            .credit_totals_at(now)
+            .ok_or(AdminServiceError::InvalidBalance { id })?;
         // 允许 remaining 显示为负值：开启超额后实际使用可能超过限额，
         // 直接保留差值便于在 UI 中体现"已欠多少"。
         let remaining = usage_limit - current_usage;
@@ -1429,21 +1455,24 @@ impl AdminService {
             0.0
         };
 
-        Ok(BalanceResponse {
-            id,
-            subscription_title: usage.subscription_title().map(|s| s.to_string()),
-            current_usage,
-            usage_limit,
-            remaining,
-            usage_percentage,
-            next_reset_at: usage.next_date_reset,
-            overage_enabled: usage.overage_enabled(),
-            overage_capable: usage.overage_capable(),
-            overage_capability_raw: usage
-                .subscription_info
-                .as_ref()
-                .and_then(|s| s.overage_capability.clone()),
-        })
+        Ok((
+            BalanceResponse {
+                id,
+                subscription_title: usage.subscription_title().map(|s| s.to_string()),
+                current_usage,
+                usage_limit,
+                remaining,
+                usage_percentage,
+                next_reset_at: usage.next_reset_at(),
+                overage_enabled: usage.overage_enabled(),
+                overage_capable: usage.overage_capable(),
+                overage_capability_raw: usage
+                    .subscription_info
+                    .as_ref()
+                    .and_then(|s| s.overage_capability.clone()),
+            },
+            usage.credit_expiry_at(now),
+        ))
     }
 
     /// 获取指定凭据当前可用的模型列表（实时查询上游，成功后更新共享模型缓存）
@@ -1591,6 +1620,7 @@ impl AdminService {
     /// 串行执行以避免对上游产生瞬时高并发，每次成功的查询都会更新内存缓存
     /// 与磁盘缓存。失败的条目不会清空旧缓存，调用方可在下次轮询时重试。
     pub async fn refresh_all_balances(&self) -> (usize, usize) {
+        let mut alert_round = BalanceRound::default();
         let snapshot = self.token_manager.snapshot();
         let now_ts = Utc::now().timestamp() as f64;
         let quota_recovery_enabled = self.token_manager.quota_reset_recovery_enabled();
@@ -1629,7 +1659,16 @@ impl AdminService {
                 continue;
             }
             match self.fetch_balance(entry.id).await {
-                Ok(balance) => {
+                Ok((balance, valid_until)) => {
+                    alert_round.balances.insert(
+                        entry.id,
+                        BalanceSample {
+                            queried_at: Utc::now().timestamp(),
+                            balance: Some(balance.clone()),
+                            valid_until,
+                            invalid_quota: false,
+                        },
+                    );
                     // 此路径只恢复此前因额度耗尽而被禁用的账号。即使超额开关
                     // 仍为开启，也不能证明超额额度尚未耗尽；只有订阅额度在新
                     // 计费周期恢复为正数时才重新加入调度。
@@ -1667,6 +1706,15 @@ impl AdminService {
                 }
                 Err(e) => {
                     tracing::warn!("后台刷新凭据 #{} 余额失败: {}", entry.id, e);
+                    alert_round.balances.insert(
+                        entry.id,
+                        BalanceSample {
+                            queried_at: Utc::now().timestamp(),
+                            balance: None,
+                            valid_until: None,
+                            invalid_quota: matches!(e, AdminServiceError::InvalidBalance { .. }),
+                        },
+                    );
                     failure += 1;
                 }
             }
@@ -1676,6 +1724,10 @@ impl AdminService {
 
         if success > 0 {
             self.save_balance_cache();
+        }
+        alert_round.completed_at = Utc::now().timestamp();
+        if let Ok(alerts) = &self.quota_alerts {
+            alerts.submit(alert_round);
         }
         (success, failure)
     }
