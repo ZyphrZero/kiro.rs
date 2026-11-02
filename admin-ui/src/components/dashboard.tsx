@@ -128,6 +128,7 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import {
+  getCredentials,
   getCredentialBalance,
   forceRefreshToken,
   disableQuotaExceeded,
@@ -142,7 +143,11 @@ import {
   generateApiKey,
   overageFailureMessage,
 } from "@/lib/utils";
-import type { BalanceResponse, CredentialStatusItem } from "@/types/api";
+import type {
+  BalanceResponse,
+  CredentialQueryParams,
+  CredentialStatusItem,
+} from "@/types/api";
 import { StatusStrip } from "@/components/console/status-strip";
 import { BulkBar } from "@/components/console/bulk-bar";
 import {
@@ -274,6 +279,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [updatingAdminKey, setUpdatingAdminKey] = useState(false);
   const [showAdminKeyPlain, setShowAdminKeyPlain] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [selectedFilterIds, setSelectedFilterIds] = useState<number[] | null>(null);
+  const [selectingFiltered, setSelectingFiltered] = useState(false);
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false);
   const [verifying, setVerifying] = useState(false);
   const [verifyDeleting, setVerifyDeleting] = useState(false);
@@ -329,33 +336,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
     return false;
   });
-
-  const queryClient = useQueryClient();
-  const { data, isLoading, error, refetch } = useCredentials();
-  const { mutate: deleteCredential } = useDeleteCredential();
-  const { mutate: resetFailure } = useResetFailure();
-  const { data: loadBalancingData, isLoading: isLoadingMode } =
-    useLoadBalancingMode();
-  const { mutate: setLoadBalancingMode, isPending: isSettingMode } =
-    useSetLoadBalancingMode();
-  const resetAllSuccess = useResetAllSuccessCount();
-  const setPriority = useSetPriority();
-  const { data: updateCheck } = useUpdateCheck();
-  const { data: failureStatsMap } = useFailureStats();
-  const groupOptions = useGroupOptions();
-  const allCredentials = import.meta.env.DEV
-    ? [DEV_PREVIEW_CREDENTIAL, ...(data?.credentials ?? [])]
-    : (data?.credentials ?? []);
-
-  // 按 profile 分组：上游 prompt cache 按 profile 隔离，同 profile 的账号共享缓存。
-  // 只有一个 profile 时，会话在账号间换号不会丢缓存；多个 profile 才需要关心粘性路由。
-  const profileSummary = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const c of allCredentials) {
-      if (c.profileArn) counts.set(c.profileArn, (counts.get(c.profileArn) ?? 0) + 1);
-    }
-    return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
-  }, [allCredentials]);
 
   // 分组筛选：'' = 全部；'__none__' = 仅显示未分组；其他 = 按分组名筛选
   const [groupFilter, setGroupFilter] = useState<string>("");
@@ -437,8 +417,91 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     });
   };
 
-  // 应用分组 + 分级筛选后的凭据全集（分页前先过滤，确保翻页粒度正确）
-  const filteredCredentials = useMemo(() => {
+  // 服务端分页只在「未选分级」或「只选一个分级」时启用：多选分级无法用单个
+  // tier 参数表达，此时回退到前端内存筛选（不传任何查询参数，后端返回全量）。
+  const serverPaginationEligible = tierFilter.size <= 1;
+  const singleTier = tierFilter.size === 1 ? Array.from(tierFilter)[0] : undefined;
+  const filterSelectionKey = JSON.stringify([groupFilter, Array.from(tierFilter).sort(), deferredSearchQuery, stateFilter]);
+  const currentFilterSelectionKey = useRef(filterSelectionKey);
+  currentFilterSelectionKey.current = filterSelectionKey;
+
+  // 服务端查询参数构建
+  const credentialQueryParams = useMemo<CredentialQueryParams | undefined>(() => {
+    if (!serverPaginationEligible) return undefined;
+    return {
+      page: currentPage,
+      pageSize: pageSize === 0 ? 0 : pageSize,
+      search: deferredSearchQuery.trim() || undefined,
+      group: groupFilter || undefined,
+      status: stateFilter || undefined,
+      tier: singleTier,
+      sortField,
+      sortDir,
+    };
+  }, [
+    serverPaginationEligible,
+    currentPage,
+    pageSize,
+    deferredSearchQuery,
+    groupFilter,
+    stateFilter,
+    singleTier,
+    sortField,
+    sortDir,
+  ]);
+
+  const queryClient = useQueryClient();
+  const { data, isLoading, error, refetch } = useCredentials(credentialQueryParams);
+  const { mutate: deleteCredential } = useDeleteCredential();
+  const { mutate: resetFailure } = useResetFailure();
+  const { data: loadBalancingData, isLoading: isLoadingMode } =
+    useLoadBalancingMode();
+  const { mutate: setLoadBalancingMode, isPending: isSettingMode } =
+    useSetLoadBalancingMode();
+  const resetAllSuccess = useResetAllSuccessCount();
+  const setPriority = useSetPriority();
+  const { data: updateCheck } = useUpdateCheck();
+  const { data: failureStatsMap } = useFailureStats();
+  const groupOptions = useGroupOptions();
+  const allCredentials = import.meta.env.DEV
+    ? [DEV_PREVIEW_CREDENTIAL, ...(data?.credentials ?? [])]
+    : (data?.credentials ?? []);
+
+  // 按 profile 分组：上游 prompt cache 按 profile 隔离，同 profile 的账号共享缓存。
+  // 只有一个 profile 时，会话在账号间换号不会丢缓存；多个 profile 才需要关心粘性路由。
+  const profileSummary = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const c of allCredentials) {
+      if (c.profileArn) counts.set(c.profileArn, (counts.get(c.profileArn) ?? 0) + 1);
+    }
+    return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
+  }, [allCredentials]);
+
+  // 判断后端是否已支持服务端分页（带分页/筛选参数时返回 filteredTotal）
+  const isServerPaginated = data?.filteredTotal !== undefined;
+
+  // 各状态计数（状态账条用）。优先采用后端全局统计，避免当前页数据被筛选/分页截断后账条失真。
+  const stateCounts = useMemo(() => {
+    if (data?.stateCounts) {
+      return {
+        healthy: data.stateCounts.healthy,
+        // 后端统计未单列「当前优先」，该字段仅用于旧版客户端兼容
+        current: 0,
+        throttled: data.stateCounts.throttled,
+        quota: data.stateCounts.quota,
+        dead: data.stateCounts.dead,
+        total: data.stateCounts.total,
+      };
+    }
+    return countByState(
+      data?.credentials ?? [],
+      (c) => balanceMap.get(c.id) ?? c.balance,
+    );
+  }, [data?.stateCounts, data?.credentials, balanceMap]);
+
+  // 当后端未分页时（如连接旧版后端），回退到前端内存筛选与排序
+  const clientFilteredCredentials = useMemo(() => {
+    if (isServerPaginated) return allCredentials;
     const all = allCredentials;
     let out = all;
     if (groupFilter) {
@@ -500,30 +563,31 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       });
     }
     return out;
-  }, [allCredentials, groupFilter, tierFilter, deferredSearchQuery, stateFilter, balanceMap, sortField, sortDir]);
-
-  // 各状态计数（状态账条用）。基于全量凭据而非当前筛选结果 ——
-  // 账条是导航器，点进某一段之后其余段的数字不该跟着变。
-  const stateCounts = countByState(
-    data?.credentials ?? [],
-    (c) => balanceMap.get(c.id) ?? c.balance,
-  );
+  }, [isServerPaginated, allCredentials, groupFilter, tierFilter, deferredSearchQuery, stateFilter, balanceMap, sortField, sortDir]);
 
   // 切换分组 / 分级筛选 / 搜索 / 状态 / 排序时复位到第 1 页，避免空页
   useEffect(() => {
     setCurrentPage(1);
   }, [groupFilter, tierFilter, deferredSearchQuery, stateFilter, sortField, sortDir]);
 
+  // 筛选后的总条数（用于分页计算）：服务端分页时取后端 filteredTotal
+  const totalFilteredCount = isServerPaginated
+    ? (data?.filteredTotal ?? data?.credentials?.length ?? 0) +
+      (import.meta.env.DEV ? 1 : 0)
+    : clientFilteredCredentials.length;
+
   // pageSize === 0 表示“全部”：单页容纳全部已筛选凭据
   const effectivePageSize =
-    pageSize === 0 ? Math.max(filteredCredentials.length, 1) : pageSize;
+    pageSize === 0 ? Math.max(totalFilteredCount, 1) : pageSize;
   const totalPages = Math.max(
     1,
-    Math.ceil(filteredCredentials.length / effectivePageSize),
+    Math.ceil(totalFilteredCount / effectivePageSize),
   );
   const startIndex = (currentPage - 1) * effectivePageSize;
   const endIndex = startIndex + effectivePageSize;
-  const serverPageCreds = filteredCredentials.slice(startIndex, endIndex);
+  const serverPageCreds = isServerPaginated
+    ? allCredentials
+    : clientFilteredCredentials.slice(startIndex, endIndex);
   // 拖拽排序的本地乐观顺序：仅当 id 集合与当前页一致时生效，否则回落到服务端顺序，
   // 避免翻页 / 数据变更后顺序错乱。
   const [pageOrder, setPageOrder] = useState<number[] | null>(null);
@@ -544,10 +608,16 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const currentPageAllSelected =
     currentPageIds.length > 0 &&
     currentPageIds.every((id) => selectedIds.has(id));
-  const allFilteredIds = filteredCredentials.map((c) => c.id);
+  const allFilteredIds = isServerPaginated
+    ? (selectedFilterIds ?? [])
+    : clientFilteredCredentials.map((c) => c.id);
   const allFilteredSelected =
-    allFilteredIds.length > 0 &&
+    allFilteredIds.length === totalFilteredCount && allFilteredIds.length > 0 &&
     allFilteredIds.every((id) => selectedIds.has(id));
+
+  useEffect(() => {
+    setSelectedFilterIds(null);
+  }, [groupFilter, tierFilter, deferredSearchQuery, stateFilter, totalFilteredCount]);
 
   // 翻页时清掉本地排序覆盖，回到服务端顺序
   useEffect(() => {
@@ -684,9 +754,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const overageEnableableCount = overageStats.disabledOff;
   const overageRetryableCount = overageStats.disabledOff + overageStats.unknown;
 
+  // 当总页数变小（如删除凭据后）且当前页超出总页数时，自动修正到最后一页，
+  // 避免停留在空页触发反复请求的翻页循环。
   useEffect(() => {
-    setCurrentPage(1);
-  }, [data?.credentials.length]);
+    if (currentPage > totalPages) {
+      setCurrentPage(totalPages);
+    }
+  }, [currentPage, totalPages]);
 
   useEffect(() => {
     if (!data?.credentials) {
@@ -761,16 +835,28 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   };
 
   /** 全选 / 取消全选所有筛选后的凭据（跨页） */
-  const toggleSelectAllFiltered = () => {
-    if (allFilteredSelected) {
-      // 取消：仅清除筛选范围内的，保留筛选范围外的已选项
-      setSelectedIds((prev) => {
-        const next = new Set(prev);
-        allFilteredIds.forEach((id) => next.delete(id));
+  const toggleSelectAllFiltered = async () => {
+    const requestedFilter = currentFilterSelectionKey.current;
+    setSelectingFiltered(true);
+    try {
+      const ids = isServerPaginated
+        ? (await getCredentials({ ...credentialQueryParams, page: undefined, pageSize: 0 })).credentials.map((credential) => credential.id)
+        : clientFilteredCredentials.map((credential) => credential.id);
+      if (currentFilterSelectionKey.current !== requestedFilter) {
+        toast.error("筛选条件已变化，请重新全选");
+        return;
+      }
+      setSelectedFilterIds(ids);
+      setSelectedIds((previous) => {
+        const next = new Set(previous);
+        const allSelected = ids.length > 0 && ids.every((id) => next.has(id));
+        ids.forEach((id) => allSelected ? next.delete(id) : next.add(id));
         return next;
       });
-    } else {
-      setSelectedIds(new Set(allFilteredIds));
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+    } finally {
+      setSelectingFiltered(false);
     }
   };
 
@@ -828,10 +914,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       toast.error("请先选择要恢复的凭据");
       return;
     }
-    const failedIds = Array.from(selectedIds).filter((id) => {
-      const c = data?.credentials.find((x) => x.id === id);
-      return c && c.failureCount > 0;
-    });
+    let credentials: CredentialStatusItem[];
+    try {
+      credentials = (await getCredentials()).credentials;
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+      return;
+    }
+    const failedIds = credentials.filter((credential) => selectedIds.has(credential.id) && credential.failureCount > 0).map((credential) => credential.id);
     if (failedIds.length === 0) {
       toast.error("选中的凭据中没有失败的凭据");
       return;
@@ -864,10 +954,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       toast.error("请先选择要刷新的凭据");
       return;
     }
-    const enabledIds = Array.from(selectedIds).filter((id) => {
-      const c = data?.credentials.find((x) => x.id === id);
-      return c && !c.disabled;
-    });
+    let credentials: CredentialStatusItem[];
+    try {
+      credentials = (await getCredentials()).credentials;
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+      return;
+    }
+    const enabledIds = credentials.filter((credential) => selectedIds.has(credential.id) && !credential.disabled).map((credential) => credential.id);
     if (enabledIds.length === 0) {
       toast.error("选中的凭据中没有启用的凭据");
       return;
@@ -893,11 +987,18 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   };
 
   const handleClearAll = async () => {
-    if (!data?.credentials || data.credentials.length === 0) {
+    let credentials: CredentialStatusItem[];
+    try {
+      credentials = (await getCredentials()).credentials;
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+      return;
+    }
+    if (credentials.length === 0) {
       toast.error("没有可清除的凭据");
       return;
     }
-    const disabled = data.credentials.filter((c) => c.disabled);
+    const disabled = credentials.filter((credential) => credential.disabled);
     if (disabled.length === 0) {
       toast.error("没有可清除的已禁用凭据");
       return;
@@ -1795,22 +1896,23 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   {currentPageAllSelected ? "取消全选" : "全选当前页"}
                 </Button>
               )}
-              {filteredCredentials.length > currentCredentials.length && (
+              {totalFilteredCount > currentCredentials.length && (
                 <Button
                   size="sm"
                   variant="outline"
                   className="w-full sm:w-auto"
                   onClick={toggleSelectAllFiltered}
+                  disabled={selectingFiltered}
                   title={
                     allFilteredSelected
                       ? "取消选择全部筛选结果"
-                      : `全选所有 ${filteredCredentials.length} 个筛选结果`
+                      : `全选所有 ${totalFilteredCount} 个筛选结果`
                   }
                 >
                   <CheckSquare className="h-3.5 w-3.5" />
                   {allFilteredSelected
                     ? "取消全选所有页"
-                    : `全选所有页 (${filteredCredentials.length})`}
+                    : `全选所有页 (${totalFilteredCount})`}
                 </Button>
               )}
 
@@ -2022,7 +2124,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           改哪个数字影响哪片区域。激活项的底边线用该状态的色轨色，与下方行的左侧色轨
           是同一个信号。
         */}
-        {(data?.credentials.length ?? 0) > 0 && (
+        {(data?.total ?? 0) > 0 && (
           <StatusStrip
             className="mb-2"
             segments={[
@@ -2093,7 +2195,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         )}
 
         {/* 列表 */}
-        {allCredentials.length === 0 ? (
+        {(data?.total ?? 0) === 0 ? (
           <Card>
             <CardContent className="py-16 text-center">
               <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-secondary text-muted-foreground">
@@ -2104,7 +2206,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </p>
             </CardContent>
           </Card>
-        ) : filteredCredentials.length === 0 ? (
+        ) : totalFilteredCount === 0 ? (
           /*
             有凭据但当前筛选下一个都不剩。默认筛「可用」时这很容易发生（全池超额
             或全被禁用），此时说"暂无凭据，去添加"是假话 —— 凭据在，只是都不健康。
@@ -2257,7 +2359,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </Button>
             </BulkBar>
 
-            {filteredCredentials.length > 0 && (
+            {totalFilteredCount > 0 && (
               <div className="mt-6 flex flex-col items-center justify-center gap-3 sm:mt-8 sm:flex-row sm:gap-5">
                 {/* 每页数量 */}
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -2290,7 +2392,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       variant="outline"
                       size="sm"
                       onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
-                      disabled={currentPage === 1}
+                      disabled={currentPage <= 1}
                     >
                       <ChevronLeft className="h-3.5 w-3.5" />
                       上一页
@@ -2302,7 +2404,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       </span>{" "}
                       / {totalPages} 页
                       <span className="mx-1.5 text-muted-foreground/50">·</span>
-                      共 {filteredCredentials.length} 个
+                      共 {totalFilteredCount} 个
                     </div>
                     <Button
                       variant="outline"
@@ -2310,7 +2412,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       onClick={() =>
                         setCurrentPage((p) => Math.min(totalPages, p + 1))
                       }
-                      disabled={currentPage === totalPages}
+                      disabled={currentPage >= totalPages}
                     >
                       下一页
                       <ChevronRight className="h-3.5 w-3.5" />

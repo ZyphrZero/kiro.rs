@@ -2,6 +2,7 @@ import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
   GroupsResponse,
+  GroupQueryParams,
   GroupItem,
   CreateGroupRequest,
   UpdateGroupRequest,
@@ -20,8 +21,12 @@ api.interceptors.request.use((config) => {
   return config
 })
 
-export async function listGroups(): Promise<GroupsResponse> {
-  const { data } = await api.get<GroupsResponse>('/groups')
+export async function listGroups(
+  params?: GroupQueryParams,
+): Promise<GroupsResponse> {
+  const { data } = await api.get<GroupsResponse>('/groups', {
+    params,
+  })
   return data
 }
 
