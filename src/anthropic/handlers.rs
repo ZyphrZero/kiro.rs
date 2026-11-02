@@ -2348,40 +2348,42 @@ fn build_non_stream_content(
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.6：覆写为 adaptive 类型
-/// - 其他模型：覆写为 enabled 类型
-/// - budget_tokens 固定为 20000
+/// 支持原生推理的模型使用 adaptive；保留客户端 budget 和显式 effort。
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
     if !model_lower.contains("thinking") {
         return;
     }
 
-    let is_opus_4_6 = model_lower.contains("opus")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let mapped = super::converter::map_model(&payload.model)
+        .unwrap_or_else(|| payload.model.clone())
+        .to_ascii_lowercase();
+    let supports_adaptive = super::converter::model_supports_native_reasoning(&mapped);
 
-    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
+    let thinking_type = if supports_adaptive { "adaptive" } else { "enabled" };
+    let budget_tokens = payload
+        .thinking
+        .as_ref()
+        .map(|t| t.budget_tokens)
+        .filter(|b| *b > 0)
+        .unwrap_or(20000);
 
     tracing::info!(
         model = %payload.model,
+        mapped_model = %mapped,
         thinking_type = thinking_type,
         "模型名包含 thinking 后缀，覆写 thinking 配置"
     );
 
     payload.thinking = Some(Thinking {
         thinking_type: thinking_type.to_string(),
-        budget_tokens: 20000,
+        budget_tokens,
     });
 
-    if is_opus_4_6 {
-        // 只覆写 effort，保留客户端的 format（结构化输出）。
-        let format = payload
-            .output_config
-            .take()
-            .and_then(|config| config.format);
+    if supports_adaptive && payload.output_config.is_none() {
         payload.output_config = Some(OutputConfig {
-            effort: "high".to_string(),
-            format,
+            effort: super::converter::effort_from_budget_tokens(budget_tokens).to_string(),
+            format: None,
         });
     }
 }
@@ -2888,6 +2890,38 @@ mod tests {
         assert_eq!(config.effort, "high");
         assert!(config.json_schema().is_some());
         assert!(inject_system_instruction(&mut payload).is_some());
+    }
+
+    #[test]
+    fn thinking_suffix_preserves_budget_and_explicit_effort() {
+        for (model, effort) in [("claude-sonnet-5.5-thinking", "low"), ("gpt-5.6-sol-thinking", "low")] {
+            let mut payload: MessagesRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "thinking": {"type": "enabled", "budget_tokens": 3000}
+            })).unwrap();
+            override_thinking_from_model_name(&mut payload);
+            assert_eq!(payload.thinking.as_ref().unwrap().thinking_type, "adaptive");
+            let conversion = convert_request_with_mode(&payload, ToolCompatibilityMode::ClaudeCode).unwrap();
+            let fields = conversion.additional_model_request_fields.unwrap();
+            let actual = if model.starts_with("gpt-") {
+                fields.reasoning.unwrap().effort
+            } else {
+                fields.output_config.unwrap().effort
+            };
+            assert_eq!(actual, effort);
+        }
+
+        let mut payload: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-6-thinking",
+            "messages": [{"role": "user", "content": "hello"}],
+            "thinking": {"type": "enabled", "budget_tokens": 3000},
+            "output_config": {"effort": "medium", "format": {"type": "json_schema", "schema": {"type": "object"}}}
+        })).unwrap();
+        override_thinking_from_model_name(&mut payload);
+        let output = payload.output_config.unwrap();
+        assert_eq!(output.effort, "medium");
+        assert!(output.json_schema().is_some());
     }
 
     #[test]
