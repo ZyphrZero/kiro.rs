@@ -175,6 +175,11 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
+    /// 后台余额刷新完成后的等待秒数；0 表示不启动后台刷新。
+    /// 优先级：配置文件 > KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS > 300。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_refresh_interval_secs: Option<u64>,
+
     /// 上一次成功更新前正在运行的版本号，用于在前端展示「回退到 vX.Y.Z」按钮。
     /// 实际回退动作通过 `<exe>.backup` 文件完成，无需访问网络。
     #[serde(default)]
@@ -585,6 +590,7 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            balance_refresh_interval_secs: None,
             update_previous_version: None,
             github_token: None,
             update_last_applied_at: None,
@@ -630,6 +636,28 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn resolve_balance_refresh_interval(
+        &self,
+        env_value: Result<String, std::env::VarError>,
+    ) -> anyhow::Result<std::time::Duration> {
+        let seconds = if let Some(seconds) = self.balance_refresh_interval_secs {
+            seconds
+        } else {
+            match env_value {
+                Ok(value) => value.trim().parse::<u64>().context(
+                    "KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS 必须是非负整数（秒，0 表示关闭）",
+                )?,
+                Err(std::env::VarError::NotPresent) => 300,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    anyhow::bail!(
+                        "KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS 必须是有效的 Unicode 字符串"
+                    )
+                }
+            }
+        };
+        Ok(std::time::Duration::from_secs(seconds))
+    }
+
     /// 获取默认配置文件路径
     pub fn default_config_path() -> &'static str {
         "config.json"
@@ -693,6 +721,116 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::Config;
+
+    #[test]
+    fn balance_refresh_interval_defaults_for_existing_configs() {
+        for config in [Config::default(), serde_json::from_str("{}").unwrap()] {
+            assert_eq!(config.balance_refresh_interval_secs, None);
+            let interval = config
+                .resolve_balance_refresh_interval(Err(std::env::VarError::NotPresent))
+                .unwrap();
+            assert_eq!(interval.as_secs(), 300);
+            let serialized = serde_json::to_value(&config).unwrap();
+            assert!(serialized.get("balanceRefreshIntervalSecs").is_none());
+        }
+    }
+
+    #[test]
+    fn balance_refresh_interval_accepts_explicit_values_and_round_trips() {
+        for seconds in [0, 1, 300, 1800, 3600] {
+            let value = serde_json::json!({"balanceRefreshIntervalSecs": seconds});
+            let config: Config = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(config.balance_refresh_interval_secs, Some(seconds));
+            assert_eq!(
+                config
+                    .resolve_balance_refresh_interval(Err(std::env::VarError::NotPresent))
+                    .unwrap()
+                    .as_secs(),
+                seconds
+            );
+            let serialized = serde_json::to_value(&config).unwrap();
+            assert_eq!(
+                serialized["balanceRefreshIntervalSecs"],
+                value["balanceRefreshIntervalSecs"]
+            );
+        }
+    }
+
+    #[test]
+    fn balance_refresh_interval_uses_environment_when_unconfigured() {
+        let config = Config::default();
+        for (value, seconds) in [("0", 0), ("1800", 1800), (" 3600 ", 3600)] {
+            assert_eq!(
+                config
+                    .resolve_balance_refresh_interval(Ok(value.to_string()))
+                    .unwrap()
+                    .as_secs(),
+                seconds
+            );
+        }
+        assert!(
+            serde_json::to_value(&config)
+                .unwrap()
+                .get("balanceRefreshIntervalSecs")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn balance_refresh_interval_config_takes_precedence_over_environment() {
+        for seconds in [0, 1800] {
+            let mut config = Config::default();
+            config.balance_refresh_interval_secs = Some(seconds);
+            for value in ["0", "3600", "invalid"] {
+                assert_eq!(
+                    config
+                        .resolve_balance_refresh_interval(Ok(value.to_string()))
+                        .unwrap()
+                        .as_secs(),
+                    seconds
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn balance_refresh_interval_rejects_invalid_environment_values() {
+        let config = Config::default();
+        for value in ["", " ", "-1", "1.5", "invalid", "18446744073709551616"] {
+            let error = config
+                .resolve_balance_refresh_interval(Ok(value.to_string()))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS")
+            );
+        }
+        assert!(
+            config
+                .resolve_balance_refresh_interval(Err(std::env::VarError::NotUnicode(
+                    std::ffi::OsString::new()
+                )))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn balance_refresh_interval_rejects_invalid_config_values() {
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("1800"),
+            serde_json::json!(true),
+        ] {
+            assert!(
+                serde_json::from_value::<Config>(serde_json::json!({
+                    "balanceRefreshIntervalSecs": value
+                }))
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn upstream_deadlines_default_for_existing_configs() {

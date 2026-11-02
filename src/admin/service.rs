@@ -1682,10 +1682,19 @@ impl AdminService {
 
     /// 启动余额后台刷新调度器
     ///
-    /// - 启动后立刻执行一次刷新
-    /// - 之后按 `interval` 周期循环刷新
+    /// - `interval` 为 0 时不启动任务，包括首次刷新
+    /// - 启动后等待 3 秒执行首次刷新
+    /// - 每轮刷新完成后等待 `interval` 再启动下一轮
     /// - 调用方持有 `Arc<Self>` 即可，任务在后台 tokio runtime 上运行
     pub fn start_balance_refresher(self: &Arc<Self>, interval: std::time::Duration) {
+        if interval.is_zero() {
+            tracing::info!("余额后台刷新已关闭，仍可通过面板/API 按需查询");
+            return;
+        }
+        tracing::info!(
+            "余额后台刷新已启用，每轮完成后等待 {} 秒",
+            interval.as_secs()
+        );
         let svc = Arc::clone(self);
         tokio::spawn(async move {
             // 启动后稍等片刻，让上游/Token Manager 准备就绪
@@ -5464,6 +5473,35 @@ mod tests {
             "Enterprise"
         );
         assert_eq!(subscription_type_from_title(None), "Free");
+    }
+}
+
+#[cfg(test)]
+mod balance_refresher_tests {
+    use super::*;
+
+    fn service() -> Arc<AdminService> {
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), Vec::new(), None, None, false).unwrap(),
+        );
+        Arc::new(AdminService::new(manager, Vec::new()))
+    }
+
+    #[tokio::test]
+    async fn balance_refresher_zero_does_not_spawn_task() {
+        let service = service();
+        service.start_balance_refresher(std::time::Duration::ZERO);
+        assert_eq!(Arc::strong_count(&service), 1);
+        let weak = Arc::downgrade(&service);
+        drop(service);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn balance_refresher_positive_interval_spawns_task() {
+        let service = service();
+        service.start_balance_refresher(std::time::Duration::from_secs(1800));
+        assert_eq!(Arc::strong_count(&service), 2);
     }
 }
 

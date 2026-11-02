@@ -12,6 +12,7 @@
   "apiDomain": "amazonaws",
   "updateAutoApply": false,
   "updateAutoApplyTime": "03:00",
+  "balanceRefreshIntervalSecs": 300,
   "modelCacheTtlSecs": 3600,
   "modelApi429RetryEnabled": true,
   "cacheMeteringCapacity": 262144,

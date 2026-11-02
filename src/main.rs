@@ -48,6 +48,12 @@ async fn main() {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
     });
+    let balance_refresh_interval = config
+        .resolve_balance_refresh_interval(std::env::var("KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS"))
+        .unwrap_or_else(|error| {
+            tracing::error!("余额后台刷新配置无效: {}", error);
+            std::process::exit(1);
+        });
 
     // 加载凭证（支持单对象或数组格式）
     let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
@@ -393,10 +399,9 @@ async fn main() {
                 group_manager.clone(),
             );
 
-            // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
             admin_state
                 .service
-                .start_balance_refresher(std::time::Duration::from_secs(300));
+                .start_balance_refresher(balance_refresh_interval);
 
             // 启动代理池健康检查调度器（每 5 分钟一次）
             admin_state

@@ -362,6 +362,7 @@ Admin API 鉴权同样支持：
 | `port` | `8080` | 监听端口。自动生成配置时为 `8990` |
 | `apiKey` | 无 | 配置的 `id=0` 系统 Key；可使用任意非空自定义值，不限制前缀。`/v1` 和 `/cc/v1` 也可使用 Admin 面板创建的客户端 Key |
 | `adminApiKey` | 无 | 设置后启用 `/admin` 和 `/api/admin` |
+| `balanceRefreshIntervalSecs` | `300` | 每轮后台余额刷新完成后的等待秒数；`0` 完全关闭后台余额刷新，仍支持面板/API 按需查询 |
 | `region` | `us-east-1` | 全局默认 Region |
 | `authRegion` | 无 | token 刷新用 Region，未配置时回退 `region` |
 | `apiRegion` | 无 | Kiro API 请求用 Region，未配置时回退 `region` |
@@ -397,6 +398,20 @@ Admin API 鉴权同样支持：
 | `updateAutoApplyTime` | `03:00` | 自动更新时间，本地时区 `HH:MM` |
 
 非空的 `config.apiKey` 每次启动都会同步为不可删除、可轮换的系统 Key `id=0`。手动修改配置后，旧系统 Key 立即失效，新值自动启用；已有名称、描述、分组和累计统计会保留。Admin 面板新建或轮换的客户端 Key 统一以 `sk-` 开头，但请求鉴权不会对任何已存储 Key 强制检查前缀。`adminApiKey` 独立用于 Admin UI / Admin API 登录，不参与 `/v1` 业务流量鉴权。
+
+### 后台余额刷新
+
+启用 Admin API 后，默认在启动约 3 秒后执行首次余额刷新，随后每轮刷新完成后等待 300 秒再开始下一轮。可在 `config.json` 设置 `"balanceRefreshIntervalSecs": 1800`（30 分钟）或 `3600`（1 小时）；设为 `0` 时不创建后台任务，也不执行首次刷新。
+
+也支持环境变量 `KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS`：
+
+```bash
+KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS=1800 ./kiro-rs
+```
+
+优先级为 **`config.json` 显式值 > 环境变量 > 默认 300 秒**，修改后需重启。使用环境变量时请省略配置文件中的该字段（包括从 `config.example.json` 复制的值）。值必须是非负整数；配置文件类型错误或实际使用的环境变量值无效时，启动会报错，不会静默回退。
+
+间隔不包含每轮刷新耗时：一轮耗时 2 分钟、间隔设为 30 分钟时，相邻两轮开始时间约相隔 32 分钟。余额缓存 TTL 仍为 5 分钟，面板/API 按需查询和手动刷新不受影响。关闭后台余额刷新也会停止由该任务执行的 `quotaResetRecoveryEnabled` 月度额度恢复检查，不影响其它后台任务。
 
 <a id="credentials"></a>
 ## 🔐 凭据
