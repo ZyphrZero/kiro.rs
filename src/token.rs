@@ -154,6 +154,7 @@ async fn call_remote_count_tokens(
         messages: messages.clone(),
         system: system.clone(),
         tools: tools.clone(),
+        output_config: None,
     };
 
     // 构建请求

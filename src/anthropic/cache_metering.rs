@@ -2641,6 +2641,7 @@ mod tests {
             }),
             output_config: effort.map(|effort| OutputConfig {
                 effort: effort.to_string(),
+                format: None,
             }),
             metadata: None,
             cache_control: Some(CacheControl {

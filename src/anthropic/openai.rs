@@ -265,7 +265,10 @@ fn openai_to_anthropic(
     let output_config = req
         .reasoning_effort
         .filter(|e| !e.trim().is_empty())
-        .map(|effort| OutputConfig { effort });
+        .map(|effort| OutputConfig {
+            effort,
+            format: None,
+        });
 
     Ok(MessagesRequest {
         model: req.model,
