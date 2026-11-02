@@ -1182,8 +1182,13 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
     }
 
     // 3. messages (按顺序遍历)
-    let total_messages = req.messages.len();
-    for (m_idx, msg) in req.messages.iter().enumerate() {
+    // 与 converter 对齐：末尾连续 assistant 是被丢弃的 prefill，不参与前缀签名和 token 估算。
+    let total_messages = req
+        .messages
+        .iter()
+        .rposition(|message| message.role != "assistant")
+        .map_or(0, |index| index + 1);
+    for (m_idx, msg) in req.messages[..total_messages].iter().enumerate() {
         let is_tool_result = match &msg.content {
             serde_json::Value::Array(arr) => arr
                 .iter()
@@ -1238,6 +1243,49 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
             _ => {}
         }
     }
+
+    if total_messages == req.messages.len() {
+        return blocks;
+    }
+
+    let mut explicit_count = blocks
+        .iter()
+        .filter(|block| block.cache_control.is_some())
+        .count();
+    let mut seen_5m = blocks
+        .iter()
+        .filter_map(|block| block.cache_control.as_ref().and_then(validated_ttl))
+        .any(|ttl| ttl == DEFAULT_TTL_SECS);
+    let Some(last_block) = blocks.last_mut() else {
+        return blocks;
+    };
+
+    // 将 prefill 的断点迁到保留前缀末尾，不覆盖已有断点，也不因合并而掩盖非法配置。
+    for message in &req.messages[total_messages..] {
+        let Some(content) = message.content.as_array() else {
+            continue;
+        };
+        for value in content {
+            let Some(raw) = value.get("cache_control") else {
+                continue;
+            };
+            explicit_count += 1;
+            let Ok(cache_control) = serde_json::from_value::<CacheControl>(raw.clone()) else {
+                last_block.invalid_cache_control = true;
+                continue;
+            };
+            match validated_ttl(&cache_control) {
+                Some(ttl) => {
+                    last_block.invalid_cache_control |= seen_5m && ttl > DEFAULT_TTL_SECS;
+                    seen_5m |= ttl == DEFAULT_TTL_SECS;
+                }
+                None => last_block.invalid_cache_control = true,
+            }
+            last_block.invalid_cache_control |= !block_is_cacheable(value);
+            last_block.cache_control.get_or_insert(cache_control);
+        }
+    }
+    last_block.invalid_cache_control |= explicit_count > MAX_BREAKPOINTS;
 
     blocks
 }
@@ -1950,6 +1998,222 @@ mod tests {
         assert_eq!(u2.cache_covered_est, 0);
         assert_eq!(u2.cache_read, 0);
         assert_eq!(cache.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn prefill_breakpoint_reuses_previous_turn_prefix() {
+        use super::super::types::Message;
+
+        let async_cache = CacheMeter::new(None);
+        let sync_cache = CacheMeter::new(None);
+        let mut req = build_request_with_system_breakpoint();
+        let mut previous_covered = 0;
+
+        for turn in 0..4 {
+            req.messages.push(Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([{
+                    "type": "text",
+                    "text": format!("Unfinished prefill {turn}"),
+                    "cache_control": {"type": "ephemeral"}
+                }]),
+            });
+            let original_messages = serde_json::to_value(&req.messages).unwrap();
+            let async_usage = compute_cache_usage(&async_cache, &req, 0).await;
+            let sync_usage = compute_cache_usage_sync(&sync_cache, &req, 0);
+
+            assert_eq!(async_usage.cache_read, previous_covered);
+            assert_eq!(sync_usage.cache_read, previous_covered);
+            assert_eq!(async_usage.cache_covered_est, sync_usage.cache_covered_est);
+            assert_eq!(async_usage.prompt_total_est, sync_usage.prompt_total_est);
+            assert_eq!(
+                serde_json::to_value(&req.messages).unwrap(),
+                original_messages
+            );
+
+            req.messages.pop();
+            let prefix_tokens: u32 = extract_blocks(&req).iter().map(|block| block.tokens).sum();
+            assert_eq!(async_usage.prompt_total_est, prefix_tokens as i32);
+            assert_eq!(async_usage.cache_covered_est, prefix_tokens as i32);
+            assert!(async_usage.cache_covered_est > previous_covered);
+            let (input, creation, read) = async_usage.split_against_total(prefix_tokens as i32);
+            assert_eq!(input, 0);
+            assert_eq!(read, previous_covered);
+            assert_eq!(creation, prefix_tokens as i32 - previous_covered);
+            previous_covered = async_usage.cache_covered_est;
+
+            req.messages.extend([
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!(format!("Completed response {turn}")),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!(format!("Next question {turn}")),
+                },
+            ]);
+        }
+    }
+
+    #[test]
+    fn prefill_is_excluded_without_changing_auto_cache_target() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4.5",
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": "First question"},
+                {"role": "assistant", "content": "Completed response"},
+                {"role": "user", "content": "Current question"},
+                {"role": "assistant", "content": "Unfinished string"},
+                {"role": "assistant", "content": [{"type": "text", "text": "Unfinished block"}]}
+            ]
+        }))
+        .unwrap();
+        let blocks = extract_blocks(&req);
+        assert_eq!(blocks.len(), 3);
+        assert!(!blocks[1].is_current_turn_input);
+        assert!(blocks[2].is_current_turn_input);
+        assert!(blocks.iter().all(|block| block.cache_control.is_none()));
+        let breakpoints = resolve_breakpoints(&blocks, req.cache_control.as_ref());
+        assert_eq!(breakpoints.len(), 1);
+        assert_eq!(breakpoints[0].block_idx, 1);
+    }
+
+    #[test]
+    fn prefill_breakpoint_moves_to_prefix_without_exceeding_limit() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4.5",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "First", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                    {"type": "text", "text": "Second", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                    {"type": "text", "text": "Third", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                    {"type": "text", "text": "Last user block"}
+                ]},
+                {"role": "assistant", "content": "Unmarked prefill"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Unmarked prefill block"},
+                    {"type": "text", "text": "Marked prefill", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let blocks = extract_blocks(&req);
+        assert_eq!(blocks.len(), 4);
+        let breakpoints = resolve_breakpoints(&blocks, None);
+        assert_eq!(breakpoints.len(), MAX_BREAKPOINTS);
+        assert_eq!(breakpoints.last().unwrap().block_idx, 3);
+        assert_eq!(breakpoints.last().unwrap().ttl_secs, MAX_TTL_SECS);
+    }
+
+    #[test]
+    fn prefill_does_not_overwrite_existing_prefix_breakpoint() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4.5",
+            "messages": [
+                {"role": "user", "content": [{
+                    "type": "text", "text": "Question",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }]},
+                {"role": "assistant", "content": [{
+                    "type": "text", "text": "Prefill",
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                }]}
+            ]
+        }))
+        .unwrap();
+        let blocks = extract_blocks(&req);
+        let breakpoints = resolve_breakpoints(&blocks, None);
+        assert_eq!(breakpoints.len(), 1);
+        assert_eq!(breakpoints[0].block_idx, 0);
+        assert_eq!(breakpoints[0].ttl_secs, MAX_TTL_SECS);
+    }
+
+    #[test]
+    fn prefill_invalid_cache_controls_still_disable_metering() {
+        for cache_control in [
+            serde_json::json!(null),
+            serde_json::json!({"ttl": "5m"}),
+            serde_json::json!({"type": "persistent"}),
+            serde_json::json!({"type": "ephemeral", "ttl": "2h"}),
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"}),
+        ] {
+            let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": "claude-sonnet-4.5",
+                "messages": [
+                    {"role": "user", "content": [{
+                        "type": "text", "text": "Question",
+                        "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                    }]},
+                    {"role": "assistant", "content": [
+                        {"type": "text", "text": "Valid prefill", "cache_control": {"type": "ephemeral"}},
+                        {"type": "text", "text": "Invalid prefill", "cache_control": cache_control}
+                    ]}
+                ]
+            }))
+            .unwrap();
+            let cache = CacheMeter::new(None);
+            let usage = compute_cache_usage_sync(&cache, &req, 1);
+            assert_eq!(usage.cache_covered_est, 0);
+            assert_eq!(cache.len(), 0);
+        }
+    }
+
+    #[test]
+    fn prefill_only_messages_do_not_produce_prompt_blocks() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4.5",
+            "messages": [{"role": "assistant", "content": [{
+                "type": "text", "text": "Prefill", "cache_control": {"type": "ephemeral"}
+            }]}]
+        }))
+        .unwrap();
+        assert!(extract_blocks(&req).is_empty());
+    }
+
+    #[test]
+    fn prefill_breakpoint_merge_does_not_hide_excess_breakpoints() {
+        use super::super::types::Message;
+
+        let mut req = build_request_with_system_breakpoint();
+        req.messages.push(Message {
+            role: "assistant".to_string(),
+            content: serde_json::Value::Array(vec![
+                serde_json::json!({
+                    "type": "text", "text": "Prefill",
+                    "cache_control": {"type": "ephemeral"}
+                });
+                MAX_BREAKPOINTS
+            ]),
+        });
+        let cache = CacheMeter::new(None);
+        let usage = compute_cache_usage_sync(&cache, &req, 1);
+        assert_eq!(usage.cache_covered_est, 0);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn prefill_trimming_preserves_assistant_before_system_message() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4.5",
+            "messages": [
+                {"role": "user", "content": "Question"},
+                {"role": "assistant", "content": "Completed response"},
+                {"role": "system", "content": "Client reminder"},
+                {"role": "assistant", "content": "Unfinished prefill"}
+            ]
+        }))
+        .unwrap();
+        let blocks = extract_blocks(&req);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(
+            blocks[1].signature,
+            prompt_block_signature(
+                "message",
+                Some("assistant"),
+                &serde_json::json!({"type": "text", "text": "Completed response"})
+            )
+        );
     }
 
     #[test]
@@ -2719,15 +2983,21 @@ mod tests {
         let make = || MessagesRequest {
             model: "model-a".to_string(),
             max_tokens: 32,
-            messages: vec![Message {
-                role: "assistant".to_string(),
-                content: serde_json::json!([
-                    {"type":"text","text":"stable visible content"},
-                    {"type":"thinking","thinking":"not a direct breakpoint"},
-                    {"type":"redacted_thinking","data":"redacted"},
-                    {"type":"text","text":""}
-                ]),
-            }],
+            messages: vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type":"text","text":"stable visible content"},
+                        {"type":"thinking","thinking":"not a direct breakpoint"},
+                        {"type":"redacted_thinking","data":"redacted"},
+                        {"type":"text","text":""}
+                    ]),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Next question"),
+                },
+            ],
             stream: false,
             system: None,
             tools: None,
@@ -2756,14 +3026,20 @@ mod tests {
         let all_ineligible = MessagesRequest {
             model: "model-a".to_string(),
             max_tokens: 32,
-            messages: vec![Message {
-                role: "assistant".to_string(),
-                content: serde_json::json!([
-                    {"type":"thinking","thinking":"cannot cache"},
-                    {"type":"redacted_thinking","data":"redacted"},
-                    {"type":"text","text":"   "}
-                ]),
-            }],
+            messages: vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type":"thinking","thinking":"cannot cache"},
+                        {"type":"redacted_thinking","data":"redacted"},
+                        {"type":"text","text":"   "}
+                    ]),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!(""),
+                },
+            ],
             stream: false,
             system: None,
             tools: None,
