@@ -327,6 +327,7 @@ pub struct AdminService {
     cache_meter: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
     /// 自定义响应头管理器（热重载）
     custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
+    custom_headers_update_lock: Mutex<()>,
     quota_alerts: Result<Arc<QuotaAlerts>, String>,
 }
 
@@ -682,6 +683,7 @@ impl AdminService {
             usage_recorder: None,
             cache_meter: None,
             custom_headers: None,
+            custom_headers_update_lock: Mutex::new(()),
             quota_alerts: Err("额度告警服务尚未初始化".into()),
         };
 
@@ -2412,6 +2414,7 @@ impl AdminService {
             })
             .collect();
 
+        let _update_guard = self.custom_headers_update_lock.lock();
         let rules_for_config = rules.clone();
         self.token_manager
             .update_config_file(move |c| {

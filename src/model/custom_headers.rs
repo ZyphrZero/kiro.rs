@@ -237,4 +237,126 @@ mod tests {
         );
         assert!(resp.headers().get("x-disabled-header").is_none());
     }
+
+    #[tokio::test]
+    async fn admin_header_updates_serialize_persistence_and_publication() {
+        use crate::admin::AdminService;
+        use crate::admin::types::{CustomHeaderItem, SetCustomHeadersRequest};
+        use crate::kiro::token_manager::MultiTokenManager;
+        use crate::model::config::Config;
+        use std::time::{Duration, Instant};
+
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-header-concurrency-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&config_path, "{}").unwrap();
+        let token_manager = Arc::new(
+            MultiTokenManager::new(
+                Config::load(&config_path).unwrap(),
+                Vec::new(),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let headers = CustomHeadersManager::new(default_custom_headers());
+        let service = Arc::new(
+            AdminService::new(token_manager, Vec::new()).with_custom_headers(Some(headers.clone())),
+        );
+        let request = |value: &str| SetCustomHeadersRequest {
+            headers: vec![CustomHeaderItem {
+                key: "X-Test".into(),
+                value: value.into(),
+                enabled: true,
+            }],
+        };
+        let wait_for_value = |value: &str, timeout: Duration| {
+            let started = Instant::now();
+            loop {
+                if Config::load(&config_path).ok().is_some_and(|config| {
+                    config
+                        .custom_headers
+                        .first()
+                        .is_some_and(|header| header.value == value)
+                }) {
+                    return true;
+                }
+                if started.elapsed() >= timeout {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        let rules_guard = headers.rules.read();
+        let first_service = service.clone();
+        let first_update =
+            std::thread::spawn(move || first_service.set_custom_headers(request("first")));
+        let first_persisted = wait_for_value("first", Duration::from_secs(5));
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let second_service = service.clone();
+        let second_update = std::thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            second_service.set_custom_headers(request("second"))
+        });
+        started_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second_persisted_early = wait_for_value("second", Duration::from_secs(1));
+        drop(rules_guard);
+        first_update.join().unwrap().unwrap();
+        second_update.join().unwrap().unwrap();
+        let persisted = Config::load(&config_path).unwrap().custom_headers;
+        std::fs::remove_file(&config_path).unwrap();
+
+        assert!(first_persisted);
+        assert!(
+            !second_persisted_early,
+            "second update persisted before the first update published"
+        );
+        assert_eq!(headers.get_rules(), persisted);
+        assert_eq!(persisted[0].value, "second");
+    }
+
+    #[tokio::test]
+    async fn failed_header_persistence_does_not_change_live_rules() {
+        use crate::admin::AdminService;
+        use crate::admin::types::{CustomHeaderItem, SetCustomHeadersRequest};
+        use crate::kiro::token_manager::MultiTokenManager;
+        use crate::model::config::Config;
+
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-header-write-failure-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&config_path, "{}").unwrap();
+        let token_manager = Arc::new(
+            MultiTokenManager::new(
+                Config::load(&config_path).unwrap(),
+                Vec::new(),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let headers = CustomHeadersManager::new(default_custom_headers());
+        let service =
+            AdminService::new(token_manager, Vec::new()).with_custom_headers(Some(headers.clone()));
+        let request = || SetCustomHeadersRequest {
+            headers: vec![CustomHeaderItem {
+                key: "X-Test".into(),
+                value: "updated".into(),
+                enabled: true,
+            }],
+        };
+
+        std::fs::write(&config_path, "{").unwrap();
+        assert!(service.set_custom_headers(request()).is_err());
+        assert_eq!(headers.get_rules(), default_custom_headers());
+        std::fs::write(&config_path, "{}").unwrap();
+        service.set_custom_headers(request()).unwrap();
+        assert_eq!(headers.get_rules(), Config::load(&config_path).unwrap().custom_headers);
+        std::fs::remove_file(&config_path).unwrap();
+    }
 }
