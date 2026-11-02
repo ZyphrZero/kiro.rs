@@ -38,7 +38,7 @@ use super::proxy_pool::{mask_proxy_url, GetUrlResult, ProxyAvailability, ProxyPo
 use super::types::{
     AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
     AddCredentialResponse, ApiDomainConfig, AssignProxyRequest, AssignRoundRobinResponse,
-    AvailableModelItem, AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest,
+    AuditSuspendedRequest, AuditSuspendedResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest,
     BatchImportEvent, CacheMeteringConfigResponse, CacheMeteringStatsResponse,
     CheckRateLimitRequest, CredentialMetadataDetail, CredentialMetadataSchemaConfig,
     CredentialStateCounts, CredentialStatusItem, CredentialsExportResponse, CredentialsQuery,
@@ -893,29 +893,33 @@ impl AdminService {
             .collect();
 
         // 全量各状态统计（不受分页和筛选影响，供前端状态账条展示全局概览）
+        let credential_state = |credential: &CredentialStatusItem| {
+            if credential.disabled {
+                match credential.disabled_reason.as_deref() {
+                    Some("QuotaExceeded") => "quota",
+                    Some("Suspended") => "suspended",
+                    _ => "dead",
+                }
+            } else if credential.throttled_remaining_secs.unwrap_or(0) > 0 {
+                "throttled"
+            } else if credential.balance.as_ref().is_some_and(|balance| balance.remaining <= 0.0 || balance.usage_percentage >= 100.0) {
+                "quota"
+            } else {
+                "healthy"
+            }
+        };
         let mut healthy_count = 0;
         let mut throttled_count = 0;
         let mut quota_count = 0;
         let mut dead_count = 0;
+        let mut suspended_count = 0;
         for c in &credentials {
-            let is_overage = c
-                .balance
-                .as_ref()
-                .map(|b| b.remaining <= 0.0 || b.usage_percentage >= 100.0)
-                .unwrap_or_else(|| {
-                    c.disabled_reason
-                        .as_deref()
-                        .map(|r| r.to_lowercase().contains("quota") || r.contains("额度"))
-                        .unwrap_or(false)
-                });
-            if c.disabled {
-                dead_count += 1;
-            } else if c.throttled_remaining_secs.unwrap_or(0) > 0 {
-                throttled_count += 1;
-            } else if is_overage {
-                quota_count += 1;
-            } else {
-                healthy_count += 1;
+            match credential_state(c) {
+                "healthy" => healthy_count += 1,
+                "throttled" => throttled_count += 1,
+                "quota" => quota_count += 1,
+                "suspended" => suspended_count += 1,
+                _ => dead_count += 1,
             }
         }
         let state_counts = CredentialStateCounts {
@@ -923,6 +927,7 @@ impl AdminService {
             throttled: throttled_count,
             quota: quota_count,
             dead: dead_count,
+            suspended: suspended_count,
             total: credentials.len(),
         };
 
@@ -969,31 +974,14 @@ impl AdminService {
 
                 // 状态过滤 (healthy / available, cooling / throttled, disabled / dead, overage / quota)
                 if let Some(status) = query.effective_status() {
-                    let is_overage = c
-                        .balance
-                        .as_ref()
-                        .map(|b| b.remaining <= 0.0 || b.usage_percentage >= 100.0)
-                        .unwrap_or_else(|| {
-                            c.disabled_reason
-                                .as_deref()
-                                .map(|r| r.to_lowercase().contains("quota") || r.contains("额度"))
-                                .unwrap_or(false)
-                        });
-
                     match status {
                         "all" => {}
-                        "healthy" | "available"
-                            if c.disabled
-                                || c.throttled_remaining_secs.unwrap_or(0) > 0
-                                || is_overage =>
-                        {
-                            return false;
-                        }
-                        "cooling" | "throttled" if c.throttled_remaining_secs.unwrap_or(0) == 0 => {
-                            return false;
-                        }
-                        "disabled" | "dead" if !c.disabled => return false,
-                        "overage" | "quota" if !is_overage => return false,
+                        "healthy" | "available" if credential_state(c) != "healthy" => return false,
+                        "cooling" | "throttled" if credential_state(c) != "throttled" => return false,
+                        "disabled" if !c.disabled => return false,
+                        "dead" if credential_state(c) != "dead" => return false,
+                        "overage" | "quota" if credential_state(c) != "quota" => return false,
+                        "suspended" if credential_state(c) != "suspended" => return false,
                         _ => {}
                     }
                 }
@@ -1249,6 +1237,85 @@ impl AdminService {
             disabled_ids,
             skipped_ids,
         }
+    }
+
+    /// 通过历史请求日志排查封号凭据并标记为 Suspended
+    pub fn audit_suspended_credentials(
+        &self,
+        req: Option<AuditSuspendedRequest>,
+    ) -> Result<AuditSuspendedResponse, AdminServiceError> {
+        let trace_store = self.trace_store.as_ref().ok_or_else(|| {
+            AdminServiceError::InternalError("未启用链路追踪存储，无法查询历史日志".to_string())
+        })?;
+
+        let req = req.unwrap_or_default();
+        let only_disabled = req.only_disabled.unwrap_or(true);
+
+        // 确定待扫描的目标凭据候选集合
+        let snapshot = self.token_manager.snapshot();
+        let requested_ids = req.credential_ids.filter(|ids| !ids.is_empty())
+            .map(|ids| ids.into_iter().collect::<HashSet<_>>());
+        let candidate_creds: HashSet<u64> = snapshot.entries.iter()
+            .filter(|entry| (!only_disabled || entry.disabled)
+                && requested_ids.as_ref().is_none_or(|ids| ids.contains(&entry.id)))
+            .map(|entry| entry.id)
+            .collect();
+
+        let scanned_count = candidate_creds.len();
+        if candidate_creds.is_empty() {
+            return Ok(AuditSuspendedResponse {
+                scanned_count: 0,
+                banned_count: 0,
+                updated_count: 0,
+                updated_ids: Vec::new(),
+                banned_ids: Vec::new(),
+            });
+        }
+
+        // 从 trace 存储拉取各凭据的错误日志与结果分类
+        let error_logs = trace_store.query_credential_error_logs()
+            .map_err(|error| AdminServiceError::InternalError(format!("查询封禁历史日志失败: {error}")))?;
+
+        // 匹配封号检查逻辑
+        let mut banned_ids: HashSet<u64> = HashSet::new();
+        for (cred_id, outcome, snippet) in error_logs {
+            if !candidate_creds.contains(&cred_id) {
+                continue;
+            }
+            let is_banned = outcome == crate::admin::trace_db::outcome::ACCOUNT_SUSPENDED
+                || snippet.as_deref().is_some_and(|body| {
+                    crate::kiro::endpoint::default_is_account_suspended(body)
+                        || self.token_manager.matches_suspended_ban_keywords(body)
+                });
+            if is_banned {
+                banned_ids.insert(cred_id);
+            }
+        }
+
+        let banned_count = banned_ids.len();
+        let banned_vec: Vec<u64> = banned_ids.into_iter().collect();
+
+        // 批量更新为 Suspended 并持久化
+        let updated_ids = self
+            .token_manager
+            .batch_mark_suspended(&banned_vec)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        let updated_count = updated_ids.len();
+
+        tracing::info!(
+            "历史日志排查封号完成: 扫描 {} 个凭据，命中 {} 个封号特征，新标记 {} 个凭据为 Suspended",
+            scanned_count,
+            banned_count,
+            updated_count
+        );
+
+        Ok(AuditSuspendedResponse {
+            scanned_count,
+            banned_count,
+            updated_count,
+            updated_ids,
+            banned_ids: banned_vec,
+        })
     }
 
     /// 设置凭据禁用状态
@@ -3001,6 +3068,7 @@ impl AdminService {
         ) = self.token_manager.get_self_heal_config();
         SelfHealConfigResponse {
             suspended_detection_enabled,
+            suspended_ban_keywords: self.token_manager.get_suspended_ban_keywords(),
             enabled,
             min_interval_secs,
             max_consecutive_rounds,
@@ -3015,12 +3083,13 @@ impl AdminService {
         req: SetSelfHealConfigRequest,
     ) -> Result<SelfHealConfigResponse, AdminServiceError> {
         if req.suspended_detection_enabled.is_none()
+            && req.suspended_ban_keywords.is_none()
             && req.enabled.is_none()
             && req.min_interval_secs.is_none()
             && req.max_consecutive_rounds.is_none()
         {
             return Err(AdminServiceError::InvalidCredential(
-                "至少提供 suspendedDetectionEnabled / enabled / minIntervalSecs / maxConsecutiveRounds 一个字段"
+                "至少提供 suspendedDetectionEnabled / suspendedBanKeywords / enabled / minIntervalSecs / maxConsecutiveRounds 一个字段"
                     .to_string(),
             ));
         }
@@ -3028,6 +3097,7 @@ impl AdminService {
         self.token_manager
             .set_self_heal_config(
                 req.suspended_detection_enabled,
+                req.suspended_ban_keywords,
                 req.enabled,
                 req.min_interval_secs,
                 req.max_consecutive_rounds,
@@ -5109,6 +5179,36 @@ mod tests {
         });
         assert_eq!(response.filtered_total, Some(3));
         assert!(response.credentials.is_empty());
+    }
+
+    #[tokio::test]
+    async fn credential_state_counts_and_filters_distinguish_suspension_and_quota() {
+        let service = paged_credentials_service();
+        service.token_manager.report_suspended_for_request(1, None, None);
+        service.token_manager.report_quota_exhausted_for_request(2, None, None);
+        let response = service.get_credentials_paged(&CredentialsQuery::default());
+        let counts = response.state_counts.unwrap();
+        assert_eq!(counts.suspended, 1);
+        assert_eq!(counts.quota, 1);
+        for (status, expected_id) in [("suspended", 1), ("quota", 2)] {
+            let filtered = service.get_credentials_paged(&CredentialsQuery {
+                status: Some(status.to_string()), ..CredentialsQuery::default()
+            });
+            assert_eq!(filtered.credentials.len(), 1);
+            assert_eq!(filtered.credentials[0].id, expected_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn suspended_audit_respects_only_disabled_for_explicit_ids() {
+        let mut service = paged_credentials_service();
+        service.trace_store = Some(Arc::new(crate::admin::trace_db::TraceStore::open_in_memory().unwrap()));
+        let result = service.audit_suspended_credentials(Some(AuditSuspendedRequest {
+            credential_ids: Some(vec![1]),
+            only_disabled: Some(true),
+        })).unwrap();
+        assert_eq!(result.scanned_count, 0);
+        assert_eq!(result.updated_count, 0);
     }
 
     #[tokio::test]

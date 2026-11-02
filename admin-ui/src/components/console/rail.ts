@@ -12,13 +12,15 @@
  * `warn` 与 `cool` 分色的信息量就在这里：橙色代表"等它自己好"，
  * 琥珀代表"你得去做点什么"。CSS 变量定义见 index.css 的 `--rail-*`。
  */
-export type RailTone = 'ok' | 'warn' | 'cool' | 'dead' | 'none'
+export type RailTone = 'ok' | 'warn' | 'cool' | 'dead' | 'disabled' | 'banned' | 'none'
 
 const RAIL_CLASS: Record<RailTone, string> = {
   ok: 'console-rail rail-ok',
   warn: 'console-rail rail-warn',
   cool: 'console-rail rail-cool',
   dead: 'console-rail rail-dead',
+  disabled: 'console-rail rail-disabled',
+  banned: 'console-rail rail-banned',
   none: '',
 }
 
@@ -32,6 +34,8 @@ const BORDER_CLASS: Record<RailTone, string> = {
   warn: 'border-l-[3px] border-l-amber-500',
   cool: 'border-l-[3px] border-l-orange-500',
   dead: 'border-l-[3px] border-l-red-500',
+  disabled: 'border-l-[3px] border-l-slate-400 dark:border-l-slate-500',
+  banned: 'border-l-[3px] border-l-rose-500',
   none: 'border-l-[3px] border-l-transparent',
 }
 
@@ -51,6 +55,8 @@ const DOT_CLASS: Record<RailTone, string> = {
   warn: 'bg-amber-500',
   cool: 'bg-orange-500',
   dead: 'bg-red-500',
+  disabled: 'bg-slate-400 dark:bg-slate-500',
+  banned: 'bg-rose-500',
   none: 'bg-muted-foreground/40',
 }
 
@@ -64,6 +70,8 @@ const CHIP_CLASS: Record<RailTone, string> = {
   warn: 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400',
   cool: 'border-orange-500/30 bg-orange-500/10 text-orange-700 dark:text-orange-400',
   dead: 'border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-400',
+  disabled: 'border-slate-400/30 bg-slate-500/10 text-slate-600 dark:text-slate-400',
+  banned: 'border-rose-500/30 bg-rose-500/10 text-rose-700 dark:text-rose-400',
   none: 'border-border bg-secondary/60 text-muted-foreground',
 }
 
@@ -82,6 +90,8 @@ const TEXT_CLASS: Record<RailTone, string> = {
   warn: 'text-amber-600 dark:text-amber-400',
   cool: 'text-orange-600 dark:text-orange-400',
   dead: 'text-red-600 dark:text-red-400',
+  disabled: 'text-slate-600 dark:text-slate-400',
+  banned: 'text-rose-600 dark:text-rose-400',
   none: 'text-muted-foreground',
 }
 

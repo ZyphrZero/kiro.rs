@@ -199,16 +199,43 @@ pub fn default_is_account_rate_limited(body: &str) -> bool {
 
 /// 默认的"账号被封禁/停用"判断逻辑
 ///
-/// 上游对被封账号返回 403 + 类似：
+/// 上游对被封账号返回 403 或 429 + 类似：
+///
+/// 格式一（旧）：
 /// `Your User ID (...) temporarily is suspended. We've locked your account as a
 /// security precaution. To restore access, please contact our support team ...`
 ///
-/// 与普通 403（权限不足 / WAF / 区域抖动）的关键差异：同时出现 "suspended" 与
-/// "locked your account" 两个高特异短语。大小写不敏感匹配，兼容文案微调。
-/// 两个短语都命中才判定，避免把偶发 403 误判为封禁。
+/// 格式二（新）：
+/// `{"message":"Your User ID is temporarily suspended. We detected unusual user
+/// activity and locked it as a security precaution. ...","reason":"TEMPORARILY_SUSPENDED"}`
+///
+/// 识别策略（任一命中即判定）：
+/// 1. JSON `reason` 字段为 `"TEMPORARILY_SUSPENDED"` — 最可靠的结构化信号
+/// 2. 同时出现 "suspended" 与 "locked your account"（旧文案）
+/// 3. 同时出现 "suspended" 与 "locked it"（新文案，用 "locked it" 而非 "locked your account"）
 pub fn default_is_account_suspended(body: &str) -> bool {
+    // 策略 1：明确的 reason 结构化字段精确匹配（最可靠）
+    if body.contains("TEMPORARILY_SUSPENDED") {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+            let top = value.get("reason").and_then(|v| v.as_str());
+            let nested = value.pointer("/error/reason").and_then(|v| v.as_str());
+            if top == Some("TEMPORARILY_SUSPENDED") || nested == Some("TEMPORARILY_SUSPENDED") {
+                return true;
+            }
+        } else {
+            // body 是非 JSON 但包含强特异性枚举子串
+            return true;
+        }
+    }
+
+    // 快速路径：非结构化匹配必须先包含 "suspended"
     let lower = body.to_ascii_lowercase();
-    lower.contains("suspended") && lower.contains("locked your account")
+    if !lower.contains("suspended") {
+        return false;
+    }
+
+    // 策略 2/3：文案双短语交叉匹配
+    lower.contains("locked your account") || lower.contains("locked it")
 }
 
 /// 默认的上游网关超时判断逻辑。
@@ -580,9 +607,20 @@ mod tests {
         let body = r#"{"message":"Your User ID (736048611274) temporarily is suspended. We've locked your account as a security precaution. To restore access, please contact our support team to verify your identity: https://aws.amazon.com/contact-us/","reason":null}"#;
         assert!(default_is_account_suspended(body));
 
+        // 新版上游格式（明确包含 reason: TEMPORARILY_SUSPENDED 与 locked it）
+        let new_format = r#"{"message":"Your User ID is temporarily suspended. We detected unusual user activity and locked it as a security precaution. To restore access, please contact our support team to verify your identity: https://support.aws.amazon.com/#/contacts/kiro","reason":"TEMPORARILY_SUSPENDED"}"#;
+        assert!(default_is_account_suspended(new_format));
+
+        // 嵌套 reason: /error/reason
+        let nested_reason = r#"{"error":{"message":"Account suspended","reason":"TEMPORARILY_SUSPENDED"}}"#;
+        assert!(default_is_account_suspended(nested_reason));
+
         // 大小写不敏感
         assert!(default_is_account_suspended(
             "Account SUSPENDED. We've LOCKED YOUR ACCOUNT."
+        ));
+        assert!(default_is_account_suspended(
+            "Account is suspended and locked it as security precaution"
         ));
 
         // 普通 403 权限错误不应命中

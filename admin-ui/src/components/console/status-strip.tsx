@@ -35,8 +35,9 @@ export function StatusStrip({
               {s.tone !== 'none' && (
                 <span
                   className={cn(
-                    'h-2 w-2 shrink-0 rounded-full',
-                    s.active ? 'bg-current' : railDotClass(s.tone),
+                    'h-2 w-2 shrink-0 rounded-full transition-all',
+                    railDotClass(s.tone),
+                    s.active && 'ring-2 ring-primary/40 ring-offset-1 ring-offset-background scale-110',
                     !s.active && s.count === 0 && 'opacity-30',
                   )}
                 />

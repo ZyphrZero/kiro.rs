@@ -4,6 +4,7 @@ export interface CredentialStateCounts {
   throttled: number
   quota: number
   dead: number
+  suspended?: number
   total: number
 }
 
