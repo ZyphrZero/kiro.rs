@@ -17,7 +17,7 @@ use crate::model::config::ToolCompatibilityMode;
 
 use super::{
     cache_metering::SharedCacheMeter,
-    handlers::{count_tokens, get_models, post_messages, post_messages_cc},
+    handlers::{count_tokens, get_models, post_messages_cc_route, post_messages_route},
     middleware::{AppState, auth_middleware, cors_layer},
     openai::post_chat_completions,
     responses::post_responses,
@@ -94,7 +94,7 @@ pub fn create_router_with_shared_provider(
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()
         .route("/models", get(get_models))
-        .route("/messages", post(post_messages))
+        .route("/messages", post(post_messages_route))
         .route("/messages/count_tokens", post(count_tokens))
         .route("/chat/completions", post(post_chat_completions))
         .route("/responses", post(post_responses))
@@ -106,7 +106,7 @@ pub fn create_router_with_shared_provider(
     // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
     // 与 /v1 的区别：流式内容即时发送，最终用量由 message_delta 更正
     let cc_v1_routes = Router::new()
-        .route("/messages", post(post_messages_cc))
+        .route("/messages", post(post_messages_cc_route))
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
             state.clone(),
