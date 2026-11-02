@@ -80,7 +80,7 @@ were not changed.
 `upstreamTotalTimeoutSecs` is the deadline for a whole request, body included.
 An active stream cannot reset it, so it also caps how long an answer may be: a
 request still delivering tokens when it expires dies with a half-written body,
-and every token already generated is paid for and lost. It defaults to 720,
+and every token already generated is paid for and lost. It defaults to 0 (disabled),
 the value previously hardcoded in the API client, so behaviour is unchanged
 unless you set it.
 

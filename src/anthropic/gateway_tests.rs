@@ -41,6 +41,8 @@ use std::{
 
 #[derive(Clone, Copy)]
 enum Mode {
+    ReviewRepetition,
+    ReviewEndTurn,
     Normal(Duration),
     Interrupted,
     Overloaded,
@@ -67,6 +69,12 @@ enum Mode {
     Reply(&'static [&'static str]),
     /// 同 `Reply`，但先返回一段原生 reasoning。
     ReplyWithReasoning(&'static [&'static str]),
+    /// 正文以字面 `<thinking>` 开头（L7：extractThinking=false 时流式不能拆出思考块）。
+    ThinkingText,
+    /// 正文之后上游下发 ThrottlingException 异常帧（M3）。
+    Throttled,
+    /// web_search 循环里工具参数是半截 JSON（L10）。
+    SearchInvalidToolJson,
 }
 
 struct Fixture {
@@ -77,6 +85,35 @@ struct Fixture {
     /// 上游收到的 Kiro 请求体（JSON）。
     bodies: Arc<Mutex<Vec<serde_json::Value>>>,
     task: tokio::task::JoinHandle<()>,
+}
+
+#[tokio::test]
+async fn integration_repeat_guard_records_error() {
+    let mut fixture = fixture(Mode::ReviewRepetition).await;
+    let store = Arc::new(TraceStore::open_in_memory().unwrap());
+    fixture.state = fixture.state.clone().with_trace_store(Some(store.clone()));
+    let response = request(fixture.state.clone(), "messages", true).await;
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("repeated-token loop"));
+    let mut records = Vec::new();
+    for _ in 0..50 {
+        records = store.query_paged(&TraceQuery { limit: 10, ..Default::default() }).0;
+        if !records.is_empty() { break; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].final_status, "error");
+}
+
+#[tokio::test]
+async fn integration_native_end_turn_matches_streaming_and_non_streaming() {
+    let fixture = fixture(Mode::ReviewEndTurn).await;
+    for streaming in [true, false] {
+        let response = request(fixture.state.clone(), "messages", streaming).await;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("\"stop_reason\":\"end_turn\""), "streaming={streaming}: {body}");
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -112,6 +149,25 @@ impl KiroEndpoint for LocalEndpoint {
     fn transform_api_body(&self, body: &str, _: &RequestContext<'_>) -> String {
         body.to_owned()
     }
+}
+
+fn exception_frame(exception_type: &str, payload: &str) -> Bytes {
+    let mut headers = Vec::new();
+    for (name, value) in [(":message-type", "exception"), (":exception-type", exception_type)] {
+        headers.push(name.len() as u8);
+        headers.extend_from_slice(name.as_bytes());
+        headers.push(7);
+        headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        headers.extend_from_slice(value.as_bytes());
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&((16 + headers.len() + payload.len()) as u32).to_be_bytes());
+    out.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+    out.extend_from_slice(&crc32(&out).to_be_bytes());
+    out.extend(headers);
+    out.extend_from_slice(payload.as_bytes());
+    out.extend_from_slice(&crc32(&out).to_be_bytes());
+    Bytes::from(out)
 }
 
 fn frame(event: &str, payload: serde_json::Value) -> Bytes {
@@ -188,6 +244,29 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 let mut bytes = frame("assistantResponseEvent", json!({"content": "damaged"})).to_vec();
                 if matches!(mode, Mode::Truncated) { bytes.truncate(bytes.len() - 4); }
                 else { let last = bytes.len() - 1; bytes[last] ^= 1; }
+                return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::Throttled) {
+                let mut bytes = frame("assistantResponseEvent", json!({"content": "partial answer"})).to_vec();
+                bytes.extend_from_slice(&exception_frame("ThrottlingException", r#"{"message":"Rate exceeded for account 123456789012"}"#));
+                return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::SearchInvalidToolJson) {
+                let bytes = frame("toolUseEvent", json!({"name":"run","toolUseId":"run_1","input":"{\"command\":\"ls","stop":true})).to_vec();
+                return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::ThinkingText) {
+                let mut bytes = frame("assistantResponseEvent", json!({"content": "<thinking>先想想</thinking>\n\n答案"})).to_vec();
+                bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":5,"outputTokens":3,"cacheReadInputTokens":0,"cacheWriteInputTokens":0}})));
+                return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::ReviewRepetition | Mode::ReviewEndTurn) {
+                let content = if matches!(mode, Mode::ReviewRepetition) { "count\n".repeat(40) } else { "complete".to_string() };
+                let mut bytes = frame("assistantResponseEvent", json!({"content": content})).to_vec();
+                bytes.extend_from_slice(&frame("metadataEvent", json!({"stopReason": "END_TURN"})));
+                if matches!(mode, Mode::ReviewEndTurn) {
+                    bytes.extend_from_slice(&frame("contextUsageEvent", json!({"contextUsagePercentage": 100.0})));
+                }
                 return Response::new(Body::from(bytes));
             }
             if matches!(mode, Mode::Tools) {
@@ -916,6 +995,26 @@ async fn structured_output_non_stream_extracts_json_from_prose() {
 }
 
 #[tokio::test]
+async fn gateway_stream_respects_extract_thinking_disabled() {
+    // L7：fixture 的 AppState 是 extract_thinking=false。流式与非流式必须一致：不拆出 thinking 块。
+    let f = fixture(Mode::ThinkingText).await;
+    let req = json!({"model": "gpt-5.6-sol", "max_tokens": 2048, "stream": true,
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "messages": [{"role": "user", "content": "hello"}]});
+    for endpoint in ["messages", "cc"] {
+        let response = if endpoint == "cc" {
+            post_messages_cc(axum::extract::State(f.state.clone()), Extension(key()), Json(serde_json::from_value(req.clone()).unwrap())).await
+        } else {
+            post_messages(axum::extract::State(f.state.clone()), Extension(key()), Json(serde_json::from_value(req.clone()).unwrap())).await
+        };
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let sse = String::from_utf8_lossy(&bytes);
+        assert!(!sse.contains(r#""type":"thinking""#), "{endpoint}: {sse}");
+        assert!(sse.contains("先想想</thinking>"), "{endpoint}: {sse}");
+    }
+}
+
+#[tokio::test]
 async fn structured_output_stream_emits_one_compliant_json_text_block() {
     for endpoint in ["messages", "cc"] {
         for (reply, expected) in goal_cases() {
@@ -1325,4 +1424,51 @@ async fn structured_output_stream_first_token_trace_is_emit_time() {
     }
     assert!(first_token["structured"] >= 300, "{first_token:?}");
     assert!(first_token["plain"] < 300, "{first_token:?}");
+}
+
+#[tokio::test]
+async fn gateway_upstream_exception_keeps_classified_reason() {
+    // M3：流中途的 ThrottlingException 必须以 rate_limit_error 告诉客户端，且不带上游原文。
+    let f = fixture(Mode::Throttled).await;
+    let sse = {
+        let response = request(f.state.clone(), "messages", true).await;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    assert!(sse.contains("rate_limit_error"), "{sse}");
+    assert!(!sse.contains("message_stop"), "{sse}");
+    assert!(!sse.contains("123456789012"), "{sse}");
+    let response = request(f.state.clone(), "messages", false).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn gateway_search_loop_rejects_truncated_tool_json() {
+    // L10：web_search 循环里半截工具参数不能以 {} 交给客户端执行。
+    let mut failures = Vec::new();
+    for streaming in [false, true] {
+        let f = fixture(Mode::SearchInvalidToolJson).await;
+        let payload = json!({
+            "model":"gpt-5.6-sol","max_tokens":64,"stream":streaming,
+            "messages":[{"role":"user","content":"hello"}],
+            "tools":[
+                {"type":"web_search_20250305","name":"web_search"},
+                {"name":"run","description":"test command","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}
+            ]
+        });
+        let response = post_messages(
+            axum::extract::State(f.state.clone()),
+            Extension(key()),
+            Json(serde_json::from_value(payload).unwrap()),
+        )
+        .await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        let failed_visibly = status != StatusCode::OK || body.contains("event: error");
+        if !failed_visibly || body.contains(r#""stop_reason":"tool_use""#) {
+            failures.push(format!("stream={streaming}, status={status}, body={body}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

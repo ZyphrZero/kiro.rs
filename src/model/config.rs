@@ -140,8 +140,9 @@ pub struct Config {
 
     /// Deadline for a whole upstream API request, body included. An active
     /// stream cannot reset it, so it also caps how long an answer may be.
-    /// Defaults to the previously hardcoded 720s; set 0 to disable it and
-    /// leave stalled upstreams to `upstream_read_timeout_secs`.
+    /// Defaults to 0 (disabled): a stream that is still delivering tokens is
+    /// never cut mid-answer, and stalled upstreams are cut by
+    /// `upstream_read_timeout_secs`. Set a positive value to cap request time.
     #[serde(default = "default_upstream_total_timeout_secs")]
     pub upstream_total_timeout_secs: u64,
 
@@ -432,7 +433,8 @@ fn default_upstream_read_timeout_secs() -> u64 {
     120
 }
 fn default_upstream_total_timeout_secs() -> u64 {
-    720
+    // M6：不设整请求截止时间，静默由 read timeout（默认 120 秒）负责。
+    0
 }
 
 fn default_load_balancing_mode() -> String {
@@ -652,13 +654,12 @@ mod tests {
         assert_eq!(Config::default().upstream_read_timeout_secs, 120);
     }
 
-    /// The default keeps the previously hardcoded deadline, so existing
-    /// deployments behave exactly as before this became configurable.
+    /// M6：默认不设整请求截止时间，仍在输出的长回复不会被切断。
     #[test]
-    fn upstream_total_timeout_defaults_to_previous_hardcoded_value() {
+    fn upstream_total_timeout_defaults_to_disabled() {
         let config: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(config.upstream_total_timeout_secs, 720);
-        assert_eq!(Config::default().upstream_total_timeout_secs, 720);
+        assert_eq!(config.upstream_total_timeout_secs, 0);
+        assert_eq!(Config::default().upstream_total_timeout_secs, 0);
     }
 
     #[test]

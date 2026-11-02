@@ -5,7 +5,7 @@
   "tlsBackend": "rustls",
   "upstreamConnectTimeoutSecs": 15,
   "upstreamReadTimeoutSecs": 120,
-  "upstreamTotalTimeoutSecs": 720,
+  "upstreamTotalTimeoutSecs": 0,
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
   "defaultEndpoint": "ide",
