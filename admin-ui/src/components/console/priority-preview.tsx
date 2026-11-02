@@ -1,4 +1,4 @@
-import { useCredentials } from '@/hooks/use-credentials'
+import { useCredentials, useLoadBalancingMode } from '@/hooks/use-credentials'
 
 /**
  * 优先级编辑时的队列位置预览 —— 优先级这件事的签名元素。
@@ -35,6 +35,8 @@ export function PriorityPreview({
 }) {
   // 读 react-query 缓存里的凭据全集（与列表同一个 queryKey，不会额外发请求）
   const { data } = useCredentials()
+  const { data: lbData } = useLoadBalancingMode()
+  const invert = lbData?.invertPriority ?? false
 
   const n = Number(draft)
   if (draft.trim() === '' || !Number.isInteger(n) || n < 0) {
@@ -58,7 +60,10 @@ export function PriorityPreview({
   const queue = all
     .filter((c) => !c.disabled)
     .map((c) => (c.id === credentialId ? { ...c, priority: n } : c))
-    .sort((a, b) => a.priority - b.priority || a.id - b.id)
+    .sort((a, b) => {
+      const pDiff = invert ? b.priority - a.priority : a.priority - b.priority
+      return pDiff || a.id - b.id
+    })
 
   const idx = queue.findIndex((c) => c.id === credentialId)
   if (idx < 0) {

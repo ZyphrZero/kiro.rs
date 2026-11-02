@@ -601,8 +601,9 @@ pub(crate) async fn call_mcp_api(
             .await;
     }
 
-    let response = provider.call_mcp(&request_body, group).await?;
-    let body = response.text().await?;
+    let result = provider.call_mcp(&request_body, group).await?;
+    let _in_flight = result._in_flight;
+    let body = result.response.text().await?;
     parse_mcp_response(&body)
 }
 

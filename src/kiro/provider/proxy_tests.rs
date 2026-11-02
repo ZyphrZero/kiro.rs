@@ -125,6 +125,20 @@ async fn model_response(provider: &KiroProvider) -> String {
     .expect("loopback model request timed out")
 }
 
+#[tokio::test]
+async fn mcp_in_flight_guard_covers_response_body() {
+    let server = LocalServer::named("mcp").await;
+    let (provider, _) = setup(&server, None);
+    let result = provider.call_mcp("{}", None).await.unwrap();
+    assert_eq!(provider.token_manager().get_in_flight(result.credential_id), 1);
+    let guard = result._in_flight;
+    let body = result.response.text().await.unwrap();
+    assert_eq!(body, "mcp|");
+    assert_eq!(provider.token_manager().get_in_flight(1), 1);
+    drop(guard);
+    assert_eq!(provider.token_manager().get_in_flight(1), 0);
+}
+
 async fn credential_response(
     provider: &KiroProvider,
     credential: &KiroCredentials,
@@ -216,6 +230,7 @@ async fn hot_update_routes_model_stream_and_mcp_through_new_proxy() {
             .call_mcp("{}", None)
             .await
             .unwrap()
+            .response
             .text()
             .await
             .unwrap()

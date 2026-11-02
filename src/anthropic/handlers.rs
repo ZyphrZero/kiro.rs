@@ -1257,6 +1257,7 @@ async fn handle_stream_request(
     tracer.mark_upstream_headers_received();
     let response = call_result.response;
     let credential_id = call_result.credential_id;
+    let in_flight = call_result._in_flight;
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(
@@ -1281,6 +1282,7 @@ async fn handle_stream_request(
         credential_id,
         tracer.clone(),
         structured_schema.map(|schema| StructuredCollector::new(schema, model)),
+        in_flight,
     );
 
     // 返回 SSE 响应
@@ -1320,6 +1322,7 @@ fn create_sse_stream(
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
     mut structured: Option<StructuredCollector>,
+    in_flight: Option<std::sync::Arc<crate::kiro::token_manager::InFlightGuard>>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 结构化输出模式：只先发 message_start，其余初始事件与后续内容缓冲到流结束再改写发出。
     let initial_events = match structured.as_mut() {
@@ -1339,7 +1342,7 @@ fn create_sse_stream(
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
-    let mut settlement = StreamSettlement::new(hook, credential_id, tracer, &ctx);
+    let mut settlement = StreamSettlement::new(hook, credential_id, tracer, &ctx, in_flight);
     settlement.structured = structured;
 
     let processing_stream = stream::unfold(
@@ -1480,6 +1483,8 @@ struct StreamSettlement {
     settled: bool,
     /// 结构化输出模式下的事件缓冲；None 表示按原样实时转发。
     structured: Option<StructuredCollector>,
+    /// 在途请求守卫：随流处理上下文存活，流结束 / 中断后自动递减并发计数
+    _in_flight: Option<std::sync::Arc<crate::kiro::token_manager::InFlightGuard>>,
 }
 
 impl StreamSettlement {
@@ -1538,6 +1543,7 @@ impl StreamSettlement {
         credential_id: u64,
         tracer: std::sync::Arc<RequestTracer>,
         ctx: &StreamContext,
+        in_flight: Option<std::sync::Arc<crate::kiro::token_manager::InFlightGuard>>,
     ) -> Self {
         Self {
             hook,
@@ -1547,6 +1553,7 @@ impl StreamSettlement {
             sent_bytes: 0,
             settled: false,
             structured: None,
+            _in_flight: in_flight,
         }
     }
 
@@ -2911,7 +2918,7 @@ mod tests {
         ctx.output_tokens = 7;
         ctx.credits = 0.5;
 
-        let mut settlement = StreamSettlement::new(hook, 42, tracer, &ctx);
+        let mut settlement = StreamSettlement::new(hook, 42, tracer, &ctx, None);
         settlement.update(&ctx, 123);
         drop(settlement);
 
@@ -2957,7 +2964,7 @@ mod tests {
         );
         ctx.cache_usage = super::super::cache_metering::CacheUsage::default();
 
-        let mut settlement = StreamSettlement::new(hook, 42, tracer, &ctx);
+        let mut settlement = StreamSettlement::new(hook, 42, tracer, &ctx, None);
         settlement.update(&ctx, 456);
         drop(settlement);
 

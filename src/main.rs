@@ -221,6 +221,8 @@ async fn main() {
             tracing::info!("分组注册表：自动迁移 {} 个已用分组", added);
         }
     }
+    // 让调度器能解析分组级负载均衡 / 优先级反转覆盖。
+    token_manager.set_group_manager(group_manager.clone());
 
     // 请求链路追踪存储（SQLite，traces.db）。失败不致命：trace 不可用但服务正常。
     let trace_store: Option<admin::SharedTraceStore> = match admin::TraceStore::open(

@@ -471,6 +471,12 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "is_zero")]
     pub priority: u32,
 
+    /// 凭据负载因子（均衡模式下的调度权重，数值越大调度频次越高，默认为 10）
+    #[serde(default = "default_load_factor")]
+    #[serde(skip_serializing_if = "is_default_load_factor")]
+    #[serde(alias = "weight", alias = "loadFactor")]
+    pub load_factor: u32,
+
     /// 凭据级默认 Region，作为 auth_region 和 api_region 的共同回退
     /// 未配置时分别使用 config.json 的全局 Auth / API Region
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -597,6 +603,14 @@ fn is_zero_u64(value: &u64) -> bool {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn default_load_factor() -> u32 {
+    10
+}
+
+fn is_default_load_factor(value: &u32) -> bool {
+    *value == 10 || *value == 0
 }
 
 /// 仅显示长度，不暴露明文。例如 `Some(42 chars)` 或 `None`。
@@ -815,6 +829,15 @@ impl KiroCredentials {
     /// 获取默认凭证文件路径
     pub fn default_credentials_path() -> &'static str {
         "credentials.json"
+    }
+
+    /// 获取有效的负载因子（默认 10，最小为 1）
+    pub fn effective_load_factor(&self) -> u32 {
+        if self.load_factor == 0 {
+            10
+        } else {
+            self.load_factor
+        }
     }
 
     /// 获取有效的 Auth Region（用于 Token 刷新）
@@ -1242,6 +1265,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 0,
+            load_factor: 10,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1520,6 +1544,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 0,
+            load_factor: 10,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
@@ -1566,6 +1591,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 0,
+            load_factor: 10,
             region: None,
             auth_region: None,
             api_region: None,
@@ -1695,6 +1721,7 @@ mod tests {
             issuer_url: None,
             scopes: None,
             priority: 3,
+            load_factor: 10,
             region: Some("us-west-2".to_string()),
             auth_region: None,
             api_region: None,
