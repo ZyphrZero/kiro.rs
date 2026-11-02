@@ -870,8 +870,8 @@ pub struct CompletedToolUse {
 impl CompletedToolUse {
     /// 从 Kiro 侧 (name, input) 还原为客户端可见的完整工具调用。
     ///
-    /// 这是**唯一的还原入口**：名字按 `tool_name_map` 还原、入参按 Kiro 名反向重写
-    /// （见 `converter::restore_tool_use_for_client`）。结构化事件、`<invoke>` 文本捞回、
+    /// 这是**唯一的还原入口**：名字按 `tool_name_map` 还原；入参只对 ClaudeCode 模式下
+    /// 做过内置名映射的工具反向重写，raw 模式原样返回（见 `converter::restore_tool_use_for_client`）。结构化事件、`<invoke>` 文本捞回、
     /// websearch 三条来源都经此收敛，避免各站点各自调用还原逻辑。
     pub fn from_kiro(
         id: String,
