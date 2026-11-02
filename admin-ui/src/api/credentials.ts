@@ -21,6 +21,9 @@ import type {
   AssignProxyRequest,
   ProxyCheckResponse,
   ProxyCheckAllResponse,
+  ProxyRotationResponse,
+  ProxyFailoverConfig,
+  ProxyFailoverConfigPatch,
   AssignRoundRobinResponse,
   StartIdcLoginRequest,
   StartIdcLoginResponse,
@@ -420,9 +423,29 @@ export async function checkProxy(id: number): Promise<ProxyCheckResponse> {
   return data
 }
 
-// 触发全部代理健康检查
+// 触发一轮完整巡检：自动检测在用代理 → 健康探测 → 凭据代理自动轮换
 export async function checkAllProxies(): Promise<ProxyCheckAllResponse> {
   const { data } = await api.post<ProxyCheckAllResponse>('/proxy-pool/check-all')
+  return data
+}
+
+// 按当前代理池状态立即执行一次凭据代理轮换（不重新探测）
+export async function rotateCredentialProxies(): Promise<ProxyRotationResponse> {
+  const { data } = await api.post<ProxyRotationResponse>('/proxy-pool/rotate')
+  return data
+}
+
+// 读取代理故障转移配置
+export async function getProxyFailoverConfig(): Promise<ProxyFailoverConfig> {
+  const { data } = await api.get<ProxyFailoverConfig>('/config/proxy-failover')
+  return data
+}
+
+// 更新代理故障转移配置
+export async function setProxyFailoverConfig(
+  patch: ProxyFailoverConfigPatch
+): Promise<ProxyFailoverConfig> {
+  const { data } = await api.put<ProxyFailoverConfig>('/config/proxy-failover', patch)
   return data
 }
 

@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::model::config::TlsBackend;
 
 /// 代理配置
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct ProxyConfig {
     /// 代理地址，支持 http/https/socks5
     pub url: String,
@@ -16,6 +16,26 @@ pub struct ProxyConfig {
     pub username: Option<String>,
     /// 代理认证密码
     pub password: Option<String>,
+}
+
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ProxyConfig")
+            .field("url", &mask_proxy_url(&self.url))
+            .field("username", &self.username.as_ref().map(|_| "<set>"))
+            .field("password", &self.password.as_ref().map(|_| "<set>"))
+            .finish()
+    }
+}
+
+pub(crate) fn mask_proxy_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    match rest.rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}://***@{host}"),
+        None => url.to_string(),
+    }
 }
 
 impl ProxyConfig {
@@ -110,7 +130,7 @@ fn client_builder(
         }
 
         builder = builder.proxy(proxy);
-        tracing::debug!("HTTP Client 使用代理: {}", proxy_config.url);
+        tracing::debug!("HTTP Client 使用代理: {}", mask_proxy_url(&proxy_config.url));
     }
 
     Ok(builder)

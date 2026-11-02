@@ -748,6 +748,8 @@ pub struct ProxyPoolEntry {
     pub consecutive_failures: u32,
     /// 是否由健康检查自动禁用
     pub auto_disabled: bool,
+    /// 是否由自动检测登记（凭据或全局配置在用、但此前未登记到池内）
+    pub auto_detected: bool,
 }
 
 /// 代理池列表响应
@@ -779,6 +781,46 @@ pub struct ProxyCheckAllResponse {
     pub healthy: usize,
     pub unhealthy: usize,
     pub auto_disabled: usize,
+    /// 从自动禁用状态恢复启用的代理数
+    pub auto_recovered: usize,
+    /// 本轮自动检测新登记进池的代理数
+    pub detected: usize,
+    /// 本轮代理自动轮换结果
+    pub rotation: ProxyRotationResponse,
+}
+
+/// 代理自动轮换结果
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyRotationResponse {
+    /// 从不可用代理轮换到其它可用代理的凭据数
+    pub rotated: usize,
+    /// 因无可用代理而回退直连的凭据数
+    pub switched_to_direct: usize,
+    /// 已恢复可用代理、从直连改回代理的凭据数
+    pub restored_to_proxy: usize,
+    /// 代理不可用但无处可换、保持原配置的凭据数
+    pub unresolved: usize,
+}
+
+/// 代理故障转移配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyFailoverConfigResponse {
+    /// 是否启用凭据代理的自动检测与轮换
+    pub auto_rotate_enabled: bool,
+    /// 无可用代理时是否允许凭据回退直连
+    pub direct_fallback_enabled: bool,
+}
+
+/// 设置代理故障转移配置请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetProxyFailoverConfigRequest {
+    #[serde(default)]
+    pub auto_rotate_enabled: Option<bool>,
+    #[serde(default)]
+    pub direct_fallback_enabled: Option<bool>,
 }
 
 /// 轮询批量分配请求

@@ -4,8 +4,17 @@
 //!
 //! 除增删改查外，还提供主动健康检查：周期性（或按需）通过每个代理请求一个
 //! 轻量公网探测端点，记录连通性与延迟；连续探测失败达阈值的代理会被自动禁用。
+//!
+//! 健康检查覆盖两类条目：
+//! - 手动登记的代理；
+//! - 由 [`ProxyPoolManager::register_detected`] 自动登记的、凭据实际在用但未登记
+//!   到池内的代理（含全局代理）。这类条目带 `autoDetected` 标记。
+//!
+//! 被自动禁用的条目仍会继续探测，恢复连通后自动重新启用；用户手动禁用的条目
+//! 不参与探测，也不会被自动启用。
 
 use crate::http_client::{ProxyConfig, build_client};
+pub(crate) use crate::http_client::mask_proxy_url;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -58,6 +67,12 @@ pub struct ProxyEntry {
     /// 是否由健康检查自动禁用（区别于用户手动禁用）
     #[serde(default)]
     pub auto_disabled: bool,
+
+    /// 是否由自动检测登记（凭据或全局配置在用、但此前未登记到池内）
+    #[serde(default)]
+    pub auto_detected: bool,
+    #[serde(skip)]
+    runtime_proxy: Option<ProxyConfig>,
 }
 
 fn default_true() -> bool {
@@ -83,12 +98,36 @@ pub struct CheckSummary {
     pub unhealthy: usize,
     /// 本轮新增的自动禁用数
     pub auto_disabled: usize,
+    /// 本轮从自动禁用状态恢复启用的数量
+    pub auto_recovered: usize,
+}
+
+/// 某个代理 URL 在池内的可用性判定
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyAvailability {
+    /// 已登记且可用（启用且最近一次探测未失败）
+    Available,
+    /// 已登记但不可用（被禁用，或最近一次探测失败）
+    Unavailable,
+    /// 未登记，无判定依据
+    Untracked,
 }
 
 /// 单个代理探测结果
 enum ProbeResult {
     Ok { latency_ms: u32 },
     Err { error: String },
+}
+
+/// 一次探测回写后的状态迁移结果，用于摘要统计
+#[derive(Debug, Clone, Copy, Default)]
+struct ProbeOutcome {
+    /// 本次探测判定为不可用
+    unhealthy: bool,
+    /// 本次新增自动禁用
+    newly_disabled: bool,
+    /// 本次从自动禁用状态恢复启用
+    recovered: bool,
 }
 
 pub struct ProxyPoolManager {
@@ -100,13 +139,20 @@ pub struct ProxyPoolManager {
     tls_backend: TlsBackend,
 }
 
+fn proxy_address(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => format!("{scheme}://{}", rest.rsplit('@').next().unwrap_or(rest)),
+        None => url.to_string(),
+    }
+}
+
 /// 校验代理 URL 的 scheme 是否合法
 fn validate_proxy_url(url: &str) -> anyhow::Result<()> {
     let valid_schemes = ["http://", "https://", "socks5://", "socks4://"];
     if !valid_schemes.iter().any(|s| url.starts_with(s)) {
         anyhow::bail!(
             "代理 URL scheme 无效，支持: http/https/socks4/socks5（收到: {}）",
-            url
+            mask_proxy_url(url)
         );
     }
     // 简单检查 host:port 存在
@@ -118,7 +164,7 @@ fn validate_proxy_url(url: &str) -> anyhow::Result<()> {
     // after_scheme 可能是 user:pass@host:port 或 host:port
     let host_part = after_scheme.rsplit('@').next().unwrap_or(after_scheme);
     if !host_part.contains(':') {
-        anyhow::bail!("代理 URL 缺少端口号: {}", url);
+        anyhow::bail!("代理 URL 缺少端口号: {}", mask_proxy_url(url));
     }
     Ok(())
 }
@@ -169,6 +215,8 @@ impl ProxyPoolManager {
             last_checked_at: None,
             consecutive_failures: 0,
             auto_disabled: false,
+            auto_detected: false,
+            runtime_proxy: None,
         };
         entries.push(entry.clone());
         drop(entries);
@@ -207,6 +255,8 @@ impl ProxyPoolManager {
                 last_checked_at: None,
                 consecutive_failures: 0,
                 auto_disabled: false,
+                auto_detected: false,
+                runtime_proxy: None,
             };
             entries.push(entry.clone());
             added.push(entry);
@@ -245,8 +295,8 @@ impl ProxyPoolManager {
             .find(|e| e.id == id)
             .ok_or_else(|| anyhow::anyhow!("代理不存在: {}", id))?;
         entry.enabled = enabled;
+        entry.auto_disabled = false;
         if enabled {
-            entry.auto_disabled = false;
             entry.consecutive_failures = 0;
         }
         drop(entries);
@@ -268,9 +318,96 @@ impl ProxyPoolManager {
         self.entries
             .lock()
             .iter()
-            .filter(|e| e.enabled && e.health != ProxyHealth::Unhealthy)
+            .filter(|e| e.enabled && e.health != ProxyHealth::Unhealthy
+                && (!e.auto_detected || (e.health == ProxyHealth::Healthy && e.runtime_proxy.as_ref().is_some_and(|proxy| proxy.username.is_none() && proxy.password.is_none() && proxy_address(&proxy.url) == proxy.url))))
             .map(|e| e.url.clone())
             .collect()
+    }
+
+    /// 判定指定 URL 在池内的可用性。
+    ///
+    /// 未登记的 URL 返回 [`ProxyAvailability::Untracked`]：没有探测记录时不做任何
+    /// 推断，调用方不应据此轮换凭据。
+    pub fn availability(&self, url: &str) -> ProxyAvailability {
+        match self.entries.lock().iter().find(|e| e.url == url) {
+            None => ProxyAvailability::Untracked,
+            Some(e) if e.enabled && e.health != ProxyHealth::Unhealthy => {
+                ProxyAvailability::Available
+            }
+            Some(_) => ProxyAvailability::Unavailable,
+        }
+    }
+
+    pub fn availability_for_proxy(&self, proxy: &ProxyConfig) -> ProxyAvailability {
+        match self.entries.lock().iter().find(|entry| {
+            if entry.auto_detected {
+                entry.runtime_proxy.as_ref() == Some(proxy)
+            } else {
+                entry.url == proxy.url && proxy.username.is_none() && proxy.password.is_none()
+            }
+        }) {
+            None => ProxyAvailability::Untracked,
+            Some(entry) if !entry.enabled && !entry.auto_disabled => ProxyAvailability::Unavailable,
+            Some(entry) if entry.auto_detected && entry.health == ProxyHealth::Unknown => ProxyAvailability::Untracked,
+            Some(entry) if entry.enabled && entry.health != ProxyHealth::Unhealthy => ProxyAvailability::Available,
+            Some(_) => ProxyAvailability::Unavailable,
+        }
+    }
+
+    /// 把「实际在用但未登记」的代理 URL 自动登记进池，纳入后续健康检查。
+    ///
+    /// 已登记的 URL 原样保留（不改动其 enabled / health 等状态）；非法 URL 跳过。
+    /// 返回本次新登记的条目数。
+    pub fn register_detected(&self, proxies: &[ProxyConfig]) -> usize {
+        let mut added = 0usize;
+        {
+            let mut entries = self.entries.lock();
+            for proxy in proxies {
+                let url = proxy.url.trim();
+                if url.is_empty() || validate_proxy_url(url).is_err() {
+                    continue;
+                }
+                if entries.iter().any(|entry| {
+                    if entry.auto_detected {
+                        entry.runtime_proxy.as_ref() == Some(proxy)
+                    } else {
+                        entry.url == url && proxy.username.is_none() && proxy.password.is_none()
+                    }
+                }) {
+                    continue;
+                }
+                let address = proxy_address(url);
+                if let Some(entry) = entries.iter_mut().find(|entry| entry.auto_detected && entry.url == address && entry.runtime_proxy.is_none()) {
+                    entry.runtime_proxy = Some(proxy.clone());
+                    entry.health = ProxyHealth::Unknown;
+                    entry.consecutive_failures = 0;
+                    continue;
+                }
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                entries.push(ProxyEntry {
+                    id,
+                    url: address,
+                    label: None,
+                    enabled: true,
+                    health: ProxyHealth::Unknown,
+                    latency_ms: None,
+                    last_checked_at: None,
+                    consecutive_failures: 0,
+                    auto_disabled: false,
+                    auto_detected: true,
+                    runtime_proxy: Some(proxy.clone()),
+                });
+                added += 1;
+                tracing::info!("检测到在用但未登记的代理，已自动登记进池: {}", mask_proxy_url(url));
+            }
+        }
+
+        if added > 0
+            && let Err(e) = self.persist()
+        {
+            tracing::warn!("自动登记代理后持久化失败: {}", e);
+        }
+        added
     }
 
     fn persist(&self) -> anyhow::Result<()> {
@@ -292,9 +429,12 @@ impl ProxyPoolManager {
     ///
     /// 通过该代理请求 `PROXY_HEALTH_CHECK_URL`，成功（HTTP 2xx/3xx）即视为连通，
     /// 返回往返延迟；任何网络错误或非预期状态码视为失败。
-    async fn probe_one(&self, url: &str) -> ProbeResult {
-        let proxy = ProxyConfig::new(url);
-        let client = match build_client(Some(&proxy), PROXY_PROBE_TIMEOUT_SECS, self.tls_backend) {
+    async fn probe_one(&self, proxy: &ProxyConfig) -> ProbeResult {
+        self.probe_with_url(proxy, PROXY_HEALTH_CHECK_URL).await
+    }
+
+    async fn probe_with_url(&self, proxy: &ProxyConfig, check_url: &str) -> ProbeResult {
+        let client = match build_client(Some(proxy), PROXY_PROBE_TIMEOUT_SECS, self.tls_backend) {
             Ok(c) => c,
             Err(e) => {
                 return ProbeResult::Err {
@@ -304,7 +444,7 @@ impl ProxyPoolManager {
         };
 
         let started = Instant::now();
-        match client.get(PROXY_HEALTH_CHECK_URL).send().await {
+        match client.get(check_url).send().await {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() || status.is_redirection() {
@@ -323,17 +463,26 @@ impl ProxyPoolManager {
         }
     }
 
-    /// 将一次探测结果回写到指定条目，并按需触发自动禁用。
-    ///
-    /// 返回 `(变为不健康, 本次新自动禁用)` 供摘要统计。
-    fn apply_probe_result(entry: &mut ProxyEntry, result: &ProbeResult) -> (bool, bool) {
+    /// 将一次探测结果回写到指定条目，并按需触发自动禁用或自动恢复。
+    fn apply_probe_result(entry: &mut ProxyEntry, result: &ProbeResult) -> ProbeOutcome {
         entry.last_checked_at = Some(chrono::Utc::now().to_rfc3339());
         match result {
             ProbeResult::Ok { latency_ms } => {
                 entry.health = ProxyHealth::Healthy;
                 entry.latency_ms = Some(*latency_ms);
                 entry.consecutive_failures = 0;
-                (false, false)
+                // 自动禁用的条目恢复连通后自动重新启用；手动禁用的条目保持禁用
+                let recovered = entry.auto_disabled;
+                if recovered {
+                    entry.enabled = true;
+                    entry.auto_disabled = false;
+                    tracing::info!("代理 #{} 探测恢复连通，已自动重新启用", entry.id);
+                }
+                ProbeOutcome {
+                    unhealthy: false,
+                    newly_disabled: false,
+                    recovered,
+                }
             }
             ProbeResult::Err { error } => {
                 entry.health = ProxyHealth::Unhealthy;
@@ -357,22 +506,30 @@ impl ProxyPoolManager {
                         entry.consecutive_failures
                     );
                 }
-                (true, newly_disabled)
+                ProbeOutcome {
+                    unhealthy: true,
+                    newly_disabled,
+                    recovered: false,
+                }
             }
         }
     }
 
-    /// 全量健康检查：并发探测所有「已启用」代理，回写结果并持久化一次。
+    /// 全量健康检查：并发探测所有「已启用」及「自动禁用」代理，回写结果并持久化一次。
     ///
-    /// 仅探测当前 enabled 的条目；用户/自动禁用的条目跳过（手动重新启用会清零计数）。
+    /// 自动禁用的条目一并探测，以便恢复连通后自动重新启用；用户手动禁用的条目跳过
+    /// （手动重新启用会清零计数）。
     pub async fn check_all(&self) -> CheckSummary {
         // 快照待探测的 (id, url)，避免长时间持锁
-        let targets: Vec<(u64, String)> = self
+        let targets: Vec<(u64, ProxyConfig)> = self
             .entries
             .lock()
             .iter()
-            .filter(|e| e.enabled)
-            .map(|e| (e.id, e.url.clone()))
+            .filter(|e| e.enabled || e.auto_disabled)
+            .filter_map(|e| {
+                let proxy = if e.auto_detected { e.runtime_proxy.clone()? } else { ProxyConfig::new(&e.url) };
+                Some((e.id, proxy))
+            })
             .collect();
 
         if targets.is_empty() {
@@ -381,7 +538,7 @@ impl ProxyPoolManager {
 
         let probes = targets
             .iter()
-            .map(|(id, url)| async move { (*id, self.probe_one(url).await) });
+            .map(|(id, proxy)| async move { (*id, self.probe_one(proxy).await) });
         let results = futures::future::join_all(probes).await;
 
         let mut summary = CheckSummary::default();
@@ -389,14 +546,17 @@ impl ProxyPoolManager {
             let mut entries = self.entries.lock();
             for (id, result) in &results {
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == *id) {
-                    let (unhealthy, newly_disabled) = Self::apply_probe_result(entry, result);
-                    if unhealthy {
+                    let outcome = Self::apply_probe_result(entry, result);
+                    if outcome.unhealthy {
                         summary.unhealthy += 1;
                     } else {
                         summary.healthy += 1;
                     }
-                    if newly_disabled {
+                    if outcome.newly_disabled {
                         summary.auto_disabled += 1;
+                    }
+                    if outcome.recovered {
+                        summary.auto_recovered += 1;
                     }
                 }
             }
@@ -410,15 +570,15 @@ impl ProxyPoolManager {
 
     /// 单个代理即时探测（供 UI「测试」按钮调用），回写结果并持久化。
     pub async fn check_one(&self, id: u64) -> anyhow::Result<ProxyEntry> {
-        let url = self
+        let proxy = self
             .entries
             .lock()
             .iter()
             .find(|e| e.id == id)
-            .map(|e| e.url.clone())
+            .and_then(|e| if e.auto_detected { e.runtime_proxy.clone() } else { Some(ProxyConfig::new(&e.url)) })
             .ok_or_else(|| anyhow::anyhow!("代理不存在: {}", id))?;
 
-        let result = self.probe_one(&url).await;
+        let result = self.probe_one(&proxy).await;
 
         let entry = {
             let mut entries = self.entries.lock();
@@ -439,6 +599,41 @@ impl ProxyPoolManager {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn detected_proxy_probe_uses_separate_auth_without_persisting_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use base64::Engine;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let length = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8(request[..length].to_vec()).unwrap();
+            let expected = format!("proxy-authorization: Basic {}", base64::engine::general_purpose::STANDARD.encode("fixture-user:fixture-password"));
+            let authorized = request.lines().any(|line| line.eq_ignore_ascii_case(&expected));
+            let response: &[u8] = if authorized { b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n" } else { b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n" };
+            socket.write_all(response).await.unwrap();
+            request
+        });
+        let proxy = ProxyConfig::new(format!("http://{address}")).with_auth("fixture-user", "fixture-password");
+        let manager = ProxyPoolManager::new(None, TlsBackend::Rustls);
+        assert_eq!(manager.register_detected(&[proxy.clone()]), 1);
+        assert_eq!(manager.availability_for_proxy(&proxy), ProxyAvailability::Untracked);
+        let serialized = serde_json::to_string(&manager.list()).unwrap();
+        assert!(!serialized.contains("fixture-user"));
+        assert!(!serialized.contains("fixture-password"));
+        let embedded = ProxyConfig::new(format!("http://fixture-user:fixture-password@{address}"));
+        assert_eq!(manager.register_detected(&[embedded]), 1);
+        let serialized = serde_json::to_string(&manager.list()).unwrap();
+        assert!(!serialized.contains("fixture-user"));
+        assert!(!serialized.contains("fixture-password"));
+        assert!(matches!(manager.probe_with_url(&proxy, "http://example.test/health").await, ProbeResult::Ok { .. }));
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("proxy-authorization: basic"));
+        assert!(manager.assignable_urls().is_empty());
+    }
+
     fn make_entry(url: &str) -> ProxyEntry {
         ProxyEntry {
             id: 1,
@@ -450,6 +645,8 @@ mod tests {
             last_checked_at: None,
             consecutive_failures: 0,
             auto_disabled: false,
+            auto_detected: false,
+            runtime_proxy: None,
         }
     }
 
@@ -474,16 +671,16 @@ mod tests {
         };
         // 前两次失败：计数累加，仍启用
         for n in 1..MAX_PROXY_PROBE_FAILURES {
-            let (unhealthy, disabled) = ProxyPoolManager::apply_probe_result(&mut entry, &err);
-            assert!(unhealthy);
-            assert!(!disabled);
+            let outcome = ProxyPoolManager::apply_probe_result(&mut entry, &err);
+            assert!(outcome.unhealthy);
+            assert!(!outcome.newly_disabled);
             assert_eq!(entry.consecutive_failures, n);
             assert!(entry.enabled);
             assert!(!entry.auto_disabled);
         }
         // 第 N 次失败：自动禁用
-        let (_, disabled) = ProxyPoolManager::apply_probe_result(&mut entry, &err);
-        assert!(disabled);
+        let outcome = ProxyPoolManager::apply_probe_result(&mut entry, &err);
+        assert!(outcome.newly_disabled);
         assert_eq!(entry.consecutive_failures, MAX_PROXY_PROBE_FAILURES);
         assert!(!entry.enabled);
         assert!(entry.auto_disabled);
@@ -495,12 +692,87 @@ mod tests {
         entry.consecutive_failures = 2;
         entry.health = ProxyHealth::Unhealthy;
         let ok = ProbeResult::Ok { latency_ms: 123 };
-        let (unhealthy, disabled) = ProxyPoolManager::apply_probe_result(&mut entry, &ok);
-        assert!(!unhealthy);
-        assert!(!disabled);
+        let outcome = ProxyPoolManager::apply_probe_result(&mut entry, &ok);
+        assert!(!outcome.unhealthy);
+        assert!(!outcome.newly_disabled);
+        assert!(!outcome.recovered);
         assert_eq!(entry.consecutive_failures, 0);
         assert_eq!(entry.health, ProxyHealth::Healthy);
         assert_eq!(entry.latency_ms, Some(123));
+    }
+
+    #[test]
+    fn auto_disabled_entry_recovers_on_successful_probe() {
+        let mut entry = make_entry("socks5://127.0.0.1:1080");
+        entry.enabled = false;
+        entry.auto_disabled = true;
+        entry.health = ProxyHealth::Unhealthy;
+        entry.consecutive_failures = MAX_PROXY_PROBE_FAILURES;
+
+        let outcome = ProxyPoolManager::apply_probe_result(&mut entry, &ProbeResult::Ok {
+            latency_ms: 50,
+        });
+        assert!(outcome.recovered);
+        assert!(entry.enabled);
+        assert!(!entry.auto_disabled);
+        assert_eq!(entry.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn manually_disabled_entry_stays_disabled_on_successful_probe() {
+        let mut entry = make_entry("socks5://127.0.0.1:1080");
+        entry.enabled = false;
+        entry.auto_disabled = false;
+
+        let outcome = ProxyPoolManager::apply_probe_result(&mut entry, &ProbeResult::Ok {
+            latency_ms: 50,
+        });
+        assert!(!outcome.recovered);
+        assert!(!entry.enabled);
+    }
+
+    #[test]
+    fn register_detected_adds_only_untracked_valid_urls() {
+        let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
+        let existing = mgr.add("socks5://127.0.0.1:1080".to_string(), None).unwrap();
+
+        let added = mgr.register_detected(&[
+            ProxyConfig::new("socks5://127.0.0.1:1080"),
+            ProxyConfig::new("http://10.0.0.1:8080"),
+            ProxyConfig::new("not-a-proxy"),
+            ProxyConfig::new(""),
+        ]);
+        assert_eq!(added, 1);
+
+        let list = mgr.list();
+        assert_eq!(list.len(), 2);
+        let detected = list.iter().find(|e| e.url == "http://10.0.0.1:8080").unwrap();
+        assert!(detected.auto_detected);
+        assert!(detected.enabled);
+        // 已登记条目不被自动检测改写
+        let kept = list.iter().find(|e| e.id == existing.id).unwrap();
+        assert!(!kept.auto_detected);
+    }
+
+    #[test]
+    fn availability_distinguishes_untracked_from_unavailable() {
+        let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
+        let entry = mgr.add("socks5://127.0.0.1:1080".to_string(), None).unwrap();
+
+        assert_eq!(
+            mgr.availability("socks5://127.0.0.1:1080"),
+            ProxyAvailability::Available
+        );
+        assert_eq!(
+            mgr.availability("socks5://127.0.0.1:9999"),
+            ProxyAvailability::Untracked
+        );
+
+        mgr.set_enabled(entry.id, false).unwrap();
+        assert_eq!(
+            mgr.availability("socks5://127.0.0.1:1080"),
+            ProxyAvailability::Unavailable
+        );
     }
 
     #[test]
