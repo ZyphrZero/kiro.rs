@@ -1,0 +1,56 @@
+{
+  "model": "claude-opus-5.5",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "先读 README，再概括这个项目的目录结构和主要模块，最后列出还没完成的事项。",
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        }
+      ]
+    }
+  ],
+  "max_tokens": 128000,
+  "stream": true,
+  "system": [
+    {
+      "type": "text",
+      "text": "You are a coding agent. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. Follow the workspace rules exactly and report progress after each step. ",
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    }
+  ],
+  "tools": [
+    {
+      "name": "run_code",
+      "description": "Execute a TypeScript program.",
+      "eager_input_streaming": true,
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    }
+  ],
+  "thinking": {
+    "type": "adaptive",
+    "display": "summarized"
+  },
+  "output_config": {
+    "effort": "high"
+  }
+}

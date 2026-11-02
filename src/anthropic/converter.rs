@@ -680,7 +680,7 @@ fn is_valid_uuid(s: &str) -> bool {
 /// 请求没有会话 id 时，按内容派生稳定的 conversationId：系统提示 + 第一条 user 消息。
 /// 两者在同一会话的后续轮次里不变，所以每轮得到同一个 id；只取文本和图片数据，
 /// 不受客户端每轮挪动 cache_control 断点的影响。
-fn derive_conversation_id(req: &MessagesRequest) -> String {
+pub(crate) fn derive_conversation_id(req: &MessagesRequest) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"kiro-rs.derived-conversation.v1\0");
     for s in req.system.iter().flatten() {
