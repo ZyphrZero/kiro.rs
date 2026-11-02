@@ -6,9 +6,115 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Features
+## [0.9.4] - 2026-11-02
 
-- Support `output_config.format = {"type":"json_schema","schema":{...}}` on `/v1/messages` and `/cc/v1/messages`. Kiro has no native structured-output field, so the schema is appended to the system prompt and the reply is rewritten to the last schema-conforming JSON value (non-stream: single text block; stream: buffered, then one compliant text block). Replies without conforming JSON are returned unchanged with a single warning. `format` is never forwarded upstream; requests without it behave as before.
+主题：**结构化输出与原生推理、会话和缓存兼容、流式响应修复、凭据调度与代理故障转移，以及管理端治理和额度告警**。本版汇总 `v0.9.3` 之后合并的 17 个 PR，并包含余额刷新、额度告警与整合修复的直接提交；新增配置均有默认值，现有配置、凭据与请求日志无需手动迁移。请留意均衡调度策略、总超时默认值和无可用凭据时的响应变化。
+
+### ✨ 结构化输出与模型推理
+
+> 来源：[PR #128](https://github.com/ZyphrZero/kiro.rs/pull/128)，提交人：[@d0zingcat](https://github.com/d0zingcat)；[PR #129](https://github.com/ZyphrZero/kiro.rs/pull/129)，提交人：[@ayakolin](https://github.com/ayakolin)；[PR #149](https://github.com/ZyphrZero/kiro.rs/pull/149)，提交人：[@xxy94125-sketch](https://github.com/xxy94125-sketch)。感谢贡献。
+
+- `/v1/messages` 与 `/cc/v1/messages` 支持 `output_config.format = {"type":"json_schema","schema":{...}}`。Kiro 没有原生结构化输出字段，网关通过系统提示注入 schema，并从回复中提取最后一个符合所支持校验规则的 JSON；`format` 不转发上游，不带该字段的请求行为不变。
+- 非流式回复将正文整理为单个 JSON text 块，保留 thinking 与 tool_use；流式结构化输出在 `message_start` 后缓冲内容（包括 thinking）到结束再发送，首字耗时按实际发出内容计算。未找到合规 JSON 时原样返回并警告；纯 WebSearch 与混合 WebSearch 工具循环暂不应用结构化输出，并明确记录警告。
+- schema 校验和 JSON 提取设有复杂度边界，支持部分常用 JSON Schema 规则及本地 `$ref`，不是完整 JSON Schema 实现；不能作为上游原生严格结构化输出的等价保证。`count_tokens` 估算包含注入的 schema 指令。
+- 将 `claude-haiku-5.5` 纳入 1M 上下文估算与原生 reasoning 模型族，修复回退到 200K 后低估输入用量的问题；该窗口取值为项目估算，后续以上游公布为准。
+- 所有支持原生推理的 `-thinking` 模型统一使用 adaptive 模式，系统提示与上游 reasoning 字段保持一致；优先保留显式 `output_config.effort`，否则根据 `thinking.budget_tokens` 推导档位，避免强制写入固定 20,000 Token 预算。
+
+### 🔧 请求转换、会话与缓存兼容
+
+> 来源：[PR #135](https://github.com/ZyphrZero/kiro.rs/pull/135)、[PR #136](https://github.com/ZyphrZero/kiro.rs/pull/136)、[PR #137](https://github.com/ZyphrZero/kiro.rs/pull/137) 与 [PR #145](https://github.com/ZyphrZero/kiro.rs/pull/145)，提交人：[@leinasi2014](https://github.com/leinasi2014)；[PR #139](https://github.com/ZyphrZero/kiro.rs/pull/139)，提交人：[@bestK](https://github.com/bestK)。感谢贡献。另含 [@ZyphrZero](https://github.com/ZyphrZero) 的 prefill 计量修复（[提交 `7f965a9`](https://github.com/ZyphrZero/kiro.rs/commit/7f965a9)，关联 [Issue #101](https://github.com/ZyphrZero/kiro.rs/issues/101)）。
+
+- 合并末尾连续 user 消息，不再向历史中插入伪造的 assistant `OK`，避免模型把假回复当作已发生的对话。分块写入策略仅在声明相关写入工具时追加，不再给无关客户端注入写作限制。
+- 按模型语义处理历史 thinking，保留内容顺序；原位置的 system 消息转为 system-reminder，不再静默丢失。改进孤立工具调用与结果的配对、图片归属和 raw 模式工具参数处理。
+- `/v1/messages` 与 `/cc/v1/messages` 在请求体未提供会话标识时，从 `x-session-affinity`、`x-session-id` 等请求头补充；兼容 `session-<uuid>`，不覆盖客户端已有的 `metadata.user_id`。
+- 无显式会话时按系统提示和首条 user 消息派生稳定会话 ID，供粘性路由与主 Key 的模拟缓存隔离共用；纯字符串与等价 text 块写法保持一致，修复 pi-ai / DeepSeek Harness 多轮请求的会话漂移和缓存长期为 0。
+- Chat Completions 支持消息与内容块的 `cache_control` 断点，未显式禁用时默认启用自动缓存；顶层 `null`、`false` 或 `{"type":"none"}` 可禁用自动缓存。
+- 修复消息级断点的转换边界：纯工具调用的 assistant 消息保留断点，含正文与工具调用时断点落在完整消息末尾；system/developer 数组只在末尾补充消息级断点，不再复制到每个 text 块导致超出断点上限，显式块级设置优先。
+- 缓存指纹排除转换时被丢弃的 assistant prefill，将其断点转移到保留的前缀，避免对上游未收到的内容计量。以上为网关模拟缓存口径修复，不保证上游实际缓存命中或 credits 节省。
+
+### 🌊 流式响应、结束原因与错误结算
+
+> 来源：[PR #130](https://github.com/ZyphrZero/kiro.rs/pull/130)，提交人：[@ayakolin](https://github.com/ayakolin)；[PR #138](https://github.com/ZyphrZero/kiro.rs/pull/138)，提交人：[@leinasi2014](https://github.com/leinasi2014)。感谢贡献。
+
+- 纯 thinking 回复不再被强制标为 `max_tokens`，也不再补空白 text 块；优先使用上游 `MAX_TOKENS`、`STOP_SEQUENCE` 等结束原因，不覆盖拒答和已判定的上下文溢出。
+- 收紧从文本恢复 `<invoke>` 工具调用的条件：仅在没有原生工具调用、位于回复末尾且不在代码格式中、工具已声明、参数可按 schema 解析时转换，否则保留正文；流式、非流式和 WebSearch 共用规则。
+- 正文中的 `<thinking>`、未闭合 `<tool_use>` 与孤立 `<` 不再误吞或卡住后续文本；保留文本与工具调用顺序，流式遵循 `extractThinking` 设置。
+- 流中断按限流、过载、输入过长、权限等原因分类，非流式返回对应错误，不再把解析失败或重复熔断当作正常完成；统一相关路径的用量与 trace 收尾，本地 Token 估算补入工具、thinking 和图片。
+- `upstreamTotalTimeoutSecs` 默认由 `720` 改为 `0`：正常持续输出的长回复不再默认被 12 分钟总期限切断，静默仍受 `upstreamReadTimeoutSecs` 限制；已显式配置的总超时继续生效。
+
+### ⚖️ 凭据调度与限流可观测性
+
+> 来源：[PR #147](https://github.com/ZyphrZero/kiro.rs/pull/147) 与 [PR #141](https://github.com/ZyphrZero/kiro.rs/pull/141)，提交人：[@bestK](https://github.com/bestK)；[PR #148](https://github.com/ZyphrZero/kiro.rs/pull/148)，提交人：[@leinasi2014](https://github.com/leinasi2014)。感谢贡献。
+
+- `balanced` 从随机选号改为先避让在途并发，再在并发最少的候选中执行平滑加权轮询（SWRR）。凭据负载因子默认 `10`，管理端支持编辑与权重展示；流式与 MCP 请求在响应体生命周期内持有并发守卫。
+- 新增全局 `invertPriority` 开关，支持分组独立设置调度模式与优先级方向；默认仍为 `priority`，优先级数字小的优先，已有会话粘性规则保留。
+- 无可用凭据时返回 401 `authentication_error`，不写入对应的 Trace/Usage 记录；入口预检查保留自愈和请求校验逻辑，临时 RPM 冷却不会被误判成凭据耗尽。
+- 单账号本地 RPM 限流在日志与管理端中单独标为「本地限流」，仍返回 429 与 `Retry-After`；模型与 MCP 路径均与上游真实 429 区分，避免误把本地调度限制当作 Kiro 限流。
+
+### 🌐 代理自动探测、轮换与恢复
+
+> 来源：[PR #142](https://github.com/ZyphrZero/kiro.rs/pull/142)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。另含 [@ZyphrZero](https://github.com/ZyphrZero) 的恢复状态整合修复（[提交 `8dca7cf`](https://github.com/ZyphrZero/kiro.rs/commit/8dca7cf)）。
+
+- 自动发现凭据实际使用但未登记到池内的代理，健康探测支持认证；连续失败后自动禁用的代理恢复连通时可自动启用，手动禁用的条目不会被自动恢复。
+- 新增 `proxyAutoRotateEnabled`（默认 `true`）与 `proxyDirectFallbackEnabled`（默认 `false`）。不可用代理可轮换到池内可用代理；默认无可用代理时保留原配置，不擅自直连。
+- 显式允许直连回退后，临时直连会保留原代理及认证，原代理恢复或出现其它可用代理时自动切回；管理端展示临时直连状态。轮换跳过已禁用凭据，无可用代理的告警合并输出。
+- 新增代理故障转移设置与立即轮换接口，代理池弹窗展示自动检测、自动恢复与轮换结果；手动修改代理会清除自动分配状态，避免旧探测结果覆盖用户新配置。
+
+### 🛡️ 封禁治理与历史排查
+
+> 来源：[PR #146](https://github.com/ZyphrZero/kiro.rs/pull/146)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。
+
+- 封禁检测不再仅限 403，补充 `TEMPORARILY_SUSPENDED` 等上游文案，优先于普通鉴权失败和限流处理；支持 `suspendedBanKeywords` 自定义规则，大小写不敏感，并规范化、丢弃空关键词，避免空串误判所有账号。
+- 管理端新增封号排查弹窗，支持已禁用、全部或选中凭据范围的历史 trace 扫描与批量标记；排查失败明确报错，不伪装成未命中。
+- 控制台区分封禁与普通禁用的状态色、徽章和统计，设置页展示内置与自定义规则。历史排查依赖已保留的请求日志，不等价于对上游账号状态的实时验证。
+
+### 🖥️ 管理端分页与自定义响应头
+
+> 来源：[PR #144](https://github.com/ZyphrZero/kiro.rs/pull/144) 与 [PR #143](https://github.com/ZyphrZero/kiro.rs/pull/143)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。
+
+- 凭据、客户端 Key 与分组列表支持服务端分页、搜索和筛选，凭据与 Key 列表支持排序；不带查询参数时保留旧版全量接口。状态统计与分页结果分开，管理端修正页码越界，并安全处理跨页选择和批量操作。
+- 新增 `customHeaders` 与管理端网络设置编辑器，支持启停、热更新及 `{trace_id}`、`{request_id}`、`{model}`、`{key_id}`、`{group}`、`{credential_id}`、`{client_ip}` 变量；默认提供 `X-Oneapi-Request-Id` 与 `X-Request-Id`，便于 NewAPI / OneAPI 关联请求。
+- 自定义响应头覆盖 Anthropic、Chat Completions、Responses 与 WebSearch 的相关流式、非流式及错误路径；保存时校验名称、重复项、长度与 CRLF 注入，OpenAI 协议转换保留内层响应头。
+- 串行化自定义响应头的配置写盘与内存热更新，修复并发保存时两个请求都成功、实际规则却与重启后规则不一致的问题。
+
+### 📊 后台余额刷新与飞书额度告警
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交：[余额刷新间隔 `f62afef`](https://github.com/ZyphrZero/kiro.rs/commit/f62afef)（解决 [Issue #99](https://github.com/ZyphrZero/kiro.rs/issues/99)）、[额度阈值告警 `22cbee6`](https://github.com/ZyphrZero/kiro.rs/commit/22cbee6)（解决 [Issue #140](https://github.com/ZyphrZero/kiro.rs/issues/140)）。
+
+- 新增 `balanceRefreshIntervalSecs`，默认每轮后台余额刷新完成后等待 `300` 秒再开始下一轮；`0` 完全关闭该任务，包括启动首次刷新和由其执行的月度额度恢复检查，面板/API 按需查询仍可使用。
+- 支持环境变量 `KIRO_RS_BALANCE_REFRESH_INTERVAL_SECS`，优先级为配置文件显式值、环境变量、默认值；无效值报错，修改后需重启。间隔不包含每轮刷新耗时，余额缓存 TTL 不随之改变。
+- 管理端新增「额度告警」，单账号与账号池模式分别启用，默认均关闭，阈值默认 `80 / 90 / 100`；仅计算有效 CREDIT 额度，不计超额付费额度，已禁用账号不参与。数据不完整时暂停整体判断，正常账号仍可触发单账号告警。
+- 飞书发送由独立后台任务执行，支持单账号按额度周期与阈值去重、账号池跨阈值告警和冷却；只有 HTTP 与飞书业务结果均成功才确认发送，失败保留后续重试机会，去重状态跨重启保存。
+- 渠道使用 `KIRO_RS_FEISHU_WEBHOOK` 与可选的 `KIRO_RS_FEISHU_SECRET`，或通过面板仅保存在内存中；敏感值不回显、不写入配置或数据库。仅接受飞书 / Lark 官方 HTTPS 地址，拒绝重定向。
+
+### 🙏 本版 PR 贡献者
+
+| 贡献者 | 已合并 PR |
+| --- | --- |
+| [@bestK](https://github.com/bestK) | [#139](https://github.com/ZyphrZero/kiro.rs/pull/139)、[#141](https://github.com/ZyphrZero/kiro.rs/pull/141)、[#142](https://github.com/ZyphrZero/kiro.rs/pull/142)、[#143](https://github.com/ZyphrZero/kiro.rs/pull/143)、[#144](https://github.com/ZyphrZero/kiro.rs/pull/144)、[#146](https://github.com/ZyphrZero/kiro.rs/pull/146)、[#147](https://github.com/ZyphrZero/kiro.rs/pull/147) |
+| [@leinasi2014](https://github.com/leinasi2014) | [#135](https://github.com/ZyphrZero/kiro.rs/pull/135)、[#136](https://github.com/ZyphrZero/kiro.rs/pull/136)、[#137](https://github.com/ZyphrZero/kiro.rs/pull/137)、[#138](https://github.com/ZyphrZero/kiro.rs/pull/138)、[#145](https://github.com/ZyphrZero/kiro.rs/pull/145)、[#148](https://github.com/ZyphrZero/kiro.rs/pull/148) |
+| [@ayakolin](https://github.com/ayakolin) | [#129](https://github.com/ZyphrZero/kiro.rs/pull/129)、[#130](https://github.com/ZyphrZero/kiro.rs/pull/130) |
+| [@d0zingcat](https://github.com/d0zingcat) | [#128](https://github.com/ZyphrZero/kiro.rs/pull/128) |
+| [@xxy94125-sketch](https://github.com/xxy94125-sketch) | [#149](https://github.com/ZyphrZero/kiro.rs/pull/149) |
+
+以上按 GitHub PR 作者列出；余额刷新间隔、额度告警、prefill 计量与整合修复为直接提交，不计入 PR 数量。
+
+### 🤝 Collaborators — PR 合并与维护
+
+- [@ZyphrZero](https://github.com/ZyphrZero)：合并本版 17 个 PR，补充结构化输出校验边界、错误结算、认证代理探测、跨页操作与并发生命周期等整合修复，并实现余额刷新间隔、额度阈值告警及 prefill 缓存计量修复。
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 版本统一为 `0.9.4`，无需手动转换现有配置、凭据、客户端 Key 或请求日志数据库。
+- 默认 `priority` 调度及优先级方向不变；已使用 `balanced` 的部署将从随机选号切换为并发避让与加权轮询，负载因子只在并发最少的候选集中参与分配，不代表任意负载下都严格按权重比例分流。
+- 未配置 `upstreamTotalTimeoutSecs` 时默认取消总时长上限；希望保留旧版 12 分钟限制的部署可显式设为 `720`，读超时仍独立生效。
+- 代理自动发现与轮换默认开启，直连回退默认关闭；对固定出口有严格要求的部署应检查 `proxyAutoRotateEnabled`，不要在未评估出口暴露风险时开启 `proxyDirectFallbackEnabled`。
+- 额度告警默认关闭；启用后需持久化凭据目录中的 `quota_alerts.db` 及 SQLite 边车文件。多副本仅指定一个通知实例，其它实例设置 `KIRO_RS_QUOTA_ALERT_NOTIFIER=false`，不要让多个通知实例共用同一状态文件。
+- `balanceRefreshIntervalSecs=0` 会同时停止后台余额刷新、月度额度恢复检查与自动额度告警；面板/API 按需查询和告警测试发送不受影响。告警不能保证 exactly-once，超时或落盘前崩溃可能重复投递。
+- 无可用凭据现在返回 401 而非笼统上游错误；客户端应区分凭据池不可用与 429 限流，不要仅凭状态码判断客户端 Key 已失效。
+- 多人共用主 Key 且不传会话 ID 时，相同系统提示和首条 user 消息会派生相同会话标识，共用模拟缓存；需要严格区分会话时应提供显式会话标识。系统提示包装格式调整也可能使升级后的首次请求无法复用旧上游缓存。
+
+完整变更：[v0.9.3...v0.9.4](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.3...v0.9.4)。
 
 ## [0.9.3] - 2026-10-26
 
