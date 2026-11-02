@@ -139,6 +139,27 @@ async fn mcp_in_flight_guard_covers_response_body() {
     assert_eq!(provider.token_manager().get_in_flight(1), 0);
 }
 
+#[tokio::test]
+async fn mcp_local_rpm_rejection_records_local_rate_limit() {
+    struct RecordingSink(Mutex<Vec<TraceAttempt>>);
+    impl TraceSink for RecordingSink {
+        fn on_attempt(&self, attempt: TraceAttempt) { self.0.lock().push(attempt); }
+    }
+    let server = LocalServer::named("mcp").await;
+    let mut config = Config::default();
+    config.account_rpm_limit_enabled = true;
+    config.account_rpm_limit = 1;
+    let credential = KiroCredentials { id: Some(1), kiro_api_key: Some("offline-test".into()), ..Default::default() };
+    let manager = Arc::new(MultiTokenManager::new(config, vec![credential], None, None, false).unwrap());
+    let endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::from([("loopback".to_string(), Arc::new(LocalEndpoint(server.url.clone())) as Arc<dyn KiroEndpoint>)]);
+    let provider = KiroProvider::new(manager, endpoints, "loopback".to_string());
+    let sink = RecordingSink(Mutex::new(Vec::new()));
+    let first = provider.call_mcp_with_retry("{}", Some(&sink), None).await.unwrap();
+    assert_eq!(first.response.text().await.unwrap(), "mcp|");
+    assert!(provider.call_mcp_with_retry("{}", Some(&sink), None).await.is_err());
+    assert_eq!(sink.0.lock().last().unwrap().outcome, outcome::LOCAL_RATE_LIMITED);
+}
+
 async fn credential_response(
     provider: &KiroProvider,
     credential: &KiroCredentials,

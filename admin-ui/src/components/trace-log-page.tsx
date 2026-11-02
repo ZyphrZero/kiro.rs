@@ -59,6 +59,8 @@ function outcomeStyle(outcome: string): {
       return { label: '额度耗尽', variant: 'warning' }
     case 'account_throttled':
       return { label: '账号限流', variant: 'warning' }
+    case 'local_rate_limited':
+      return { label: '本地限流', variant: 'warning' }
     case 'auth_failed':
       return { label: '鉴权失败', variant: 'destructive' }
     case 'transient':
@@ -381,6 +383,7 @@ const ERROR_TYPE_OPTIONS = [
   { value: '', label: '全部错误类型' },
   { value: 'quota_exhausted', label: '额度耗尽' },
   { value: 'account_throttled', label: '账号限流' },
+  { value: 'local_rate_limited', label: '本地限流' },
   { value: 'auth_failed', label: '鉴权失败' },
   { value: 'transient', label: '瞬态错误' },
   { value: 'network_error', label: '网络错误' },
