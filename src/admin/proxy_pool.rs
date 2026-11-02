@@ -87,6 +87,7 @@ pub enum GetUrlResult {
     NotFound,
     /// 代理存在但已被禁用
     Disabled,
+    NotShareable,
 }
 
 /// 一次全量健康检查的摘要
@@ -309,6 +310,9 @@ impl ProxyPoolManager {
         match self.entries.lock().iter().find(|e| e.id == id) {
             None => GetUrlResult::NotFound,
             Some(e) if !e.enabled => GetUrlResult::Disabled,
+            Some(e) if e.auto_detected && e.runtime_proxy.as_ref().is_none_or(|proxy| {
+                proxy.username.is_some() || proxy.password.is_some() || proxy_address(&proxy.url) != proxy.url
+            }) => GetUrlResult::NotShareable,
             Some(e) => GetUrlResult::Ok(e.url.clone()),
         }
     }
@@ -328,6 +332,7 @@ impl ProxyPoolManager {
     ///
     /// 未登记的 URL 返回 [`ProxyAvailability::Untracked`]：没有探测记录时不做任何
     /// 推断，调用方不应据此轮换凭据。
+    #[cfg(test)]
     pub fn availability(&self, url: &str) -> ProxyAvailability {
         match self.entries.lock().iter().find(|e| e.url == url) {
             None => ProxyAvailability::Untracked,
@@ -520,6 +525,10 @@ impl ProxyPoolManager {
     /// 自动禁用的条目一并探测，以便恢复连通后自动重新启用；用户手动禁用的条目跳过
     /// （手动重新启用会清零计数）。
     pub async fn check_all(&self) -> CheckSummary {
+        self.check_all_for_url(PROXY_HEALTH_CHECK_URL).await
+    }
+
+    pub(crate) async fn check_all_for_url(&self, check_url: &str) -> CheckSummary {
         // 快照待探测的 (id, url)，避免长时间持锁
         let targets: Vec<(u64, ProxyConfig)> = self
             .entries
@@ -538,7 +547,7 @@ impl ProxyPoolManager {
 
         let probes = targets
             .iter()
-            .map(|(id, proxy)| async move { (*id, self.probe_one(proxy).await) });
+            .map(|(id, proxy)| async move { (*id, self.probe_with_url(proxy, check_url).await) });
         let results = futures::future::join_all(probes).await;
 
         let mut summary = CheckSummary::default();
@@ -623,6 +632,8 @@ mod tests {
         let serialized = serde_json::to_string(&manager.list()).unwrap();
         assert!(!serialized.contains("fixture-user"));
         assert!(!serialized.contains("fixture-password"));
+        let detected_id = manager.list()[0].id;
+        assert!(matches!(manager.get_url(detected_id), GetUrlResult::NotShareable));
         let embedded = ProxyConfig::new(format!("http://fixture-user:fixture-password@{address}"));
         assert_eq!(manager.register_detected(&[embedded]), 1);
         let serialized = serde_json::to_string(&manager.list()).unwrap();

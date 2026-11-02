@@ -41,6 +41,7 @@ use std::{
 
 #[derive(Clone, Copy)]
 enum Mode {
+    ReviewSuspended,
     ReviewRepetition,
     ReviewEndTurn,
     Normal(Duration),
@@ -132,6 +133,52 @@ async fn integration_cc_websearch_receives_custom_headers() {
             "tools":[{"type":"web_search_20250305","name":"web_search"}]});
         let response = post_messages_cc(axum::extract::State(state.clone()), Extension(key()), Json(serde_json::from_value(payload).unwrap())).await;
         assert!(response.headers().get("x-review-trace").is_some());
+    }
+}
+
+#[tokio::test]
+async fn integration_cached_model_alias_is_not_rejected_by_preflight() {
+    let fixture = fixture(Mode::Normal(Duration::ZERO)).await;
+    let manager = fixture.state.kiro_provider.as_ref().unwrap().token_manager();
+    manager.set_test_models_fetcher(Arc::new(|_| Box::pin(async {
+        Ok(serde_json::from_value(json!({"models": [{"modelId": "claude-sonnet-4.6"}]})).unwrap())
+    })));
+    manager.get_available_models_for(1).await.unwrap();
+    let payload = json!({"model":"claude-sonnet-4-6-thinking", "max_tokens":64,
+        "messages":[{"role":"user","content":"hello"}]});
+    let response = post_messages(axum::extract::State(fixture.state.clone()), Extension(key()), Json(serde_json::from_value(payload).unwrap())).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(fixture.calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn integration_no_credentials_after_upstream_failure_does_not_create_trace() {
+    for streaming in [true, false] {
+        let mut fixture = fixture(Mode::ReviewSuspended).await;
+        let store = Arc::new(TraceStore::open_in_memory().unwrap());
+        fixture.state = fixture.state.clone().with_trace_store(Some(store.clone()));
+        let response = request(fixture.state.clone(), "messages", streaming).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let (_, total) = store.query_paged(&TraceQuery { limit: 10, ..Default::default() });
+        assert_eq!(total, 0);
+    }
+}
+
+#[tokio::test]
+async fn integration_mixed_websearch_no_credentials_does_not_create_trace() {
+    for streaming in [true, false] {
+        let mut fixture = fixture(Mode::ReviewSuspended).await;
+        let store = Arc::new(TraceStore::open_in_memory().unwrap());
+        fixture.state = fixture.state.clone().with_trace_store(Some(store.clone()));
+        let payload = json!({"model":"gpt-5.6-sol","max_tokens":64,"stream":streaming,
+            "messages":[{"role":"user","content":"hello"}],
+            "tools":[{"type":"web_search_20250305","name":"web_search"},
+                {"name":"run","description":"run","input_schema":{"type":"object"}}]});
+        let response = post_messages(axum::extract::State(fixture.state.clone()), Extension(key()), Json(serde_json::from_value(payload).unwrap())).await;
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("No available credentials"));
+        let (_, total) = store.query_paged(&TraceQuery { limit: 10, ..Default::default() });
+        assert_eq!(total, 0);
     }
 }
 impl Drop for Fixture {
@@ -231,6 +278,9 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
             if headers.get("connection").is_some_and(|v| v == "close") { close.fetch_add(1, Ordering::Relaxed); }
             if matches!(mode, Mode::Overloaded) {
                 return Response::builder().status(500).body(Body::from(r#"{"message":"high load","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#)).unwrap();
+            }
+            if matches!(mode, Mode::ReviewSuspended) {
+                return Response::builder().status(403).body(Body::from(r#"{"reason":"TEMPORARILY_SUSPENDED"}"#)).unwrap();
             }
             if matches!(mode, Mode::SlowHeaders) { tokio::time::sleep(Duration::from_secs(4)).await; }
             if matches!(mode, Mode::SlowErrorBody) {
@@ -1178,6 +1228,17 @@ async fn structured_output_keeps_thinking_blocks_before_json_text() {
     assert_eq!(events[1].1["content_block"]["type"], "thinking");
     assert_eq!(events[6].1["content_block"]["type"], "text");
     assert_goal_json(&sse_text(&events), json!({"ok": false, "reason": "file missing"}));
+}
+
+#[tokio::test]
+async fn structured_output_cc_preserves_thinking_with_format_only() {
+    let fixture = fixture(Mode::ReplyWithReasoning(OPENING_CONDITION)).await;
+    let response = goal_request(fixture.state.clone(), "cc", false, true, Some(goal_output_config())).await;
+    let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(body["content"][0]["type"], "thinking");
+    let response = goal_request(fixture.state.clone(), "cc", true, true, Some(goal_output_config())).await;
+    let events = parse_sse(&body_string(response).await);
+    assert!(events.iter().any(|(_, data)| data["content_block"]["type"] == "thinking"));
 }
 
 /// 去掉注入的指令、忽略空行与随机会话 id 后，便于比较“除注入外完全一致”。

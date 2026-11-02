@@ -157,6 +157,35 @@ pub(crate) async fn refresh_token(
     }
 }
 
+fn merge_refreshed_credentials(
+    current: &mut KiroCredentials,
+    original: &KiroCredentials,
+    refreshed: &KiroCredentials,
+) -> anyhow::Result<()> {
+    if current.access_token != original.access_token
+        || current.refresh_token != original.refresh_token
+        || current.client_id != original.client_id
+        || current.client_secret != original.client_secret
+        || current.auth_method != original.auth_method
+        || current.token_endpoint != original.token_endpoint
+    {
+        return Err(RefreshSupersededError.into());
+    }
+    current.access_token = refreshed.access_token.clone();
+    current.refresh_token = refreshed.refresh_token.clone();
+    if current.expires_at == original.expires_at && refreshed.expires_at != original.expires_at {
+        current.expires_at = refreshed.expires_at.clone();
+    }
+    if current.profile_arn == original.profile_arn && refreshed.profile_arn != original.profile_arn {
+        current.profile_arn = refreshed.profile_arn.clone();
+    }
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("凭据认证信息在 Token 刷新期间发生变化，请重试")]
+struct RefreshSupersededError;
+
 /// 刷新 Social Token
 async fn refresh_social_token(
     credentials: &KiroCredentials,
@@ -1002,6 +1031,7 @@ struct CredentialEntry {
     in_flight: Arc<AtomicU32>,
     /// SWRR 平滑加权轮询的当前动态权重
     current_weight: i64,
+    proxy_generation: u64,
 }
 
 impl CredentialEntry {
@@ -1121,12 +1151,23 @@ pub struct CredentialProxySnapshot {
     /// 实际在用的代理 URL；`None` 表示当前直连
     pub in_use_proxy_url: Option<String>,
     pub in_use_proxy: Option<ProxyConfig>,
+    pub recovery_proxy: Option<ProxyConfig>,
+    pub temporary_direct: bool,
+    pub generation: u64,
+    pub global_generation: u64,
     /// 是否显式配置为直连（`proxy_url == "direct"`）
     pub explicit_direct: bool,
     /// 当前 `proxy_url` 是否由自动轮换写入
     pub auto_assigned: bool,
     /// 凭据是否已禁用（禁用的凭据不参与调度，也就无需轮换代理）
     pub disabled: bool,
+}
+
+pub struct ProxyRotationUpdate {
+    pub id: u64,
+    pub target: Option<String>,
+    pub generation: u64,
+    pub global_generation: u64,
 }
 
 /// 凭据条目快照（用于 Admin API 读取）
@@ -1173,6 +1214,7 @@ pub struct CredentialEntrySnapshot {
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
+    pub proxy_temporary_direct: bool,
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
@@ -1313,6 +1355,7 @@ pub struct MultiTokenManager {
     model_cache_generations: Mutex<HashMap<u64, u64>>,
     /// 全局代理变化时递增，阻止所有在途旧请求回填缓存。
     model_cache_epoch: AtomicU64,
+    proxy_generation: AtomicU64,
     /// 测试替身：替换 ListAvailableModels 的上游请求，使模型缓存相关测试不走网络。
     #[cfg(test)]
     test_models_fetcher: Mutex<Option<TestModelsFetcher>>,
@@ -1529,6 +1572,7 @@ impl MultiTokenManager {
                     self_heal_model: cred.self_heal_model.clone(),
                     in_flight: Arc::new(AtomicU32::new(0)),
                     current_weight: 0,
+                    proxy_generation: 0,
                 }
             })
             .collect();
@@ -1630,6 +1674,7 @@ impl MultiTokenManager {
             model_refresh_semaphore: Semaphore::new(4),
             model_cache_generations: Mutex::new(HashMap::new()),
             model_cache_epoch: AtomicU64::new(0),
+            proxy_generation: AtomicU64::new(0),
             #[cfg(test)]
             test_models_fetcher: Mutex::new(None),
         };
@@ -1694,7 +1739,11 @@ impl MultiTokenManager {
 
     /// 设置全局代理配置（运行时修改，可传 None 清除）
     pub fn set_global_proxy(&self, proxy: Option<ProxyConfig>) {
-        *self.proxy.lock() = proxy;
+        {
+            let mut current = self.proxy.lock();
+            *current = proxy;
+            self.proxy_generation.fetch_add(1, Ordering::SeqCst);
+        }
         self.invalidate_all_model_caches();
     }
 
@@ -2490,6 +2539,10 @@ impl MultiTokenManager {
                     return Ok((ctx, is_balanced, route));
                 }
                 Err(e) => {
+                    if e.is::<RefreshSupersededError>() {
+                        attempt_count += 1;
+                        continue;
+                    }
                     let Some(has_available) = self.handle_token_refresh_error(id, e)? else {
                         // 从源文件加载到了轮换后的 Token，不计失败次数，直接重试。
                         continue;
@@ -2622,20 +2675,20 @@ impl MultiTokenManager {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
                 }
 
-                // 更新凭据
-                {
+                let merged = {
                     let mut entries = self.entries.lock();
-                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
-                    }
-                }
+                    let entry = entries.iter_mut().find(|entry| entry.id == id)
+                        .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+                    merge_refreshed_credentials(&mut entry.credentials, &current_creds, &new_creds)?;
+                    entry.credentials.clone()
+                };
 
                 // 回写凭据到文件（仅多凭据格式），失败只记录警告
                 if let Err(e) = self.persist_credentials() {
                     tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
                 }
 
-                new_creds
+                merged
             } else {
                 // 其他请求已经完成刷新，直接使用新凭据
                 tracing::debug!("Token 已被其他请求刷新，跳过刷新");
@@ -2676,17 +2729,12 @@ impl MultiTokenManager {
     /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
-        use anyhow::Context;
-
         // 仅多凭据格式才回写
         if !self.is_multiple_format.load(Ordering::Relaxed) {
             return Ok(false);
         }
 
-        let path = match &self.credentials_path {
-            Some(p) => p,
-            None => return Ok(false),
-        };
+        if self.credentials_path.is_none() { return Ok(false); }
 
         // 持 persist_lock 覆盖「快照 + 序列化 + 写盘」整个临界区：并发 persist 严格串行，
         // 最后写盘者必在其临界区内重新快照到最新内存，杜绝陈旧快照覆盖已轮换的 token
@@ -2702,6 +2750,14 @@ impl MultiTokenManager {
                 .map(CredentialEntry::credentials_snapshot)
                 .collect()
         };
+
+        self.persist_credentials_snapshot(&credentials)
+    }
+
+    fn persist_credentials_snapshot(&self, credentials: &[KiroCredentials]) -> anyhow::Result<bool> {
+        use anyhow::Context;
+        if !self.is_multiple_format.load(Ordering::Relaxed) { return Ok(false); }
+        let Some(path) = &self.credentials_path else { return Ok(false); };
 
         // 序列化为 pretty JSON
         let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
@@ -3666,6 +3722,7 @@ impl MultiTokenManager {
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
+                    proxy_temporary_direct: e.credentials.proxy_temporary_direct,
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
                     disabled_reason: e.disabled_reason.map(|reason| reason.as_str().to_string()),
@@ -3695,6 +3752,7 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
             entry.disabled = disabled;
             if !disabled {
                 // 启用时重置失败计数
@@ -4016,9 +4074,9 @@ impl MultiTokenManager {
                             .await?;
                     {
                         let mut entries = self.entries.lock();
-                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
-                        }
+                        let entry = entries.iter_mut().find(|entry| entry.id == id)
+                            .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+                        merge_refreshed_credentials(&mut entry.credentials, &current_creds, &new_creds)?;
                     }
                     // 持久化失败只记录警告，不影响本次请求
                     if let Err(e) = self.persist_credentials() {
@@ -4165,9 +4223,9 @@ impl MultiTokenManager {
                     refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
                 {
                     let mut entries = self.entries.lock();
-                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
-                    }
+                    let entry = entries.iter_mut().find(|entry| entry.id == id)
+                        .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+                    merge_refreshed_credentials(&mut entry.credentials, &current_creds, &new_creds)?;
                 }
                 // 持久化失败只记录警告，不影响本次请求
                 if let Err(e) = self.persist_credentials() {
@@ -4278,9 +4336,9 @@ impl MultiTokenManager {
                             .await?;
                     {
                         let mut entries = self.entries.lock();
-                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
-                        }
+                        let entry = entries.iter_mut().find(|entry| entry.id == id)
+                            .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+                        merge_refreshed_credentials(&mut entry.credentials, &current_creds, &new_creds)?;
                     }
                     if let Err(e) = self.persist_credentials() {
                         tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
@@ -4508,6 +4566,7 @@ impl MultiTokenManager {
                 self_heal_model: None,
                 in_flight: Arc::new(AtomicU32::new(0)),
                 current_weight: 0,
+                proxy_generation: 0,
             });
         }
 
@@ -4552,6 +4611,12 @@ impl MultiTokenManager {
                 .iter_mut()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            if invalidate_models {
+                entry.proxy_generation = entry.proxy_generation.wrapping_add(1);
+                entry.credentials.proxy_temporary_direct = false;
+                entry.credentials.proxy_auto_assigned = false;
+            }
 
             if let Some(v) = email {
                 entry.credentials.email = v.filter(|s| !s.is_empty());
@@ -4883,10 +4948,10 @@ impl MultiTokenManager {
 
             // 更新 entries 中对应凭据
             let mut entries = self.entries.lock();
-            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                entry.credentials = new_creds;
-                entry.refresh_failure_count = 0;
-            }
+            let entry = entries.iter_mut().find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+            merge_refreshed_credentials(&mut entry.credentials, &credentials, &new_creds)?;
+            entry.refresh_failure_count = 0;
         }
         self.invalidate_model_cache(id);
 
@@ -5426,7 +5491,10 @@ impl MultiTokenManager {
     /// `in_use_proxy_url` 已按「凭据代理 > 全局代理 > 直连」的优先级折算，调用方
     /// 无需再关心回退规则。
     pub fn credential_proxy_snapshot(&self) -> Vec<CredentialProxySnapshot> {
-        let global_proxy = self.proxy();
+        let (global_proxy, global_generation) = {
+            let proxy = self.proxy.lock();
+            (proxy.clone(), self.proxy_generation.load(Ordering::SeqCst))
+        };
         self.entries
             .lock()
             .iter()
@@ -5437,7 +5505,11 @@ impl MultiTokenManager {
                     .effective_proxy(global_proxy.as_ref())
                     .map(|proxy| proxy.url),
                 in_use_proxy: entry.credentials.effective_proxy(global_proxy.as_ref()),
-                explicit_direct: entry.credentials.is_explicit_direct(),
+                recovery_proxy: entry.credentials.proxy_temporary_direct.then(|| entry.credentials.configured_proxy(global_proxy.as_ref())).flatten(),
+                temporary_direct: entry.credentials.proxy_temporary_direct,
+                generation: entry.proxy_generation,
+                global_generation,
+                explicit_direct: entry.credentials.is_explicit_direct() || entry.credentials.proxy_temporary_direct,
                 auto_assigned: entry.credentials.proxy_auto_assigned,
                 disabled: entry.disabled,
             })
@@ -5446,51 +5518,92 @@ impl MultiTokenManager {
 
     /// 批量改写凭据的 `proxy_url` 并置位 `proxy_auto_assigned`（代理自动轮换专用）。
     ///
-    /// 在单次加锁内完成全部改写，最后统一持久化一次，避免逐条写盘。传入的
-    /// `Some(url)` 设置代理（`"direct"` 表示直连），`None` 清除凭据级代理以回退全局配置。
-    /// 返回实际改写的凭据数；不存在的凭据 id 被忽略。
-    ///
-    /// 同时清除凭据级 `proxy_username` / `proxy_password`：这对认证信息属于轮换前的
-    /// 那个代理，套用到新代理上只会认证失败。代理池条目的认证信息写在 URL 里
-    /// （`socks5://user:pass@host:port`），轮换后随 URL 一起生效。
-    pub fn apply_proxy_rotation(&self, updates: &[(u64, Option<String>)]) -> anyhow::Result<usize> {
+    /// 先校验快照版本，再在同一事务内更新并持久化；写盘失败时恢复原始配置。
+    /// `direct` 保留原代理和认证信息，`None` 在临时直连时恢复原代理。
+    pub fn apply_proxy_rotation(&self, updates: &[ProxyRotationUpdate]) -> anyhow::Result<usize> {
         if updates.is_empty() {
             return Ok(0);
         }
 
         let mut changed_ids = Vec::new();
-        {
-            let mut entries = self.entries.lock();
-            for (id, proxy_url) in updates {
-                let entry = match entries.iter_mut().find(|e| e.id == *id) {
-                    Some(entry) => entry,
-                    None => continue,
-                };
-                let normalized = proxy_url.clone().filter(|s| !s.is_empty());
-                let unchanged = entry.credentials.proxy_url == normalized
+        let _persist_guard = self.persist_lock.lock();
+        let _global_proxy_guard = self.proxy.lock();
+        let mut entries = self.entries.lock();
+        for update in updates {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.id == update.id)
+                .ok_or_else(|| anyhow::anyhow!("凭据 #{} 已不存在", update.id))?;
+            if entry.disabled
+                || entry.proxy_generation != update.generation
+                || self.proxy_generation.load(Ordering::SeqCst) != update.global_generation
+            {
+                anyhow::bail!("凭据 #{} 或全局代理已变化，请重新执行轮换", update.id);
+            }
+        }
+        let mut previous = Vec::new();
+        for update in updates {
+            let Some(entry) = entries.iter_mut().find(|entry| entry.id == update.id) else {
+                continue;
+            };
+            let normalized = update.target.clone().filter(|value| !value.is_empty());
+            let fallback = normalized.as_deref() == Some(KiroCredentials::PROXY_DIRECT);
+            let restore = normalized.is_none() && entry.credentials.proxy_temporary_direct;
+            let unchanged = if fallback {
+                entry.credentials.proxy_temporary_direct
+            } else {
+                !restore
+                    && !entry.credentials.proxy_temporary_direct
+                    && entry.credentials.proxy_url == normalized
                     && entry.credentials.proxy_auto_assigned
                     && entry.credentials.proxy_username.is_none()
-                    && entry.credentials.proxy_password.is_none();
-                if unchanged {
-                    continue;
-                }
+                    && entry.credentials.proxy_password.is_none()
+            };
+            if unchanged {
+                continue;
+            }
+            previous.push((update.id, entry.credentials.clone()));
+            if fallback {
+                entry.credentials.proxy_temporary_direct = true;
+                entry.credentials.proxy_auto_assigned = true;
+            } else if restore {
+                entry.credentials.proxy_temporary_direct = false;
+                entry.credentials.proxy_auto_assigned = false;
+            } else {
                 entry.credentials.proxy_url = normalized;
                 entry.credentials.proxy_username = None;
                 entry.credentials.proxy_password = None;
                 entry.credentials.proxy_auto_assigned = true;
-                changed_ids.push(*id);
+                entry.credentials.proxy_temporary_direct = false;
             }
+            changed_ids.push(update.id);
         }
 
         if changed_ids.is_empty() {
             return Ok(0);
         }
 
-        // 代理变化会影响上游可用模型列表，逐个作废对应缓存
+        let credentials: Vec<_> = entries
+            .iter()
+            .map(CredentialEntry::credentials_snapshot)
+            .collect();
+        if let Err(error) = self.persist_credentials_snapshot(&credentials) {
+            for (id, credentials) in previous.into_iter().rev() {
+                if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                    entry.credentials = credentials;
+                }
+            }
+            return Err(error);
+        }
+        for id in &changed_ids {
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == *id) {
+                entry.proxy_generation = entry.proxy_generation.wrapping_add(1);
+            }
+        }
+        drop(entries);
         for id in &changed_ids {
             self.invalidate_model_cache(*id);
         }
-        self.persist_credentials()?;
         Ok(changed_ids.len())
     }
 }
@@ -5507,6 +5620,36 @@ impl Drop for MultiTokenManager {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn refresh_merge_preserves_concurrent_proxy_changes() {
+        let original = KiroCredentials {
+            refresh_token: Some("old-refresh".into()),
+            access_token: Some("old-access".into()),
+            proxy_url: Some("http://localhost:1234".into()),
+            proxy_username: Some("user".into()),
+            proxy_password: Some("password".into()),
+            ..Default::default()
+        };
+        let mut refreshed = original.clone();
+        refreshed.access_token = Some("new-access".into());
+        refreshed.refresh_token = Some("new-refresh".into());
+        let mut current = original.clone();
+        current.proxy_temporary_direct = true;
+        current.email = Some("updated@example.test".into());
+        merge_refreshed_credentials(&mut current, &original, &refreshed).unwrap();
+        assert!(current.proxy_temporary_direct);
+        assert_eq!(current.proxy_password.as_deref(), Some("password"));
+        assert_eq!(current.email.as_deref(), Some("updated@example.test"));
+        assert_eq!(current.access_token.as_deref(), Some("new-access"));
+        assert_eq!(current.refresh_token.as_deref(), Some("new-refresh"));
+
+        let mut replaced = original.clone();
+        replaced.refresh_token = Some("manually-replaced".into());
+        assert!(merge_refreshed_credentials(&mut replaced, &original, &refreshed).is_err());
+        assert_eq!(replaced.refresh_token.as_deref(), Some("manually-replaced"));
+        assert_eq!(replaced.access_token.as_deref(), Some("old-access"));
+    }
 
     #[tokio::test]
     async fn active_guard_remains_valid_during_health_reset() {
@@ -5534,6 +5677,70 @@ mod tests {
         drop(first_guard);
         drop(second_guard);
         assert_eq!(manager.get_in_flight(first), 0);
+    }
+
+    #[test]
+    fn proxy_rotation_persistence_failure_restores_original_configuration() {
+        let credential = KiroCredentials {
+            id: Some(1),
+            machine_id: Some("0".repeat(64)),
+            proxy_url: Some("http://localhost:1234".into()),
+            proxy_username: Some("test-user".into()),
+            proxy_password: Some("test-password".into()),
+            ..Default::default()
+        };
+        let path = std::env::temp_dir().join(format!("missing-{}", uuid::Uuid::new_v4())).join("credentials.json");
+        let manager = MultiTokenManager::new(Config::default(), vec![credential], None, Some(path), true).unwrap();
+        let snapshot = manager.credential_proxy_snapshot().remove(0);
+        let update = ProxyRotationUpdate { id: 1, target: Some(KiroCredentials::PROXY_DIRECT.to_string()), generation: snapshot.generation, global_generation: snapshot.global_generation };
+        assert!(manager.apply_proxy_rotation(&[update]).is_err());
+        let restored = manager.clone_credential(1).unwrap();
+        assert_eq!(restored.proxy_url.as_deref(), Some("http://localhost:1234"));
+        assert_eq!(restored.proxy_username.as_deref(), Some("test-user"));
+        assert_eq!(restored.proxy_password.as_deref(), Some("test-password"));
+        assert!(!restored.proxy_temporary_direct);
+    }
+
+    #[test]
+    fn temporary_direct_preserves_authentication_for_recovery_and_restart() {
+        let credential = KiroCredentials {
+            id: Some(1),
+            proxy_url: Some("http://localhost:1234".into()),
+            proxy_username: Some("test-user".into()),
+            proxy_password: Some("test-password".into()),
+            ..Default::default()
+        };
+        let manager = MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+        let snapshot = manager.credential_proxy_snapshot().remove(0);
+        manager.apply_proxy_rotation(&[ProxyRotationUpdate { id: 1, target: Some(KiroCredentials::PROXY_DIRECT.to_string()), generation: snapshot.generation, global_generation: snapshot.global_generation }]).unwrap();
+        let snapshot = manager.credential_proxy_snapshot().remove(0);
+        assert!(snapshot.temporary_direct);
+        assert!(snapshot.in_use_proxy.is_none());
+        assert_eq!(snapshot.recovery_proxy.unwrap().username.as_deref(), Some("test-user"));
+        let persisted = serde_json::to_string(&manager.clone_credential(1).unwrap()).unwrap();
+        let reloaded: KiroCredentials = serde_json::from_str(&persisted).unwrap();
+        assert!(reloaded.effective_proxy(None).is_none());
+        assert_eq!(reloaded.configured_proxy(None).unwrap().password.as_deref(), Some("test-password"));
+        let snapshot = manager.credential_proxy_snapshot().remove(0);
+        manager.apply_proxy_rotation(&[ProxyRotationUpdate { id: 1, target: None, generation: snapshot.generation, global_generation: snapshot.global_generation }]).unwrap();
+        let restored = manager.clone_credential(1).unwrap();
+        assert_eq!(restored.effective_proxy(None).unwrap().username.as_deref(), Some("test-user"));
+        assert!(!restored.proxy_temporary_direct);
+    }
+
+    #[test]
+    fn proxy_rotation_rejects_stale_manual_or_global_proxy_updates() {
+        let credential = KiroCredentials { id: Some(1), proxy_url: Some("http://localhost:1234".into()), ..Default::default() };
+        let manager = MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+        let original = manager.credential_proxy_snapshot().remove(0);
+        manager.update_credential(1, None, Some(Some("http://localhost:5678".into())), None, None, None, None, None, None).unwrap();
+        let stale = ProxyRotationUpdate { id: 1, target: Some("direct".into()), generation: original.generation, global_generation: original.global_generation };
+        assert!(manager.apply_proxy_rotation(&[stale]).is_err());
+        assert_eq!(manager.clone_credential(1).unwrap().proxy_url.as_deref(), Some("http://localhost:5678"));
+        let current = manager.credential_proxy_snapshot().remove(0);
+        manager.set_global_proxy(Some(ProxyConfig::new("http://localhost:9012")));
+        let stale = ProxyRotationUpdate { id: 1, target: Some("direct".into()), generation: current.generation, global_generation: current.global_generation };
+        assert!(manager.apply_proxy_rotation(&[stale]).is_err());
     }
 
     /// 构造一个仅含单凭据、可配置 RPM 限流的测试用 manager。

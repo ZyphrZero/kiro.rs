@@ -123,6 +123,7 @@ export interface CredentialStatusItem {
   successCount: number
   lastUsedAt: string | null
   hasProxy: boolean
+  proxyTemporaryDirect?: boolean
   proxyUrl?: string
   refreshFailureCount: number
   disabledReason?: string

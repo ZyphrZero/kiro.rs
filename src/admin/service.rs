@@ -29,7 +29,7 @@ use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{
-    priority_key, IdcReloginCredentials, MultiTokenManager, RefreshTokenInvalidError,
+    priority_key, IdcReloginCredentials, MultiTokenManager, ProxyRotationUpdate, RefreshTokenInvalidError,
 };
 use crate::model::config::Config;
 
@@ -878,6 +878,7 @@ impl AdminService {
                     success_count: entry.success_count,
                     last_used_at: entry.last_used_at.clone(),
                     has_proxy: entry.has_proxy,
+                    proxy_temporary_direct: entry.proxy_temporary_direct,
                     proxy_url: entry.proxy_url,
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
@@ -1929,6 +1930,7 @@ impl AdminService {
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
             proxy_auto_assigned: false,
+            proxy_temporary_direct: false,
             disabled: false, // 新添加的凭据默认启用
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,
@@ -3545,6 +3547,12 @@ impl AdminService {
                             proxy_id
                         )));
                     }
+                    GetUrlResult::NotShareable => {
+                        return Err(AdminServiceError::InvalidCredential(format!(
+                            "代理 #{} 的认证信息不可共享，请在代理池中显式配置后再分配",
+                            proxy_id
+                        )));
+                    }
                 };
                 Some(url)
             }
@@ -3623,10 +3631,10 @@ impl AdminService {
             in_use.push(proxy);
         }
         for cred in self.token_manager.credential_proxy_snapshot() {
-            if let Some(proxy) = cred.in_use_proxy
-                && !in_use.contains(&proxy)
-            {
-                in_use.push(proxy);
+            for proxy in [cred.in_use_proxy, cred.recovery_proxy].into_iter().flatten() {
+                if !in_use.contains(&proxy) {
+                    in_use.push(proxy);
+                }
             }
         }
 
@@ -3653,7 +3661,7 @@ impl AdminService {
         let credentials = self.token_manager.credential_proxy_snapshot();
 
         let mut result = ProxyRotationResponse::default();
-        let mut updates: Vec<(u64, Option<String>)> = Vec::new();
+        let mut updates: Vec<ProxyRotationUpdate> = Vec::new();
         // 轮换目标在可用代理间轮转，避免所有凭据挤到同一个代理上
         let mut cursor = 0usize;
         // 无可用代理的凭据汇总后只记一条日志：这类凭据可能成批出现（例如整批账号
@@ -3665,20 +3673,31 @@ impl AdminService {
             if cred.disabled {
                 continue;
             }
+            let update = |target| ProxyRotationUpdate {
+                id: cred.id,
+                target,
+                generation: cred.generation,
+                global_generation: cred.global_generation,
+            };
 
             let current_url = match &cred.in_use_proxy_url {
                 Some(url) => url.clone(),
                 None => {
+                    if cred.temporary_direct && cred.recovery_proxy.as_ref().is_some_and(|proxy| self.proxy_pool.availability_for_proxy(proxy) == ProxyAvailability::Available) {
+                        updates.push(update(None));
+                        result.restored_to_proxy += 1;
+                        continue;
+                    }
                     // 当前直连。仅回收「自动回退直连」的凭据，用户显式配置的直连不动
                     if cred.explicit_direct && cred.auto_assigned && !available.is_empty() {
                         let target = available[cursor % available.len()].clone();
                         cursor += 1;
                         tracing::info!(
-                            "凭据 #{} 此前因无可用代理回退直连，现已改回代理: {}",
+                            "凭据 #{} 此前因无可用代理回退直连，准备改回代理: {}",
                             cred.id,
                             mask_proxy_url(&target)
                         );
-                        updates.push((cred.id, Some(target)));
+                        updates.push(update(Some(target)));
                         result.restored_to_proxy += 1;
                     }
                     continue;
@@ -3701,24 +3720,21 @@ impl AdminService {
                 Some((index, url)) => {
                     cursor = index + 1;
                     tracing::warn!(
-                        "凭据 #{} 在用代理不可用，已轮换: {} -> {}",
+                        "凭据 #{} 在用代理不可用，准备轮换: {} -> {}",
                         cred.id,
                         mask_proxy_url(&current_url),
                         mask_proxy_url(&url)
                     );
-                    updates.push((cred.id, Some(url)));
+                    updates.push(update(Some(url)));
                     result.rotated += 1;
                 }
                 None if direct_fallback_enabled => {
                     tracing::warn!(
-                        "凭据 #{} 在用代理 {} 不可用且无其它可用代理，已按配置回退直连",
+                        "凭据 #{} 在用代理 {} 不可用且无其它可用代理，准备按配置回退直连",
                         cred.id,
                         mask_proxy_url(&current_url)
                     );
-                    updates.push((
-                        cred.id,
-                        Some(KiroCredentials::PROXY_DIRECT.to_string()),
-                    ));
+                    updates.push(update(Some(KiroCredentials::PROXY_DIRECT.to_string())));
                     result.switched_to_direct += 1;
                 }
                 None => {
@@ -4768,6 +4784,51 @@ mod tests {
 
         // 再次检测不重复登记
         assert_eq!(service.detect_credential_proxies(), 0);
+    }
+
+    #[tokio::test]
+    async fn authenticated_proxy_recovers_after_temporary_direct_fallback() {
+        use base64::Engine;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let healthy = Arc::new(AtomicBool::new(false));
+        let state = healthy.clone();
+        let expected = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode("user:password"));
+        let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+            let state = state.clone();
+            let expected = expected.clone();
+            async move {
+                if state.load(Ordering::Relaxed) && headers.get("proxy-authorization").and_then(|value| value.to_str().ok()) == Some(expected.as_str()) {
+                    axum::http::StatusCode::NO_CONTENT
+                } else {
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let credential = KiroCredentials {
+            proxy_url: Some(format!("http://{address}")),
+            proxy_username: Some("user".into()),
+            proxy_password: Some("password".into()),
+            ..Default::default()
+        };
+        let service = proxy_rotation_service(vec![credential], None, true, true);
+        assert_eq!(service.detect_credential_proxies(), 1);
+        assert_eq!(service.proxy_pool.check_all_for_url("http://example.test/health").await.unhealthy, 1);
+        assert_eq!(service.rotate_unavailable_credential_proxies().switched_to_direct, 1);
+        let direct = service.token_manager.clone_credential(1).unwrap();
+        assert!(direct.proxy_temporary_direct);
+        assert!(service.get_all_credentials().credentials[0].proxy_temporary_direct);
+        assert_eq!(direct.proxy_password.as_deref(), Some("password"));
+        healthy.store(true, Ordering::Relaxed);
+        service.detect_credential_proxies();
+        assert_eq!(service.proxy_pool.check_all_for_url("http://example.test/health").await.healthy, 1);
+        assert_eq!(service.rotate_unavailable_credential_proxies().restored_to_proxy, 1);
+        let restored = service.token_manager.clone_credential(1).unwrap();
+        assert!(!restored.proxy_temporary_direct);
+        assert_eq!(restored.effective_proxy(None).unwrap().password.as_deref(), Some("password"));
+        task.abort();
     }
 
     #[tokio::test]

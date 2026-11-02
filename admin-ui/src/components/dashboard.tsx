@@ -651,7 +651,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   // 字段排序开启时禁止拖拽调优先级（拖拽只在“手动顺序”下有意义）
   const dragDisabled = sortField !== "manual";
 
-  const handleDragEnd = (event: DragEndEvent) => {
+  const handleDragEnd = async (event: DragEndEvent) => {
     if (dragDisabled) return;
     const { active, over } = event;
     if (!over || active.id === over.id) return;
@@ -673,7 +673,21 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     // 正确做法：只在这批被拖动的凭据**原本占据的那些全局槽位**里重新分配。
     // 隐藏的凭据一格都不动，可见的几个在自己已有的槽位之间换位。
     const invertPriority = loadBalancingData?.invertPriority ?? false;
-    const queue = [...(data?.credentials ?? [])].sort((a, b) => {
+    const requestedFilter = currentFilterSelectionKey.current;
+    let allCredentials: CredentialStatusItem[];
+    try {
+      allCredentials = (await getCredentials()).credentials;
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+      setPageOrder(null);
+      return;
+    }
+    if (requestedFilter !== currentFilterSelectionKey.current) {
+      setPageOrder(null);
+      toast.error("筛选条件已变化，请重新排序");
+      return;
+    }
+    const queue = [...allCredentials].sort((a, b) => {
       const pDiff = invertPriority ? b.priority - a.priority : a.priority - b.priority;
       return pDiff || a.id - b.id;
     });

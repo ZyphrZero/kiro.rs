@@ -524,7 +524,8 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 | `email` / `subscriptionTitle` | Admin 查询后回填的展示信息 |
 | `proxyUrl` | 凭据级代理；填 `direct` 表示绕过全局代理 |
 | `proxyUsername` / `proxyPassword` | 凭据级代理认证 |
-| `proxyAutoAssigned` | 当前 `proxyUrl` 是否由自动轮换写入；由程序维护，手动改代理时清除 |
+| `proxyAutoAssigned` | 当前代理状态是否由自动轮换设置；由程序维护，手动改代理时清除 |
+| `proxyTemporaryDirect` | 是否因代理不可用而临时直连；保留原代理及认证，恢复后自动切回 |
 | `disabled` | 是否禁用 |
 | `kiroApiKey` | `ksk_*` Kiro API Key |
 | `endpoint` | `ide` 或 `cli`，未填使用 `config.defaultEndpoint` |
@@ -897,7 +898,7 @@ credential.proxyUrl -> config.proxyUrl -> direct
 无可用代理时的行为由 `proxyDirectFallbackEnabled` 决定：
 
 - `false`（默认）：凭据保持原代理配置，请求继续失败直至代理恢复，避免真实出口 IP 意外暴露。
-- `true`：凭据临时改为 `direct`；池内重新出现可用代理后自动改回代理。
+- `true`：凭据临时直连并保留原代理配置及认证；原代理恢复或池内出现其它可用代理后自动改回代理。管理页面会标记临时直连状态。
 
 手动修改某个凭据的代理会清除自动轮换标记，此后自动轮换不再回收改写该凭据，直到它的
 代理再次被判定不可用。

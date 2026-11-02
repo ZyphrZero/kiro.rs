@@ -527,6 +527,9 @@ pub struct KiroCredentials {
     #[serde(default, skip_serializing_if = "is_false")]
     pub proxy_auto_assigned: bool,
 
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub proxy_temporary_direct: bool,
+
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,
@@ -896,6 +899,13 @@ impl KiroCredentials {
     /// 优先级：凭据代理 > 全局代理 > 无代理
     /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
     pub fn effective_proxy(&self, global_proxy: Option<&ProxyConfig>) -> Option<ProxyConfig> {
+        if self.proxy_temporary_direct {
+            return None;
+        }
+        self.configured_proxy(global_proxy)
+    }
+
+    pub fn configured_proxy(&self, global_proxy: Option<&ProxyConfig>) -> Option<ProxyConfig> {
         match self.proxy_url.as_deref() {
             Some(url) if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => None,
             Some(url) if url.trim().is_empty() => global_proxy.cloned(),
@@ -1276,6 +1286,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             proxy_auto_assigned: false,
+            proxy_temporary_direct: false,
             disabled: false,
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,
@@ -1555,6 +1566,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             proxy_auto_assigned: false,
+            proxy_temporary_direct: false,
             disabled: false,
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,
@@ -1602,6 +1614,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             proxy_auto_assigned: false,
+            proxy_temporary_direct: false,
             disabled: false,
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,
@@ -1732,6 +1745,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             proxy_auto_assigned: false,
+            proxy_temporary_direct: false,
             disabled: false,
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,

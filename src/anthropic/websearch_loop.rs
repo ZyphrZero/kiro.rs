@@ -899,6 +899,13 @@ impl WebSearchUsageSettlement {
         self.usage.sanitized()
     }
 
+    fn discard(&mut self) {
+        if let Some(tracer) = &self.tracer {
+            tracer.discard();
+        }
+        self.settled = true;
+    }
+
     /// 构造最终响应的计费信息：费用取整条 agentic loop 中所有模型调用的
     /// meteringEvent 累计值，单位沿用最近一次上游事件。
     fn response_metering(&self, latest: Option<&MeteringEvent>) -> Option<MeteringEvent> {
@@ -1511,6 +1518,14 @@ async fn run_web_search_loop_inner(
             {
                 Ok(v) => v,
                 Err(failure) => {
+                    if failure.response.status() == StatusCode::UNAUTHORIZED && round_idx == 0 && empty_retries == 0 {
+                        settlement.discard();
+                        return failure.response;
+                    }
+                    if failure.response.status() == StatusCode::UNAUTHORIZED {
+                        settlement.finish("error", "error", Some(failure.error_type), Some(&failure.error_message));
+                        return failure.response;
+                    }
                     if let Some(usage) = failure.token_usage {
                         settlement.add(failure.credential_id, usage, failure.credits);
                         settlement.note_source(failure.usage_source);

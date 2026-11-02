@@ -161,6 +161,7 @@ pub struct CredentialStatusItem {
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
+    pub proxy_temporary_direct: bool,
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,

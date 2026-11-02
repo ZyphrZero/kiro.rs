@@ -286,7 +286,7 @@ impl RequestTracer {
         }
     }
 
-    fn discard(&self) {
+    pub(crate) fn discard(&self) {
         self.finalized.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -1004,7 +1004,9 @@ pub async fn post_messages(
         } else {
             "error"
         };
-        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
+        if resp.status() != StatusCode::UNAUTHORIZED {
+            hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
+        }
         let trace_id = Uuid::new_v4().to_string();
         attach_custom_headers(
             &mut resp,
@@ -2521,7 +2523,9 @@ pub async fn post_messages_cc(
         } else {
             "error"
         };
-        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
+        if resp.status() != StatusCode::UNAUTHORIZED {
+            hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
+        }
         let trace_id = Uuid::new_v4().to_string();
         attach_custom_headers(&mut resp, state.custom_headers.as_ref(), &early_header_context(&trace_id, &payload.model, &key_ctx, None));
         return resp;
@@ -2677,7 +2681,7 @@ pub async fn post_messages_cc(
             &request_body,
             &payload.model,
             // L7：流式与非流式一致，遵守 extractThinking 配置。
-            state.extract_thinking && thinking_enabled,
+            (state.extract_thinking || payload.output_config.is_some()) && thinking_enabled,
             tool_name_map,
             known_tool_names,
             invoke_tool_schemas,
@@ -2692,7 +2696,7 @@ pub async fn post_messages_cc(
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
+        let extract_thinking = (state.extract_thinking || payload.output_config.is_some()) && thinking_enabled;
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {

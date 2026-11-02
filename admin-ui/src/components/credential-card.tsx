@@ -1465,7 +1465,11 @@ function CredentialCardImpl({
                       <span className="font-mono text-xs text-muted-foreground">{credential.maskedApiKey}</span>
                     </LedgerRow>
                   )}
-                  {credential.hasProxy && (
+                  {credential.proxyTemporaryDirect ? (
+                    <LedgerRow label="代理地址" icon={Globe} danger>
+                      <span className="text-xs font-medium text-destructive">临时直连（等待代理恢复）</span>
+                    </LedgerRow>
+                  ) : credential.hasProxy && (
                     <LedgerRow label="代理地址" icon={Globe} danger={proxyUnhealthy}>
                       <span
                         className="font-mono text-xs"
