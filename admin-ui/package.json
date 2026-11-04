@@ -1,6 +1,6 @@
 {
   "name": "kiro-admin-ui",
-  "version": "0.9.4",
+  "version": "0.9.5",
   "type": "module",
   "packageManager": "pnpm@12.11.2",
   "engines": {

@@ -156,12 +156,12 @@ Windows:
 
 ### 从源码构建
 
-前端 Admin UI 会通过 `rust-embed` 嵌入到最终二进制。构建后端前先构建前端：
+前端 Admin UI 会通过 `rust-embed` 嵌入到最终二进制。前端使用 Node.js 24 LTS（最低 22.12）和 pnpm 12.11.2；如未安装 pnpm，可执行 `npm install --global pnpm@12.11.2`。构建后端前先构建前端：
 
 ```bash
 cd admin-ui
-bun install
-bun run build
+pnpm install --frozen-lockfile
+pnpm run build
 cd ..
 cargo build --release --locked
 ```
@@ -865,6 +865,10 @@ JSON 重写的代价线性放大。关闭时启动不读该文件、运行与退
 - 客户端 Key：创建、编辑、禁用、轮换、删除、分组绑定和重置统计；系统 Key 不可删除但可轮换。
 - 请求日志：查询 `traces.db`，查看失败原因、状态码、凭据尝试链路和 token 用量。
 
+凭据管理工具栏提供“隐私”开关，默认关闭，选择会保存在当前浏览器。开启后，卡片、列表及悬浮提示会隐藏邮箱、API Key、代理地址、Profile ARN、分组、来源和自定义备注，搜索内容也会遮蔽；需要显示账号明文的单账号编辑、重登、Token 导入和失败日志入口需先关闭防护。该功能仅用于页面展示脱敏，不修改凭据、接口返回或导出内容，也不替代访问控制；其他页面和管理弹窗不在此开关的保护范围内。
+
+凭据卡片和列表同时展示“今日请求数”和“实时 RPM”，每 5 秒批量刷新一次。统计沿用用量日志的请求完成口径，包含成功和失败，归属最终记录的凭据，不重复计算同一请求的重试次数；“今日”按服务端本地日期计算，RPM 为最近 60 秒完成的请求数，与 RPM 限流开关无关。运行中的长请求会在结束后计入，重启时从保留的用量日志恢复。加载中或查询失败显示“—”，失败时提供重试提示，不会冒充零请求。此功能需要同步更新并重启后端，以提供 `/api/admin/stats/credential-activity` 接口。
+
 Admin 还提供：
 
 - Social 登录和 IdC / Enterprise 登录流程。
@@ -985,7 +989,7 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 构建并推送 Docker Hub 多架构镜像。
 - 创建 GitHub Release。
 
-当前稳定版：[v0.9.4](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.9.4)。
+当前稳定版：[v0.9.5](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.9.5)。
 
 Docker 镜像：
 
@@ -1005,7 +1009,7 @@ Docker 镜像：
 cargo test
 
 # 前端构建
-cd admin-ui && bun run build
+pnpm --dir admin-ui run build
 
 # 后端 release 构建
 cargo build --release --locked
@@ -1018,7 +1022,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ```bash
 cargo test
-cd admin-ui && bun run build
+pnpm --dir admin-ui run build
 git diff --check
 ```
 
