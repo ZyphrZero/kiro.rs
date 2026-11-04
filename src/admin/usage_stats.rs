@@ -458,10 +458,15 @@ impl UsageAggregator {
         upsert_bucket(&mut inner.day_buckets, day_ts, rec, DAY_BUCKETS);
 
         let now_ts = now.timestamp();
-        let cutoff = now_ts - RPM_WINDOW_SECS;
+        let latest_ts = inner
+            .recent_credential_calls
+            .last_key_value()
+            .map(|(timestamp, _)| (*timestamp).max(now_ts))
+            .unwrap_or(now_ts);
+        let cutoff = latest_ts - RPM_WINDOW_SECS;
         inner
             .recent_credential_calls
-            .retain(|timestamp, _| *timestamp > cutoff && *timestamp <= now_ts);
+            .retain(|timestamp, _| *timestamp > cutoff);
         let request_ts = dt.timestamp();
         if rec.credential_id != 0 && request_ts > cutoff && request_ts <= now_ts {
             *inner
@@ -963,6 +968,23 @@ mod tests {
             CredentialActivity {
                 today_calls: 4,
                 rpm: 3
+            }
+        );
+    }
+
+    #[test]
+    fn credential_activity_preserves_newer_concurrent_records() {
+        let aggregator = UsageAggregator::new();
+        let earlier = activity_test_time();
+        let later = earlier + Duration::seconds(1);
+        aggregator.ingest_at(&activity_record(7, later, "success"), later);
+        aggregator.ingest_at(&activity_record(7, earlier, "success"), earlier);
+
+        assert_eq!(
+            aggregator.query_credential_activity_at(later)[&7],
+            CredentialActivity {
+                today_calls: 2,
+                rpm: 2
             }
         );
     }
