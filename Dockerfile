@@ -1,10 +1,11 @@
-FROM oven/bun:1-alpine AS frontend-builder
+FROM node:24-alpine AS frontend-builder
 
 WORKDIR /app/admin-ui
-COPY admin-ui/package.json admin-ui/bun.lock* ./
-RUN bun install --frozen-lockfile --ignore-scripts
+RUN npm install --global pnpm@12.11.2
+COPY admin-ui/package.json admin-ui/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
 COPY admin-ui ./
-RUN bun run build
+RUN pnpm run build
 
 FROM rust:1.92-alpine AS builder
 

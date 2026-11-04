@@ -79,7 +79,7 @@ fn serve_index() -> Response<Body> {
         None => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from(
-                "Admin UI not built. Run 'bun run build' in admin-ui directory.",
+                "Admin UI not built. Run 'pnpm run build' in admin-ui directory.",
             ))
             .expect("Failed to build response"),
     }
