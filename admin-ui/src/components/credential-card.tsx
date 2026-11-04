@@ -15,16 +15,10 @@ import {
   ScrollText,
   Boxes,
   Wallet,
-  ChevronRight,
-  Activity,
-  Key,
-  Globe,
-  Server,
-  Layers,
   Sparkles,
   Flag,
 } from "lucide-react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
@@ -48,12 +42,13 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type {
+  CredentialActivity,
   CredentialMetadataSchema,
   CredentialStatusItem,
   BalanceResponse,
   ProxyPoolEntry,
 } from "@/types/api";
-import { maskProxyUrl, extractErrorMessage, overageFailureMessage, cn } from "@/lib/utils";
+import { maskEmail, maskProxyUrl, extractErrorMessage, overageFailureMessage, formatNumber as formatCompactNumber, cn } from "@/lib/utils";
 import {
   useSetDisabled,
   useSetPriority,
@@ -75,10 +70,7 @@ import { CredentialFailuresDialog } from "@/components/credential-failures-dialo
 import { AvailableModelsDialog } from "@/components/available-models-dialog";
 import { BalanceDialog } from "@/components/balance-dialog";
 import { getDisposition } from "@/components/console/credential-state";
-import {
-  railBorderClass,
-  railChipClass,
-} from "@/components/console/rail";
+import { railBorderClass } from "@/components/console/rail";
 import { PriorityPreview } from "@/components/console/priority-preview";
 import { CredentialLabel } from "@/components/console/credential-label";
 
@@ -91,12 +83,16 @@ interface CredentialCardProps {
   onRefreshBalance: (id: number) => void | Promise<void>;
   /** 该凭据的失败分类计数（来自 trace 聚合）；无数据时回退 totalFailureCount */
   failureStats?: { auth: number; throttle: number; other: number };
+  activity?: CredentialActivity;
+  loadingActivity?: boolean;
+  activityError?: boolean;
   /** 展示形态：卡片（默认）或紧凑列表行 */
   view?: "card" | "list";
   /** 字段排序开启时禁用拖拽调优先级（隐藏拖拽手柄） */
   dragDisabled?: boolean;
   /** 开发预览卡：仅展示，不发起任何凭据操作。 */
   preview?: boolean;
+  privacyMode?: boolean;
   metadataSchema?: CredentialMetadataSchema;
 }
 
@@ -115,7 +111,7 @@ function formatLastUsed(lastUsedAt: string | null): string {
 }
 
 /** 添加时间用绝对时刻展示 */
-function formatCreatedAt(createdAt: string | null | undefined): string {
+function formatCreatedAt(createdAt: string | null | undefined, includeTime = true): string {
   if (!createdAt) return "未知";
   const date = new Date(createdAt);
   if (Number.isNaN(date.getTime())) return "未知";
@@ -123,8 +119,8 @@ function formatCreatedAt(createdAt: string | null | undefined): string {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
+    hour: includeTime ? "2-digit" : undefined,
+    minute: includeTime ? "2-digit" : undefined,
     hour12: false,
   });
 }
@@ -161,15 +157,6 @@ function formatThrottleCountdown(secs: number): string {
   const s = total % 60;
   const pad = (n: number) => String(n).padStart(2, "0");
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
-}
-
-function proxyDisplayLabel(proxyUrl: string): string {
-  try {
-    const { host } = new URL(proxyUrl);
-    return host || maskProxyUrl(proxyUrl);
-  } catch {
-    return maskProxyUrl(proxyUrl);
-  }
 }
 
 function endpointDisplayLabel(endpoint: string): string {
@@ -222,67 +209,6 @@ function metadataEntries(
 }
 
 
-
-/** 账目行 —— 标签 + 描述在左，值贴右边缘 */
-function LedgerRow({
-  label,
-  hint,
-  title,
-  description,
-  icon: Icon,
-  danger,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  title?: string;
-  description?: string;
-  icon?: React.ElementType;
-  danger?: boolean;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className={cn(
-      "grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-2.5 gap-y-0.5 py-0.5 -mx-2 px-2 rounded",
-      danger && "bg-destructive/10 border border-destructive/30",
-    )}>
-      <dt className="flex shrink-0 flex-col" title={title}>
-        <span className="flex items-center gap-1.5">
-          {Icon && <Icon className="h-3.5 w-3.5 text-muted-foreground/70" />}
-          <span className="text-[12px] font-normal tracking-normal text-muted-foreground">
-            {label}
-          </span>
-          {hint && (
-            <span className="text-[10px] text-muted-foreground/50">{hint}</span>
-          )}
-        </span>
-        {description && (
-          <span className="text-[10px] leading-tight text-muted-foreground/50 mt-0.5">
-            {description}
-          </span>
-        )}
-      </dt>
-      <dd className="min-w-0 break-all text-right text-[12px] leading-4 text-foreground/90 font-medium">
-        {children}
-      </dd>
-    </div>
-  );
-}
-
-function CardSectionTitle({
-  children,
-  icon: Icon,
-}: {
-  children: React.ReactNode;
-  icon?: React.ElementType;
-}) {
-  return (
-    <h3 className="flex items-center gap-1.5 text-[11px] font-semibold leading-4 uppercase tracking-wider text-muted-foreground/80">
-      {Icon && <Icon className="h-3.5 w-3.5 opacity-70" />}
-      {children}
-    </h3>
-  );
-}
 
 function OverageStatusPill({ balance }: { balance: BalanceResponse }) {
   const cap = balance.overageCapable;
@@ -352,30 +278,37 @@ function getDisabledReasonStyle(reason?: string | null): {
 
 function MetadataSummary({
   credential,
+  wrap = false,
+  privacyMode = false,
 }: {
   credential: CredentialStatusItem;
+  wrap?: boolean;
+  privacyMode?: boolean;
 }) {
   const entries = metadataEntries(credential);
   if (entries.length === 0) return null;
+  if (privacyMode) return <Badge variant="outline" className="self-start">备注已隐藏</Badge>;
 
   return (
     <div
-      className="mt-1 flex min-w-0 items-center gap-1 overflow-hidden"
+      className={cn("flex min-w-0 items-center gap-1", wrap ? "flex-wrap" : "mt-1 overflow-hidden")}
       aria-label="凭据 Metadata"
     >
       {entries.map((entry) => (
         <span
           key={entry.key}
-          className={`inline-flex min-w-0 max-w-full shrink-0 items-center overflow-hidden rounded-md border px-1.5 py-0.5 text-[11px] ${
+          className={cn(
+            "inline-flex min-w-0 max-w-full items-center overflow-hidden rounded-md border px-1.5 py-0.5 text-[11px]",
+            !wrap && "shrink-0",
             entry.emphasized
               ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
-              : "border-border/60 bg-muted/45 text-foreground"
-          }`}
-          title={entry.description || `${entry.label}: ${entry.value}`}
+              : "border-border/60 bg-muted/45 text-foreground",
+          )}
+          title={[`${entry.label}: ${entry.value}`, entry.description].filter(Boolean).join("\n")}
         >
-          <span className="shrink-0 text-muted-foreground">{entry.label}</span>
+          <span className={cn("shrink-0 text-muted-foreground", wrap && "max-w-32 truncate")}>{entry.label}</span>
           <span className="mx-1 text-border">·</span>
-          <span className="max-w-40 truncate font-medium">{entry.value}</span>
+          <span className="min-w-0 max-w-40 truncate font-medium">{entry.value}</span>
         </span>
       ))}
     </div>
@@ -390,11 +323,46 @@ function CredentialCardImpl({
   loadingBalance,
   onRefreshBalance,
   failureStats,
+  activity,
+  loadingActivity = false,
+  activityError = false,
   view = "card",
   dragDisabled = false,
   preview = false,
+  privacyMode = false,
   metadataSchema,
 }: CredentialCardProps) {
+  const displayEmail = privacyMode ? maskEmail(credential.email) : credential.email;
+  const displayApiKey = privacyMode ? "••••••••" : credential.maskedApiKey;
+  const displayProxyUrl = privacyMode ? "地址已隐藏" : maskProxyUrl(credential.proxyUrl ?? "");
+  const displaySourceChannel = privacyMode ? "已隐藏" : credential.sourceChannel;
+  const privacyActionHint = "隐私防护已开启，请先关闭防护再查看或编辑账号明文信息";
+  const displayedActivity = preview || activityError ? undefined : activity;
+  const activityUnavailable = preview
+    ? "开发预览不参与请求统计"
+    : activityError
+      ? "请求统计获取失败，等待重试"
+      : loadingActivity
+        ? "正在加载请求统计"
+        : "暂无请求统计数据";
+  const activityStats = (
+    <>
+      <span title={displayedActivity
+        ? `今日请求数：${displayedActivity.todayCalls.toLocaleString("zh-CN")}（服务端本地零点起，完成时记账，含成功和失败）`
+        : activityUnavailable}>
+        今日 <span className={cn("tabular-nums text-foreground/80", activityError && "text-destructive")}>
+          {displayedActivity ? formatCompactNumber(displayedActivity.todayCalls) : "—"}
+        </span>
+      </span>
+      <span title={displayedActivity
+        ? `实时 RPM：最近 60 秒完成 ${displayedActivity.rpm.toLocaleString("zh-CN")} 次请求（含成功和失败，每 5 秒刷新）`
+        : activityUnavailable}>
+        实时 <span className={cn("tabular-nums text-foreground/80", activityError && "text-destructive")}>
+          {displayedActivity ? formatCompactNumber(displayedActivity.rpm) : "—"} RPM
+        </span>
+      </span>
+    </>
+  );
   const [editingPriority, setEditingPriority] = useState(false);
   const [priorityValue, setPriorityValue] = useState(
     String(credential.priority),
@@ -406,7 +374,15 @@ function CredentialCardImpl({
   const [showFailuresDialog, setShowFailuresDialog] = useState(false);
   const [showModelsDialog, setShowModelsDialog] = useState(false);
   const [showBalanceDialog, setShowBalanceDialog] = useState(false);
-  const [connectionExpanded, setConnectionExpanded] = useState(false);
+
+  useEffect(() => {
+    if (privacyMode) {
+      setShowEditDialog(false);
+      setShowUpdateTokenDialog(false);
+      setShowReloginDialog(false);
+      setShowFailuresDialog(false);
+    }
+  }, [privacyMode]);
 
   const { data: lbData } = useLoadBalancingMode();
   const balanced = lbData?.mode === "balanced";
@@ -629,11 +605,14 @@ function CredentialCardImpl({
       variant="outline"
       onClick={runDisposition}
       disabled={
+        (privacyMode && (disposition.action === "relogin" || disposition.action === "viewFailures")) ||
         (disposition.action === "clearThrottle" && clearThrottle.isPending) ||
         (disposition.action === "enable" && setDisabled.isPending) ||
         (disposition.action === "refreshToken" && forceRefresh.isPending)
       }
-      title={`${disposition.stateLabel} → ${disposition.actionLabel}`}
+      title={privacyMode && (disposition.action === "relogin" || disposition.action === "viewFailures")
+        ? privacyActionHint
+        : `${disposition.stateLabel} → ${disposition.actionLabel}`}
       className="h-7 whitespace-nowrap px-3 text-xs font-medium border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300 hover:bg-amber-500/20"
     >
       <Sparkles className="mr-1 h-3 w-3" />
@@ -701,42 +680,7 @@ function CredentialCardImpl({
     <SubscriptionBadge title={subscriptionTitle} />
   ) : null;
 
-  const metadataItems = metadataEntries(credential);
-  const renderMetadataRows = (items: typeof metadataItems) =>
-    items.map((entry) => (
-      <LedgerRow
-        key={entry.key}
-        label={entry.label}
-        description={entry.description}
-        title={entry.description || (entry.key === entry.label ? undefined : `key: ${entry.key}`)}
-      >
-        <span
-          className={`font-medium ${
-            entry.emphasized ? "text-amber-600 dark:text-amber-400" : ""
-          }`}
-        >
-          {entry.value}
-        </span>
-      </LedgerRow>
-    ));
-  const metadataRows = renderMetadataRows(metadataItems);
-
   const groups = credential.groups ?? [];
-  const groupingBlock =
-    groups.length > 0 ? (
-      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-        <span className="mr-0.5 text-[11px] text-muted-foreground/80">分组</span>
-        {groups.map((g) => (
-          <span
-            key={g}
-            title="账号分组"
-            className="inline-flex max-w-full items-center break-all rounded-md bg-secondary/80 px-2 py-0.5 text-[11px] font-medium text-secondary-foreground"
-          >
-            {g}
-          </span>
-        ))}
-      </div>
-    ) : null;
 
   const moreMenu = (
     <DropdownMenu modal={false}>
@@ -806,13 +750,21 @@ function CredentialCardImpl({
           ))}
         {credential.authMethod !== "api_key" && <DropdownMenuSeparator />}
         {credential.authMethod !== "api_key" && (
-          <DropdownMenuItem onSelect={() => setShowReloginDialog(true)}>
+          <DropdownMenuItem
+            onSelect={() => setShowReloginDialog(true)}
+            disabled={privacyMode}
+            title={privacyMode ? privacyActionHint : undefined}
+          >
             <LogIn className="mr-2 h-4 w-4" />
             重新登录
           </DropdownMenuItem>
         )}
         {credential.authMethod !== "api_key" && (
-          <DropdownMenuItem onSelect={() => setShowUpdateTokenDialog(true)}>
+          <DropdownMenuItem
+            onSelect={() => setShowUpdateTokenDialog(true)}
+            disabled={privacyMode}
+            title={privacyMode ? privacyActionHint : undefined}
+          >
             <RefreshCw className="mr-2 h-4 w-4" />
             重新导入 Token
           </DropdownMenuItem>
@@ -876,11 +828,11 @@ function CredentialCardImpl({
 
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2 text-sm font-medium leading-5">
-          <CredentialLabel id={credential.id} email={credential.email} />
+          <CredentialLabel id={credential.id} email={displayEmail} />
         </div>
         <div className="mt-1 flex min-w-0 items-center gap-1.5 overflow-hidden [&>*]:shrink-0">
           {statusBadges}
-          {groups.map((g) => (
+          {privacyMode && groups.length > 0 ? <Badge variant="secondary">分组已隐藏</Badge> : groups.map((g) => (
             <span
               key={g}
               title="账号分组"
@@ -894,11 +846,14 @@ function CredentialCardImpl({
               title="账号来源渠道"
               className="text-[11px] text-muted-foreground/80"
             >
-              {credential.sourceChannel}
+              {displaySourceChannel}
             </span>
           )}
         </div>
-        <MetadataSummary credential={credential} />
+        <MetadataSummary credential={credential} privacyMode={privacyMode} />
+        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+          {activityStats}
+        </div>
       </div>
 
       <div className="hidden shrink-0 items-center gap-6 lg:flex">
@@ -996,8 +951,9 @@ function CredentialCardImpl({
           <button
             type="button"
             onClick={() => setShowFailuresDialog(true)}
+            disabled={privacyMode}
             className="mt-0.5 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-semibold tabular-nums transition-colors hover:bg-accent"
-            title="鉴权失败 / 风控 / 其他。点击查看日志"
+            title={privacyMode ? privacyActionHint : "鉴权失败 / 风控 / 其他。点击查看日志"}
           >
             {failureStats ? (
               <span className="tabular-nums font-mono">
@@ -1135,7 +1091,9 @@ function CredentialCardImpl({
           variant="ghost"
           className="h-8 w-8"
           onClick={() => setShowEditDialog(true)}
-          title="编辑"
+          disabled={privacyMode}
+          title={privacyMode ? privacyActionHint : "编辑"}
+          aria-label="编辑凭据"
         >
           <Pencil className="h-3.5 w-3.5" />
         </Button>
@@ -1154,378 +1112,349 @@ function CredentialCardImpl({
           ref={setNodeRef}
           style={dragStyle}
           data-credential-id={credential.id}
-          className={`group flex h-full min-w-0 flex-col overflow-hidden rounded-lg border border-border bg-card shadow-xs transition-colors duration-100 [transform:translateZ(0)] ${
-            isDragging ? "shadow-md opacity-80" : "hover:border-primary/40"
-          } ${stateClasses}`}
+          className={cn(
+            "group flex h-full min-w-0 flex-col rounded-2xl border-border/60 transition-[border-color,box-shadow] duration-150 [transform:translateZ(0)]",
+            isDragging ? "shadow-md opacity-80" : "hover:border-primary/30 hover:shadow-md",
+            selected && "border-primary/60 ring-1 ring-primary/30",
+            stateClasses,
+          )}
         >
-          {/* Card Header: 选择框 + Title + 呼吸指示 + 禁用开关 */}
-          <CardHeader className="p-4 pb-3 sm:p-4 sm:pb-3 border-b border-border/40 bg-muted/20">
-            <div className="flex min-w-0 items-center justify-between gap-2">
-              <div className="flex min-w-0 flex-1 items-center gap-2.5">
+          <CardHeader className="px-4 pb-2 pt-3">
+            <div className="flex min-w-0 items-start justify-between gap-3">
+              <div className="flex min-w-0 flex-1 items-start gap-2">
                 <label
                   data-no-rect-select
-                  className="flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-accent"
+                  className="-ml-1 flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors hover:bg-accent"
                   title={selected ? "取消选择" : "选择凭据"}
                   onClick={(e) => e.stopPropagation()}
                 >
                   <Checkbox
-                    className="h-4 w-4 [&_svg]:h-3 [&_svg]:w-3"
+                    className="size-3.5 rounded-full border-primary/50 [&_svg]:size-2.5"
                     checked={selected}
                     onCheckedChange={handleToggleSelect}
                     disabled={preview}
+                    aria-label={`选择凭据 ${credential.id}`}
                   />
                 </label>
-                <CardTitle className="min-w-0 flex-1 text-sm font-semibold leading-snug">
-                  <CredentialLabel
-                    id={credential.id}
-                    email={credential.email}
-                    showId={false}
-                    className="flex w-full min-w-0 items-baseline gap-1.5 [&>span:last-child]:min-w-0 [&>span:last-child]:truncate font-mono"
-                  />
-                </CardTitle>
+                <div className="min-w-0 flex-1">
+                  <CardTitle title={`凭据 #${credential.id}${displayEmail ? ` · ${displayEmail}` : ""}`}>
+                    <CredentialLabel
+                      id={credential.id}
+                      email={displayEmail}
+                      showId={false}
+                      className="flex min-w-0 items-baseline gap-1.5 text-sm leading-6 [&>span:last-child]:min-w-0 [&>span:last-child]:truncate"
+                    />
+                  </CardTitle>
+                </div>
               </div>
-
-              <div className="flex shrink-0 items-center gap-2">
-                <Switch
-                  checked={!credential.disabled}
-                  onCheckedChange={handleToggleDisabled}
-                  disabled={preview || setDisabled.isPending}
-                  title={credential.disabled ? "点击启用" : "点击禁用"}
-                  className="scale-90"
-                />
-              </div>
+              <Switch
+                checked={!credential.disabled}
+                onCheckedChange={handleToggleDisabled}
+                disabled={preview || setDisabled.isPending}
+                title={credential.disabled ? "点击启用" : "点击禁用"}
+                aria-label={credential.disabled ? "启用凭据" : "禁用凭据"}
+                className="mt-0.5 shrink-0"
+              />
             </div>
+            <div className="flex min-w-0 flex-wrap items-center gap-1">
+              {subscriptionBadge}
+              {authLabel && <Badge variant="secondary">{authLabel}</Badge>}
+              {credential.endpoint && (
+                <Badge
+                  variant="outline"
+                  title={[
+                    endpointDisplayLabel(credential.endpoint),
+                    credential.hasProfileArn
+                      ? `${privacyMode ? "Profile ARN 已隐藏" : credential.profileArn ?? "已配置 Profile ARN"}\n同 profile 的账号共享上游 prompt cache`
+                      : "",
+                  ].filter(Boolean).join("\n")}
+                >
+                  {credential.endpoint}{credential.hasProfileArn ? " · ARN" : ""}
+                </Badge>
+              )}
+              {credential.sourceChannel && (
+                <span className="max-w-24 truncate text-[10px] text-muted-foreground" title={`来源：${displaySourceChannel}`}>
+                  来源 {displaySourceChannel}
+                </span>
+              )}
+              <span className="ml-auto text-[10px] tabular-nums text-muted-foreground" title={`凭据 #${credential.id} · ${formatCreatedAtFull(credential.createdAt)}`}>
+                添加 {formatCreatedAt(credential.createdAt, false)}
+              </span>
+            </div>
+            {hasStatusBadges && (
+              <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                {statusBadges}
+              </div>
+            )}
+          </CardHeader>
 
-        {hasStatusBadges && (
-          <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1.5">
-            {statusBadges}
-          </div>
-        )}
-      </CardHeader>
-
-          <CardContent className="flex flex-1 flex-col p-4 space-y-3.5">
-            {/* 核心指标 (Metrics Grid) */}
-            <div className="grid grid-cols-3 divide-x divide-border/30 text-center py-1">
-              {/* Priority */}
-              <div className="flex flex-col items-center justify-center px-1">
-                <span className="text-[10px] font-semibold text-muted-foreground/80 uppercase tracking-wider">
+          <CardContent className="flex flex-1 flex-col gap-2 px-4 pb-3 pt-0">
+            <div className="grid min-w-0 grid-cols-[0.85fr_1.3fr_1fr_1fr] gap-1 py-1">
+              <div className="flex min-w-0 flex-col items-start gap-1">
+                <span className="text-[11px] text-muted-foreground">
                   {balanced ? "权重" : "优先级"}
                 </span>
                 {balanced ? (
                   <span
-                    className="mt-0.5 inline-flex items-center gap-1 rounded-md border px-2 py-0.5 font-mono text-xs font-semibold"
+                    className="inline-flex h-5 items-center text-xs font-medium tabular-nums"
                     title="均衡负载权重（可在编辑凭据中修改）"
                   >
                     ×{credential.loadFactor}
                   </span>
-                ) : editingPriority ? (
-                  <div className="mt-1 flex items-center justify-center gap-0.5">
-                    <Input
-                      type="number"
-                      value={priorityValue}
-                      onChange={(e) => setPriorityValue(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") handlePriorityChange();
-                        if (e.key === "Escape") {
-                          setEditingPriority(false);
-                          setPriorityValue(String(credential.priority));
-                        }
-                      }}
-                      className="h-6 w-12 text-center text-xs font-mono p-0"
-                      min="0"
-                      autoFocus
-                    />
-                    <button
-                      type="button"
-                      onClick={handlePriorityChange}
-                      className="text-xs text-emerald-600 font-bold px-1"
-                    >
-                      ✓
-                    </button>
-                  </div>
                 ) : (
                   <button
                     type="button"
-                    onClick={() => {
-                      if (!preview) setEditingPriority(true);
-                    }}
-                    className={`mt-0.5 inline-flex items-center gap-1 rounded-md px-2 py-0.5 font-mono text-xs font-semibold border transition-colors hover:brightness-105 ${railChipClass(disposition.tone)}`}
-                    title={credential.isCurrent ? "当前调度优先凭据 · 点击编辑优先级" : "点击编辑优先级（数字越小越先被使用）"}
+                    onClick={() => setEditingPriority(true)}
+                    disabled={preview}
+                    className="inline-flex h-5 items-center gap-1 rounded text-xs font-medium tabular-nums transition-colors hover:text-primary"
+                    title={credential.isCurrent ? "当前调度优先凭据 · 点击编辑优先级" : invertPriority ? "点击编辑优先级（数字越大越先被使用）" : "点击编辑优先级（数字越小越先被使用）"}
                   >
                     {credential.isCurrent && (
-                      <Flag className="h-3 w-3 fill-emerald-500 text-emerald-500 shrink-0" />
+                      <Flag className="size-3 shrink-0 fill-primary text-primary" />
                     )}
-                    #{credential.priority}
-                    <Pencil className="h-2.5 w-2.5 opacity-60" />
+                    {credential.priority}
+                    <Pencil className="size-2.5 text-muted-foreground" />
                   </button>
                 )}
               </div>
-
-              {/* Success */}
-              <div className="flex flex-col items-center justify-center px-1">
-                <span className="text-[10px] font-semibold text-muted-foreground/80 uppercase tracking-wider">
-                  成功数
+              <div className="flex min-w-0 flex-col items-start gap-1">
+                <span className="text-[11px] text-muted-foreground">
+                  失败次数
                 </span>
                 <button
                   type="button"
-                  onClick={preview ? undefined : handleResetSuccess}
-                  disabled={preview}
-                  className="mt-0.5 inline-flex items-center gap-1 font-mono text-xs font-semibold text-emerald-600 dark:text-emerald-400 hover:text-emerald-500 transition-colors"
-                  title="点击重置成功次数"
-                >
-                  {credential.successCount}
-                  <RotateCcw className="h-2.5 w-2.5 opacity-50" />
-                </button>
-              </div>
-
-              {/* Failures */}
-              <div className="flex flex-col items-center justify-center px-1">
-                <span className="text-[10px] font-semibold text-muted-foreground/80 uppercase tracking-wider">
-                  失败数
-                </span>
-                <button
-                  type="button"
-                  onClick={preview ? undefined : () => setShowFailuresDialog(true)}
-                  disabled={preview}
-                  className="mt-0.5 inline-flex items-center gap-1 font-mono text-xs font-semibold hover:text-primary transition-colors"
-                  title="查看失败日志"
+                  onClick={() => setShowFailuresDialog(true)}
+                  disabled={preview || privacyMode}
+                  className="inline-flex min-h-5 max-w-full items-center gap-1 rounded text-xs font-medium tabular-nums transition-colors hover:text-primary"
+                  title={privacyMode ? privacyActionHint : failureStats ? `鉴权失败 ${failureStats.auth} / 风控 ${failureStats.throttle} / 其他 ${failureStats.other} · 点击查看失败日志` : `累计失败 ${credential.totalFailureCount} 次 · 点击查看失败日志`}
                 >
                   {failureStats ? (
-                    <span className="text-[11px]">
+                    <span className="truncate text-[11px]">
                       <span className="text-destructive">{failureStats.auth}</span>
-                      <span className="text-muted-foreground/40">/</span>
-                      <span className="text-amber-600 dark:text-amber-400">{failureStats.throttle}</span>
-                      <span className="text-muted-foreground/40">/</span>
+                      <span className="text-muted-foreground/50">/</span>
+                      <span className="text-[hsl(var(--rail-warn))]">{failureStats.throttle}</span>
+                      <span className="text-muted-foreground/50">/</span>
                       <span className="text-muted-foreground">{failureStats.other}</span>
                     </span>
                   ) : (
-                    <span
-                      className={
-                        credential.totalFailureCount > 0
-                          ? "text-destructive"
-                          : "text-muted-foreground"
-                      }
-                    >
+                    <span className={cn("truncate", credential.totalFailureCount > 0 && "text-destructive")}>
                       {credential.totalFailureCount}
                     </span>
                   )}
-                  <ScrollText className="h-2.5 w-2.5 opacity-50" />
+                  <ScrollText className="size-3 shrink-0 text-muted-foreground" />
+                </button>
+              </div>
+              <div className="flex min-w-0 flex-col items-start gap-1">
+                <span className="text-[11px] text-muted-foreground">
+                  刷新失败
+                </span>
+                <span className={cn(
+                  "inline-flex min-h-5 items-center break-all text-xs font-medium tabular-nums",
+                  credential.refreshFailureCount > 0 && "text-destructive",
+                )}>
+                  {credential.refreshFailureCount}
+                </span>
+              </div>
+              <div className="flex min-w-0 flex-col items-end gap-1">
+                <span className="text-[11px] text-muted-foreground">
+                  成功次数
+                </span>
+                <button
+                  type="button"
+                  onClick={handleResetSuccess}
+                  disabled={preview || resetSuccess.isPending}
+                  className="inline-flex min-h-5 max-w-full items-center gap-1 rounded text-xs font-medium tabular-nums transition-colors hover:text-primary"
+                  title={`成功 ${credential.successCount} 次 · 点击重置成功次数`}
+                >
+                  <span className="truncate">{credential.successCount}</span>
+                  <RotateCcw className="size-3 shrink-0 text-muted-foreground" />
                 </button>
               </div>
             </div>
 
-            {/* Status & Ledger Section */}
-            <div className="space-y-1 border-t border-border/40 pt-3 px-3 text-[12px]">
-              <CardSectionTitle icon={Activity}>运行与账号信息</CardSectionTitle>
-              {groupingBlock && <div className="py-1">{groupingBlock}</div>}
-              <LedgerRow label="凭据类型">
-                <span className="font-semibold">{authLabel}</span>
-              </LedgerRow>
-              <LedgerRow label="最近调用">
-                <span className="font-mono text-muted-foreground">
-                  {formatLastUsed(credential.lastUsedAt)}
+            {editingPriority && (
+              <div className="flex flex-wrap items-center gap-2 rounded-lg bg-muted/60 p-2">
+                <Input
+                  type="number"
+                  value={priorityValue}
+                  onChange={(event) => setPriorityValue(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") handlePriorityChange();
+                    if (event.key === "Escape") {
+                      setEditingPriority(false);
+                      setPriorityValue(String(credential.priority));
+                    }
+                  }}
+                  className="h-7 w-20"
+                  aria-label="优先级"
+                  min="0"
+                  autoFocus
+                />
+                <Button size="sm" variant="outline" onClick={handlePriorityChange} disabled={setPriority.isPending}>
+                  保存
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => {
+                  setEditingPriority(false);
+                  setPriorityValue(String(credential.priority));
+                }}>
+                  取消
+                </Button>
+                <PriorityPreview credentialId={credential.id} draft={priorityValue} disabled={credential.disabled} />
+              </div>
+            )}
+
+            <div className="flex min-w-0 flex-col gap-1 text-[11px]">
+              <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 text-muted-foreground">
+                {activityStats}
+                <span title="最近一次 API 调用">
+                  最近 <span className="tabular-nums text-foreground/80">{formatLastUsed(credential.lastUsedAt)}</span>
                 </span>
-              </LedgerRow>
-              <LedgerRow label="添加时间">
+              </div>
+              {credential.maskedApiKey && (
+                <div className="flex min-w-0 items-center justify-between gap-3">
+                  <span className="shrink-0 text-muted-foreground">API Key</span>
+                  <span className="truncate font-mono text-foreground/80" title={displayApiKey}>
+                    {displayApiKey}
+                  </span>
+                </div>
+              )}
+              <div className={cn(
+                "flex min-w-0 items-center justify-between gap-3",
+                (credential.proxyTemporaryDirect || proxyUnhealthy) && "text-destructive",
+              )}>
+                <span className="shrink-0 text-muted-foreground">代理</span>
                 <span
-                  className="font-mono text-muted-foreground/80"
-                  title={formatCreatedAtFull(credential.createdAt)}
+                  className="truncate text-right font-mono"
+                  title={credential.proxyTemporaryDirect
+                    ? "临时直连（等待代理恢复）"
+                    : credential.hasProxy
+                      ? displayProxyUrl
+                      : "未配置凭据级代理，使用全局代理设置"}
                 >
-                  {formatCreatedAt(credential.createdAt)}
+                  {credential.proxyTemporaryDirect
+                    ? "临时直连（等待代理恢复）"
+                    : credential.hasProxy
+                      ? displayProxyUrl || "已配置"
+                      : "跟随全局"}
                 </span>
-              </LedgerRow>
-              {metadataRows}
+                {proxyEntry && proxyUnhealthy && !credential.proxyTemporaryDirect && (
+                  <span className="shrink-0">
+                    {proxyEntry.autoDisabled ? "已自动禁用" : `异常 ×${proxyEntry.consecutiveFailures}`}
+                  </span>
+                )}
+              </div>
             </div>
 
-            {/* Usage & Quota Card (余额与额度) */}
-            <div
-              className={`rounded-xl border p-3 transition-colors duration-200 space-y-2 ${
-                isQuotaExceeded || disabledByQuota
-                  ? "border-amber-500/50 bg-amber-500/[0.04]"
-                  : "border-border/60 bg-secondary/20"
-              }`}
-            >
-              <div className="flex items-center justify-between gap-2">
-                <CardSectionTitle icon={Wallet}>额度与用量</CardSectionTitle>
-                <div className="flex items-center gap-1.5">
-                  {subscriptionBadge}
-                  {balance && <OverageStatusPill balance={balance} />}
-                </div>
+            {(groups.length > 0 || metadataEntries(credential).length > 0) && (
+              <div className="flex min-w-0 flex-col gap-1">
+                {groups.length > 0 && (
+                  <div className="flex min-w-0 flex-wrap items-center gap-1">
+                    {privacyMode ? <Badge variant="secondary">分组已隐藏</Badge> : groups.map((group) => (
+                      <Badge key={group} variant="secondary" title={`分组：${group}`} className="min-w-0 max-w-full">
+                        <span className="truncate">{group}</span>
+                      </Badge>
+                    ))}
+                  </div>
+                )}
+                <MetadataSummary credential={credential} wrap privacyMode={privacyMode} />
               </div>
+            )}
+
+            <div className="mt-auto flex flex-col gap-2 border-t border-border/40 pt-2.5">
 
               {loadingBalance ? (
-                <div className="flex items-center justify-center gap-2 py-3 text-xs text-muted-foreground">
-                  <Loader2 className="h-4 w-4 animate-spin" />
+                <div role="status" className="flex min-h-16 items-center justify-center gap-2 text-xs text-muted-foreground">
+                  <Loader2 className="size-4 animate-spin" />
                   正在查询最新余额…
                 </div>
               ) : balance ? (
-                <div className="space-y-2">
-                  <div className="flex items-baseline justify-between gap-2">
-                    <div>
-                      <div className="text-[10px] font-semibold text-muted-foreground uppercase">
-                        剩余可用
-                      </div>
-                      <div
-                        className={`console-num font-mono text-xl font-semibold tracking-tight ${
+                <>
+                  <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
+                    <div className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-1">
+                      <span className="text-[11px] text-muted-foreground">余额</span>
+                      <span
+                        className={cn(
+                          "console-num break-all text-xl font-semibold tracking-tight tabular-nums",
                           balance.remaining < 0
-                            ? "text-red-600 dark:text-red-400"
+                            ? "text-destructive"
                             : balance.remaining === 0
-                              ? "text-amber-600 dark:text-amber-400"
-                              : "text-emerald-600 dark:text-emerald-400"
-                        }`}
+                              ? "text-[hsl(var(--rail-warn))]"
+                              : "text-[hsl(var(--rail-ok))]",
+                        )}
                       >
                         {balance.remaining < 0
                           ? `-$${formatNumber(Math.abs(balance.remaining))}`
                           : `$${formatNumber(balance.remaining)}`}
-                      </div>
+                      </span>
                     </div>
-                    <div className="text-right font-mono">
-                      <div className="text-[10px] font-semibold text-muted-foreground uppercase">
-                        已用比例
-                      </div>
-                      <div className="text-sm font-semibold text-foreground">
-                        {balance.usagePercentage.toFixed(1)}%
-                      </div>
-                    </div>
+                    <OverageStatusPill balance={balance} />
                   </div>
-
-                  <Progress value={balance.usagePercentage} className="h-1.5 bg-muted" />
-
-                  <div className="grid grid-cols-2 gap-1 text-[11px] font-mono text-muted-foreground pt-1 border-t border-border/30">
-                    <div>已用: ${formatNumber(balance.currentUsage)}</div>
-                    <div className="text-right">上限: ${formatNumber(balance.usageLimit)}</div>
+                  <Progress value={balance.usagePercentage} className="h-1" aria-label="额度已用比例" />
+                  <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 text-[10px] leading-4 tabular-nums text-muted-foreground">
+                    <span>已用 ${formatNumber(balance.currentUsage)} <span className="ml-1">{balance.usagePercentage.toFixed(1)}%</span></span>
+                    <span>额度 ${formatNumber(balance.usageLimit)}</span>
+                    <span title={balance.nextResetAt ? new Date(balance.nextResetAt * 1000).toLocaleString("zh-CN") : undefined}>
+                      重置 {formatResetDate(balance.nextResetAt)}
+                    </span>
                   </div>
-
-                  {balance.nextResetAt && (
-                    <div className="flex items-center justify-between text-[11px] font-mono text-muted-foreground/80 pt-0.5">
-                      <span>下次重置</span>
-                      <span>{formatResetDate(balance.nextResetAt)}</span>
-                    </div>
-                  )}
-                </div>
+                </>
               ) : (
-                <div className="flex items-center justify-between py-1 text-xs">
+                <div className="flex min-h-16 flex-wrap items-center justify-between gap-2 text-xs">
                   <span className="text-muted-foreground">尚未获取余额数据</span>
                   <Button
                     size="sm"
                     variant="outline"
-                    className="h-7 px-2.5 text-xs font-medium"
                     onClick={handleRefreshBalanceClick}
+                    disabled={preview || credential.disabled}
                   >
-                    <Wallet className="mr-1.5 h-3.5 w-3.5" />
+                    <Wallet data-icon="inline-start" />
                     查询余额
                   </Button>
                 </div>
               )}
             </div>
-
-            {/* Connection Details 手风琴展开面板 */}
-            <div className="rounded-xl border border-border/40 bg-card/40 overflow-hidden">
-              <button
-                type="button"
-                className="flex w-full items-center justify-between px-3 py-2 text-left hover:bg-accent/40 transition-colors"
-                onClick={() => setConnectionExpanded((expanded) => !expanded)}
-                aria-expanded={connectionExpanded}
-              >
-                <CardSectionTitle icon={Server}>连接与代理详情</CardSectionTitle>
-                <ChevronRight
-                  className={`h-4 w-4 text-muted-foreground transition-transform duration-200 ${
-                    connectionExpanded ? "rotate-90" : ""
-                  }`}
-                />
-              </button>
-              {connectionExpanded && (
-                <div className="px-3 pb-2.5 pt-1 space-y-1 border-t border-border/30 text-[12px]">
-                  {credential.endpoint && (
-                    <LedgerRow label="端点" icon={Server}>
-                      <span>{endpointDisplayLabel(credential.endpoint)}</span>
-                    </LedgerRow>
-                  )}
-                  {credential.hasProfileArn && (
-                    <LedgerRow label="Profile" icon={Layers}>
-                      <span
-                        className="font-mono text-xs"
-                        title={
-                          credential.profileArn
-                            ? `${credential.profileArn}\n上游 prompt cache 按 profile 隔离：同 profile 的账号互相共享缓存，会话在它们之间换号不会丢缓存`
-                            : "已配置"
-                        }
-                      >
-                        {credential.profileArn ? profileShortId(credential.profileArn) : "已配置"}
-                      </span>
-                    </LedgerRow>
-                  )}
-                  {credential.sourceChannel && (
-                    <LedgerRow label="来源" icon={Globe}>
-                      <span>{credential.sourceChannel}</span>
-                    </LedgerRow>
-                  )}
-                  {credential.maskedApiKey && (
-                    <LedgerRow label="API Key" icon={Key}>
-                      <span className="font-mono text-xs text-muted-foreground">{credential.maskedApiKey}</span>
-                    </LedgerRow>
-                  )}
-                  {credential.proxyTemporaryDirect ? (
-                    <LedgerRow label="代理地址" icon={Globe} danger>
-                      <span className="text-xs font-medium text-destructive">临时直连（等待代理恢复）</span>
-                    </LedgerRow>
-                  ) : credential.hasProxy && (
-                    <LedgerRow label="代理地址" icon={Globe} danger={proxyUnhealthy}>
-                      <span
-                        className="font-mono text-xs"
-                        title={maskProxyUrl(credential.proxyUrl ?? "")}
-                      >
-                        {proxyDisplayLabel(credential.proxyUrl ?? "")}
-                      </span>
-                      {proxyEntry && proxyUnhealthy && (
-                        <span className="ml-1.5 text-[11px] font-medium text-destructive">
-                          {proxyEntry.autoDisabled ? '已自动禁用' : `异常 ×${proxyEntry.consecutiveFailures}`}
-                        </span>
-                      )}
-                    </LedgerRow>
-                  )}
-                </div>
-              )}
-            </div>
-
-            {/* 底栏 ToolBar */}
+          </CardContent>
+          <CardFooter className="mx-4 mt-auto min-h-11 flex-wrap gap-1 border-t border-border/40 px-0 py-1.5">
             {preview ? (
-              <div className="mt-auto flex items-center justify-end gap-2 pt-2.5 border-t border-border/40">
-                <Button size="icon" variant="ghost" className="h-8 w-8" disabled title="预览">
-                  <RefreshCw className="h-4 w-4" />
+              <>
+                <Button size="icon" variant="ghost" className="size-8" disabled title="预览 · 拖拽排序">
+                  <GripVertical />
                 </Button>
-                <Button size="icon" variant="ghost" className="h-8 w-8" disabled title="预览">
-                  <Wallet className="h-4 w-4" />
+                <Button size="icon" variant="ghost" className="size-8" disabled title="预览 · 刷新 Token">
+                  <RefreshCw />
                 </Button>
-                <Button size="icon" variant="ghost" className="h-8 w-8" disabled title="预览">
-                  <Pencil className="h-4 w-4" />
+                <Button size="icon" variant="ghost" className="size-8" disabled title="预览 · 刷新余额">
+                  <Wallet />
                 </Button>
-                <Button size="icon" variant="ghost" className="h-8 w-8" disabled title="预览">
-                  <MoreHorizontal className="h-4 w-4" />
+                <span className="flex-1" />
+                <Button size="icon" variant="outline" className="size-8 rounded-full" disabled title="预览 · 编辑">
+                  <Pencil />
                 </Button>
-              </div>
+                <Button size="icon" variant="ghost" className="size-8" disabled title="预览 · 更多操作">
+                  <MoreHorizontal />
+                </Button>
+              </>
             ) : (
-              <div className="mt-auto flex min-w-0 items-center gap-2 pt-2.5 border-t border-border/40">
+              <>
                 {!dragDisabled && (
                   <Button
                     ref={setActivatorNodeRef}
                     size="icon"
                     variant="ghost"
                     data-no-rect-select
-                    className="h-8 w-8 shrink-0 cursor-grab touch-none active:cursor-grabbing hover:bg-accent"
+                    className="size-8 shrink-0 cursor-grab touch-none active:cursor-grabbing"
                     title="拖拽排序"
+                    aria-label="拖拽排序"
                     {...attributes}
                     {...listeners}
                   >
-                    <GripVertical className="h-4 w-4 text-muted-foreground/70" />
+                    <GripVertical />
                   </Button>
                 )}
-                {dispositionButton}
-                <span className="min-w-0 flex-1" />
                 <Button
                   size="icon"
                   variant="ghost"
-                  className="h-8 w-8 shrink-0 hover:bg-accent"
+                  className={cn("size-8 shrink-0", forceRefresh.isPending && "[&_svg]:animate-spin")}
                   onClick={handleForceRefresh}
                   disabled={
                     forceRefresh.isPending ||
@@ -1539,38 +1468,38 @@ function CredentialCardImpl({
                         ? "已禁用"
                         : "强制刷新 Token"
                   }
+                  aria-label="强制刷新 Token"
                 >
-                  <RefreshCw
-                    className={`h-4 w-4 ${forceRefresh.isPending ? "animate-spin" : ""}`}
-                  />
+                  <RefreshCw />
                 </Button>
                 <Button
                   size="icon"
                   variant="ghost"
-                  className="h-8 w-8 shrink-0 hover:bg-accent"
+                  className={cn("size-8 shrink-0", loadingBalance && "[&_svg]:animate-spin")}
                   onClick={handleRefreshBalanceClick}
                   disabled={loadingBalance || credential.disabled}
                   title={credential.disabled ? "已禁用" : "刷新余额"}
+                  aria-label="刷新余额"
                 >
-                  {loadingBalance ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Wallet className="h-4 w-4" />
-                  )}
+                  {loadingBalance ? <Loader2 /> : <Wallet />}
                 </Button>
+                <span className="min-w-0 flex-1" />
+                {dispositionButton}
                 <Button
                   size="icon"
-                  variant="ghost"
-                  className="h-8 w-8 shrink-0 hover:bg-accent"
+                  variant="outline"
+                  className="size-8 shrink-0 rounded-full"
                   onClick={() => setShowEditDialog(true)}
-                  title="编辑"
+                  disabled={privacyMode}
+                  title={privacyMode ? privacyActionHint : "编辑"}
+                  aria-label="编辑凭据"
                 >
-                  <Pencil className="h-4 w-4" />
+                  <Pencil />
                 </Button>
                 {moreMenu}
-              </div>
+              </>
             )}
-          </CardContent>
+          </CardFooter>
         </Card>
       )}
 
@@ -1604,7 +1533,7 @@ function CredentialCardImpl({
         </Dialog>
       )}
 
-      {showEditDialog && (
+      {showEditDialog && !privacyMode && (
         <EditCredentialDialog
           open={showEditDialog}
           onOpenChange={setShowEditDialog}
@@ -1612,21 +1541,21 @@ function CredentialCardImpl({
           metadataSchema={metadataSchema}
         />
       )}
-      {showUpdateTokenDialog && (
+      {showUpdateTokenDialog && !privacyMode && (
         <UpdateTokenDialog
           open={showUpdateTokenDialog}
           onOpenChange={setShowUpdateTokenDialog}
           credential={credential}
         />
       )}
-      {showReloginDialog && (
+      {showReloginDialog && !privacyMode && (
         <ReloginDialog
           open={showReloginDialog}
           onOpenChange={setShowReloginDialog}
           credential={credential}
         />
       )}
-      {showFailuresDialog && (
+      {showFailuresDialog && !privacyMode && (
         <CredentialFailuresDialog
           open={showFailuresDialog}
           onOpenChange={setShowFailuresDialog}

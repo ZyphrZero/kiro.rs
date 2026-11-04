@@ -8,6 +8,7 @@ import {
 const API_KEY_STORAGE_KEY = 'adminApiKey'
 const CREDENTIAL_VIEW_KEY = 'credentialView'
 const CREDENTIAL_PAGE_SIZE_KEY = 'credentialPageSize'
+const CREDENTIAL_PRIVACY_MODE_KEY = 'credentialPrivacyMode'
 
 export type CredentialView = 'card' | 'list'
 
@@ -44,6 +45,11 @@ export const storage = {
     localStorage.getItem(CREDENTIAL_VIEW_KEY) === 'list' ? 'list' : 'card',
   setCredentialView: (view: CredentialView) =>
     localStorage.setItem(CREDENTIAL_VIEW_KEY, view),
+
+  getCredentialPrivacyMode: (): boolean =>
+    localStorage.getItem(CREDENTIAL_PRIVACY_MODE_KEY) === 'true',
+  setCredentialPrivacyMode: (enabled: boolean) =>
+    localStorage.setItem(CREDENTIAL_PRIVACY_MODE_KEY, String(enabled)),
 
   // 凭据列表每页数量（0 = 全部），默认 12
   getCredentialPageSize: (): number => {

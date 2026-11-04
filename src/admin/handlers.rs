@@ -1590,6 +1590,10 @@ pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoRespons
     Json(response)
 }
 
+pub async fn stats_credential_activity(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.usage_aggregator.query_credential_activity())
+}
+
 /// GET /api/admin/stats/timeseries?range=24h|7d|30d&granularity=hour|day&group=...
 pub async fn stats_timeseries(
     State(state): State<AdminState>,

@@ -202,6 +202,17 @@ export function normalizeImportAuthMethod(
   return { authMethod: 'social' }
 }
 
+export function maskEmail(email?: string | null): string {
+  if (!email) return ''
+  const separator = email.lastIndexOf('@')
+  if (separator <= 0 || separator === email.length - 1) return '••••••'
+  const account = Array.from(email.slice(0, separator))
+  const domain = Array.from(email.slice(separator + 1))
+  const accountPrefix = account.length > 2 ? account.slice(0, 2).join('') : ''
+  const domainPrefix = domain.length > 1 ? domain[0] : ''
+  return `${accountPrefix}••••@${domainPrefix}••••`
+}
+
 export function maskProxyUrl(url: string): string {
   const match = url.match(/^(\w+:\/\/)([^:@]+):([^@]+)@(.+)$/)
   if (!match) return url

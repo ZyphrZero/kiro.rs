@@ -1,6 +1,7 @@
 import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
+  CredentialActivityResponse,
   CredentialDistribution,
   KeyDistribution,
   ModelDistribution,
@@ -24,6 +25,18 @@ api.interceptors.request.use((config) => {
 
 export async function getOverview(): Promise<OverviewStats> {
   const { data } = await api.get<OverviewStats>('/stats/overview')
+  return data
+}
+
+export async function getCredentialActivity(): Promise<CredentialActivityResponse> {
+  const { data } = await api.get<CredentialActivityResponse>('/stats/credential-activity')
+  if (!data || typeof data !== 'object' || Array.isArray(data) || Object.values(data).some((activity) =>
+    !activity || typeof activity !== 'object' ||
+    !Number.isSafeInteger(activity.todayCalls) || activity.todayCalls < 0 ||
+    !Number.isSafeInteger(activity.rpm) || activity.rpm < 0
+  )) {
+    throw new Error('请求统计响应格式无效')
+  }
   return data
 }
 

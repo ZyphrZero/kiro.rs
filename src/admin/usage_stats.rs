@@ -6,7 +6,7 @@
 //!
 //! 启动时扫描历史 JSONL 文件重建聚合，保证重启后趋势图不丢数据。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +22,7 @@ const RETENTION_DAYS: i64 = 31;
 const HOUR_BUCKETS: usize = 24 * 31;
 /// 天桶数量（31 天）
 const DAY_BUCKETS: usize = 31;
+const RPM_WINDOW_SECS: i64 = 60;
 
 /// 单次请求的用量记录（与 JSONL 一行一一对应）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,6 +231,7 @@ struct AggregatorInner {
     hour_buckets: Vec<BucketEntry>,
     /// 天桶（按本地日期），最近 31 天
     day_buckets: Vec<BucketEntry>,
+    recent_credential_calls: BTreeMap<i64, HashMap<u64, u64>>,
 }
 
 /// 预设聚合查询时间范围
@@ -326,6 +328,13 @@ pub struct CredentialDistribution {
     pub errors: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialActivity {
+    pub today_calls: u64,
+    pub rpm: u64,
+}
+
 /// 入口 Key 分布
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -363,6 +372,7 @@ impl UsageAggregator {
             inner: parking_lot::RwLock::new(AggregatorInner {
                 hour_buckets: Vec::new(),
                 day_buckets: Vec::new(),
+                recent_credential_calls: BTreeMap::new(),
             }),
         }
     }
@@ -420,9 +430,13 @@ impl UsageAggregator {
 
     /// 接收一条记录并落入对应桶
     pub fn ingest(&self, rec: &UsageRecord) {
+        self.ingest_at(rec, Utc::now());
+    }
+
+    fn ingest_at(&self, rec: &UsageRecord, now: DateTime<Utc>) {
         let dt: DateTime<Utc> = match DateTime::parse_from_rfc3339(&rec.ts) {
             Ok(d) => d.with_timezone(&Utc),
-            Err(_) => Utc::now(),
+            Err(_) => now,
         };
         let local = dt.with_timezone(&Local);
 
@@ -442,6 +456,51 @@ impl UsageAggregator {
 
         upsert_bucket(&mut inner.hour_buckets, hour_ts, rec, HOUR_BUCKETS);
         upsert_bucket(&mut inner.day_buckets, day_ts, rec, DAY_BUCKETS);
+
+        let now_ts = now.timestamp();
+        let cutoff = now_ts - RPM_WINDOW_SECS;
+        inner
+            .recent_credential_calls
+            .retain(|timestamp, _| *timestamp > cutoff && *timestamp <= now_ts);
+        let request_ts = dt.timestamp();
+        if rec.credential_id != 0 && request_ts > cutoff && request_ts <= now_ts {
+            *inner
+                .recent_credential_calls
+                .entry(request_ts)
+                .or_default()
+                .entry(rec.credential_id)
+                .or_default() += 1;
+        }
+    }
+
+    pub fn query_credential_activity(&self) -> HashMap<u64, CredentialActivity> {
+        self.query_credential_activity_at(Utc::now())
+    }
+
+    fn query_credential_activity_at(&self, now: DateTime<Utc>) -> HashMap<u64, CredentialActivity> {
+        let inner = self.inner.read();
+        let today = now.with_timezone(&Local).date_naive();
+        let mut activity: HashMap<u64, CredentialActivity> = HashMap::new();
+        for bucket in &inner.day_buckets {
+            let is_today = DateTime::from_timestamp(bucket.ts, 0)
+                .is_some_and(|start| start.with_timezone(&Local).date_naive() == today);
+            if is_today {
+                for (credential_id, stats) in &bucket.by_credential {
+                    activity.entry(*credential_id).or_default().today_calls += stats.calls;
+                }
+            }
+        }
+        let now_ts = now.timestamp();
+        for counts in inner
+            .recent_credential_calls
+            .range((now_ts - RPM_WINDOW_SECS + 1)..=now_ts)
+            .map(|(_, counts)| counts)
+        {
+            for (credential_id, calls) in counts {
+                activity.entry(*credential_id).or_default().rpm += calls;
+            }
+        }
+        activity
     }
 
     /// 时序数据查询
@@ -773,6 +832,184 @@ pub type SharedAggregator = Arc<UsageAggregator>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn activity_test_time() -> DateTime<Utc> {
+        Local
+            .with_ymd_and_hms(2026, 11, 4, 12, 0, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn activity_record(credential_id: u64, timestamp: DateTime<Utc>, status: &str) -> UsageRecord {
+        UsageRecord {
+            ts: timestamp.to_rfc3339(),
+            key_id: 1,
+            credential_id,
+            model: "activity-test".to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 0.0,
+            duration_ms: 100,
+            status: status.to_string(),
+        }
+    }
+
+    #[test]
+    fn credential_activity_counts_completed_requests_by_credential() {
+        let aggregator = UsageAggregator::new();
+        let now = activity_test_time();
+        for (credential_id, age, status) in [
+            (7, 0, "success"),
+            (7, 0, "error"),
+            (7, 59, "success"),
+            (7, 60, "error"),
+            (7, 3600, "success"),
+            (8, 5, "success"),
+            (9, 2 * 86400, "success"),
+            (0, 0, "error"),
+        ] {
+            aggregator.ingest_at(
+                &activity_record(credential_id, now - Duration::seconds(age), status),
+                now,
+            );
+        }
+
+        let activity = aggregator.query_credential_activity_at(now);
+        assert_eq!(activity.len(), 2);
+        assert_eq!(
+            activity[&7],
+            CredentialActivity {
+                today_calls: 5,
+                rpm: 3
+            }
+        );
+        assert_eq!(
+            activity[&8],
+            CredentialActivity {
+                today_calls: 1,
+                rpm: 1
+            }
+        );
+        let json = serde_json::to_value(activity).unwrap();
+        assert_eq!(json["7"]["todayCalls"], 5);
+        assert_eq!(json["7"]["rpm"], 3);
+    }
+
+    #[test]
+    fn credential_activity_rpm_expires_without_new_requests() {
+        let aggregator = UsageAggregator::new();
+        let now = activity_test_time();
+        aggregator.ingest_at(&activity_record(7, now, "success"), now);
+
+        assert_eq!(
+            aggregator.query_credential_activity_at(now + Duration::seconds(59))[&7].rpm,
+            1
+        );
+        assert_eq!(
+            aggregator.query_credential_activity_at(now + Duration::seconds(60))[&7],
+            CredentialActivity {
+                today_calls: 1,
+                rpm: 0
+            }
+        );
+    }
+
+    #[test]
+    fn credential_activity_resets_today_at_local_midnight() {
+        let aggregator = UsageAggregator::new();
+        let now = Local
+            .with_ymd_and_hms(2026, 11, 5, 0, 0, 30)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        aggregator.ingest_at(
+            &activity_record(7, now - Duration::seconds(45), "success"),
+            now,
+        );
+        aggregator.ingest_at(
+            &activity_record(7, now - Duration::seconds(15), "error"),
+            now,
+        );
+
+        assert_eq!(
+            aggregator.query_credential_activity_at(now)[&7],
+            CredentialActivity {
+                today_calls: 1,
+                rpm: 2
+            }
+        );
+        assert!(
+            aggregator
+                .query_credential_activity_at(now + Duration::days(1))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn credential_activity_accepts_out_of_order_records() {
+        let aggregator = UsageAggregator::new();
+        let now = activity_test_time();
+        for age in [1, 59, 120, 2] {
+            aggregator.ingest_at(
+                &activity_record(7, now - Duration::seconds(age), "success"),
+                now,
+            );
+        }
+        assert_eq!(
+            aggregator.query_credential_activity_at(now)[&7],
+            CredentialActivity {
+                today_calls: 4,
+                rpm: 3
+            }
+        );
+    }
+
+    #[test]
+    fn credential_activity_bounds_recent_buckets_and_ignores_future_rpm() {
+        let aggregator = UsageAggregator::new();
+        let start = activity_test_time();
+        for elapsed in 0..=120 {
+            let now = start + Duration::seconds(elapsed);
+            aggregator.ingest_at(&activity_record(7, now, "success"), now);
+        }
+        let now = start + Duration::seconds(120);
+        aggregator.ingest_at(&activity_record(7, start, "success"), now);
+        aggregator.ingest_at(
+            &activity_record(7, now + Duration::seconds(1), "success"),
+            now,
+        );
+
+        assert_eq!(aggregator.inner.read().recent_credential_calls.len(), 60);
+        assert_eq!(aggregator.query_credential_activity_at(now)[&7].rpm, 60);
+    }
+
+    #[test]
+    fn credential_activity_rebuilds_from_usage_logs() {
+        let directory =
+            std::env::temp_dir().join(format!("kiro-activity-{}", uuid::Uuid::new_v4()));
+        let recorder = UsageRecorder::with_retention(directory.clone(), RETENTION_DAYS);
+        let now = Utc::now();
+        recorder.record(&activity_record(7, now, "success"));
+        recorder.record(&activity_record(7, now, "error"));
+        drop(recorder);
+
+        let aggregator = UsageAggregator::new();
+        aggregator.rebuild_from_logs(&directory);
+        assert_eq!(
+            aggregator.query_credential_activity_at(now)[&7],
+            CredentialActivity {
+                today_calls: 2,
+                rpm: 2
+            }
+        );
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        std::fs::remove_dir(directory).unwrap();
+    }
 
     #[test]
     fn parse_log_filename() {

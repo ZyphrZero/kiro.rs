@@ -115,6 +115,7 @@ import {
 } from "@/hooks/use-credentials";
 import { useUpdateCheck } from "@/hooks/use-update-check";
 import { useFailureStats } from "@/hooks/use-traces";
+import { useCredentialActivity } from "@/hooks/use-stats";
 import { useGroupOptions } from "@/hooks/use-groups";
 import { useRectSelect } from "@/hooks/use-rect-select";
 import {
@@ -157,6 +158,7 @@ import {
 } from "@/lib/utils";
 import type {
   BalanceResponse,
+  CredentialActivity,
   CredentialQueryParams,
   CredentialStatusItem,
 } from "@/types/api";
@@ -167,6 +169,8 @@ import {
   matchesStateFilter,
   type StateFilter,
 } from "@/components/console/credential-state";
+
+const EMPTY_CREDENTIAL_ACTIVITY: CredentialActivity = { todayCalls: 0, rpm: 0 };
 
 interface DashboardProps {
   onLogout: () => void;
@@ -340,6 +344,18 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [pageSize, setPageSize] = useState<number>(() =>
     storage.getCredentialPageSize(),
   );
+  const [privacyMode, setPrivacyMode] = useState(() =>
+    storage.getCredentialPrivacyMode(),
+  );
+  const togglePrivacyMode = () => {
+    const enabled = !privacyMode;
+    setPrivacyMode(enabled);
+    try {
+      storage.setCredentialPrivacyMode(enabled);
+    } catch {
+      toast.error("隐私防护已在当前页面切换，但浏览器无法保存偏好，刷新后需要重新设置");
+    }
+  };
   const changeViewMode = (v: CredentialView) => {
     setViewMode(v);
     storage.setCredentialView(v);
@@ -481,6 +497,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const setPriority = useSetPriority();
   const { data: updateCheck } = useUpdateCheck();
   const { data: failureStatsMap } = useFailureStats();
+  const {
+    data: credentialActivity,
+    isPending: loadingActivity,
+    isError: activityFailed,
+    error: activityError,
+    isFetching: refreshingActivity,
+    refetch: refreshActivity,
+  } = useCredentialActivity();
   const groupOptions = useGroupOptions();
   const allCredentials = import.meta.env.DEV
     ? [DEV_PREVIEW_CREDENTIAL, ...(data?.credentials ?? [])]
@@ -834,6 +858,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
 
   const handleRefresh = () => {
     refetch();
+    refreshActivity();
     toast.success("已刷新凭据列表");
   };
 
@@ -1658,7 +1683,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     : "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300"
                 }`}
                 title={
-                  profileSummary.length === 1
+                  privacyMode
+                    ? "隐私防护已隐藏 Profile ARN"
+                    : profileSummary.length === 1
                     ? `全部账号同属 profile ${profileShortId(profileSummary[0][0])}\n上游 prompt cache 按 profile 隔离：这些账号互相共享缓存，会话在它们之间换号不会丢缓存`
                     : `账号分布在 ${profileSummary.length} 个 profile：\n${profileSummary
                         .map(([arn, n]) => `  ${profileShortId(arn)} × ${n}`)
@@ -1683,7 +1710,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 说的是同一件事，总数已由状态标签条的「全部 N」给出，两者都删掉。 */}
             {groupFilter && (
               <Badge variant="outline" className="gap-1">
-                筛选：{groupFilter === "__none__" ? "未分组" : groupFilter}
+                筛选：{groupFilter === "__none__" ? "未分组" : privacyMode ? "分组已隐藏" : groupFilter}
                 <button
                   type="button"
                   className="ml-1 text-muted-foreground hover:text-foreground"
@@ -1741,7 +1768,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground opacity-80" />
                 <input
                   ref={searchInputRef}
-                  type="text"
+                  type={privacyMode ? "password" : "text"}
+                  autoComplete="off"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder="搜索来源渠道 / 备注 / 邮箱"
@@ -1770,14 +1798,16 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   className="h-8 w-full rounded-md border-border bg-card px-2.5 text-xs sm:w-[130px]"
                   title="按分组筛选凭据"
                 >
-                  <SelectValue placeholder="全部分组" />
+                  {privacyMode && groupFilter && groupFilter !== "__none__"
+                    ? <span>分组已隐藏</span>
+                    : <SelectValue placeholder="全部分组" />}
                 </SelectTrigger>
                 <SelectContent align="end">
                   <SelectItem value="all">全部分组</SelectItem>
                   <SelectItem value="__none__">未分组</SelectItem>
-                  {groupOptions.map((g) => (
+                  {groupOptions.map((g, index) => (
                     <SelectItem key={g} value={g}>
-                      {g}
+                      {privacyMode ? `分组 ${index + 1}` : g}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -1888,6 +1918,20 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   })}
                 </DropdownMenuContent>
               </DropdownMenu>
+
+              <Button
+                type="button"
+                size="sm"
+                variant={privacyMode ? "secondary" : "outline"}
+                className="h-8 gap-1.5"
+                aria-label="隐私防护"
+                aria-pressed={privacyMode}
+                onClick={togglePrivacyMode}
+                title="隐藏凭据卡片、列表和提示中的邮箱、密钥、代理、Profile ARN、来源及备注；仅影响页面展示，不修改原始数据"
+              >
+                {privacyMode ? <EyeOff data-icon="inline-start" /> : <Eye data-icon="inline-start" />}
+                隐私：{privacyMode ? "开" : "关"}
+              </Button>
 
               {/* 卡片 / 列表 视图切换 */}
               <div className="col-span-2 inline-flex h-8 shrink-0 items-center justify-self-start rounded-md border border-border bg-secondary/50 p-0.5 sm:col-span-1">
@@ -2406,6 +2450,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 )}
               </div>
             )}
+            {activityFailed && (
+              <div role="status" className="mb-3 flex flex-wrap items-center gap-2 text-xs text-destructive">
+                <span>请求统计获取失败：{extractErrorMessage(activityError)}。今日请求数和 RPM 暂不可用，每 5 秒自动重试。</span>
+                <Button size="sm" variant="outline" onClick={() => refreshActivity()} disabled={refreshingActivity}>
+                  重试统计
+                </Button>
+              </div>
+            )}
             <DndContext
               sensors={dragSensors}
               collisionDetection={closestCenter}
@@ -2423,7 +2475,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   className={
                     viewMode === "list"
                       ? "flex select-none flex-col gap-2 [transform:translateZ(0)]"
-                      : "grid select-none gap-3 sm:gap-4 md:grid-cols-2 lg:grid-cols-3 [transform:translateZ(0)]"
+                      : "grid select-none grid-cols-[repeat(auto-fill,minmax(min(100%,320px),1fr))] items-stretch gap-4 [transform:translateZ(0)]"
                   }
                 >
                   {currentCredentials.map((credential) => (
@@ -2431,6 +2483,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       key={credential.id}
                       credential={credential}
                       view={viewMode}
+                      privacyMode={privacyMode}
                       selected={selectedIds.has(credential.id)}
                       onToggleSelect={toggleSelect}
                       balance={
@@ -2441,6 +2494,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       loadingBalance={loadingBalanceIds.has(credential.id)}
                       onRefreshBalance={handleRefreshBalance}
                       failureStats={failureStatsMap?.[String(credential.id)]}
+                      activity={credentialActivity
+                        ? credentialActivity[String(credential.id)] ?? EMPTY_CREDENTIAL_ACTIVITY
+                        : undefined}
+                      loadingActivity={loadingActivity}
+                      activityError={activityFailed}
                       dragDisabled={dragDisabled || credential.id === DEV_PREVIEW_CREDENTIAL.id}
                       preview={credential.id === DEV_PREVIEW_CREDENTIAL.id}
                       metadataSchema={data?.metadataSchema}

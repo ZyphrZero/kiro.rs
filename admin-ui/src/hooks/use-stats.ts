@@ -1,5 +1,5 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { getByCredential, getByKey, getByModel, getOverview, getTimeSeries } from '@/api/stats'
+import { getByCredential, getByKey, getByModel, getCredentialActivity, getOverview, getTimeSeries } from '@/api/stats'
 import type { StatsFilter, StatsTimeFilter } from '@/types/api'
 
 /**
@@ -21,6 +21,17 @@ export function useOverview() {
     queryKey: ['stats', 'overview'],
     queryFn: getOverview,
     ...COMMON,
+  })
+}
+
+export function useCredentialActivity() {
+  return useQuery({
+    queryKey: ['stats', 'credential-activity'],
+    queryFn: getCredentialActivity,
+    staleTime: 5_000,
+    refetchInterval: 5_000,
+    refetchIntervalInBackground: false,
+    retry: false,
   })
 }
 
