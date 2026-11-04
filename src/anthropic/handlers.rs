@@ -108,7 +108,7 @@ impl UsageRecordHook {
         if let Some(a) = &self.aggregator {
             a.ingest(&rec);
         }
-        if status == "success" && self.key_id != 0 {
+        if status == "success" {
             if let Some(m) = &self.client_keys {
                 m.record_usage(
                     self.key_id,

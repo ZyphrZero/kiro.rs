@@ -68,6 +68,7 @@ enum Mode {
     RefusedBare,
     /// 上游按给定片段依次返回 assistantResponseEvent，随后 metadataEvent（用量 13/17）。
     Reply(&'static [&'static str]),
+    ReplyWithCredits(&'static [&'static str]),
     /// 同 `Reply`，但先返回一段原生 reasoning。
     ReplyWithReasoning(&'static [&'static str]),
     /// 正文以字面 `<thinking>` 开头（L7：extractThinking=false 时流式不能拆出思考块）。
@@ -107,6 +108,109 @@ async fn integration_repeat_guard_records_error() {
     }
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].final_status, "error");
+}
+
+async fn assert_ungrouped_key_usage(is_system: bool) {
+    use crate::admin::client_keys::ClientKeyManager;
+
+    let fixture = fixture(Mode::ReplyWithCredits(&["hello"])).await;
+    let path = std::env::temp_dir().join(format!("client-key-usage-{}.json", uuid::Uuid::new_v4()));
+    let manager = Arc::new(ClientKeyManager::load(&path).unwrap());
+    let plaintext = if is_system {
+        manager.sync_system_key("system".into(), None, "fixture-system-key".into());
+        "fixture-system-key"
+    } else {
+        manager.create_with_key("client".into(), None, None, "fixture-client-key".into());
+        "fixture-client-key"
+    };
+    let key_id = manager.list()[0].id;
+    assert_eq!(key_id == 0, is_system);
+    assert_eq!(manager.group_of(key_id), None);
+
+    let app = super::router::create_router_with_shared_provider(
+        fixture.state.kiro_provider.clone(),
+        false,
+        ToolCompatibilityMode::Raw,
+        Some(manager.clone()),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let mut calls = 0;
+    for endpoint in [
+        "/v1/messages",
+        "/cc/v1/messages",
+        "/v1/chat/completions",
+        "/v1/responses",
+    ] {
+        for streaming in [false, true] {
+            let payload = json!({
+                "model": "gpt-5.6-sol",
+                "max_tokens": 64,
+                "stream": streaming,
+                "messages": [{"role": "user", "content": "hello"}],
+                "input": [{"role": "user", "content": "hello"}]
+            });
+            let response = client
+                .post(format!("http://{address}{endpoint}"))
+                .header("x-api-key", plaintext)
+                .json(&payload)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{endpoint}, stream={streaming}"
+            );
+            let body = response.text().await.unwrap();
+            assert!(
+                body.contains("hello"),
+                "{endpoint}, stream={streaming}: {body}"
+            );
+            calls += 1;
+            let reloaded = ClientKeyManager::load(&path).unwrap();
+            for snapshot in [manager.list(), reloaded.list()] {
+                let entry = snapshot.iter().find(|entry| entry.id == key_id).unwrap();
+                assert_eq!(entry.group, None);
+                assert_eq!(entry.total_calls, calls);
+                assert_eq!(
+                    (
+                        entry.total_input_tokens,
+                        entry.total_output_tokens,
+                        entry.total_credits,
+                    ),
+                    (13 * calls, 17 * calls, 0.25 * calls as f64),
+                    "key={key_id}, {endpoint}, stream={streaming}"
+                );
+                assert_eq!(entry.total_cache_read_tokens, 3 * calls);
+                assert_eq!(entry.total_cache_creation_tokens, 2 * calls);
+            }
+        }
+    }
+    assert_eq!(fixture.calls.load(Ordering::Relaxed), calls as usize);
+    server.abort();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn gateway_ungrouped_system_key_records_and_persists_usage() {
+    assert_ungrouped_key_usage(true).await;
+}
+
+#[tokio::test]
+async fn gateway_ungrouped_client_key_records_and_persists_usage() {
+    assert_ungrouped_key_usage(false).await;
 }
 
 #[tokio::test]
@@ -287,13 +391,16 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 return Response::builder().status(500).body(Body::from_stream(stream::pending::<Result<Bytes, Infallible>>())).unwrap();
             }
             if matches!(mode, Mode::Empty) { return Response::new(Body::empty()); }
-            if let Mode::Reply(pieces) | Mode::ReplyWithReasoning(pieces) = mode {
+            if let Mode::Reply(pieces) | Mode::ReplyWithReasoning(pieces) | Mode::ReplyWithCredits(pieces) = mode {
                 let mut bytes = Vec::new();
                 if matches!(mode, Mode::ReplyWithReasoning(_)) {
                     bytes.extend_from_slice(&frame("reasoningContentEvent", json!({"text":"Let me think about the goal."})));
                 }
                 for piece in pieces { bytes.extend_from_slice(&frame("assistantResponseEvent", json!({"content": piece}))); }
                 bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})));
+                if matches!(mode, Mode::ReplyWithCredits(_)) {
+                    bytes.extend_from_slice(&frame("meteringEvent", json!({"unit":"credit","unitPlural":"credits","usage":0.25})));
+                }
                 return Response::new(Body::from(bytes));
             }
             if matches!(mode, Mode::Filtered) {
