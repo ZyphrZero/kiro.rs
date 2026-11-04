@@ -2016,8 +2016,7 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_add_error(e))?;
 
-        // 主动获取余额（含订阅等级 / 邮箱）并写入缓存，添加后立即可见，
-        // 同时避免首次请求时 Free 账号绕过 Opus 模型过滤。
+        // 主动获取余额（含订阅等级 / 邮箱）并写入缓存，添加后立即可见。
         // 仅验活路径需要；"直接导入"路径跳过以省掉这次上游往返。
         if fetch_balance {
             if let Err(e) = self.get_balance(credential_id).await {

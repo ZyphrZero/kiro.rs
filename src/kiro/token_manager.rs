@@ -687,7 +687,7 @@ pub(crate) async fn get_usage_limits(
 /// 获取该凭据当前可用的模型列表
 ///
 /// 上游接口：`GET https://q.{api_region}.amazonaws.com/ListAvailableModels?origin=AI_EDITOR`
-/// 返回值随订阅等级不同而不同（如 FREE 账号不含 Opus）。
+/// 以该凭据的上游返回值为准，不根据订阅名称推断模型权限。
 /// 请求头与构造方式与 [`get_usage_limits`] 完全一致。
 pub(crate) async fn get_available_models(
     credentials: &KiroCredentials,
@@ -1450,22 +1450,6 @@ pub fn priority_key(priority: u32, invert: bool) -> u32 {
     }
 }
 
-fn credential_matches_request(
-    credentials: &KiroCredentials,
-    model: Option<&str>,
-    group: Option<&str>,
-) -> bool {
-    let is_opus = model
-        .map(|m| m.to_ascii_lowercase().contains("opus"))
-        .unwrap_or(false);
-
-    if is_opus && !credentials.supports_opus() {
-        return false;
-    }
-
-    group_matches(&credentials.groups, group)
-}
-
 fn normalize_self_heal_model(model: Option<&str>) -> Option<String> {
     model
         .map(str::trim)
@@ -2056,7 +2040,7 @@ impl MultiTokenManager {
                 .map(|until| until > now)
                 .unwrap_or(false)
             && !self.rpm_exceeded(entry, now)
-            && credential_matches_request(&entry.credentials, model, group)
+            && group_matches(&entry.credentials.groups, group)
             && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
     }
 
@@ -2106,7 +2090,7 @@ impl MultiTokenManager {
                     .throttled_until
                     .map(|until| until > now)
                     .unwrap_or(false)
-                && credential_matches_request(&entry.credentials, model, group)
+                && group_matches(&entry.credentials.groups, group)
                 && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
         }) {
             let fresh_count = entry
@@ -2199,7 +2183,7 @@ impl MultiTokenManager {
         let has_candidate = |entries: &[CredentialEntry]| {
             entries.iter().any(|entry| {
                 !entry.disabled
-                    && credential_matches_request(&entry.credentials, model, group)
+                    && group_matches(&entry.credentials.groups, group)
                     && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
             })
         };
@@ -2246,7 +2230,7 @@ impl MultiTokenManager {
     /// 粘性未命中 / 无会话时的选号。
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// - `model`: 可选的模型名称，根据上游模型列表缓存过滤明确不支持该模型的凭据
     #[cfg(test)]
     pub fn select_next_credential(
         &self,
@@ -2358,7 +2342,7 @@ impl MultiTokenManager {
     /// Token 刷新失败会累计到当前凭据，达到阈值后禁用并切换
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// - `model`: 可选的模型名称，根据上游模型列表缓存过滤明确不支持该模型的凭据
     pub async fn acquire_context(
         &self,
         model: Option<&str>,
@@ -2505,7 +2489,7 @@ impl MultiTokenManager {
                     let now = Instant::now();
                     if let Some(retry_after) = entries.iter()
                         .filter(|entry| !entry.disabled
-                            && credential_matches_request(&entry.credentials, model, group)
+                            && group_matches(&entry.credentials.groups, group)
                             && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported)
                         .filter_map(|entry| entry.throttled_until.and_then(|until| until.checked_duration_since(now)))
                         .map(|duration| duration.as_secs().saturating_add(u64::from(duration.subsec_nanos() > 0)))
@@ -3320,7 +3304,7 @@ impl MultiTokenManager {
             for entry in entries.iter_mut() {
                 if !entry.disabled
                     || entry.disabled_reason != Some(DisabledReason::TooManyFailures)
-                    || !credential_matches_request(&entry.credentials, model, group)
+                    || !group_matches(&entry.credentials.groups, group)
                     || self.cached_model_support(entry.id, model) == CachedModelSupport::Unsupported
                 {
                     continue;
@@ -3812,7 +3796,8 @@ impl MultiTokenManager {
                             .throttled_until
                             .map(|t| t > throttled_now)
                             .unwrap_or(false)
-                        && credential_matches_request(&e.credentials, model, group)
+                        && group_matches(&e.credentials.groups, group)
+                        && self.cached_model_support(e.id, model) != CachedModelSupport::Unsupported
                 })
                 .count()
         }
@@ -8437,6 +8422,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_model_routing_free_subscription_uses_model_cache() {
+        for mode in ["priority", "balanced"] {
+            for supported in [Some(true), None, Some(false)] {
+                let mut credential = grouped_cred("free", &["team"]);
+                credential.subscription_title = Some("KIRO FREE".to_string());
+                let mut config = Config::default();
+                config.load_balancing_mode = mode.to_string();
+                let manager =
+                    MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+                if let Some(supported) = supported {
+                    let model = if supported {
+                        "claude-opus-5.5"
+                    } else {
+                        "claude-sonnet-5.5"
+                    };
+                    seed_model_cache(&manager, 1, &[model]);
+                }
+
+                let model = Some("claude-opus-5.5");
+                let expected_available = supported != Some(false);
+                assert_eq!(
+                    manager.has_available_credentials(model, Some("team")),
+                    expected_available,
+                    "mode={mode}, supported={supported:?}"
+                );
+                let context = manager.acquire_context(model, Some("team")).await;
+                if expected_available {
+                    let context = context.unwrap();
+                    assert_eq!(context.id, 1);
+                    assert_eq!(
+                        context.credentials.subscription_title.as_deref(),
+                        Some("KIRO FREE")
+                    );
+                } else {
+                    assert!(context.err().unwrap().is::<NoAvailableCredentialsError>());
+                }
+                assert!(!manager.has_available_credentials(model, Some("other")));
+                manager.set_disabled(1, true).unwrap();
+                assert!(!manager.has_available_credentials(model, Some("team")));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_model_routing_free_subscription_preserves_rpm_limit() {
+        let mut credential = grouped_cred("free", &[]);
+        credential.subscription_title = Some("KIRO FREE".to_string());
+        let mut config = Config::default();
+        config.account_rpm_limit_enabled = true;
+        config.account_rpm_limit = 1;
+        let manager = MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+        seed_model_cache(&manager, 1, &["claude-opus-5.5"]);
+
+        let model = Some("claude-opus-5.5");
+        assert_eq!(manager.acquire_context(model, None).await.unwrap().id, 1);
+        assert!(manager.has_available_credentials(model, None));
+        let error = manager.acquire_context(model, None).await.err().unwrap();
+        assert!(
+            error
+                .downcast_ref::<UpstreamRateLimitError>()
+                .unwrap()
+                .is_local()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_model_routing_free_subscription_preserves_cooldown() {
+        let credentials = ["first", "unsupported", "last"]
+            .into_iter()
+            .map(|token| {
+                let mut credential = grouped_cred(token, &[]);
+                credential.subscription_title = Some("KIRO FREE".to_string());
+                credential
+            })
+            .collect();
+        let manager =
+            MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap();
+        seed_model_cache(&manager, 1, &["claude-opus-5.5"]);
+        seed_model_cache(&manager, 2, &["claude-sonnet-5.5"]);
+        seed_model_cache(&manager, 3, &["claude-opus-5.5"]);
+
+        let model = Some("claude-opus-5.5");
+        let cooldown = StdDuration::from_secs(60);
+        assert_eq!(manager.acquire_context(model, None).await.unwrap().id, 1);
+        assert_eq!(
+            manager.report_account_throttled_for_request(1, cooldown, model, None),
+            1
+        );
+        assert_eq!(manager.acquire_context(model, None).await.unwrap().id, 3);
+        assert_eq!(
+            manager.report_account_throttled_for_request(3, cooldown, model, None),
+            0
+        );
+        assert!(manager.has_available_credentials(model, None));
+        let error = manager.acquire_context(model, None).await.err().unwrap();
+        let rate_limit = error.downcast_ref::<UpstreamRateLimitError>().unwrap();
+        assert!(!rate_limit.is_local());
+        assert!(rate_limit.retry_after().is_some());
+    }
+
+    #[tokio::test]
     async fn test_model_discovery_respects_group_and_reports_cold_start_failure() {
         let manager = MultiTokenManager::new(
             Config::default(),
@@ -8761,6 +8847,8 @@ mod tests {
             false,
         )
         .unwrap();
+        seed_model_cache(&manager, 1, &["claude-sonnet-4.6"]);
+        seed_model_cache(&manager, 2, &["claude-sonnet-4.6", "claude-opus-4.6"]);
 
         // Warm current_id with the highest-priority Free account.
         let current = manager.acquire_context(None, None).await.unwrap();
@@ -8772,7 +8860,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             opus.id, 2,
-            "priority current_id must not bypass Opus subscription filtering"
+            "priority current_id must not bypass upstream model filtering"
         );
     }
 
