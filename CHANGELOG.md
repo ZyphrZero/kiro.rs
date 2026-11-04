@@ -8,7 +8,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.9.5] - 2026-11-04
 
-主题：**凭据管理卡片优化、页面隐私防护、单账号请求活跃度统计、模型权限判定修正，以及前端构建工具迁移**。本版包含 `v0.9.4` 之后的 3 笔功能与构建直接提交，没有新增合并 PR；现有配置、凭据与用量日志无需手动迁移。请留意隐私开关的保护范围、RPM 的统计口径，以及源码构建命令的变化。
+主题：**凭据管理卡片优化、页面隐私防护、单账号请求活跃度统计、模型权限判定修正，以及前端构建工具迁移**。本版包含 `v0.9.4` 之后的 4 笔功能、修复与构建直接提交，没有新增合并 PR；现有配置、凭据与用量日志无需手动迁移。请留意隐私开关的保护范围、RPM 的统计口径，以及源码构建命令的变化。
 
 ### 🖥️ 凭据卡片与信息布局
 
@@ -27,12 +27,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### 📊 今日请求数与实时 RPM
 
-> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [请求活跃度统计 `2ab1d25`](https://github.com/ZyphrZero/kiro.rs/commit/2ab1d25)。
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [请求活跃度统计 `2ab1d25`](https://github.com/ZyphrZero/kiro.rs/commit/2ab1d25)、[并发 RPM 计数修复 `a7a3d89`](https://github.com/ZyphrZero/kiro.rs/commit/a7a3d89)。
 
 - 新增 `GET /api/admin/stats/credential-activity`，按凭据批量返回 `todayCalls` 与 `rpm`；管理端卡片和列表每 5 秒刷新一次，不为每张卡片单独发起统计请求。
 - 统计沿用用量日志的请求完成口径，包含成功与失败，归属最终记录的凭据，不把同一次请求的内部重试重复计数；没有归属凭据的记录不计入单账号统计。
 - 「今日」按服务端本地日期计算，RPM 为最近 60 秒完成的请求数，与单账号 RPM 限流开关无关；长请求在结束后计入，窗口内无新增请求时 RPM 也会随时间归零，重启后从保留的用量日志重建。
 - 加载中、开发预览或查询失败时显示「—」，失败会展示原因并提供手动重试与后续定时刷新，不将失败伪装成零请求；补充时间窗口、跨日、乱序记录与日志重建回归测试。
+- 修复并发请求乱序写入时，较早取得时间戳的请求误删已写入的较新 RPM 记录的问题；清理窗口兼顾已记录的最新时间，保留窗口内的新记录，同时继续拒绝本次写入中的未来时间戳，并补充回归测试。
 
 ### 🔧 模型权限以上游模型列表为准
 
@@ -54,7 +55,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 | 贡献者 | 直接提交 |
 | --- | --- |
-| [@ZyphrZero](https://github.com/ZyphrZero) | 凭据管理与统计 [`2ab1d25`](https://github.com/ZyphrZero/kiro.rs/commit/2ab1d25)、模型筛选 [`59b6d48`](https://github.com/ZyphrZero/kiro.rs/commit/59b6d48)、构建迁移 [`4481261`](https://github.com/ZyphrZero/kiro.rs/commit/4481261) |
+| [@ZyphrZero](https://github.com/ZyphrZero) | 凭据管理与统计 [`2ab1d25`](https://github.com/ZyphrZero/kiro.rs/commit/2ab1d25)、并发 RPM 修复 [`a7a3d89`](https://github.com/ZyphrZero/kiro.rs/commit/a7a3d89)、模型筛选 [`59b6d48`](https://github.com/ZyphrZero/kiro.rs/commit/59b6d48)、构建迁移 [`4481261`](https://github.com/ZyphrZero/kiro.rs/commit/4481261) |
 
 本版没有新增合并 PR，以上直接提交不计入 PR 数量。
 
@@ -69,6 +70,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - 隐私开关默认关闭且仅对当前浏览器生效，不能当作服务端数据脱敏或访问控制；截图、演示前仍应检查当前页面和弹窗是否包含敏感内容。
 - RPM 展示的是最近 60 秒已完成请求，不是请求进入速率或在途并发量；「今日」边界遵循服务端时区，可能与浏览器所在时区不同。
 - 从源码或自定义镜像构建时，请将原有 Bun 安装和构建命令改为 pnpm，并提交、使用新的锁文件；直接下载 Release 二进制或使用发布镜像的部署不受包管理器迁移影响。
+- 本次发布在纳入并发 RPM 修复后重新构建，`v0.9.5` 标签已更新。若在流水线重启前已获取该标签或拉取 `0.9.5` / `latest` 镜像，请以本次 Release 对应提交为准更新源码，或重新拉取镜像并重建容器；此前的镜像不含该修复，仅比较版本号无法识别这次更新。
 
 完整变更：[v0.9.4...v0.9.5](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.4...v0.9.5)。
 
