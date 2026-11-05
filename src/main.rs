@@ -8,6 +8,9 @@ mod kiro;
 mod model;
 pub mod token;
 
+#[cfg(test)]
+mod credential_startup_tests;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -40,6 +43,20 @@ async fn main() {
         .credentials
         .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
 
+    if args.deduplicate_credentials {
+        match kiro::credential_dedup::run(
+            std::path::Path::new(&credentials_path),
+            args.apply_credential_dedup,
+        ) {
+            Ok(report) => println!("{}", serde_json::to_string_pretty(&report).unwrap()),
+            Err(error) => {
+                eprintln!("凭据去重失败：{error:#}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     // 文件不存在时自动初始化（Docker 首次部署友好）
     ensure_config_files(&config_path, &credentials_path);
 
@@ -69,18 +86,15 @@ async fn main() {
 
     // 检查 KIRO_API_KEY 环境变量，自动创建 API Key 凭据
     if let Ok(kiro_api_key) = std::env::var("KIRO_API_KEY") {
-        if kiro_api_key.is_empty() {
-            tracing::warn!("KIRO_API_KEY 环境变量已设置但为空，视为未配置");
-        } else {
-            tracing::info!("检测到 KIRO_API_KEY 环境变量，添加 API Key 凭据（最高优先级）");
-            let api_key_cred = KiroCredentials {
-                kiro_api_key: Some(kiro_api_key),
-                auth_method: Some("api_key".to_string()),
-                priority: 0,
-                ..Default::default()
-            };
-            credentials_list.insert(0, api_key_cred);
-        }
+        merge_environment_api_key(&mut credentials_list, kiro_api_key);
+    }
+
+    let duplicate_groups = kiro::credential_dedup::duplicate_groups(&credentials_list);
+    if !duplicate_groups.is_empty() {
+        tracing::warn!(
+            groups = duplicate_groups.len(),
+            "发现历史重复凭据；停止服务后使用 --deduplicate-credentials 预览，确认后加 --apply-credential-dedup 清理"
+        );
     }
 
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
@@ -456,6 +470,25 @@ async fn main() {
     )
     .await
     .unwrap();
+}
+
+fn merge_environment_api_key(credentials: &mut Vec<KiroCredentials>, api_key: String) {
+    if api_key.trim().is_empty() {
+        tracing::warn!("KIRO_API_KEY 环境变量已设置但为空，视为未配置");
+        return;
+    }
+    if credentials.iter().any(|credential| credential.kiro_api_key.as_deref() == Some(&api_key)) {
+        tracing::info!("KIRO_API_KEY 已存在于凭据文件，沿用原记录及其配置");
+        return;
+    }
+    tracing::info!("检测到新的 KIRO_API_KEY，添加 API Key 凭据");
+    credentials.insert(0, KiroCredentials {
+        kiro_api_key: Some(api_key),
+        auth_method: Some("api_key".to_string()),
+        priority: 0,
+        created_at: Some(chrono::Utc::now().to_rfc3339()),
+        ..Default::default()
+    });
 }
 
 /// 文件不存在时初始化配置/凭证文件

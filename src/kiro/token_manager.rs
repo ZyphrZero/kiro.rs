@@ -1493,7 +1493,12 @@ impl MultiTokenManager {
     ) -> anyhow::Result<Self> {
         // 计算当前最大 ID，为没有 ID 的凭据分配新 ID
         let max_existing_id = credentials.iter().filter_map(|c| c.id).max().unwrap_or(0);
-        let mut next_id = max_existing_id + 1;
+        let reserved_id = credentials_path.as_deref()
+            .map(super::credential_dedup::reserved_id)
+            .transpose()?
+            .unwrap_or(0);
+        let mut next_id = max_existing_id.max(reserved_id)
+            .checked_add(1).ok_or_else(|| anyhow::anyhow!("凭据 ID 已耗尽"))?;
         let mut has_new_ids = false;
         let mut has_new_machine_ids = false;
         let config_ref = &config;

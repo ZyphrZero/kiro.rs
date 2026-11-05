@@ -9,6 +9,10 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[cfg(test)]
+#[path = "service_credential_dedup_tests.rs"]
+mod credential_dedup_tests;
+
 use crate::admin::types::GlobalProxyResponse;
 use crate::http_client::ProxyConfig;
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};

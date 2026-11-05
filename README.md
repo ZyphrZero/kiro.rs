@@ -542,11 +542,33 @@ Enterprise / IdC 账号在流式调用前会按需调用 `ListAvailableProfiles`
 }
 ```
 
-也可以通过环境变量临时注入最高优先级 API Key 凭据：
+也可以通过环境变量补充 API Key 凭据。只有文件中不存在相同完整 Key 时才新增，初始优先级为 `0` 并记录添加时间；已有 Key 沿用原 ID、分组、代理、优先级与禁用状态，不在每次启动时复制，也不会因环境变量重新启用已禁用的凭据。
 
 ```bash
 KIRO_API_KEY=ksk_xxx ./kiro-rs
 ```
+
+### 历史重复凭据清理
+
+早期版本可能在配置 `KIRO_API_KEY` 后，每次启动都将同一 Key 作为新记录写入文件。升级后不再继续新增这些副本；已有重复项不会被静默删除，启动日志会提示。单条添加、批量导入仍统一检查完整 API Key / refreshToken 并明确拒绝重复。
+
+请先停止所有共享此凭据文件的服务、容器和其他写入进程，再运行离线预览（不会启动网关或访问上游）：
+
+```bash
+./kiro-rs --credentials /path/to/credentials.json --deduplicate-credentials
+```
+
+检查输出中的保留 / 移除 ID 和文件条目位置，确认后才执行：
+
+```bash
+./kiro-rs --credentials /path/to/credentials.json --deduplicate-credentials --apply-credential-dedup
+```
+
+- 仅按同一认证类型的完整 `kiroApiKey` 或 `refreshToken` 识别重复，不按邮箱、余额或脱敏尾号合并；不同 API Key、不同 refreshToken 仍保留。
+- 优先保留 `kiro_stats.json` 中有使用记录的条目，再优先有合法添加时间、成功次数较多、原 ID 较小的条目。只保留所选记录的原始字段，包括未知扩展字段；不会合并分组或代理配置，也不会伪造历史添加时间。若预览结果不是你想保留的配置，请先手动整理文件，不要执行清理。
+- 写入前在同目录生成 `credentials.json.pre-dedup-<随机标识>.bak`，有统计文件时也备份 `kiro_stats.json`；这些备份包含敏感凭据 / 统计，请按原文件的安全要求保管，Unix 下以仅所有者可读写权限创建。
+- 清理采用临时文件加原子替换，并生成 `credentials.json.id-watermark` 保留已使用的 ID 上界，避免删除高 ID 副本后新账号重用这些 ID。请随凭据文件一同保留、迁移该侧车文件。
+- 原始统计文件、用量日志和 trace 不自动重写，也不把多个 ID 的累计统计合并成一个 ID；保留项继续沿用原 ID 的统计，其他旧 ID 的历史保持原归属。多进程共享写入不受此命令保护，不能在服务仍写入时执行。
 
 ### 凭据字段
 

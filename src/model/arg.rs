@@ -11,4 +11,17 @@ pub struct Args {
     /// 凭证文件路径
     #[arg(long)]
     pub credentials: Option<String>,
+
+    #[arg(
+        long,
+        help = "Preview duplicate credentials without starting the server"
+    )]
+    pub deduplicate_credentials: bool,
+
+    #[arg(
+        long,
+        requires = "deduplicate_credentials",
+        help = "Apply the previewed cleanup with backups; stop all writers first"
+    )]
+    pub apply_credential_dedup: bool,
 }
