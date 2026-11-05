@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::admin::error::AdminServiceError;
+use crate::http_client::ProxyConfig;
 
 /// 单个下载体的最大字节数，避免 GitHub 异常返回时占满磁盘。
 /// kiro-rs musl 二进制实测 < 50 MB，留 200 MB 上限足够覆盖未来增长。
@@ -96,7 +97,7 @@ fn archive_filename(version: &str) -> Result<String, AdminServiceError> {
 /// 把 GitHub API 限流从匿名 60/h 提升到认证 5000/h。
 pub async fn download_release_binary(
     version: &str,
-    proxy: Option<&str>,
+    proxy: Option<&ProxyConfig>,
     github_token: Option<&str>,
     dest: &Path,
 ) -> Result<(), AdminServiceError> {
@@ -159,18 +160,20 @@ pub async fn download_release_binary(
 }
 
 pub(super) fn build_http_client(
-    proxy: Option<&str>,
+    proxy: Option<&ProxyConfig>,
 ) -> Result<reqwest::Client, AdminServiceError> {
     let mut builder = reqwest::Client::builder()
         .user_agent("kiro-rs-updater")
         .timeout(std::time::Duration::from_secs(180));
-    if let Some(url) = proxy.and_then(|u| {
-        let s = u.trim();
-        if s.is_empty() { None } else { Some(s) }
-    }) {
-        let proxy = reqwest::Proxy::all(url).map_err(|e| {
+    if let Some(config) = proxy.filter(|p| !p.url.trim().is_empty()) {
+        let mut proxy = reqwest::Proxy::all(config.url.trim()).map_err(|e| {
             AdminServiceError::InternalError(format!("代理配置无效: {}", e))
         })?;
+        // Keep URL-embedded authentication unless both separate fields are set,
+        // matching the application's other outbound HTTP clients.
+        if let (Some(username), Some(password)) = (&config.username, &config.password) {
+            proxy = proxy.basic_auth(username, password);
+        }
         builder = builder.proxy(proxy);
     }
     builder
@@ -471,3 +474,7 @@ pub fn schedule_self_exit(delay: std::time::Duration) {
         std::process::exit(0);
     });
 }
+
+#[cfg(test)]
+#[path = "binary_update_proxy_tests.rs"]
+mod tests;
