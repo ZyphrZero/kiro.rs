@@ -697,6 +697,8 @@ Kiro 上游没有原生的结构化输出字段，因此 `output_config.format =
 
 `toolCompatibilityMode` 默认是 `raw`：保留客户端工具名、描述和参数，不替换为硬编码的 Kiro 内置工具 schema，也不注入旧的分块写入策略。上游要求的工具名长度限制、描述长度限制与 schema 规范化仍然生效。
 
+在管理后台「系统设置 → 模型 → 工具兼容模式」点击 `raw` 或 `claude-code` 即可切换。保存成功后写入 `config.json` 并立即对后续请求生效，已经开始的请求保持原模式，无需重启。管理接口为 `GET/PUT /api/admin/config/tool-compatibility`，更新请求体为 `{"mode":"raw"}` 或 `{"mode":"claude-code"}`；需要 Admin API Key，保存失败不会切换运行时模式。
+
 未设置该字段的配置升级后使用 `raw`；已有显式 `"toolCompatibilityMode": "claude-code"` 的配置保持不变。旧模式仍会将 Write/Edit/Bash/Read 等映射为内置工具，并可能丢弃客户端新增字段，建议仅在确认需要该映射时启用。
 
 普通流式响应中，不需要参数改写的原生工具调用会逐片发送 `input_json_delta`，最后才校验完整 JSON；非法 JSON、传输中断或已开始工具调用后的拒答，不会把半截调用标记为可执行的完整结果。旧模式中必须重写参数的工具、从文本识别的 `<invoke>` 调用仍需等参数完整后发送；结构化输出的缓冲行为见上一节。

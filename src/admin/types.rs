@@ -4,6 +4,12 @@ use crate::admin::proxy_pool::ProxyHealth;
 use crate::kiro::model::credentials::CredentialMetadata;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCompatibilityConfig {
+    pub mode: crate::model::config::ToolCompatibilityMode,
+}
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应

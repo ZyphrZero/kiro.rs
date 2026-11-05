@@ -528,6 +528,22 @@ export async function setLoadBalancingMode(
 
 export type ApiDomain = 'amazonaws' | 'kiro'
 
+export type ToolCompatibilityMode = 'raw' | 'claude-code'
+
+export interface ToolCompatibilityConfig {
+  mode: ToolCompatibilityMode
+}
+
+export async function getToolCompatibilityMode(): Promise<ToolCompatibilityConfig> {
+  const { data } = await api.get<ToolCompatibilityConfig>('/config/tool-compatibility')
+  return data
+}
+
+export async function setToolCompatibilityMode(mode: ToolCompatibilityMode): Promise<ToolCompatibilityConfig> {
+  const { data } = await api.put<ToolCompatibilityConfig>('/config/tool-compatibility', { mode })
+  return data
+}
+
 // 获取上游域名
 export async function getApiDomain(): Promise<{ domain: ApiDomain }> {
   const { data } = await api.get<{ domain: ApiDomain }>('/config/api-domain')

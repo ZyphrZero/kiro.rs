@@ -95,6 +95,95 @@ struct Fixture {
 }
 
 #[tokio::test]
+async fn tool_mode_admin_switch_updates_gateway_and_preserves_in_flight_snapshot() {
+    use crate::admin::{
+        AdminService, AdminState, ClientKeyManager, GroupManager, UsageAggregator,
+        create_admin_router,
+    };
+
+    let path = std::env::temp_dir().join(format!("tool-mode-api-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&path, r#"{"toolCompatibilityMode":"claude-code"}"#).unwrap();
+    let fixture = fixture_with_config(Mode::Reply(&["ok"]), Config::load(&path).unwrap()).await;
+    let manager = fixture.state.kiro_provider.as_ref().unwrap().token_manager();
+    let state = AdminState::new(
+        "fixture-admin-only",
+        AdminService::new(manager.clone(), vec!["fixture".into()]),
+        Arc::new(ClientKeyManager::new()),
+        Arc::new(UsageAggregator::new()),
+        Arc::new(TraceStore::open_in_memory().unwrap()),
+        Arc::new(GroupManager::new()),
+    );
+    let app = create_admin_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/config/tool-compatibility", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    assert_eq!(client.get(&url).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        client.put(&url).json(&json!({"mode":"raw"})).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let initial: serde_json::Value = client.get(&url).header("x-api-key", "fixture-admin-only")
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(initial, json!({"mode":"claude-code"}));
+    for invalid in [json!({"mode":"invalid"}), json!({}), json!({"mode":"raw","extra":true})] {
+        let response = client.put(&url).header("x-api-key", "fixture-admin-only")
+            .json(&invalid).send().await.unwrap();
+        assert!(response.status().is_client_error());
+        assert_eq!(manager.tool_compatibility_mode(), ToolCompatibilityMode::ClaudeCode);
+    }
+    let in_flight = fixture.state.clone().snapshot_tool_compatibility_mode();
+    for (mode, name) in [("raw", "Write"), ("claude-code", "fs_write"), ("raw", "Write")] {
+        let response = client.put(&url).header("x-api-key", "fixture-admin-only")
+            .json(&json!({"mode":mode})).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.json::<serde_json::Value>().await.unwrap(), json!({"mode":mode}));
+        for endpoint in ["messages", "cc", "chat", "responses"] {
+            for streaming in [false, true] {
+                let mut payload = json!({
+                    "model":"gpt-5.6-sol", "max_tokens":64, "stream":streaming,
+                    "messages":[{"role":"user","content":"hello"}],
+                    "input":[{"role":"user","content":"hello"}],
+                    "tools":[{"name":"Write","description":"fixture", "input_schema":{
+                        "type":"object", "properties":{"file_path":{"type":"string"},"content":{"type":"string"}}
+                    }}]
+                });
+                let parameters = payload["tools"][0]["input_schema"].clone();
+                let response = if endpoint == "chat" {
+                    payload["tools"] = json!([{"type":"function", "function":{
+                        "name":"Write", "description":"fixture", "parameters":parameters
+                    }}]);
+                    post_chat_completions(axum::extract::State(fixture.state.clone()), Extension(key()), HeaderMap::new(), Json(serde_json::from_value(payload).unwrap())).await
+                } else if endpoint == "responses" {
+                    payload["tools"] = json!([{
+                        "type":"function", "name":"Write", "description":"fixture", "parameters":parameters
+                    }]);
+                    post_responses(axum::extract::State(fixture.state.clone()), Extension(key()), HeaderMap::new(), Json(serde_json::from_value(payload).unwrap())).await
+                } else if endpoint == "cc" {
+                    post_messages_cc(axum::extract::State(fixture.state.clone()), Extension(key()), Json(serde_json::from_value(payload).unwrap())).await
+                } else {
+                    post_messages(axum::extract::State(fixture.state.clone()), Extension(key()), Json(serde_json::from_value(payload).unwrap())).await
+                };
+                assert_eq!(response.status(), StatusCode::OK);
+                to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                let bodies = fixture.bodies.lock();
+                let tools = &bodies.last().unwrap()["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]["tools"];
+                assert_eq!(tools[0]["toolSpecification"]["name"], name, "{tools}");
+            }
+        }
+    }
+    assert_eq!(in_flight.tool_compatibility_mode, ToolCompatibilityMode::ClaudeCode);
+    assert_eq!(Config::load(&path).unwrap().tool_compatibility_mode, ToolCompatibilityMode::Raw);
+    std::fs::write(&path, "invalid json").unwrap();
+    let response = client.put(&url).header("x-api-key", "fixture-admin-only")
+        .json(&json!({"mode":"claude-code"})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(manager.tool_compatibility_mode(), ToolCompatibilityMode::Raw);
+    server.abort();
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[tokio::test]
 async fn integration_repeat_guard_records_error() {
     let mut fixture = fixture(Mode::ReviewRepetition).await;
     let store = Arc::new(TraceStore::open_in_memory().unwrap());

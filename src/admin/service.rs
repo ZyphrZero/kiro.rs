@@ -56,7 +56,7 @@ use super::types::{
     SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest, SetSessionAffinityConfigRequest,
     SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
     StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
-    UpdateRefreshTokenRequest,
+    ToolCompatibilityConfig, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -3022,6 +3022,23 @@ impl AdminService {
             .set_api_domain(req.domain)
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         Ok(self.get_api_domain())
+    }
+
+    pub fn get_tool_compatibility_mode(&self) -> ToolCompatibilityConfig {
+        ToolCompatibilityConfig {
+            mode: self.token_manager.tool_compatibility_mode(),
+        }
+    }
+
+    pub fn set_tool_compatibility_mode(
+        &self,
+        req: ToolCompatibilityConfig,
+    ) -> Result<ToolCompatibilityConfig, AdminServiceError> {
+        let mode = self
+            .token_manager
+            .set_tool_compatibility_mode(req.mode)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        Ok(ToolCompatibilityConfig { mode })
     }
 
     /// 获取会话粘性路由配置与运行时统计

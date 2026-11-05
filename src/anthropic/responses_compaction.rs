@@ -78,6 +78,7 @@ pub(super) async fn handle(
     headers: HeaderMap,
     mut req: ResponsesRequest,
 ) -> Response {
+    let state = state.snapshot_tool_compatibility_mode();
     let want_stream = req.stream;
     let model = req.model.clone();
     tracing::info!(

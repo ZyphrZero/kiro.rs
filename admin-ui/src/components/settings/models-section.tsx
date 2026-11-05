@@ -22,6 +22,7 @@ import {
 import { reportSaveError } from '@/components/settings/report-error'
 import { extractErrorMessage, cn, parseError } from '@/lib/utils'
 import type { CustomModelItem, AvailableModelItem } from '@/types/api'
+import { ToolCompatibilitySetting } from '@/components/settings/tool-compatibility-setting'
 
 // ──── 厂商定义 ────────────────────────────────────────────────────────────
 
@@ -206,6 +207,7 @@ export function ModelsSection() {
 
   return (
     <div className="space-y-6">
+      <ToolCompatibilitySetting />
       <SettingGroup
         title="Prompt Cache 提示词缓存"
         description="控制向客户端返回的用量中是否包含 Anthropic 格式的缓存计量"

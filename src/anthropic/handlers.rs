@@ -916,6 +916,7 @@ pub async fn post_messages(
     Extension(key_ctx): Extension<KeyContext>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let state = state.snapshot_tool_compatibility_mode();
     // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
     let img_stats = count_image_budget(&payload);
     tracing::info!(
@@ -2451,6 +2452,7 @@ pub async fn post_messages_cc(
     Extension(key_ctx): Extension<KeyContext>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let state = state.snapshot_tool_compatibility_mode();
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
