@@ -57,6 +57,7 @@ enum Mode {
     Tools,
     GatedChatText,
     GatedToolArguments,
+    CompactionRetry,
     Filtered,
     Stalled,
     SlowHeaders,
@@ -576,7 +577,9 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                     }));
                 return Response::new(Body::from_stream(chunks));
             }
-            if matches!(mode, Mode::Tools) {
+            if matches!(mode, Mode::Tools)
+                || (matches!(mode, Mode::CompactionRetry) && calls.load(Ordering::Relaxed) == 1)
+            {
                 let mut bytes = Vec::new();
                 for part in [
                     frame("toolUseEvent", json!({"name":"run", "toolUseId":"call_1", "input":"{\"command\":", "stop":false})),
@@ -672,11 +675,15 @@ fn key() -> KeyContext {
     }
 }
 async fn request(state: AppState, endpoint: &str, streaming: bool) -> Response {
+    request_with_key(state, endpoint, streaming, key()).await
+}
+
+async fn request_with_key(state: AppState, endpoint: &str, streaming: bool, key_ctx: KeyContext) -> Response {
     let req = json!({"model": "gpt-5.6-sol", "max_tokens": 64, "stream": streaming, "messages": [{"role": "user", "content": "hello"}], "input": [{"role":"user", "content":"hello"}]});
     if endpoint == "chat" {
         post_chat_completions(
             axum::extract::State(state),
-            Extension(key()),
+            Extension(key_ctx),
             HeaderMap::new(),
             Json(serde_json::from_value(req).unwrap()),
         )
@@ -684,7 +691,7 @@ async fn request(state: AppState, endpoint: &str, streaming: bool) -> Response {
     } else if endpoint == "responses" {
         post_responses(
             axum::extract::State(state),
-            Extension(key()),
+            Extension(key_ctx),
             HeaderMap::new(),
             Json(serde_json::from_value(req).unwrap()),
         )
@@ -692,14 +699,14 @@ async fn request(state: AppState, endpoint: &str, streaming: bool) -> Response {
     } else if endpoint == "cc" {
         post_messages_cc(
             axum::extract::State(state),
-            Extension(key()),
+            Extension(key_ctx),
             Json(serde_json::from_value(req).unwrap()),
         )
         .await
     } else {
         post_messages(
             axum::extract::State(state),
-            Extension(key()),
+            Extension(key_ctx),
             Json(serde_json::from_value(req).unwrap()),
         )
         .await
@@ -715,6 +722,149 @@ async fn first_content(
         }
     }
     panic!("stream ended without content");
+}
+
+#[tokio::test]
+async fn effective_call_billing_counts_completed_requests_across_protocols() {
+    use crate::admin::client_keys::{BillingMode, ClientKeyManager, KeyAuth};
+
+    for endpoint in ["messages", "cc", "chat", "responses"] {
+        for streaming in [false, true] {
+            let fixture = fixture(Mode::Normal(Duration::ZERO)).await;
+            let manager = Arc::new(ClientKeyManager::new());
+            let entry = manager.create("billable".into(), None, None);
+            manager.update_meta(entry.id, None, None, None, Some((BillingMode::Calls, Some(1))));
+            let state = fixture.state.clone().with_usage(Some(manager.clone()), None, None);
+            assert_eq!(manager.verify_and_touch_ex(&entry.key), KeyAuth::Ok(entry.id));
+            let key_ctx = KeyContext { key_id: entry.id, key_source: TraceKeySource::ClientKey, ..key() };
+            let response = request_with_key(state, endpoint, streaming, key_ctx).await;
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint} streaming={streaming}");
+            to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let snapshot = manager.list().remove(0);
+            assert_eq!(snapshot.total_successful_calls, 1, "{endpoint} streaming={streaming}");
+            assert_eq!(snapshot.total_input_tokens, 13);
+            assert_eq!(snapshot.total_output_tokens, 17);
+            assert_eq!(manager.verify_and_touch_ex(&entry.key), KeyAuth::CallsOverLimit {
+                id: entry.id, used: 1, limit: 1,
+            });
+        }
+    }
+}
+
+#[tokio::test]
+async fn effective_call_billing_does_not_charge_failed_or_interrupted_requests() {
+    use crate::admin::client_keys::ClientKeyManager;
+
+    for endpoint in ["messages", "cc", "chat", "responses"] {
+        for mode in [Mode::Overloaded, Mode::Interrupted, Mode::Empty, Mode::InvalidFrame] {
+            for streaming in [false, true] {
+                let fixture = fixture(mode).await;
+                let manager = Arc::new(ClientKeyManager::new());
+                let entry = manager.create("billable".into(), None, None);
+                let state = fixture.state.clone().with_usage(Some(manager.clone()), None, None);
+                let key_ctx = KeyContext { key_id: entry.id, key_source: TraceKeySource::ClientKey, ..key() };
+                let response = request_with_key(state, endpoint, streaming, key_ctx).await;
+                let status = response.status();
+                let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                assert!(status.is_client_error() || status.is_server_error() || String::from_utf8_lossy(&body).contains("error"));
+                assert_eq!(manager.list()[0].total_successful_calls, 0, "{endpoint} streaming={streaming}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn effective_call_billing_does_not_charge_cancelled_streams() {
+    use crate::admin::client_keys::ClientKeyManager;
+
+    for endpoint in ["messages", "cc", "chat", "responses"] {
+        let fixture = fixture(Mode::Stalled).await;
+        let manager = Arc::new(ClientKeyManager::new());
+        let entry = manager.create("billable".into(), None, None);
+        let state = fixture.state.clone().with_usage(Some(manager.clone()), None, None);
+        let key_ctx = KeyContext { key_id: entry.id, key_source: TraceKeySource::ClientKey, ..key() };
+        let mut body = request_with_key(state, endpoint, true, key_ctx).await.into_body().into_data_stream();
+        tokio::time::timeout(Duration::from_secs(2), first_content(&mut body)).await.unwrap();
+        drop(body);
+        assert_eq!(manager.list()[0].total_successful_calls, 0, "{endpoint}");
+    }
+}
+
+#[tokio::test]
+async fn effective_call_billing_counts_system_key() {
+    use crate::admin::client_keys::ClientKeyManager;
+
+    let fixture = fixture(Mode::Normal(Duration::ZERO)).await;
+    let manager = Arc::new(ClientKeyManager::new());
+    manager.sync_system_key("system".into(), None, "fixture-system-key".into());
+    let state = fixture.state.clone().with_usage(Some(manager.clone()), None, None);
+    let response = request(state, "messages", false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(manager.list()[0].total_successful_calls, 1);
+}
+
+#[tokio::test]
+async fn effective_call_billing_http_quota_and_non_generation_routes() {
+    use crate::admin::client_keys::{BillingMode, ClientKeyManager};
+    use super::middleware::auth_middleware;
+
+    let fixture = fixture(Mode::Normal(Duration::ZERO)).await;
+    let manager = Arc::new(ClientKeyManager::new());
+    let entry = manager.create("billable".into(), None, None);
+    manager.update_meta(entry.id, None, None, None, Some((BillingMode::Calls, Some(1))));
+    let state = fixture.state.clone().with_usage(Some(manager.clone()), None, None);
+    let app = Router::new()
+        .route("/messages", post(post_messages))
+        .route("/count_tokens", post(super::handlers::count_tokens))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let payload = json!({"model": "gpt-5.6-sol", "max_tokens": 64, "messages": [{"role": "user", "content": "hello"}]});
+    let response = client.post(format!("{base}/count_tokens")).header("x-api-key", &entry.key).json(&payload).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(manager.list()[0].total_successful_calls, 0);
+    let response = client.post(format!("{base}/messages")).header("x-api-key", &entry.key).json(&json!({})).send().await.unwrap();
+    assert!(response.status().is_client_error());
+    assert_eq!(manager.list()[0].total_successful_calls, 0);
+    let response = client.post(format!("{base}/messages")).header("x-api-key", &entry.key).json(&payload).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    let response = client.post(format!("{base}/messages")).header("x-api-key", &entry.key).json(&payload).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let error: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(error["error"]["type"], "rate_limit_error");
+    assert!(error["error"]["message"].as_str().unwrap().contains("有效调用次数"));
+    assert_eq!(fixture.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(manager.list()[0].total_successful_calls, 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn effective_call_billing_compaction_counts_final_success_not_internal_rounds() {
+    use crate::admin::client_keys::ClientKeyManager;
+
+    for streaming in [false, true] {
+        for (mode, expected_calls) in [(Mode::CompactionRetry, 1), (Mode::Tools, 0)] {
+            let fixture = fixture(mode).await;
+            let manager = Arc::new(ClientKeyManager::new());
+            let entry = manager.create("billable".into(), None, None);
+            let state = fixture.state.clone().with_usage(Some(manager.clone()), None, None);
+            let key_ctx = KeyContext { key_id: entry.id, key_source: TraceKeySource::ClientKey, ..key() };
+            let payload = json!({"model": "gpt-5.6-sol", "stream": streaming, "input": [
+                {"role": "user", "content": "Summarize our work"}, {"type": "compaction_trigger"}
+            ]});
+            let response = post_responses(axum::extract::State(state), Extension(key_ctx), HeaderMap::new(), Json(serde_json::from_value(payload).unwrap())).await;
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(body.contains(if expected_calls == 1 { "completed" } else { "compaction_error" }), "{body}");
+            assert_eq!(fixture.calls.load(Ordering::Relaxed), 2);
+            assert_eq!(manager.list()[0].total_successful_calls, expected_calls);
+            assert_eq!(manager.list()[0].total_input_tokens, 26);
+        }
+    }
 }
 
 #[tokio::test]

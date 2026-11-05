@@ -164,6 +164,16 @@ pub async fn auth_middleware(
                 );
                 return (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
             }
+            KeyAuth::CallsOverLimit { used, limit, .. } => {
+                let error = ErrorResponse::new(
+                    "rate_limit_error",
+                    format!(
+                        "该 API Key 已达到有效调用次数上限（已用 {} / 上限 {}），请联系管理员调整额度或重置统计",
+                        used, limit
+                    ),
+                );
+                return (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
+            }
             KeyAuth::NotFound => {}
         }
     }

@@ -17,6 +17,16 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
+use super::usage_stats::UsageRecord;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BillingMode {
+    #[default]
+    Credits,
+    Calls,
+}
+
 /// 单条客户端 Key
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,6 +44,12 @@ pub struct ClientKey {
     pub last_used_at: Option<String>,
     #[serde(default)]
     pub total_calls: u64,
+    #[serde(default)]
+    pub total_successful_calls: u64,
+    #[serde(default)]
+    pub billing_mode: BillingMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_calls: Option<u64>,
     #[serde(default)]
     pub total_input_tokens: u64,
     #[serde(default)]
@@ -70,6 +86,7 @@ pub enum KeyAuth {
     Ok(u64),
     /// 命中但已达积分上限
     OverLimit { id: u64, used: f64, limit: f64 },
+    CallsOverLimit { id: u64, used: u64, limit: u64 },
     /// 未匹配到任何启用的 Key
     NotFound,
 }
@@ -189,6 +206,9 @@ impl ClientKeyManager {
             created_at: Utc::now().to_rfc3339(),
             last_used_at: None,
             total_calls: 0,
+            total_successful_calls: 0,
+            billing_mode: BillingMode::default(),
+            max_calls: None,
             total_input_tokens: 0,
             total_output_tokens: 0,
             total_cache_creation_tokens: 0,
@@ -233,6 +253,9 @@ impl ClientKeyManager {
                     created_at: Utc::now().to_rfc3339(),
                     last_used_at: None,
                     total_calls: 0,
+                    total_successful_calls: 0,
+                    billing_mode: BillingMode::default(),
+                    max_calls: None,
                     total_input_tokens: 0,
                     total_output_tokens: 0,
                     total_cache_creation_tokens: 0,
@@ -317,6 +340,7 @@ impl ClientKeyManager {
         name: Option<String>,
         description: Option<Option<String>>,
         group: Option<Option<String>>,
+        billing: Option<(BillingMode, Option<u64>)>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -329,6 +353,10 @@ impl ClientKeyManager {
                 }
                 if let Some(g) = group {
                     e.group = g.filter(|s| !s.trim().is_empty());
+                }
+                if let Some((mode, max_calls)) = billing {
+                    e.billing_mode = mode;
+                    e.max_calls = max_calls;
                 }
                 true
             }
@@ -434,6 +462,7 @@ impl ClientKeyManager {
         let updated = match inner.entries.get_mut(&id) {
             Some(e) => {
                 e.total_calls = 0;
+                e.total_successful_calls = 0;
                 e.total_input_tokens = 0;
                 e.total_output_tokens = 0;
                 e.total_cache_creation_tokens = 0;
@@ -457,11 +486,11 @@ impl ClientKeyManager {
         match self.verify_and_touch_ex(presented) {
             KeyAuth::Ok(id) => Some(id),
             // 兼容旧语义：超额与未命中都视为 None
-            KeyAuth::OverLimit { .. } | KeyAuth::NotFound => None,
+            KeyAuth::OverLimit { .. } | KeyAuth::CallsOverLimit { .. } | KeyAuth::NotFound => None,
         }
     }
 
-    /// 常量时间匹配所有启用 Key；命中后若已达积分上限则返回 [`KeyAuth::OverLimit`]，
+    /// 常量时间匹配所有启用 Key；命中后按计费模式检查积分或有效调用上限，
     /// 否则累加调用次数并返回 [`KeyAuth::Ok`]。
     pub fn verify_and_touch_ex(&self, presented: &str) -> KeyAuth {
         let mut inner = self.inner.write();
@@ -479,14 +508,30 @@ impl ClientKeyManager {
             return KeyAuth::NotFound;
         };
         if let Some(entry) = inner.entries.get_mut(&id) {
-            // 达到积分上限：拒绝，不累加调用次数
-            if let Some(limit) = entry.max_credits {
-                if entry.total_credits >= limit {
-                    return KeyAuth::OverLimit {
-                        id,
-                        used: entry.total_credits,
-                        limit,
-                    };
+            match entry.billing_mode {
+                BillingMode::Credits => {
+                    if let Some(limit) = entry
+                        .max_credits
+                        .filter(|limit| entry.total_credits >= *limit)
+                    {
+                        return KeyAuth::OverLimit {
+                            id,
+                            used: entry.total_credits,
+                            limit,
+                        };
+                    }
+                }
+                BillingMode::Calls => {
+                    if let Some(limit) = entry
+                        .max_calls
+                        .filter(|limit| entry.total_successful_calls >= *limit)
+                    {
+                        return KeyAuth::CallsOverLimit {
+                            id,
+                            used: entry.total_successful_calls,
+                            limit,
+                        };
+                    }
                 }
             }
             entry.total_calls += 1;
@@ -520,28 +565,32 @@ impl ClientKeyManager {
         updated
     }
 
-    /// 在请求结束时累计 Token 用量并落盘
-    pub fn record_usage(
-        &self,
-        id: u64,
-        input_tokens: u64,
-        output_tokens: u64,
-        cache_creation_tokens: u64,
-        cache_read_tokens: u64,
-        credits: f64,
-    ) {
+    /// 成功结算时累计用量；内部压缩轮次保留用量但不重复计次。
+    pub fn record_usage(&self, usage: &UsageRecord, count_call: bool) {
         let mut inner = self.inner.write();
-        if let Some(entry) = inner.entries.get_mut(&id) {
-            entry.total_input_tokens += input_tokens;
-            entry.total_output_tokens += output_tokens;
-            entry.total_cache_creation_tokens += cache_creation_tokens;
-            entry.total_cache_read_tokens += cache_read_tokens;
-            if credits.is_finite() && credits > 0.0 {
-                entry.total_credits += credits;
+        if let Some(entry) = inner.entries.get_mut(&usage.key_id) {
+            if count_call {
+                entry.total_successful_calls = entry.total_successful_calls.saturating_add(1);
+            }
+            entry.total_input_tokens += usage.input_tokens;
+            entry.total_output_tokens += usage.output_tokens;
+            entry.total_cache_creation_tokens += usage.cache_creation_tokens;
+            entry.total_cache_read_tokens += usage.cache_read_tokens;
+            if usage.credits.is_finite() && usage.credits > 0.0 {
+                entry.total_credits += usage.credits;
             }
             entry.last_used_at = Some(Utc::now().to_rfc3339());
         }
         self.save_locked(&inner);
+    }
+
+    pub fn record_successful_call(&self, id: u64) {
+        let mut inner = self.inner.write();
+        if let Some(entry) = inner.entries.get_mut(&id) {
+            entry.total_successful_calls = entry.total_successful_calls.saturating_add(1);
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            self.save_locked(&inner);
+        }
     }
 
     /// 获取统计后的 active Key 数（未禁用）
@@ -562,8 +611,7 @@ fn is_false(b: &bool) -> bool {
 
 /// 生成 `sk-` 前缀 + 32 位 base62 随机字符串
 pub fn generate_client_key() -> String {
-    const CHARSET: &[u8] =
-        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let body: String = (0..32)
         .map(|_| {
             let idx = fastrand::usize(..CHARSET.len());
@@ -594,6 +642,29 @@ pub type SharedClientKeyManager = Arc<ClientKeyManager>;
 mod tests {
     use super::*;
 
+    fn usage(
+        key_id: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
+        credits: f64,
+    ) -> UsageRecord {
+        UsageRecord {
+            ts: Utc::now().to_rfc3339(),
+            key_id,
+            credential_id: 1,
+            model: "test-model".into(),
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+            credits,
+            duration_ms: 0,
+            status: "success".into(),
+        }
+    }
+
     #[test]
     fn create_and_verify() {
         let mgr = ClientKeyManager::new();
@@ -617,14 +688,284 @@ mod tests {
     fn record_usage_accumulates() {
         let mgr = ClientKeyManager::new();
         let entry = mgr.create("test".to_string(), None, None);
-        mgr.record_usage(entry.id, 100, 50, 0, 0, 0.0);
-        mgr.record_usage(entry.id, 200, 30, 5, 10, 1.5);
+        mgr.record_usage(&usage(entry.id, 100, 50, 0, 0, 0.0), true);
+        mgr.record_usage(&usage(entry.id, 200, 30, 5, 10, 1.5), true);
         let list = mgr.list();
         let e = list.iter().find(|x| x.id == entry.id).unwrap();
         assert_eq!(e.total_input_tokens, 300);
         assert_eq!(e.total_output_tokens, 80);
         assert_eq!(e.total_cache_creation_tokens, 5);
         assert_eq!(e.total_cache_read_tokens, 10);
+        assert_eq!(e.total_successful_calls, 2);
+    }
+
+    #[test]
+    fn calls_billing_uses_successful_requests_not_auth_attempts_or_credits() {
+        let manager = ClientKeyManager::new();
+        let entry = manager.create("calls".into(), None, None);
+        assert!(manager.update_meta(
+            entry.id,
+            None,
+            None,
+            None,
+            Some((BillingMode::Calls, Some(2)))
+        ));
+        assert!(manager.set_max_credits(entry.id, Some(0.0)));
+        for _ in 0..4 {
+            assert_eq!(
+                manager.verify_and_touch_ex(&entry.key),
+                KeyAuth::Ok(entry.id)
+            );
+        }
+        manager.record_usage(&usage(entry.id, 10, 20, 0, 0, 50.0), false);
+        assert_eq!(manager.list()[0].total_successful_calls, 0);
+        manager.record_usage(&usage(entry.id, 10, 20, 0, 0, 50.0), true);
+        assert_eq!(
+            manager.verify_and_touch_ex(&entry.key),
+            KeyAuth::Ok(entry.id)
+        );
+        manager.record_usage(&usage(entry.id, 0, 0, 0, 0, 0.0), true);
+        assert_eq!(
+            manager.verify_and_touch_ex(&entry.key),
+            KeyAuth::CallsOverLimit {
+                id: entry.id,
+                used: 2,
+                limit: 2,
+            }
+        );
+        assert_eq!(manager.verify_and_touch(&entry.key), None);
+        let snapshot = manager.list().remove(0);
+        assert_eq!(snapshot.total_calls, 5);
+        assert_eq!(snapshot.total_successful_calls, 2);
+        assert_eq!(snapshot.total_credits, 100.0);
+
+        let rotated = manager.rotate(entry.id).unwrap();
+        assert_eq!(rotated.total_successful_calls, 2);
+        assert_eq!(rotated.billing_mode, BillingMode::Calls);
+        assert_eq!(rotated.max_calls, Some(2));
+        assert!(manager.reset_stats(entry.id));
+        assert_eq!(manager.list()[0].total_successful_calls, 0);
+        assert_eq!(
+            manager.verify_and_touch_ex(&rotated.key),
+            KeyAuth::Ok(entry.id)
+        );
+    }
+
+    #[test]
+    fn calls_billing_zero_unlimited_and_mode_switch_keep_counters() {
+        let manager = ClientKeyManager::new();
+        let entry = manager.create("calls".into(), None, None);
+        assert!(manager.update_meta(
+            entry.id,
+            None,
+            None,
+            None,
+            Some((BillingMode::Calls, Some(0)))
+        ));
+        assert_eq!(
+            manager.verify_and_touch_ex(&entry.key),
+            KeyAuth::CallsOverLimit {
+                id: entry.id,
+                used: 0,
+                limit: 0,
+            }
+        );
+        assert!(manager.update_meta(entry.id, None, None, None, Some((BillingMode::Calls, None))));
+        assert_eq!(
+            manager.verify_and_touch_ex(&entry.key),
+            KeyAuth::Ok(entry.id)
+        );
+        manager.record_usage(&usage(entry.id, 1, 1, 0, 0, 2.0), true);
+        assert!(manager.set_max_credits(entry.id, Some(1.0)));
+        assert!(manager.update_meta(
+            entry.id,
+            None,
+            None,
+            None,
+            Some((BillingMode::Credits, None))
+        ));
+        assert_eq!(
+            manager.verify_and_touch_ex(&entry.key),
+            KeyAuth::OverLimit {
+                id: entry.id,
+                used: 2.0,
+                limit: 1.0,
+            }
+        );
+        assert!(manager.update_meta(
+            entry.id,
+            None,
+            None,
+            None,
+            Some((BillingMode::Calls, Some(1)))
+        ));
+        assert_eq!(
+            manager.verify_and_touch_ex(&entry.key),
+            KeyAuth::CallsOverLimit {
+                id: entry.id,
+                used: 1,
+                limit: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn calls_billing_persists_and_legacy_keys_keep_credit_billing() {
+        let path =
+            std::env::temp_dir().join(format!("client-key-billing-{}.json", uuid::Uuid::new_v4()));
+        let manager = ClientKeyManager::load(&path).unwrap();
+        let entry = manager.create("calls".into(), None, None);
+        assert!(manager.update_meta(
+            entry.id,
+            None,
+            None,
+            None,
+            Some((BillingMode::Calls, Some(1)))
+        ));
+        manager.record_usage(&usage(entry.id, 1, 1, 0, 0, 0.0), true);
+        let reloaded = ClientKeyManager::load(&path).unwrap();
+        assert_eq!(
+            reloaded.verify_and_touch_ex(&entry.key),
+            KeyAuth::CallsOverLimit {
+                id: entry.id,
+                used: 1,
+                limit: 1,
+            }
+        );
+        std::fs::remove_file(path).unwrap();
+
+        let mut legacy = serde_json::to_value(entry).unwrap();
+        for field in ["billingMode", "maxCalls", "totalSuccessfulCalls"] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        legacy["totalCalls"] = serde_json::json!(123);
+        let restored: ClientKey = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.billing_mode, BillingMode::Credits);
+        assert_eq!(restored.max_calls, None);
+        assert_eq!(restored.total_successful_calls, 0);
+        assert_eq!(restored.total_calls, 123);
+    }
+
+    #[tokio::test]
+    async fn calls_billing_admin_create_update_and_list() {
+        use super::super::{handlers, middleware::AdminState, types::*};
+        use axum::{
+            Json,
+            body::to_bytes,
+            extract::{Path, Query, State},
+            http::StatusCode,
+            response::IntoResponse,
+        };
+        use serde_json::{Value, json};
+
+        let manager = Arc::new(ClientKeyManager::new());
+        let tokens = Arc::new(
+            crate::kiro::token_manager::MultiTokenManager::new(
+                crate::model::config::Config::default(),
+                Vec::new(),
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let state = AdminState::new(
+            "fixture-admin",
+            crate::admin::AdminService::new(tokens, Vec::new()),
+            manager.clone(),
+            Arc::new(crate::admin::usage_stats::UsageAggregator::new()),
+            Arc::new(crate::admin::trace_db::TraceStore::open_in_memory().unwrap()),
+            Arc::new(crate::admin::groups::GroupManager::new()),
+        );
+        let payload =
+            serde_json::from_value(json!({"name": "calls", "billingMode": "calls", "maxCalls": 2}))
+                .unwrap();
+        let response = handlers::create_client_key(State(state.clone()), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        let id = created["id"].as_u64().unwrap();
+        assert_eq!(manager.list()[0].billing_mode, BillingMode::Calls);
+        assert_eq!(manager.list()[0].max_calls, Some(2));
+
+        for (payload, expected_limit) in [
+            (json!({"billingMode": "calls", "maxCalls": 0}), Some(0)),
+            (json!({"billingMode": "calls", "maxCalls": null}), None),
+        ] {
+            let response = handlers::update_client_key(
+                State(state.clone()),
+                Path(id),
+                Json(serde_json::from_value(payload).unwrap()),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(manager.list()[0].max_calls, expected_limit);
+        }
+        let response = handlers::update_client_key(
+            State(state.clone()),
+            Path(id),
+            Json(serde_json::from_value(json!({"name": "renamed"})).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(manager.list()[0].billing_mode, BillingMode::Calls);
+        let response = handlers::update_client_key(
+            State(state.clone()),
+            Path(id),
+            Json(serde_json::from_value(json!({"maxCalls": 5})).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(manager.list()[0].max_calls, None);
+        let response = handlers::update_client_key(
+            State(state.clone()),
+            Path(id + 1),
+            Json(serde_json::from_value(json!({"billingMode": "calls", "maxCalls": 5})).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = handlers::list_client_keys(State(state), Query(ClientKeysQuery::default()))
+            .await
+            .into_response();
+        let listed: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(listed["keys"][0]["billingMode"], "calls");
+        assert_eq!(listed["keys"][0]["totalSuccessfulCalls"], 0);
+        assert!(listed["keys"][0].get("key").is_none());
+        assert!(listed["keys"][0].get("maskedKey").is_some());
+
+        for max_calls in [json!(-1), json!(1.5), json!("10")] {
+            assert!(
+                serde_json::from_value::<CreateClientKeyRequest>(
+                    json!({"name": "invalid", "billingMode": "calls", "maxCalls": max_calls})
+                )
+                .is_err()
+            );
+            assert!(
+                serde_json::from_value::<UpdateClientKeyRequest>(
+                    json!({"billingMode": "calls", "maxCalls": max_calls})
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            serde_json::from_value::<CreateClientKeyRequest>(
+                json!({"name": "invalid", "billingMode": "typo"})
+            )
+            .is_err()
+        );
+        let legacy: CreateClientKeyRequest =
+            serde_json::from_value(json!({"name": "legacy"})).unwrap();
+        assert_eq!(legacy.billing_mode, BillingMode::Credits);
     }
 
     #[test]
@@ -637,7 +978,7 @@ mod tests {
         assert_eq!(mgr.verify_and_touch_ex(&entry.key), KeyAuth::Ok(entry.id));
 
         // 累计到达上限后拒绝
-        mgr.record_usage(entry.id, 0, 0, 0, 0, 2.5);
+        mgr.record_usage(&usage(entry.id, 0, 0, 0, 0, 2.5), true);
         match mgr.verify_and_touch_ex(&entry.key) {
             KeyAuth::OverLimit { id, used, limit } => {
                 assert_eq!(id, entry.id);
@@ -654,7 +995,7 @@ mod tests {
         assert_eq!(mgr.verify_and_touch_ex(&entry.key), KeyAuth::Ok(entry.id));
 
         // 清除上限：不再拦截
-        mgr.record_usage(entry.id, 0, 0, 0, 0, 999.0);
+        mgr.record_usage(&usage(entry.id, 0, 0, 0, 0, 999.0), true);
         assert!(mgr.set_max_credits(entry.id, None));
         assert_eq!(mgr.verify_and_touch_ex(&entry.key), KeyAuth::Ok(entry.id));
     }
@@ -680,7 +1021,7 @@ mod tests {
     fn rotate_replaces_key_but_keeps_metadata_and_stats() {
         let mgr = ClientKeyManager::new();
         let entry = mgr.create("kb".to_string(), Some("desc".into()), Some("groupA".into()));
-        mgr.record_usage(entry.id, 100, 50, 5, 10, 1.5);
+        mgr.record_usage(&usage(entry.id, 100, 50, 5, 10, 1.5), true);
         let old_key = entry.key.clone();
         let rotated = mgr.rotate(entry.id).expect("rotate should succeed");
         assert_ne!(rotated.key, old_key);
@@ -721,8 +1062,9 @@ mod tests {
             Some("保留名称".into()),
             Some(Some("保留描述".into())),
             Some(Some("group-a".into())),
+            None,
         );
-        mgr.record_usage(0, 100, 50, 5, 10, 1.5);
+        mgr.record_usage(&usage(0, 100, 50, 5, 10, 1.5), true);
         assert_eq!(mgr.verify_and_touch("custom-a"), Some(0));
         mgr.set_disabled(0, true);
 

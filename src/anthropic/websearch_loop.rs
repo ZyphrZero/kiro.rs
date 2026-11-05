@@ -2228,6 +2228,7 @@ mod tests {
             key_id: 0,
             model: "test-model".to_string(),
             started_at: std::time::Instant::now(),
+            count_call: true,
         };
         let (sender, receiver) = mpsc::channel::<Bytes>(1);
         let in_flight = async move {
@@ -3411,6 +3412,7 @@ mod tests {
             key_id: 0,
             model: "gpt-5.6-sol".to_string(),
             started_at: std::time::Instant::now(),
+            count_call: true,
         };
         let mut settlement = WebSearchUsageSettlement::without_trace(hook);
         settlement.note_source(UsageSource::Provider);
@@ -3529,6 +3531,7 @@ mod tests {
             key_id: 0,
             model: "gpt-5.6-sol".to_string(),
             started_at: std::time::Instant::now(),
+            count_call: true,
         };
         let mut settlement = WebSearchUsageSettlement::without_trace(hook);
         settlement.add(1, token_usage(10, 2), 0.25);
@@ -3572,6 +3575,35 @@ mod tests {
             .expect("streaming response must contain message_delta");
         assert_eq!(delta.data["usage"]["credit_usage"], json!(0.75));
         settlement.settled = true;
+    }
+
+    #[test]
+    fn effective_call_billing_websearch_settles_once_for_multiple_rounds() {
+        use crate::admin::client_keys::ClientKeyManager;
+
+        for status in ["success", "error"] {
+            let manager = Arc::new(ClientKeyManager::new());
+            let entry = manager.create("billable".into(), None, None);
+            let hook = UsageRecordHook {
+                recorder: None,
+                aggregator: None,
+                client_keys: Some(manager.clone()),
+                key_id: entry.id,
+                model: "gpt-5.6-sol".into(),
+                started_at: std::time::Instant::now(),
+                count_call: true,
+            };
+            let mut settlement = WebSearchUsageSettlement::without_trace(hook);
+            settlement.add(1, token_usage(10, 2), 0.25);
+            settlement.add(1, token_usage(20, 3), 0.50);
+            assert_eq!(manager.list()[0].total_successful_calls, 0);
+            settlement.finish(status, status, None, None);
+            settlement.finish(status, status, None, None);
+            drop(settlement);
+            let snapshot = manager.list().remove(0);
+            assert_eq!(snapshot.total_successful_calls, u64::from(status == "success"));
+            assert_eq!(snapshot.total_credits, if status == "success" { 0.75 } else { 0.0 });
+        }
     }
 
     #[test]

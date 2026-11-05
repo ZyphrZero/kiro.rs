@@ -519,6 +519,8 @@ export type PollSocialLoginResponse = PollIdcLoginResponse
 
 // ============ 客户端 API Key 分发 ============
 
+export type ClientKeyBillingMode = 'credits' | 'calls'
+
 export interface ClientKeyItem {
   id: number
   /** 脱敏后的 Key（仅展示） */
@@ -529,6 +531,9 @@ export interface ClientKeyItem {
   createdAt: string
   lastUsedAt?: string
   totalCalls: number
+  totalSuccessfulCalls: number
+  billingMode: ClientKeyBillingMode
+  maxCalls?: number
   totalInputTokens: number
   totalOutputTokens: number
   totalCacheCreationTokens: number
@@ -567,6 +572,8 @@ export interface CreateClientKeyRequest {
   group?: string
   /** 积分使用上限（可选，不传表示不限制） */
   maxCredits?: number
+  billingMode?: ClientKeyBillingMode
+  maxCalls?: number
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -581,6 +588,8 @@ export interface UpdateClientKeyRequest {
   name?: string
   description?: string
   group?: string
+  billingMode?: ClientKeyBillingMode
+  maxCalls?: number | null
 }
 
 // ============ 用量统计 ============

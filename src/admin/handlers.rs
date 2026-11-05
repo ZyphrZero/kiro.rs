@@ -1115,6 +1115,9 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         created_at: k.created_at.clone(),
         last_used_at: k.last_used_at.clone(),
         total_calls: k.total_calls,
+        total_successful_calls: k.total_successful_calls,
+        billing_mode: k.billing_mode,
+        max_calls: k.max_calls,
         total_input_tokens: k.total_input_tokens,
         total_output_tokens: k.total_output_tokens,
         total_cache_creation_tokens: k.total_cache_creation_tokens,
@@ -1282,6 +1285,13 @@ pub async fn create_client_key(
             .filter(|g| !g.is_empty()),
     );
     // 创建后若指定了上限则应用
+    state.client_keys.update_meta(
+        entry.id,
+        None,
+        None,
+        None,
+        Some((payload.billing_mode, payload.max_calls)),
+    );
     if let Some(v) = payload.max_credits {
         state.client_keys.set_max_credits(entry.id, Some(v));
     }
@@ -1367,6 +1377,15 @@ pub async fn update_client_key(
     Json(payload): Json<UpdateClientKeyRequest>,
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
+    if payload.max_calls.is_some() && payload.billing_mode.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "设置 maxCalls 时必须同时提供 billingMode",
+            )),
+        )
+            .into_response();
+    }
     let description = payload
         .description
         .map(|d| if d.is_empty() { None } else { Some(d) });
@@ -1380,7 +1399,13 @@ pub async fn update_client_key(
     });
     if state
         .client_keys
-        .update_meta(id, payload.name, description, group)
+        .update_meta(
+            id,
+            payload.name,
+            description,
+            group,
+            payload.billing_mode.map(|mode| (mode, payload.max_calls)),
+        )
     {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {

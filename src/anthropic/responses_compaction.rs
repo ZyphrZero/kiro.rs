@@ -80,6 +80,8 @@ pub(super) async fn handle(
 ) -> Response {
     let state = state.snapshot_tool_compatibility_mode();
     let want_stream = req.stream;
+    let client_keys = state.client_keys.clone();
+    let key_id = key_ctx.key_id;
     let model = req.model.clone();
     tracing::info!(
         model = %model,
@@ -204,6 +206,11 @@ pub(super) async fn handle(
         Some(parsed) => validate(parsed, usage),
         None => context_overflow_outcome(usage),
     };
+    if matches!(&outcome, Outcome::Complete { .. })
+        && let Some(manager) = client_keys
+    {
+        manager.record_successful_call(key_id);
+    }
     if want_stream {
         render_stream(outcome, &model)
     } else {
@@ -309,7 +316,8 @@ async fn run_attempt(
         anthropic_req.messages.clone(),
         anthropic_req.tools.clone(),
     ) as i32;
-    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, model.to_string());
+    let mut hook = UsageRecordHook::from_state(&state, key_ctx.key_id, model.to_string());
+    hook.count_call = false;
     let cache_usage = match state.cache_meter.as_ref() {
         Some(cache) => {
             super::super::cache_metering::compute_cache_usage(cache, &anthropic_req, key_ctx.key_id)

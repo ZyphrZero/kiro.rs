@@ -61,6 +61,7 @@ pub(crate) struct UsageRecordHook {
     pub key_id: u64,
     pub model: String,
     pub started_at: Instant,
+    pub count_call: bool,
 }
 
 impl UsageRecordHook {
@@ -72,6 +73,7 @@ impl UsageRecordHook {
             key_id,
             model,
             started_at: Instant::now(),
+            count_call: true,
         }
     }
 
@@ -110,14 +112,7 @@ impl UsageRecordHook {
         }
         if status == "success" {
             if let Some(m) = &self.client_keys {
-                m.record_usage(
-                    self.key_id,
-                    rec.input_tokens,
-                    rec.output_tokens,
-                    rec.cache_creation_tokens,
-                    rec.cache_read_tokens,
-                    rec.credits,
-                );
+                m.record_usage(&rec, self.count_call);
             }
         }
     }
