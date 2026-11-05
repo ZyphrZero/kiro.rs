@@ -6,6 +6,60 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-11-05
+
+主题：**客户端 Key 按有效调用次数计费、独立次数配额，以及成功请求结算与管理界面配套支持**。本版包含 `v0.9.6` 之后的 1 笔功能直接提交，没有新增合并 PR。旧 Key 默认继续按积分计费；新增有效调用统计从升级后开始累积，不根据历史鉴权放行次数推算。
+
+### 💳 可选择的客户端 Key 计费方式
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [有效调用次数计费 `d563fac`](https://github.com/ZyphrZero/kiro.rs/commit/d563fac)。
+
+- 新增 `billingMode`（`credits` / `calls`）、`maxCalls` 和 `totalSuccessfulCalls`，持久化在与凭据文件同目录的 `client_api_keys.json`；旧数据缺少这些字段时使用积分模式、无次数上限和零有效调用数。
+- 按积分模式继续使用 `totalCredits / maxCredits`；按次数模式使用 `totalSuccessfulCalls / maxCalls`。只检查当前模式对应的上限，不叠加两种额度限制，Token、缓存用量和上游 credits 统计仍保留。
+- 次数上限留空或 `null` 表示不限制，`0` 表示立即禁止调用；达到上限时返回 HTTP 429 `rate_limit_error`，明确提示有效调用次数已用量和上限。
+- 两种模式都会累积升级后的成功请求数。切换模式或轮换 Key 保留统计，重置统计会清零有效调用数及原有用量，但保留计费方式和额度配置；系统 Key `id=0` 与普通 Key 均适用。
+
+### ✅ 在请求成功结算时计次
+
+> 来源：[成功请求结算与回归 `d563fac`](https://github.com/ZyphrZero/kiro.rs/commit/d563fac)。
+
+- 普通 Messages、`/cc/v1/messages`、Chat Completions 和 Responses 的流式、非流式请求，在网关正常完成并成功结算后计 1 次；普通工具调用回复属于有效请求。
+- 鉴权失败、参数错误、上游错误、生成过程中断和取消不计有效调用；流式响应先返回 HTTP 200 不代表最终成功。模型列表查询、Token 计数等非生成接口不计有效调用。
+- 内部重试、多轮 WebSearch 与压缩恢复不会按内部轮次重复计费；压缩请求只有最终生成有效摘要才计 1 次，各轮 Token / credits 仍按原有用量路径记录。
+- 保留 `totalCalls` 的原始鉴权放行统计语义，管理端将其与「有效调用」分开展示，不能把旧的总调用量直接视作可计费成功次数。
+
+### 🖥️ 管理界面与 Admin API
+
+> 来源：[计费配置入口 `d563fac`](https://github.com/ZyphrZero/kiro.rs/commit/d563fac)。
+
+- 「客户端 Key」的新建、编辑弹窗新增计费方式选择及对应额度输入；列表新增「有效调用」列，「计费 / 上限」列按当前模式显示积分或次数，并保留上游 credits 的查看信息。
+- 前端拒绝负数、非整数及超出 JavaScript 安全整数范围的次数上限，说明零额度、无限额度、切换保留统计与并发请求的边界。
+- `POST /api/admin/client-keys` 支持 `billingMode` 和 `maxCalls`；`PUT /api/admin/client-keys/{id}` 可更新计费配置，仅修改名称、描述或分组时不会改变现有计费方式。
+- 更新时提供 `billingMode` 而省略 `maxCalls`，或显式传入 `null`，均表示取消次数上限；单独提交数值 `maxCalls` 而没有 `billingMode` 返回 400。积分额度继续通过已有 `/max-credits` 接口管理。
+- 补充成功 / 失败 / 取消、配额拦截、模式切换、持久化重载、旧数据默认值、Key 轮换与统计重置、系统 Key、多轮搜索和压缩计次的回归测试；管理页面完成本地真实后台的创建、切换、清空上限和重启保持验证。
+
+### 🙏 本版贡献者
+
+| 贡献者 | 直接提交 |
+| --- | --- |
+| [@ZyphrZero](https://github.com/ZyphrZero) | 客户端 Key 有效调用计费 [`d563fac`](https://github.com/ZyphrZero/kiro.rs/commit/d563fac) |
+
+本版没有新增合并 PR，以上直接提交不计入 PR 数量。
+
+### 🤝 Collaborators — 整合与维护
+
+- [@ZyphrZero](https://github.com/ZyphrZero)：整合计费模式、请求结算、Admin API 与管理界面，完成多协议回归和本地浏览器验收，维护升级说明与版本发布。
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 版本统一为 `0.9.7`；前后端需同步更新，旧 Key 默认保持积分模式，无需手动改写数据文件。
+- 升级前建议备份 `client_api_keys.json`。新字段会在后续保存时落盘；回退到不支持次数计费的旧版本时，旧程序可能忽略并在写回时丢弃这些字段，不应把降级视为保留新计费配置的迁移方案。
+- 有效调用数从升级后的成功请求开始累积，历史 `totalCalls` 不会回填；切换到次数模式前请确认当前累计值，如需开始新的计费周期，按业务需要显式重置统计。
+- 配额在请求进入时检查，不预占在途请求额度；已放行的并发请求仍会结算，可能超过上限。此实现不是跨进程共享额度或严格并发硬限额，也不处理货币单价、订单或支付。
+- Docker 部署需拉取 `0.9.7` 或 `latest` 并重建容器；仅重启旧容器不会更新二进制。本次为独立新版本，不改写已发布的 `v0.9.6` 标签或产物。
+
+完整变更：[v0.9.6...v0.9.7](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.6...v0.9.7)。
+
 ## [0.9.6] - 2026-11-05
 
 主题：**工具原生透传默认值、工具参数实时流式输出、管理端工具模式热切换、重复凭据治理，以及缓存与系统 Key 用量统计修复**。本版汇总 `v0.9.5` 之后合并的 1 个 PR 与 5 笔功能、修复和测试直接提交，覆盖 Issue #151 的重复凭据修复与 Issue #98 的流式回归验证。现有配置、凭据与用量日志格式保持兼容；请留意工具模式默认值、历史重复项的离线清理步骤，以及旧模式和结构化输出仍然存在的缓冲边界。
