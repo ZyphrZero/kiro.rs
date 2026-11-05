@@ -1025,7 +1025,7 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 构建并推送 Docker Hub 多架构镜像。
 - 创建 GitHub Release。
 
-当前稳定版：[v0.9.5](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.9.5)。
+当前稳定版：[v0.9.6](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.9.6)。
 
 Docker 镜像：
 

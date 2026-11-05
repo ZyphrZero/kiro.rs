@@ -6,6 +6,96 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-11-05
+
+主题：**工具原生透传默认值、工具参数实时流式输出、管理端工具模式热切换、重复凭据治理，以及缓存与系统 Key 用量统计修复**。本版汇总 `v0.9.5` 之后合并的 1 个 PR 与 5 笔功能、修复和测试直接提交，覆盖 Issue #151 的重复凭据修复与 Issue #98 的流式回归验证。现有配置、凭据与用量日志格式保持兼容；请留意工具模式默认值、历史重复项的离线清理步骤，以及旧模式和结构化输出仍然存在的缓冲边界。
+
+### 🔧 工具兼容默认使用 raw
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [工具透传修复 `247bf16`](https://github.com/ZyphrZero/kiro.rs/commit/247bf16)。
+
+- `toolCompatibilityMode` 默认由 `claude-code` 改为 `raw`，保留客户端声明的工具名、描述、schema 和参数，不再给 raw 工具追加旧版 Write / Edit / Bash 说明或分块写入策略。
+- 已显式配置 `"toolCompatibilityMode": "claude-code"` 的部署保持原模式；旧模式继续提供 Claude Code 内置工具名、schema 与入参的双向映射，仅在确认需要该映射时使用。
+- raw 仍执行 Kiro 上游要求的工具名长度限制、描述长度限制与 JSON Schema 规范化，不是请求字节级透传，也不承诺上游接受任意 schema。
+
+### 🌊 工具参数增量输出与完整性校验
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [流式工具参数修复 `247bf16`](https://github.com/ZyphrZero/kiro.rs/commit/247bf16)。
+
+- 不需要参数改写的原生工具调用逐片发送 `input_json_delta`，不再等待完整 JSON 后才一次性返回参数；按 `tool_use_id` 隔离并行调用，并处理迟到工具名、空结束片段和长工具名还原。
+- 转发分片的同时累积并校验最终 JSON。非法 JSON、流截断、传输失败或工具参数输出途中发生拒答时，不发送让半截工具调用正常完成的标记；拒答使用 `permission_error` 终止，客户端应丢弃不完整参数，不执行工具。
+- 工具参数的本地输出 Token 估算按累计字符数计算，避免相同内容因为分片更多而被重复高估；上游精确用量仍优先使用。
+- 需要完整参数才能改写的旧兼容工具、从文本恢复的 `<invoke>` 调用仍在参数完整后发送；结构化输出继续按设计缓冲到结束。本次不保证消除模型长时间仅推理、上游未产生正文，或客户端自身显示缓冲造成的等待。
+- 补充并行工具、分片 JSON、旧模式改写、拒答、断流与用量估算回归，以及验证首片参数在上游结束前到达客户端的 HTTP/SSE 测试；另提供显式启用的真实 Kiro 诊断测试，不执行返回的工具、不持久化凭据，但会消耗上游额度。
+
+### 🖥️ 管理端工具模式热切换
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [前端切换入口 `5b597cd`](https://github.com/ZyphrZero/kiro.rs/commit/5b597cd)。
+
+- 在「系统设置 → 模型配置 → 工具兼容模式」新增 `raw（推荐）` 与 `claude-code（旧版兼容）` 按钮，显示当前生效模式、保存状态和失败原因；读取失败时禁用切换并提供重试，不用默认值冒充真实运行状态。
+- 新增需要 Admin API Key 的 `GET/PUT /api/admin/config/tool-compatibility`，更新请求体为 `{"mode":"raw"}` 或 `{"mode":"claude-code"}`；拒绝未知模式、缺失字段及额外字段。
+- 先成功写入 `config.json`，再发布到运行时；保存失败保留原模式，并串行化并发更新，避免持久化值与内存模式错位。切换后新请求立即生效，无需重启，已经开始的请求保持自己的模式快照。
+- 覆盖普通 Messages、`/cc`、Chat Completions、Responses 与压缩路径的模式读取，补充鉴权、配置校验、持久化失败、重启保持、并发发布和多协议流式/非流式回归测试。
+
+### 📊 全缓存覆盖时避免客户端重复统计输入
+
+> 来源：[PR #150](https://github.com/ZyphrZero/kiro.rs/pull/150)，提交人：[@XIUDENBENNY](https://github.com/XIUDENBENNY)，感谢贡献。关联 [Issue #111](https://github.com/ZyphrZero/kiro.rs/issues/111)。
+
+- 修复最深 `cache_control` 断点覆盖整个 prompt，或比例舍入使未缓存输入为 0 时，Claude Code 保留 `message_start` 非零估算值、再叠加缓存用量，导致上下文统计偏大与提前压缩的问题。
+- 在本地模拟分摊的总输入大于 0、算出的 `input_tokens` 为 0 时，保留 1 个 input Token，优先从 `cache_creation` 扣除，creation 为 0 时再从 `cache_read` 扣除；三个字段之和保持不变，总输入为 0 时仍全部为 0。
+- 不修改初始 `message_start`、缓存命中判定、发往上游的请求或 credits；共享分摊函数同时影响相关非流式、WebSearch 和本地统计字段。上游精确 usage 的 `input=0` 仍优先原样使用，因此不是对所有可能的零值合并情形的完整修复。
+
+### 🧾 系统客户端 Key 用量统计
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [系统 Key 统计修复 `cba46ea`](https://github.com/ZyphrZero/kiro.rs/commit/cba46ea)。
+
+- 移除成功请求结算中对客户端 Key `id=0` 的错误排除，修复由 `config.json` 的 `apiKey` 同步生成的系统 Key，其输入、输出、缓存读写 Token 和 credits 一直未累积到 Key 统计的问题。
+- 此问题与是否绑定分组无关，未绑定分组仍表示可以使用全部账号；补充系统 Key 与普通未分组 Key 在 Messages、`/cc`、Chat Completions、Responses 的流式和非流式、持久化重载回归。
+- 修复仅影响升级后的成功请求结算，不清零现有统计，也不自动回填此前漏记的历史用量。
+
+### 🔁 Chat Completions 真流式回归与文档校正
+
+> 对应：[Issue #98](https://github.com/ZyphrZero/kiro.rs/issues/98)，报告者：[@lifeibo](https://github.com/lifeibo)；本版验收与文档校正：[提交 `8df8af7`](https://github.com/ZyphrZero/kiro.rs/commit/8df8af7)，提交人：[@ZyphrZero](https://github.com/ZyphrZero)。基础真流式链路已由既有提交 [`14f9b6c`](https://github.com/ZyphrZero/kiro.rs/commit/14f9b6c) 引入，并已包含在 `v0.9.2` 至 `v0.9.5`，不将旧修复重复算作新功能。
+
+- 使用真实 HTTP 连接与分阶段放行的上游验证：上游尚不允许继续生成或结束时，客户端已收到独立正文段落、工具调用名称和首片参数；完整正文不再等待结束后合成一个 SSE 内容帧。
+- 补充 UTF-8 / CRLF 跨分片解析、并行工具参数索引、最终 Token / credits、无需等待连接 EOF 的完成事件，以及损坏帧和断流不得输出正常 `[DONE]` 的回归；移除仅用于测试的旧整包合成 SSE 辅助函数，改为验证生产流式适配器。
+- 修正 README 仍将 OpenAI 端点描述为「合成 SSE」的过时说明，补充 `curl -N`、反向代理缓冲、上游推理阶段与 TCP 包数量不能等同于 SSE 分片数量的诊断边界。
+
+### 🧹 凭据重复注入与历史清理
+
+> 问题反馈：[Issue #151](https://github.com/ZyphrZero/kiro.rs/issues/151)，报告者：[@gujunxiang](https://github.com/gujunxiang)，感谢提供现象与排查线索。修复来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [`dbc2b05`](https://github.com/ZyphrZero/kiro.rs/commit/dbc2b05)。
+
+- 修复启动时无条件将 `KIRO_API_KEY` 追加到凭据池的路径：新分配 ID 后回写文件、下次启动再次追加，会持续产生同 Key、添加时间未知的副本。现在存在相同完整 Key 时沿用原记录，不覆盖其 ID、分组、代理、优先级或禁用状态；真正新增的环境 Key 会填写添加时间。
+- 增加离线 `--deduplicate-credentials` 预览；只有显式添加 `--apply-credential-dedup` 才清理历史重复项。按完整 API Key 或 refreshToken、区分认证类型去重，不按邮箱、余额或 Key 脱敏尾号判断。
+- 优先保留有使用记录的条目，再考虑合法添加时间、成功次数和稳定 ID；保留选中记录的完整配置与未知扩展字段，不合并权限分组、不伪造历史时间。写入前备份凭据及已有统计文件，原子替换失败时明确报错。
+- 通过 `.id-watermark` 侧车文件保留旧 ID 上界，防止清理高 ID 副本后新账号复用其历史身份；不重写或合并原统计、trace 和用量日志，旧记录仍按原 ID 归属。
+- 补充连续重启、原配置保护、添加时间、完整密钥匹配、只读预览、备份、写入失败、ID 保留，以及单条 / 并发批量导入重复校验回归。历史清理必须先停止所有共享文件的写入进程，升级不会自动删除历史记录。
+
+### 🙏 本版 PR 贡献者
+
+| 贡献者 | 已合并 PR |
+| --- | --- |
+| [@XIUDENBENNY](https://github.com/XIUDENBENNY) | [#150](https://github.com/ZyphrZero/kiro.rs/pull/150) |
+
+以上按 GitHub PR 作者列出；系统 Key 用量、工具流式修复、管理端模式切换、凭据重复修复与 Chat Completions 流式回归为直接提交，不计入 PR 数量。
+
+另感谢 [@gujunxiang](https://github.com/gujunxiang) 报告重复凭据问题并提供截图与复现线索，以及 [@lifeibo](https://github.com/lifeibo) 提供 Chat Completions 流式问题的最小复现与排查建议。
+
+### 🤝 Collaborators — 整合与维护
+
+- [@ZyphrZero](https://github.com/ZyphrZero)：完成系统 Key 统计修复、工具契约与流式参数修复、前端热切换、重复凭据治理与 Chat Completions 流式专项验证，审查并合并 PR #150，维护升级说明与版本发布。
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 版本统一为 `0.9.6`，无需手动转换现有配置、凭据或用量日志。
+- 前后端应同步更新，并在升级二进制后重启服务；Docker 部署需重新拉取 `0.9.6` 或 `latest` 并重建容器，仅重启旧容器不会载入新版二进制。升级完成后，工具模式切换本身无需再次重启。
+- 未设置 `toolCompatibilityMode` 的配置升级后使用 `raw`；已显式设置 `claude-code` 的配置不会被覆盖，需要在新管理页面主动切换，或修改配置后重启。
+- 已有重复凭据需停服后先运行 `--deduplicate-credentials` 预览，再按需加 `--apply-credential-dedup` 清理；备份文件包含敏感信息，请限制访问，并随原凭据文件保留 `.id-watermark` 侧车文件。
+- 工具参数流式输出不等于工具已经完成；客户端必须处理错误事件，不执行未正常完成、校验失败或被拒答中断的工具调用。旧模式参数改写和结构化输出仍可能一次性返回。
+- 本版没有修复或取消上游 429 限流，也不保证所有客户端的普通正文都以相同方式实时显示；相关行为需要结合上游输出与客户端实现判断。
+
+完整变更：[v0.9.5...v0.9.6](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.5...v0.9.6)。
+
 ## [0.9.5] - 2026-11-04
 
 主题：**凭据管理卡片优化、页面隐私防护、单账号请求活跃度统计、模型权限判定修正，以及前端构建工具迁移**。本版包含 `v0.9.4` 之后的 4 笔功能、修复与构建直接提交，没有新增合并 PR；现有配置、凭据与用量日志无需手动迁移。请留意隐私开关的保护范围、RPM 的统计口径，以及源码构建命令的变化。
