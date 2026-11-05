@@ -52,6 +52,7 @@ enum Mode {
     InvalidFrame,
     Empty,
     Tools,
+    GatedToolArguments,
     Filtered,
     Stalled,
     SlowHeaders,
@@ -89,6 +90,7 @@ struct Fixture {
     close_headers: Arc<AtomicUsize>,
     /// 上游收到的 Kiro 请求体（JSON）。
     bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+    release_tool_arguments: Arc<tokio::sync::Notify>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -370,11 +372,14 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
     let close_headers = Arc::new(AtomicUsize::new(0));
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let seen_bodies = bodies.clone();
+    let release_tool_arguments = Arc::new(tokio::sync::Notify::new());
+    let release_arguments = release_tool_arguments.clone();
     let (seen_calls, seen_connections, seen_close) =
         (calls.clone(), connections.clone(), close_headers.clone());
     let app = Router::new().route("/", post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, body: Bytes| {
         let (calls, connections, close) = (seen_calls.clone(), seen_connections.clone(), seen_close.clone());
         let seen_bodies = seen_bodies.clone();
+        let release_arguments = release_arguments.clone();
         async move {
             calls.fetch_add(1, Ordering::Relaxed);
             if let Ok(value) = serde_json::from_slice(&body) { seen_bodies.lock().push(value); }
@@ -444,6 +449,21 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                     bytes.extend_from_slice(&frame("contextUsageEvent", json!({"contextUsagePercentage": 100.0})));
                 }
                 return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::GatedToolArguments) {
+                let first = frame("toolUseEvent", json!({
+                    "name":"Write", "toolUseId":"call_1",
+                    "input":"{\"file_path\":\"/not-created\",\"content\":\"first", "stop":false
+                }));
+                let last = frame("toolUseEvent", json!({
+                    "name":"Write", "toolUseId":"call_1", "input":" second\"}", "stop":true
+                }));
+                let chunks = stream::once(async move { Ok::<_, Infallible>(first) })
+                    .chain(stream::once(async move {
+                        release_arguments.notified().await;
+                        Ok::<_, Infallible>(last)
+                    }));
+                return Response::new(Body::from_stream(chunks));
             }
             if matches!(mode, Mode::Tools) {
                 let mut bytes = Vec::new();
@@ -527,6 +547,7 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
         connections,
         close_headers,
         bodies,
+        release_tool_arguments,
         task,
     }
 }
@@ -583,6 +604,62 @@ async fn first_content(
         }
     }
     panic!("stream ended without content");
+}
+
+#[tokio::test]
+async fn gateway_raw_tool_arguments_arrive_before_upstream_finishes() {
+    let fixture = fixture(Mode::GatedToolArguments).await;
+    let payload = json!({
+        "model":"gpt-5.6-sol", "max_tokens":64, "stream":true,
+        "messages":[{"role":"user", "content":"Write the requested content."}],
+        "tools":[{
+            "name":"Write", "description":"Write exactly the supplied content.",
+            "input_schema":{
+                "type":"object",
+                "properties":{"file_path":{"type":"string"},"content":{"type":"string"}},
+                "required":["file_path","content"]
+            }
+        }]
+    });
+    let response = post_messages(
+        axum::extract::State(fixture.state.clone()),
+        Extension(key()),
+        Json(serde_json::from_value(payload).unwrap()),
+    ).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let mut received = String::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(chunk) = body.next().await {
+            received.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            if received.contains("input_json_delta") {
+                return;
+            }
+        }
+        panic!("stream ended before the first tool argument fragment");
+    }).await.expect("tool arguments were buffered while upstream waited for the client");
+    let early_events = parse_sse(&received);
+    let start = early_events.iter().find(|(_, event)| event["content_block"]["type"] == "tool_use").unwrap();
+    assert_eq!(start.1["content_block"]["name"], "Write");
+    assert_eq!(start.1["content_block"]["id"], "call_1");
+    let tool_index = start.1["index"].clone();
+    assert!(!early_events.iter().any(|(kind, event)| kind == "content_block_stop" && event["index"] == tool_index));
+    assert!(!received.contains("message_stop"));
+    fixture.release_tool_arguments.notify_one();
+    while let Some(chunk) = body.next().await {
+        received.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+    }
+    let events = parse_sse(&received);
+    let fragments: Vec<_> = events.iter()
+        .filter(|(_, event)| event["delta"]["type"] == "input_json_delta")
+        .map(|(_, event)| event["delta"]["partial_json"].as_str().unwrap())
+        .collect();
+    assert_eq!(fragments.len(), 2);
+    let input: serde_json::Value = serde_json::from_str(&fragments.concat()).unwrap();
+    assert_eq!(input, json!({"file_path":"/not-created","content":"first second"}));
+    assert_eq!(events.iter().filter(|(kind, event)| kind == "content_block_stop" && event["index"] == tool_index).count(), 1);
+    assert!(events.iter().any(|(kind, event)| kind == "message_delta" && event["delta"]["stop_reason"] == "tool_use"));
+    assert_eq!(events.last().unwrap().0, "message_stop");
 }
 
 #[tokio::test]
@@ -892,6 +969,15 @@ async fn gateway_partial_tool_before_refusal_preserves_terminal_reason() {
             let status = response.status();
             let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
             let body = String::from_utf8_lossy(&bytes);
+            if streaming && matches!(mode, Mode::RefusedWithPartialTool) {
+                let events = parse_sse(&body);
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(events.last().unwrap().1["error"]["type"], "permission_error");
+                assert!(body.contains("refusal"));
+                assert!(!body.contains("message_stop"));
+                assert!(!body.contains("upstream_tool_json_error"));
+                continue;
+            }
             if status != StatusCode::OK
                 || !body.contains("\"refusal\"")
                 || body.contains("upstream_tool_json_error")

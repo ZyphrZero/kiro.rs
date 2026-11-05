@@ -41,14 +41,14 @@ impl ApiDomain {
 
 /// 工具兼容模式。
 ///
-/// - `ClaudeCode`（默认）：把 Claude Code 内置工具（Write/Edit/Bash/Read/Glob/Grep/LS/WebSearch）
+/// - `ClaudeCode`：把 Claude Code 内置工具（Write/Edit/Bash/Read/Glob/Grep/LS/WebSearch）
 ///   的工具名与入参双向适配为 Kiro 内置工具（fs_write/str_replace/... ），并替换为 Kiro 内置 schema。
-/// - `Raw`：保留旧行为，直接透传客户端工具名/schema，用于排障。
+/// - `Raw`（默认）：保留客户端工具名、描述和参数，仅做上游要求的名称长度与 schema 规范化。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolCompatibilityMode {
-    #[default]
     ClaudeCode,
+    #[default]
     Raw,
 }
 
@@ -337,8 +337,7 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
-    /// 工具兼容模式。默认 `claude-code`：把 Claude Code 内置工具名/入参双向适配为
-    /// Kiro 内置工具；`raw` 保留旧行为、直接透传客户端工具 schema，用于排障。
+    /// 工具兼容模式。默认 `raw` 保留客户端工具定义与参数；`claude-code` 显式启用旧映射。
     #[serde(default = "default_tool_compatibility_mode")]
     pub tool_compatibility_mode: ToolCompatibilityMode,
 
@@ -547,7 +546,7 @@ fn default_extract_thinking() -> bool {
 }
 
 fn default_tool_compatibility_mode() -> ToolCompatibilityMode {
-    ToolCompatibilityMode::ClaudeCode
+    ToolCompatibilityMode::Raw
 }
 
 fn default_endpoint() -> String {
@@ -721,6 +720,16 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::Config;
+
+    #[test]
+    fn tool_mode_defaults_to_raw_without_overriding_explicit_compatibility() {
+        for config in [Config::default(), serde_json::from_str("{}").unwrap()] {
+            assert_eq!(config.tool_compatibility_mode, super::ToolCompatibilityMode::Raw);
+        }
+        assert_eq!(super::ToolCompatibilityMode::default(), super::ToolCompatibilityMode::Raw);
+        let explicit: Config = serde_json::from_str(r#"{"toolCompatibilityMode":"claude-code"}"#).unwrap();
+        assert_eq!(explicit.tool_compatibility_mode, super::ToolCompatibilityMode::ClaudeCode);
+    }
 
     #[test]
     fn balance_refresh_interval_defaults_for_existing_configs() {

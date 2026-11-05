@@ -695,11 +695,19 @@ Kiro 上游没有原生的结构化输出字段，因此 `output_config.format =
 
 ### Tool Use
 
+`toolCompatibilityMode` 默认是 `raw`：保留客户端工具名、描述和参数，不替换为硬编码的 Kiro 内置工具 schema，也不注入旧的分块写入策略。上游要求的工具名长度限制、描述长度限制与 schema 规范化仍然生效。
+
+未设置该字段的配置升级后使用 `raw`；已有显式 `"toolCompatibilityMode": "claude-code"` 的配置保持不变。旧模式仍会将 Write/Edit/Bash/Read 等映射为内置工具，并可能丢弃客户端新增字段，建议仅在确认需要该映射时启用。
+
+普通流式响应中，不需要参数改写的原生工具调用会逐片发送 `input_json_delta`，最后才校验完整 JSON；非法 JSON、传输中断或已开始工具调用后的拒答，不会把半截调用标记为可执行的完整结果。旧模式中必须重写参数的工具、从文本识别的 `<invoke>` 调用仍需等参数完整后发送；结构化输出的缓冲行为见上一节。
+
 服务端会把 Anthropic tools 转成 Kiro 工具定义，并处理以下兼容逻辑：
 
 - 长工具名会被缩短，并在响应流中恢复原始名称。
 - 孤立的 `tool_use` / `tool_result` 会被过滤或修复，避免上游因消息配对错误返回不可恢复错误。
 - tool_result 中的图片会提升到 Kiro 顶层图片字段，并走同一套图片缩放逻辑。
+
+可运行忽略的真实上游测试验证当前凭据与模型：设置 `KIRO_RS_LIVE_CONFIG`、`KIRO_RS_LIVE_CREDENTIALS` 为已有配置/凭据文件路径，设置 `KIRO_RS_LIVE_MODEL`，再运行 `cargo test live_tool_modes_preserve_input_and_measure_streaming_without_execution -- --ignored --nocapture`。该测试直接连接 Kiro，不经 Magpie，会消耗真实上游额度；凭据刷新仅在内存中进行，不修改配置/凭据文件，也不执行模型返回的工具。不要为此开启会记录请求头和请求体的全量 debug 日志。
 
 ### WebSearch
 

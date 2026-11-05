@@ -1794,13 +1794,21 @@ pub fn restore_tool_use_for_client(
     let Some(client_name) = tool_name_map.get(kiro_name) else {
         return (kiro_name.to_string(), input);
     };
-    let builtin_mapped = claude_code_tool_name_to_kiro(client_name) == Some(kiro_name);
-    let client_input = if builtin_mapped {
+    let client_input = if tool_input_needs_rewrite(kiro_name, tool_name_map) {
         map_tool_input_from_kiro(kiro_name, input)
     } else {
         input
     };
     (client_name.clone(), client_input)
+}
+
+pub(super) fn tool_input_needs_rewrite(
+    kiro_name: &str,
+    tool_name_map: &HashMap<String, String>,
+) -> bool {
+    tool_name_map
+        .get(kiro_name)
+        .is_some_and(|client_name| claude_code_tool_name_to_kiro(client_name) == Some(kiro_name))
 }
 
 fn optional_schema(schema: serde_json::Value) -> serde_json::Value {
@@ -1955,18 +1963,7 @@ fn convert_tools(
         let description = if is_builtin {
             kiro_builtin_tool_description(&mapped_name, &t.description)
         } else {
-            let mut description = t.description.clone();
-            // 非内置（或 Raw 模式）：保留旧的 Write/Edit/Bash 后缀（按原始名匹配）。
-            let suffix = match t.name.as_str() {
-                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
-                "Bash" => BASH_TOOL_DESCRIPTION_SUFFIX,
-                _ => "",
-            };
-            if !suffix.is_empty() {
-                description.push('\n');
-                description.push_str(suffix);
-            }
+            let description = t.description.clone();
             // kiro API 不接受空描述，填充占位符
             if description.trim().is_empty() {
                 t.name.clone()
@@ -2241,9 +2238,8 @@ fn build_history(
         parts.push(format!(
             "{CLIENT_SYSTEM_PROMPT_OPEN}\n{system_content}\n{CLIENT_SYSTEM_PROMPT_CLOSE}"
         ));
-        // 分块写入策略只对带 Write/Edit/Bash 工具（Claude Code 风格）的客户端追加；
-        // 它是网关加的话，放在客户端系统提示标签外面。
-        if has_chunked_tools(req) {
+        // 仅旧兼容模式注入分块策略，raw 保留客户端的工具语义。
+        if is_claude_code_mode(mode) && has_chunked_tools(req) {
             parts.push(SYSTEM_CHUNKED_POLICY.to_string());
         }
         history.push(Message::User(HistoryUserMessage::new(parts.join("\n"), model_id)));
@@ -3510,6 +3506,40 @@ mod tests {
         .unwrap();
         assert_eq!(out[0].tool_specification.name, "Write", "Raw 模式不改名");
         assert!(map.is_empty(), "Raw 模式不记录内置映射");
+    }
+
+    #[test]
+    fn raw_request_preserves_tool_description_schema_and_input() {
+        let schema = serde_json::json!({
+            "type":"object",
+            "properties":{
+                "file_path":{"type":"string"},
+                "content":{"type":"string"},
+                "client_tag":{"type":"string"}
+            },
+            "required":["file_path","content","client_tag"],
+            "additionalProperties":false
+        });
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-opus-5-5", "max_tokens":128,
+            "system":"Client owns tool semantics.",
+            "messages":[{"role":"user","content":"Write the requested content."}],
+            "tools":[{
+                "name":"Write", "description":"Keep this client-defined contract unchanged.",
+                "input_schema":schema
+            }]
+        })).unwrap();
+        let result = convert_request_with_mode(&request, ToolCompatibilityMode::Raw).unwrap();
+        let tool = &result.conversation_state.current_message.user_input_message
+            .user_input_message_context.tools[0].tool_specification;
+        assert_eq!(tool.name, "Write");
+        assert_eq!(tool.description, "Keep this client-defined contract unchanged.");
+        assert_eq!(tool.input_schema.json, schema);
+        assert!(!serde_json::to_string(&result.conversation_state).unwrap().contains("50 lines"));
+        let input = serde_json::json!({"file_path":"/example","content":"hello","client_tag":"keep-me"});
+        let (name, restored) = restore_tool_use_for_client("Write", input.clone(), &result.tool_name_map);
+        assert_eq!(name, "Write");
+        assert_eq!(restored, input);
     }
 
     #[test]

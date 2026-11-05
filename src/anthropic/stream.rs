@@ -1114,7 +1114,7 @@ impl ToolJsonAccumulatorError {
                 name,
                 bytes,
             } => format!(
-                "Upstream ended before completing tool_use {} ({}) JSON input; buffered {} bytes. The tool call was not forwarded to the client.",
+                "Upstream ended before completing tool_use {} ({}) JSON input; received {} bytes. Discard any streamed arguments; the tool call must not be executed.",
                 tool_use_id, name, bytes
             ),
         }
@@ -1132,9 +1132,8 @@ impl std::error::Error for ToolJsonAccumulatorError {}
 /// 工具调用参数（JSON）累积器。
 ///
 /// Kiro 把 tool_use 的 `input` JSON 拆成多个 `toolUseEvent` 分片下发，最后一片
-/// 带 `stop=true`。分片可能切在 JSON 的任意字节位置（甚至 token 中间），因此
-/// **不能**逐片当作 `input_json_delta` 直接转发——必须按 `tool_use_id` 累积，
-/// 只在收到 `stop=true` 时整体解析，成功后一次性发出完整的工具调用。
+/// 带 `stop=true`。按 tool_use_id 累积以便结束时校验完整 JSON；不需要参数改写的
+/// 工具同时通过 input_json_delta 转发原始分片，完整性校验不阻塞增量输出。
 #[derive(Debug, Default)]
 pub struct ToolJsonAccumulator {
     /// tool_use_id -> (工具名, 已累积的 JSON 分片)
@@ -1150,7 +1149,7 @@ impl ToolJsonAccumulator {
 
     /// 累积一个 `toolUseEvent` 分片。
     ///
-    /// - 未收到 `stop` 时返回 `Ok(None)`（继续缓冲，不发出任何事件）。
+    /// - 未收到 `stop` 时返回 `Ok(None)`，由调用方决定是否同时转发原始分片。
     /// - 收到 `stop` 时把累积的 JSON 整体解析：成功返回 `Ok(Some(CompletedToolUse))`，
     ///   失败返回 `Err(InvalidJson)`。空参数按 `{}` 处理。
     /// - 工具名按 `tool_name_map` 还原为客户端原始名（短名 → 原名）。
@@ -1544,7 +1543,7 @@ impl SseStateManager {
         let mut events = Vec::new();
 
         for (index, block) in self.active_blocks.iter_mut() {
-            if block.started && !block.stopped {
+            if block.started && !block.stopped && block.block_type != "tool_use" {
                 events.push(SseEvent::new(
                     "content_block_stop",
                     json!({
@@ -1591,6 +1590,7 @@ pub struct StreamContext {
     pub output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
+    tool_input_character_counts: HashMap<i32, (i32, i32)>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
     pub tool_name_map: HashMap<String, String>,
     /// 本次请求声明的所有工具名（原始 client 名）。`<invoke>` 文本容错的灾难兜底：
@@ -1637,12 +1637,12 @@ pub struct StreamContext {
     repeat_guard_run: u32,
     /// 复读熔断：是否已经触发过熔断（触发后本轮后续文本一律丢弃，不再吐、不写历史）。
     repeat_guard_tripped: bool,
-    /// 工具调用参数 JSON 累积器：按 tool_use_id 缓冲分片，`stop` 时整体解析，
-    /// 避免把“流式半截 JSON”当成完整工具调用转发。
+    /// 工具调用 JSON 校验器：按 tool_use_id 累积，`stop` 时整体解析。
     tool_json_accumulator: ToolJsonAccumulator,
     /// 工具调用 JSON 错误（非法 / 半截）。一旦置位，收尾时补发 `error` 事件，
     /// 上层据此把本次请求记为 error 而非 success。
     tool_json_error: Option<ToolJsonAccumulatorError>,
+    tool_stream_refused: bool,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
     /// metadataEvent.stopReason 的原始值（上游原生终止原因，M2 / M5）。
@@ -1694,6 +1694,12 @@ impl StreamContext {
         self.tool_json_error.as_ref().map(|err| err.message())
     }
 
+    pub fn tool_stream_refusal_message(&self) -> Option<&'static str> {
+        self.tool_stream_refused.then_some(
+            "Upstream refusal interrupted an incomplete tool call; discard its streamed arguments.",
+        )
+    }
+
     pub fn repeat_guard_error_message(&self) -> Option<&'static str> {
         self.repeat_guard_tripped.then_some(REPEAT_GUARD_ERROR_MESSAGE)
     }
@@ -1715,6 +1721,7 @@ impl StreamContext {
             provider_token_usage: None,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
+            tool_input_character_counts: HashMap::new(),
             tool_name_map,
             known_tool_names,
             invoke_tool_schemas: InvokeToolSchemas::new(),
@@ -1735,6 +1742,7 @@ impl StreamContext {
             repeat_guard_tripped: false,
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
+            tool_stream_refused: false,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
             native_stop_reason: None,
             context_window_full: false,
@@ -2457,18 +2465,21 @@ impl StreamContext {
     /// 块索引按 `completed.id` 复用/分配（结构化按 tool_use_id 复用；invoke 合成用新 id 故新分配），
     /// 依次发 `content_block_start{name, input:{}}` → 单个完整 `input_json_delta` → `content_block_stop`。
     fn emit_completed_tool_use(&mut self, completed: CompletedToolUse) -> Vec<SseEvent> {
-        let mut events = Vec::new();
-        self.state_manager.set_has_tool_use(true);
+        let (block_index, mut events) = self.start_tool_use(&completed.id, &completed.name);
+        events.extend(self.emit_tool_input_fragment(block_index, &completed.input.to_string()));
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
+            events.push(stop_event);
+        }
+        events
+    }
 
-        let block_index = if let Some(&idx) = self.tool_block_indices.get(&completed.id) {
-            idx
-        } else {
-            let idx = self.state_manager.next_block_index();
-            self.tool_block_indices.insert(completed.id.clone(), idx);
-            idx
-        };
-
-        events.extend(self.state_manager.handle_content_block_start(
+    fn start_tool_use(&mut self, id: &str, name: &str) -> (i32, Vec<SseEvent>) {
+        if let Some(&index) = self.tool_block_indices.get(id) {
+            return (index, Vec::new());
+        }
+        let block_index = self.state_manager.next_block_index();
+        self.tool_block_indices.insert(id.to_string(), block_index);
+        let events = self.state_manager.handle_content_block_start(
             block_index,
             "tool_use",
             json!({
@@ -2476,34 +2487,36 @@ impl StreamContext {
                 "index": block_index,
                 "content_block": {
                     "type": "tool_use",
-                    "id": completed.id,
-                    "name": completed.name,
+                    "id": id,
+                    "name": name,
                     "input": {}
                 }
             }),
-        ));
+        );
+        (block_index, events)
+    }
 
-        // 一次性发出完整参数 JSON（来源已保证是合法 JSON）。
-        self.output_tokens += estimate_tokens(&completed.input.to_string());
-        if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+    fn emit_tool_input_fragment(&mut self, block_index: i32, input: &str) -> Vec<SseEvent> {
+        if input.is_empty() {
+            return Vec::new();
+        }
+        let counts = self.tool_input_character_counts.entry(block_index).or_default();
+        let previous = if *counts == (0, 0) { 0 } else { estimate_character_tokens(counts.0, counts.1) };
+        let (chinese, other) = count_token_characters(input);
+        counts.0 += chinese;
+        counts.1 += other;
+        self.output_tokens += estimate_character_tokens(counts.0, counts.1) - previous;
+        self.state_manager.handle_content_block_delta(
             block_index,
             json!({
                 "type": "content_block_delta",
                 "index": block_index,
                 "delta": {
                     "type": "input_json_delta",
-                    "partial_json": serde_json::to_string(&completed.input).unwrap_or_else(|_| "{}".to_string())
+                    "partial_json": input
                 }
             }),
-        ) {
-            events.push(delta_event);
-        }
-
-        if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
-            events.push(stop_event);
-        }
-
-        events
+        ).into_iter().collect()
     }
 
     /// 处理工具使用事件
@@ -2577,15 +2590,26 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(&buffered));
         }
 
-        // 通过累积器缓冲工具参数 JSON 分片：只有收到 stop=true 且解析成功时才
-        // 发出完整的工具调用；半截 / 非法 JSON 记为错误，交由收尾（generate_final_events）
-        // 统一补发 error 事件，避免把无法解析的参数当成完整调用转发给客户端。
+        let pending = self.tool_json_accumulator.buffers.get(&tool_use.tool_use_id);
+        let kiro_name = pending
+            .map(|(name, _)| name.as_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&tool_use.name)
+            .to_string();
+        let stream_input = !kiro_name.is_empty()
+            && !super::converter::tool_input_needs_rewrite(&kiro_name, &self.tool_name_map);
+        let empty_input = pending.is_none_or(|(_, input)| input.trim().is_empty())
+            && tool_use.input.trim().is_empty();
+        let buffered_prefix = if stream_input && !self.tool_block_indices.contains_key(&tool_use.tool_use_id) {
+            pending.map(|(_, input)| input.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
         let completed = match self
             .tool_json_accumulator
             .push(tool_use, &self.tool_name_map)
         {
-            Ok(Some(completed)) => completed,
-            Ok(None) => return events,
+            Ok(completed) => completed,
             Err(e) => {
                 tracing::error!("{}", e);
                 self.tool_json_error = Some(e);
@@ -2594,8 +2618,23 @@ impl StreamContext {
             }
         };
 
-        // 统一发出（与 <invoke> 文本捞回路径共用同一发出口）。
-        events.extend(self.emit_completed_tool_use(completed));
+        if stream_input && (!empty_input || completed.is_some()) {
+            let client_name = self.tool_name_map.get(&kiro_name).unwrap_or(&kiro_name).clone();
+            let (index, start_events) = self.start_tool_use(&tool_use.tool_use_id, &client_name);
+            events.extend(start_events);
+            events.extend(self.emit_tool_input_fragment(index, &buffered_prefix));
+            events.extend(self.emit_tool_input_fragment(index, &tool_use.input));
+            if completed.is_some() {
+                if empty_input {
+                    events.extend(self.emit_tool_input_fragment(index, "{}"));
+                }
+                if let Some(stop) = self.state_manager.handle_content_block_stop(index) {
+                    events.push(stop);
+                }
+            }
+        } else if let Some(completed) = completed {
+            events.extend(self.emit_completed_tool_use(completed));
+        }
         events
     }
 
@@ -2696,6 +2735,16 @@ impl StreamContext {
             // Refused generation can end in the middle of a tool call. Drop
             // pending calls rather than recovering them or reporting JSON errors.
             self.tool_json_error = None;
+            if self.tool_block_indices.values().any(|index| {
+                self.state_manager.is_block_open_of_type(*index, "tool_use")
+            }) {
+                self.tool_stream_refused = true;
+                events.extend(self.generate_error_events(
+                    "permission_error",
+                    self.tool_stream_refusal_message().unwrap(),
+                ));
+                return events;
+            }
         } else if self.tool_json_error.is_none() {
             let finished = self.tool_json_accumulator.finish(&self.tool_name_map);
             match finished {
@@ -2776,19 +2825,25 @@ impl StreamContext {
 ///
 /// 公开供 cache_meter 等模块复用同一估算口径。
 pub fn estimate_tokens(text: &str) -> i32 {
-    let chars: Vec<char> = text.chars().collect();
+    let (chinese_count, other_count) = count_token_characters(text);
+    estimate_character_tokens(chinese_count, other_count)
+}
+
+fn count_token_characters(text: &str) -> (i32, i32) {
     let mut chinese_count = 0;
     let mut other_count = 0;
 
-    for c in &chars {
-        if *c >= '\u{4E00}' && *c <= '\u{9FFF}' {
+    for character in text.chars() {
+        if ('\u{4E00}'..='\u{9FFF}').contains(&character) {
             chinese_count += 1;
         } else {
             other_count += 1;
         }
     }
+    (chinese_count, other_count)
+}
 
-    // 中文约 1.5 字符/token，英文约 4 字符/token
+fn estimate_character_tokens(chinese_count: i32, other_count: i32) -> i32 {
     let chinese_tokens = (chinese_count * 2 + 2) / 3;
     let other_tokens = (other_count + 3) / 4;
 
@@ -3006,7 +3061,11 @@ mod tests {
             "{\"path\":\"/a",
             false,
         )));
-        assert!(emitted.is_empty(), "partial tool JSON must remain buffered");
+        assert!(emitted.iter().any(|event| event.data["delta"]["type"] == "input_json_delta"));
+        let tool_index = emitted.iter()
+            .find(|event| event.data["content_block"]["type"] == "tool_use")
+            .unwrap().data["index"].clone();
+        assert!(!emitted.iter().any(|event| event.event == "content_block_stop" && event.data["index"] == tool_index));
 
         let final_events = ctx.generate_final_events();
         assert_eq!(final_events.last().unwrap().event, "error");
