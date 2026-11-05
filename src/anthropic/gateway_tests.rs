@@ -28,6 +28,9 @@ use bytes::Bytes;
 use futures::{StreamExt, stream};
 use parking_lot::Mutex;
 use serde_json::json;
+
+#[path = "chat_stream_gateway_tests.rs"]
+mod chat_stream_tests;
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
@@ -52,6 +55,7 @@ enum Mode {
     InvalidFrame,
     Empty,
     Tools,
+    GatedChatText,
     GatedToolArguments,
     Filtered,
     Stalled,
@@ -538,6 +542,24 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                     bytes.extend_from_slice(&frame("contextUsageEvent", json!({"contextUsagePercentage": 100.0})));
                 }
                 return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::GatedChatText) {
+                let first = frame("assistantResponseEvent", json!({"content": chat_stream_tests::first_text()}));
+                let second = frame("assistantResponseEvent", json!({"content": chat_stream_tests::second_text()}));
+                let metadata = frame("metadataEvent", json!({"tokenUsage": {
+                    "uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2
+                }}));
+                let second_gate = release_arguments.clone();
+                let chunks = stream::once(async move { Ok::<_, Infallible>(first) })
+                    .chain(stream::once(async move {
+                        second_gate.notified().await;
+                        Ok::<_, Infallible>(second)
+                    }))
+                    .chain(stream::once(async move {
+                        release_arguments.notified().await;
+                        Ok::<_, Infallible>(metadata)
+                    }));
+                return Response::new(Body::from_stream(chunks));
             }
             if matches!(mode, Mode::GatedToolArguments) {
                 let first = frame("toolUseEvent", json!({

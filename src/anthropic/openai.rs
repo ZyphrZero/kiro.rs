@@ -39,6 +39,10 @@ const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
 /// 未显式给出 max_tokens 时的默认输出上限
 const DEFAULT_MAX_TOKENS: i32 = 32000;
 
+#[cfg(test)]
+#[path = "chat_stream_tests.rs"]
+mod stream_tests;
+
 // ============================ 请求类型 ============================
 
 #[derive(Debug, Deserialize)]
@@ -955,72 +959,6 @@ fn chat_streaming_response(body: Body, model: String) -> Response {
         .unwrap()
 }
 
-/// Complete-result SSE fixtures for conversion tests.
-#[cfg(test)]
-fn build_stream_sse(p: &ParsedResponse) -> String {
-    let id = new_id();
-    let created = now_ts();
-    let mut out = String::new();
-
-    let mut push_chunk = |delta: Value, finish: Option<&str>| {
-        let chunk = json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": p.model,
-            "choices": [{
-                "index": 0,
-                "delta": delta,
-                "finish_reason": finish,
-            }],
-        });
-        out.push_str("data: ");
-        out.push_str(&chunk.to_string());
-        out.push_str("\n\n");
-    };
-
-    // 角色帧
-    push_chunk(json!({ "role": "assistant" }), None);
-
-    // 文本帧
-    if !p.text.is_empty() {
-        push_chunk(json!({ "content": p.text }), None);
-    }
-
-    // 工具调用帧
-    for (i, tc) in p.tool_calls.iter().enumerate() {
-        let delta = json!({
-            "tool_calls": [{
-                "index": i,
-                "id": tc.get("id").cloned().unwrap_or(Value::Null),
-                "type": "function",
-                "function": tc.get("function").cloned().unwrap_or(json!({})),
-            }]
-        });
-        push_chunk(delta, None);
-    }
-
-    // 结束帧（带 usage）
-    let final_chunk = json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": p.model,
-        "choices": [{
-            "index": 0,
-            "delta": {},
-            "finish_reason": p.finish_reason,
-        }],
-        "usage": build_usage_json(p),
-    });
-    out.push_str("data: ");
-    out.push_str(&final_chunk.to_string());
-    out.push_str("\n\n");
-    out.push_str("data: [DONE]\n\n");
-
-    out
-}
-
 /// 构造 OpenAI usage 对象，并按需透传 upstream meteringEvent 写入的
 /// credit_usage / credit_unit / credit_unit_plural 字段。
 fn build_usage_json(p: &ParsedResponse) -> Value {
@@ -1241,29 +1179,6 @@ mod tests {
         assert_eq!(usage["credit_usage"], json!(0.5));
         assert_eq!(usage["credit_unit"], json!("credit"));
         assert_eq!(usage["credit_unit_plural"], json!("credits"));
-    }
-
-    #[test]
-    fn build_stream_sse_carries_credit_fields_in_final_chunk() {
-        let mut p = base_parsed();
-        p.credit_usage = Some(0.33);
-        p.credit_unit = Some("credit".to_string());
-        p.credit_unit_plural = Some("credits".to_string());
-        let sse = build_stream_sse(&p);
-        assert!(sse.contains("\"credit_usage\":0.33"));
-        assert!(sse.contains("\"credit_unit\":\"credit\""));
-        assert!(sse.contains("\"credit_unit_plural\":\"credits\""));
-        // 结束帧的 usage 必须出现在最后一个 data 块里
-        assert!(sse.contains("\"usage\""));
-    }
-
-    #[test]
-    fn build_stream_sse_omits_credit_fields_without_metering() {
-        let p = base_parsed();
-        let sse = build_stream_sse(&p);
-        assert!(!sse.contains("credit_usage"));
-        assert!(!sse.contains("credit_unit"));
-        assert!(!sse.contains("credit_unit_plural"));
     }
 
     #[test]

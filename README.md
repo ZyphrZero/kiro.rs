@@ -40,7 +40,7 @@ Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
 ## ✨ 功能
 
 - **Anthropic Messages API 兼容**：`/v1/messages`、`/v1/models`、`/v1/messages/count_tokens`。
-- **OpenAI API 兼容**：`/v1/chat/completions` 和 `/v1/responses`，支持非流式响应与合成 SSE，可供 OpenAI SDK 和新版 Codex CLI 使用。
+- **OpenAI API 兼容**：`/v1/chat/completions` 和 `/v1/responses`，支持非流式响应与逐事件转换的增量 SSE，可供 OpenAI SDK 和新版 Codex CLI 使用。
 - **Claude Code 兼容端点**：`/cc/v1/messages`、`/cc/v1/messages/count_tokens`。
 - **GPT-5.6 模型族**：`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`。
 - 流式和非流式响应：支持 Anthropic SSE 与 OpenAI SSE 事件格式。
@@ -247,6 +247,10 @@ curl http://127.0.0.1:8990/v1/chat/completions \
     ]
   }'
 ```
+
+`stream: true` 会复用 Anthropic 的实时流式链路，将正文分片转换为 `choices[0].delta.content`，工具参数分片转换为 `delta.tool_calls[].function.arguments`；正常结束时发送最终用量、结束原因和 `[DONE]`。流中错误会返回错误事件，不伪装成正常完成。需要完整参数改写的旧工具兼容模式仍存在缓冲边界，见「Tool Use」。
+
+测试流式显示时，使用 `curl -N` 并将请求中的 `stream` 改为 `true`，避免客户端自身缓存输出；网关也发送 `X-Accel-Buffering: no`。SSE 事件与 TCP 包不是一一对应关系，不能仅凭 TCP 包数量判断是否流式；若上游暂时没有正文、只在推理，或最终只提供一个正文片段，网关不会凭空制造文本增量。外层代理还需允许 SSE 透传、关闭响应缓冲。
 
 ### OpenAI Responses / Codex CLI
 
