@@ -325,6 +325,8 @@ pub struct CredentialDistribution {
     pub calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
     pub errors: u64,
 }
 
@@ -608,10 +610,7 @@ impl UsageAggregator {
                     }
                 }
                 let entry = acc.entry(*id).or_default();
-                entry.input_tokens += stats.input_tokens;
-                entry.output_tokens += stats.output_tokens;
-                entry.calls += stats.calls;
-                entry.errors += stats.errors;
+                entry.add_stats(stats);
             }
         }
         let mut out: Vec<CredentialDistribution> = acc
@@ -621,6 +620,8 @@ impl UsageAggregator {
                 calls: stats.calls,
                 input_tokens: stats.input_tokens,
                 output_tokens: stats.output_tokens,
+                cache_creation_tokens: stats.cache_creation_tokens,
+                cache_read_tokens: stats.cache_read_tokens,
                 errors: stats.errors,
             })
             .collect();
@@ -1119,6 +1120,94 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].key_id, 1);
         assert_eq!(filtered[0].input_tokens, 100);
+    }
+
+    #[test]
+    fn credential_cache_totals_respect_key_group_and_window() {
+        let agg = UsageAggregator::new();
+        let now = activity_test_time();
+        for (credential, key, input, write, read, age) in [
+            (5, 1, 0, 100, 900, 0),
+            (5, 2, 900, 10, 90, 0),
+            (6, 1, 200, 50, 0, 0),
+            (5, 1, 99_999, 99_999, 99_999, 24),
+        ] {
+            let mut rec = activity_record(credential, now - Duration::hours(age), "success");
+            rec.key_id = key;
+            rec.input_tokens = input;
+            rec.cache_creation_tokens = write;
+            rec.cache_read_tokens = read;
+            agg.ingest_at(&rec, now);
+        }
+        let window = StatsQueryWindow {
+            start_ts: now.timestamp() - 3600,
+            end_ts: now.timestamp() + 3600,
+            granularity: StatsGranularity::Hour,
+        };
+        let rows = agg.query_by_credential(window, None, None);
+        let five = rows.iter().find(|row| row.credential_id == 5).unwrap();
+        assert_eq!(
+            (
+                five.calls,
+                five.input_tokens,
+                five.cache_creation_tokens,
+                five.cache_read_tokens
+            ),
+            (2, 900, 110, 990)
+        );
+        let json = serde_json::to_value(five).unwrap();
+        assert_eq!(json["cacheCreationTokens"], 110);
+        assert_eq!(json["cacheReadTokens"], 990);
+        let key_rows = agg.query_by_credential(window, Some(1), None);
+        let five = key_rows.iter().find(|row| row.credential_id == 5).unwrap();
+        assert_eq!(
+            (five.cache_creation_tokens, five.cache_read_tokens),
+            (100, 900)
+        );
+        let allowed = [6].into_iter().collect();
+        let group_rows = agg.query_by_credential(window, None, Some(&allowed));
+        assert_eq!(group_rows.len(), 1);
+        assert_eq!(
+            (
+                group_rows[0].credential_id,
+                group_rows[0].cache_creation_tokens,
+                group_rows[0].cache_read_tokens
+            ),
+            (6, 50, 0)
+        );
+    }
+
+    #[test]
+    fn credential_cache_totals_include_failed_usage_and_report_errors() {
+        let agg = UsageAggregator::new();
+        let now = activity_test_time();
+        // A successful snapshot, a failed request with provider usage, and a
+        // failed request whose only available usage is estimated prompt input.
+        for (status, input, write, read) in [
+            ("success", 100, 100, 800),
+            ("error", 20, 30, 50),
+            ("error", 900, 0, 0),
+        ] {
+            let mut rec = activity_record(5, now, status);
+            rec.input_tokens = input;
+            rec.cache_creation_tokens = write;
+            rec.cache_read_tokens = read;
+            agg.ingest_at(&rec, now);
+        }
+        for granularity in [StatsGranularity::Hour, StatsGranularity::Day] {
+            let window = StatsQueryWindow {
+                start_ts: now.timestamp() - 86400,
+                end_ts: now.timestamp() + 3600,
+                granularity,
+            };
+            let rows = agg.query_by_credential(window, None, None);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].calls, 3);
+            assert_eq!(rows[0].errors, 2);
+            assert_eq!(rows[0].input_tokens, 1020);
+            assert_eq!(rows[0].cache_creation_tokens, 130);
+            assert_eq!(rows[0].cache_read_tokens, 850);
+        }
     }
 
     #[test]
