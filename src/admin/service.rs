@@ -2505,7 +2505,7 @@ impl AdminService {
         let (proxy, token) = {
             let runtime = self.update_config.lock();
             (
-                self.token_manager.proxy().map(|p| p.url.clone()),
+                self.token_manager.proxy(),
                 runtime.github_token.clone(),
             )
         };
@@ -2519,7 +2519,7 @@ impl AdminService {
         if !reused {
             super::binary_update::download_release_binary(
                 &version,
-                proxy.as_deref(),
+                proxy.as_ref(),
                 token.as_deref(),
                 &staged,
             )
@@ -2553,7 +2553,7 @@ impl AdminService {
         let (proxy, token) = {
             let runtime = self.update_config.lock();
             (
-                self.token_manager.proxy().map(|p| p.url.clone()),
+                self.token_manager.proxy(),
                 runtime.github_token.clone(),
             )
         };
@@ -2566,7 +2566,7 @@ impl AdminService {
         if !reused {
             super::binary_update::download_release_binary(
                 &version,
-                proxy.as_deref(),
+                proxy.as_ref(),
                 token.as_deref(),
                 &staged,
             )
@@ -2743,7 +2743,9 @@ impl AdminService {
             GITHUB_RELEASES_REPO
         );
         let token = self.update_config.lock().github_token.clone();
-        let mut req = reqwest::Client::new()
+        let proxy = self.token_manager.proxy();
+        let client = super::binary_update::build_http_client(proxy.as_ref())?;
+        let mut req = client
             .get(&url)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
@@ -2817,8 +2819,8 @@ impl AdminService {
             });
         let authenticated = token.is_some();
 
-        let proxy = self.token_manager.proxy().map(|p| p.url.clone());
-        let client = match super::binary_update::build_http_client(proxy.as_deref()) {
+        let proxy = self.token_manager.proxy();
+        let client = match super::binary_update::build_http_client(proxy.as_ref()) {
             Ok(c) => c,
             Err(e) => {
                 return GitHubRateLimitInfo {
