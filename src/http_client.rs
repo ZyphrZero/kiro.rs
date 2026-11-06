@@ -126,7 +126,7 @@ fn client_builder(
 
         // 设置代理认证
         if let (Some(username), Some(password)) = (&proxy_config.username, &proxy_config.password) {
-            proxy = proxy.basic_auth(username, password);
+            proxy = proxy.basic_auth(&escape_percent(username), &escape_percent(password));
         }
 
         builder = builder.proxy(proxy);
@@ -134,6 +134,13 @@ fn client_builder(
     }
 
     Ok(builder)
+}
+
+/// reqwest 0.12 stores `basic_auth` credentials in the proxy URL's userinfo,
+/// where `url` leaves '%' unescaped, and percent-decodes them once when
+/// connecting. Escaping '%' keeps a literal "p%40ss" from arriving as "p@ss".
+pub(crate) fn escape_percent(value: &str) -> String {
+    value.replace('%', "%25")
 }
 
 #[cfg(test)]
@@ -162,6 +169,111 @@ mod tests {
     fn test_build_client_without_proxy() {
         let client = build_client(None, 30, TlsBackend::Rustls);
         assert!(client.is_ok());
+    }
+
+    const FIXTURE_DEADLINE: Duration = Duration::from_secs(5);
+
+    /// Captures the CONNECT request headers, then refuses the tunnel so no TLS
+    /// or external traffic follows.
+    async fn capture_connect(proxy: impl FnOnce(std::net::SocketAddr) -> ProxyConfig) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(tokio::time::timeout(FIXTURE_DEADLINE, async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let mut buf = [0; 1024];
+                let count = socket.read(&mut buf).await.unwrap();
+                assert!(count > 0, "connection closed before complete headers");
+                request.extend_from_slice(&buf[..count]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        }));
+        let client = build_client(Some(&proxy(addr)), 5, TlsBackend::Rustls).unwrap();
+        client
+            .get("https://example.invalid/")
+            .send()
+            .await
+            .expect_err("fixture refuses the tunnel");
+        server.await.unwrap().expect("proxy fixture timed out")
+    }
+
+    /// Decoded `user:pass` from the Basic Proxy-Authorization header.
+    fn proxy_authorization(request: &str) -> Option<String> {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let value = request.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case("proxy-authorization").then(|| value.trim())
+        })?;
+        let decoded = STANDARD.decode(value.strip_prefix("Basic ")?).unwrap();
+        Some(String::from_utf8(decoded).unwrap())
+    }
+
+    #[tokio::test]
+    async fn separate_proxy_credentials_keep_literal_percent_sequences() {
+        let request = capture_connect(|addr| {
+            ProxyConfig::new(format!("http://{addr}")).with_auth("u%3Aser", "p%40ss%25")
+        })
+        .await;
+        assert_eq!(proxy_authorization(&request).as_deref(), Some("u%3Aser:p%40ss%25"));
+    }
+
+    #[tokio::test]
+    async fn separate_proxy_credentials_keep_reserved_characters() {
+        let request = capture_connect(|addr| {
+            ProxyConfig::new(format!("http://{addr}")).with_auth("user@name", "p@ss:/#? 密码")
+        })
+        .await;
+        assert_eq!(
+            proxy_authorization(&request).as_deref(),
+            Some("user@name:p@ss:/#? 密码")
+        );
+    }
+
+    #[tokio::test]
+    async fn url_embedded_proxy_credentials_are_decoded_once() {
+        let request =
+            capture_connect(|addr| ProxyConfig::new(format!("http://url-user:p%2540ss@{addr}")))
+                .await;
+        assert_eq!(proxy_authorization(&request).as_deref(), Some("url-user:p%40ss"));
+    }
+
+    #[tokio::test]
+    async fn separate_socks5_credentials_keep_literal_percent_sequences() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(tokio::time::timeout(FIXTURE_DEADLINE, async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 2];
+            socket.read_exact(&mut greeting).await.unwrap();
+            let mut methods = vec![0; greeting[1] as usize];
+            socket.read_exact(&mut methods).await.unwrap();
+            assert!(methods.contains(&2), "must offer username/password auth");
+            socket.write_all(&[5, 2]).await.unwrap();
+            let mut header = [0; 2];
+            socket.read_exact(&mut header).await.unwrap();
+            let mut username = vec![0; header[1] as usize];
+            socket.read_exact(&mut username).await.unwrap();
+            let mut password = vec![0; socket.read_u8().await.unwrap() as usize];
+            socket.read_exact(&mut password).await.unwrap();
+            // Reject authentication so nothing is forwarded.
+            socket.write_all(&[1, 1]).await.unwrap();
+            (username, password)
+        }));
+        let proxy = ProxyConfig::new(format!("socks5h://{addr}")).with_auth("s%40user", "s%3Apass");
+        build_client(Some(&proxy), 5, TlsBackend::Rustls)
+            .unwrap()
+            .get("https://example.invalid/")
+            .send()
+            .await
+            .expect_err("fixture rejects SOCKS authentication");
+        let (username, password) = server.await.unwrap().expect("SOCKS fixture timed out");
+        assert_eq!(username, b"s%40user");
+        assert_eq!(password, b"s%3Apass");
     }
 
     #[test]
