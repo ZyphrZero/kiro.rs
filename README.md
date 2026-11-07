@@ -819,6 +819,16 @@ data/
 - `cache_read_input_tokens`
 - `output_tokens`
 
+这里的缓存计量是网关根据请求前缀和会话信息做的本地估算，不能据此确认上游实际
+KV cache 命中或推算 Kiro 积分折扣。Redis 远端存储共享的是计量条目，也不代表共享上游缓存。
+
+如果 DSH 等客户端一直显示缓存命中率为 0%，先确认运行版本已包含 [#145](https://github.com/ZyphrZero/kiro.rs/pull/145)
+（v0.9.7 已包含），并确认 `cacheMeteringEnabled` 未被关闭（默认开启）。当前实现中，
+`id=0` 系统 Key 缺少可识别的 `metadata.user_id` 会话标识时，会根据系统提示和第一条
+user 消息派生隔离种子；缺少会话标识本身不会再导致跳过估算。仍需请求带有有效的
+`cache_control` 断点，并在 TTL 内重复使用可匹配的前缀，才有机会记为命中；首次请求
+读缓存为 0 属于正常现象。持续为 0 时，可结合下方 miss 原因排查。
+
 ### Prompt cache 计量容量选型
 
 `CacheMeter` 是一张定容表。写入速率为 `W` 条/秒时，一条 entry 的实际存活期是
@@ -859,14 +869,16 @@ C >= peak_req_per_sec × entries_per_req × TTL_secs
 后台任务每 60 秒输出一行（本周期无任何增量时不输出）：
 
 ```text
-cache_meter stats entries_len=13421 capacity=262144 hits=90120 misses=10233 evicted=0 expired=240311
-  miss_no_entry=8120 miss_expired=1900 miss_evicted=13 miss_no_breakpoint=180 miss_no_seed=20 tombstone_clears=0
+cache_meter stats entries_len=13421 capacity=262144 hits=90120 misses=10213 evicted=0 expired=240311
+  miss_no_entry=8120 miss_expired=1900 miss_evicted=13 miss_no_breakpoint=180 miss_no_seed=0 tombstone_clears=0
 ```
 
 - `miss_evicted` 持续非零 + `entries_len` 贴着 `capacity` → **容量不够**，按上面的公式调高。
 - `miss_expired` 占多数、`evicted=0` → 是真实 TTL 过期，调容量没用。
-- `miss_no_breakpoint` / `miss_no_seed` 占多数 → 客户端没声明 `cache_control`，
-  或请求缺少 `metadata.user_id` 且用的是 `id=0` 系统 Key，与容量无关。
+- `miss_no_breakpoint` 占多数 → 请求没有有效的 `cache_control` 断点，与容量无关。
+- `miss_no_seed` → 保留的隔离种子缺失诊断。当前实现的种子生成路径均有回退，
+  系统 Key 缺少会话标识也会使用派生种子，正常不应增加此计数；若仍增加，先核对
+  实际运行版本和日志所属实例，调大容量不能解决。
 
 单条 miss 的归因还会在 `RUST_LOG=debug` 下输出：有断点的请求按断点逐条打
 `cache_meter miss block_idx=.. reason=Absent|Expired|Evicted`（一个断点最多一条，
