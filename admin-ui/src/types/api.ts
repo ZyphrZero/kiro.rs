@@ -656,6 +656,9 @@ export interface CredentialDistribution {
   calls: number
   inputTokens: number
   outputTokens: number
+  /** Older servers may not provide cache counters. Missing values mean unknown. */
+  cacheCreationTokens?: number
+  cacheReadTokens?: number
   errors: number
 }
 

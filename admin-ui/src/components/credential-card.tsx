@@ -43,6 +43,8 @@ import {
 } from "@/components/ui/dialog";
 import type {
   CredentialActivity,
+  CredentialDistribution,
+  StatsRange,
   CredentialMetadataSchema,
   CredentialStatusItem,
   BalanceResponse,
@@ -72,6 +74,7 @@ import { BalanceDialog } from "@/components/balance-dialog";
 import { getDisposition } from "@/components/console/credential-state";
 import { railBorderClass } from "@/components/console/rail";
 import { PriorityPreview } from "@/components/console/priority-preview";
+import { CredentialCacheMetric } from "@/components/credential-cache-stats";
 import { CredentialLabel } from "@/components/console/credential-label";
 
 interface CredentialCardProps {
@@ -86,6 +89,11 @@ interface CredentialCardProps {
   activity?: CredentialActivity;
   loadingActivity?: boolean;
   activityError?: boolean;
+  cacheStats?: CredentialDistribution;
+  cacheRange?: StatsRange;
+  loadingCacheStats?: boolean;
+  cacheStatsError?: boolean;
+  cacheStatsStale?: boolean;
   /** 展示形态：卡片（默认）或紧凑列表行 */
   view?: "card" | "list";
   /** 字段排序开启时禁用拖拽调优先级（隐藏拖拽手柄） */
@@ -326,6 +334,11 @@ function CredentialCardImpl({
   activity,
   loadingActivity = false,
   activityError = false,
+  cacheStats,
+  cacheRange = '24h',
+  loadingCacheStats = false,
+  cacheStatsError = false,
+  cacheStatsStale = false,
   view = "card",
   dragDisabled = false,
   preview = false,
@@ -854,6 +867,7 @@ function CredentialCardImpl({
         <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
           {activityStats}
         </div>
+        <div className="mt-2 select-text"><CredentialCacheMetric stats={cacheStats} range={cacheRange} loading={loadingCacheStats} failed={cacheStatsError} stale={cacheStatsStale} compact /></div>
       </div>
 
       <div className="hidden shrink-0 items-center gap-6 lg:flex">
@@ -1318,6 +1332,7 @@ function CredentialCardImpl({
                   </span>
                 </div>
               )}
+              <div className="mt-1 select-text"><CredentialCacheMetric stats={cacheStats} range={cacheRange} loading={loadingCacheStats} failed={cacheStatsError} stale={cacheStatsStale} /></div>
               <div className={cn(
                 "flex min-w-0 items-center justify-between gap-3",
                 (credential.proxyTemporaryDirect || proxyUnhealthy) && "text-destructive",

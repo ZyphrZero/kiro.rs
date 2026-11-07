@@ -84,6 +84,9 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { CredentialCard, profileShortId } from "@/components/credential-card";
+import { AccountCacheSummary } from "@/components/credential-cache-stats";
+import { useCredentialCacheStats } from "@/hooks/use-stats";
+import type { CredentialDistribution, StatsRange } from "@/types/api";
 import { AddCredentialDialog } from "@/components/add-credential-dialog";
 import { BatchImportDialog } from "@/components/batch-import-dialog";
 import { BatchEditCredentialDialog } from "@/components/batch-edit-credential-dialog";
@@ -506,6 +509,27 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     refetch: refreshActivity,
   } = useCredentialActivity();
   const groupOptions = useGroupOptions();
+  const [cacheRange, setCacheRange] = useState<StatsRange>('24h');
+  const cacheQuery = useCredentialCacheStats(cacheRange);
+  const cacheRows = useMemo(() => cacheQuery.data ?? [], [cacheQuery.data]);
+  const cacheByCredential = useMemo(() => {
+    const rows = new Map<number, CredentialDistribution>(
+      cacheQuery.data?.map(row => [row.credentialId, row]),
+    );
+    if (cacheQuery.data !== undefined) {
+      for (const credential of data?.credentials ?? []) {
+        if (!rows.has(credential.id)) {
+          rows.set(credential.id, {
+            credentialId: credential.id, calls: 0, errors: 0,
+            inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0,
+          });
+        }
+      }
+    }
+    return rows;
+  }, [cacheQuery.data, data?.credentials]);
+  const cacheUnavailable = cacheQuery.isError && cacheQuery.data === undefined;
+  const cacheStale = cacheQuery.isError && cacheQuery.data !== undefined;
   const allCredentials = import.meta.env.DEV
     ? [DEV_PREVIEW_CREDENTIAL, ...(data?.credentials ?? [])]
     : (data?.credentials ?? []);
@@ -859,6 +883,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const handleRefresh = () => {
     refetch();
     refreshActivity();
+    cacheQuery.refetch();
     toast.success("已刷新凭据列表");
   };
 
@@ -2302,6 +2327,21 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           />
         )}
 
+        {/* 缓存汇总覆盖全部调用账号，不受列表筛选影响；筛选为空时也要保留 */}
+        {(data?.total ?? 0) > 0 && (
+          <AccountCacheSummary
+            rows={cacheRows}
+            range={cacheRange}
+            onRangeChange={setCacheRange}
+            loading={cacheQuery.isPending}
+            failed={cacheUnavailable}
+            stale={cacheStale}
+            refreshing={cacheQuery.isFetching}
+            onRefresh={() => cacheQuery.refetch()}
+            privacyMode={privacyMode}
+          />
+        )}
+
         {/* 列表 */}
         {(data?.total ?? 0) === 0 ? (
           <Card>
@@ -2366,7 +2406,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   <Server className="h-5 w-5" />
                 </div>
                 <p className="text-sm text-muted-foreground">
-                  {stateFilter === "healthy" && stateCounts.total > 0
+                  {stateFilter === "healthy" && stateCounts.total > 0 && stateCounts.healthy === 0
                     ? `${stateCounts.total} 个凭据里没有可用的：冷却 ${stateCounts.throttled} · 超额 ${stateCounts.quota} · 禁用 ${stateCounts.dead} · 封禁 ${stateCounts.suspended}`
                     : "当前筛选条件下没有凭据"}
                 </p>
@@ -2499,6 +2539,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                         : undefined}
                       loadingActivity={loadingActivity}
                       activityError={activityFailed}
+                      cacheStats={cacheByCredential.get(credential.id)}
+                      cacheRange={cacheRange}
+                      loadingCacheStats={cacheQuery.isPending}
+                      cacheStatsError={cacheUnavailable}
+                      cacheStatsStale={cacheStale}
                       dragDisabled={dragDisabled || credential.id === DEV_PREVIEW_CREDENTIAL.id}
                       preview={credential.id === DEV_PREVIEW_CREDENTIAL.id}
                       metadataSchema={data?.metadataSchema}
