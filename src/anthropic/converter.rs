@@ -515,12 +515,18 @@ fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String
     // it with `Invalid additionalModelRequestFields`, so map to the nearest
     // lower tier instead of failing the request. Unknown/future models keep
     // recognized values intact to avoid maintaining a brittle full allow-list.
+    //
+    // grok-4.7 上游 reasoning.effort 枚举为 low/medium/high/xhigh，不接受 max
+    //（实测 400 REQUEST_BODY_INVALID）。`max` 映射到已验证通过的最高档 `xhigh`。
+    // GPT-5.6 的 max 保持原样下发。
     let normalized = if requested == EffortTier::None
         && !model_uses_gpt_reasoning_effort(model_id)
     {
         EffortTier::High
     } else if requested == EffortTier::XHigh && !model_supports_xhigh_effort(model_id) {
         EffortTier::High
+    } else if requested == EffortTier::Max && model_id.eq_ignore_ascii_case("grok-4.7") {
+        EffortTier::XHigh
     } else {
         requested
     };
@@ -3220,7 +3226,8 @@ mod tests {
         assert!(model_supports_native_reasoning("grok-4.7"));
 
         // 上游拒绝 output_config，effort 必须走 reasoning 字段。
-        for effort in ["low", "medium", "high"] {
+        // xhigh 已实测为 grok-4.7 接受的最高档。
+        for effort in ["low", "medium", "high", "xhigh"] {
             let req = minimal_request_with_effort("grok-4.7", effort);
             let fields = convert_request(&req)
                 .unwrap()
@@ -3234,6 +3241,35 @@ mod tests {
         assert_eq!(
             normalize_effort_for_model("grok-4.7", "none").as_deref(),
             Some("high")
+        );
+    }
+
+    #[test]
+    fn grok_4_7_maps_max_effort_to_verified_xhigh() {
+        // Kiro 上游 grok-4.7 的 reasoning.effort 枚举为 low/medium/high/xhigh：
+        // 实测 max 返回 400 REQUEST_BODY_INVALID，xhigh 返回 200。
+        // 客户端若仍发送 output_config.effort=max，应映射为已验证的最高档 xhigh。
+        assert_eq!(
+            normalize_effort_for_model("grok-4.7", "max").as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            normalize_effort_for_model("grok-4.7", "xhigh").as_deref(),
+            Some("xhigh")
+        );
+
+        let req = minimal_request_with_effort("grok-4.7", "max");
+        let fields = convert_request(&req)
+            .unwrap()
+            .additional_model_request_fields
+            .expect("Grok 4.7 max should be mapped and forwarded");
+        assert!(fields.output_config.is_none());
+        assert_eq!(fields.reasoning.unwrap().effort, "xhigh");
+
+        // GPT-5.6 行为不变：max 仍原样走 reasoning.effort。
+        assert_eq!(
+            normalize_effort_for_model("gpt-5.6-sol", "max").as_deref(),
+            Some("max")
         );
     }
 
