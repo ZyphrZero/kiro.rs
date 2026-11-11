@@ -322,6 +322,7 @@ pub fn map_model(model: &str) -> Option<String> {
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
 /// Sonnet 5 / Sonnet 5.5 / Opus 4.7 / 4.8 / Opus 5 / 5.5 / Haiku 5.5 同 1M
+/// Kiro 于 2026-11-10 上线 Grok 4.7（Experimental preview），上下文窗口 500K。
 ///
 /// 注意：本函数的返回值会在 `Event::ContextUsage` 处被用来把上游只回报的
 /// 百分比换算成 token 数（`pct × window / 100`）。漏配某个 1M 模型不会影响
@@ -345,6 +346,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
         {
             1_000_000
         }
+        // Kiro ListAvailableModels reports grok-4.7 with maxInputTokens = 500000.
+        Some(mapped) if mapped == "grok-4.7" => 500_000,
         // Keep the existing fallback for other GPT models until their limits are confirmed.
         Some(mapped) if mapped.starts_with("gpt") => 272_000,
         Some(mapped)
@@ -373,9 +376,18 @@ fn model_uses_gpt_reasoning_effort(model_id: &str) -> bool {
     )
 }
 
+/// 使用 `additionalModelRequestFields.reasoning.effort`（而非 `output_config.effort`）
+/// 下发 effort 的模型：GPT-5.6 系列与 Grok 4.7。
+///
+/// Grok 4.7 上游 schema 拒绝 `output_config`（400 `property 'output_config' is not
+/// defined in the schema`），但接受 `reasoning.effort`。
+fn model_uses_reasoning_wire_field(model_id: &str) -> bool {
+    model_uses_gpt_reasoning_effort(model_id) || model_id.eq_ignore_ascii_case("grok-4.7")
+}
+
 /// 是否为已确认接受原生 reasoning effort 字段的模型。
 pub(crate) fn model_supports_native_reasoning(model_id: &str) -> bool {
-    if model_uses_gpt_reasoning_effort(model_id) {
+    if model_uses_reasoning_wire_field(model_id) {
         return true;
     }
     // 自定义模型可按 backend_id 声明支持 reasoning。
@@ -581,7 +593,7 @@ fn build_additional_model_request_fields(
     }
 
     let effort = select_native_reasoning_effort(req, model_id);
-    if model_uses_gpt_reasoning_effort(model_id) {
+    if model_uses_reasoning_wire_field(model_id) {
         Some(AdditionalModelRequestFields {
             output_config: None,
             reasoning: Some(KiroReasoningConfig { effort }),
@@ -3198,6 +3210,31 @@ mod tests {
                 assert_eq!(fields.reasoning.unwrap().effort, effort);
             }
         }
+    }
+
+    #[test]
+    fn grok_4_7_context_window_and_reasoning_wire_field() {
+        // Kiro 上游 ListAvailableModels：grok-4.7 maxInputTokens = 500000。
+        assert_eq!(map_model("grok-4.7"), Some("grok-4.7".to_string()));
+        assert_eq!(get_context_window_size("grok-4.7"), 500_000);
+        assert!(model_supports_native_reasoning("grok-4.7"));
+
+        // 上游拒绝 output_config，effort 必须走 reasoning 字段。
+        for effort in ["low", "medium", "high"] {
+            let req = minimal_request_with_effort("grok-4.7", effort);
+            let fields = convert_request(&req)
+                .unwrap()
+                .additional_model_request_fields
+                .expect("Grok 4.7 effort should be forwarded");
+            assert!(fields.output_config.is_none());
+            assert_eq!(fields.reasoning.unwrap().effort, effort);
+        }
+
+        // 未确认的 none 仍按非 GPT 模型回退 high。
+        assert_eq!(
+            normalize_effort_for_model("grok-4.7", "none").as_deref(),
+            Some("high")
+        );
     }
 
     #[test]
