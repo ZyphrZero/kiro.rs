@@ -2339,12 +2339,10 @@ fn build_non_stream_content(
             "type": "text",
             "text": text_content
         }));
-    } else if has_native_thinking {
-        content.push(json!({
-            "type": "text",
-            "text": native_thinking
-        }));
     }
+    // Native reasoning must never be relabeled as ordinary text. When thinking
+    // is disabled and there is no visible output, preserve the empty content
+    // response (tool blocks are appended by the caller).
     content
 }
 
@@ -3467,7 +3465,7 @@ mod tests {
     }
 
     #[test]
-    fn non_stream_native_thinking_downgrades_to_text_when_thinking_disabled() {
+    fn non_stream_native_thinking_is_not_text_when_thinking_disabled() {
         let content = build_non_stream_content(
             false,
             String::new(),
@@ -3476,9 +3474,37 @@ mod tests {
             vec!["ignored-redacted".to_string()],
         );
 
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[0]["text"], "native thinking fallback");
+        assert!(content.is_empty());
+        // A client replaying these content blocks cannot reintroduce the
+        // suppressed reasoning as text on the next turn.
+        assert!(!serde_json::to_string(&content).unwrap().contains("native thinking"));
+    }
+
+    #[test]
+    fn non_stream_disabled_thinking_keeps_only_visible_answer() {
+        let content = build_non_stream_content(
+            false,
+            "answer".into(),
+            "private reasoning".into(),
+            Some("private-signature".into()),
+            vec!["private-redacted".into()],
+        );
+        assert_eq!(content, vec![json!({"type": "text", "text": "answer"})]);
+    }
+
+    #[test]
+    fn non_stream_thinking_only_preserves_type_and_signature_when_enabled() {
+        let content = build_non_stream_content(
+            true,
+            String::new(),
+            "native reasoning".into(),
+            Some("real-signature".into()),
+            Vec::new(),
+        );
+        assert_eq!(content, vec![json!({
+            "type": "thinking", "thinking": "native reasoning",
+            "signature": "real-signature"
+        })]);
     }
 
     #[test]

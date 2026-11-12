@@ -326,6 +326,18 @@ impl HistoryAssistantMessage {
     }
 }
 
+/// Native assistant history reasoning union used by the Kiro/Q wire protocol.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum KiroReasoningContent {
+    ReasoningText {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    RedactedContent(String),
+}
+
 /// 助手消息（历史记录中使用）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -335,6 +347,8 @@ pub struct AssistantMessage {
     /// 工具使用列表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_uses: Option<Vec<ToolUseEntry>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<KiroReasoningContent>,
 }
 
 impl AssistantMessage {
@@ -343,6 +357,7 @@ impl AssistantMessage {
         Self {
             content: content.into(),
             tool_uses: None,
+            reasoning_content: None,
         }
     }
 

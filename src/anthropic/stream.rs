@@ -1649,10 +1649,6 @@ pub struct StreamContext {
     native_stop_reason: Option<String>,
     /// contextUsageEvent 报告上下文用量达到 100%。
     context_window_full: bool,
-    /// thinking 未启用时收到的原生 reasoning；只在整轮没有正文和工具调用时作为正文兜底（L9）。
-    undisclosed_reasoning: String,
-    /// 是否已经发出过非空白正文（L9 判定用）。
-    visible_text_emitted: bool,
 }
 
 impl StreamContext {
@@ -1746,8 +1742,6 @@ impl StreamContext {
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
             native_stop_reason: None,
             context_window_full: false,
-            undisclosed_reasoning: String::new(),
-            visible_text_emitted: false,
         }
     }
 
@@ -2223,10 +2217,6 @@ impl StreamContext {
         }
         let text: &str = &kept;
 
-        if !text.trim().is_empty() {
-            self.visible_text_emitted = true;
-        }
-
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
         // 则丢弃该索引并创建新的文本块继续输出，避免 delta 被状态机拒绝导致“吞字”。
         if let Some(idx) = self.text_block_index {
@@ -2359,8 +2349,8 @@ impl StreamContext {
                 && !text.is_empty()
             {
                 self.output_tokens += estimate_tokens(text);
-                // L9：thinking 未启用时 reasoning 不混入正文，只在整轮没有正文和工具调用时兜底。
-                self.undisclosed_reasoning.push_str(text);
+                // Count upstream work, but never expose suppressed reasoning as
+                // ordinary text, including reasoning-only responses.
                 return Vec::new();
             }
             return Vec::new();
@@ -2774,17 +2764,6 @@ impl StreamContext {
         if self.repeat_guard_tripped {
             events.extend(self.generate_error_events("api_error", REPEAT_GUARD_ERROR_MESSAGE));
             return events;
-        }
-
-        // L9：thinking 未启用时，原生 reasoning 只在整轮既没有正文也没有工具调用时作为正文兜底。
-        // 兜底直接走 emit_text_delta_raw，不经过 invoke 识别。
-        if !self.thinking_enabled
-            && !self.visible_text_emitted
-            && !self.state_manager.has_tool_use
-            && !self.undisclosed_reasoning.trim().is_empty()
-        {
-            let reasoning = std::mem::take(&mut self.undisclosed_reasoning);
-            events.extend(self.emit_text_delta_raw(&reasoning));
         }
 
         // M2 / L2 / M5：终止原因以上游原生 stopReason 为准。没有原生截断信号时，只有 thinking 的
@@ -5432,7 +5411,7 @@ mod tests {
     }
 
     #[test]
-    fn test_native_reasoning_text_downgrades_to_text_when_thinking_disabled() {
+    fn test_native_reasoning_is_not_text_when_thinking_disabled() {
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -5451,10 +5430,17 @@ mod tests {
         )));
         all_events.extend(ctx.generate_final_events());
 
-        assert_eq!(
-            collect_text_content(&all_events),
-            "visible reasoning fallback"
-        );
+        assert_eq!(collect_text_content(&all_events), "");
+        // The disabled-thinking stream retains its initial empty text block,
+        // but must not append reasoning to that block.
+        assert!(!all_events.iter().any(|e| {
+            e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
+        }));
+        assert!(all_events.iter().any(|e| e.event == "message_stop"));
+        let terminal = all_events.iter().find(|e| e.event == "message_delta").unwrap();
+        assert_eq!(terminal.data["delta"]["stop_reason"], "end_turn");
+        assert!(!serde_json::to_string(&all_events.iter().map(|e| &e.data).collect::<Vec<_>>())
+            .unwrap().contains("visible reasoning fallback"));
         assert_eq!(collect_thinking_content(&all_events), "");
         assert!(!all_events.iter().any(|e| {
             e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
@@ -5463,6 +5449,37 @@ mod tests {
             e.event == "content_block_start"
                 && e.data["content_block"]["type"] == "redacted_thinking"
         }));
+    }
+
+    #[test]
+    fn disabled_reasoning_does_not_replace_text_or_tools() {
+        for with_tool in [false, true] {
+            let mut ctx = StreamContext::new_with_thinking(
+                "test-model", 1, false, HashMap::new(), test_known_tools(),
+            );
+            let mut events = ctx.generate_initial_events();
+            events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                crate::kiro::model::events::ReasoningContentEvent {
+                    text: Some("private reasoning".into()),
+                    signature: Some("private-signature".into()),
+                    redacted_content: Some("private-redacted".into()),
+                },
+            )));
+            if with_tool {
+                events.extend(ctx.process_kiro_event(&Event::ToolUse(
+                    tool_evt("t1", "tool_a", "{}", true),
+                )));
+            } else {
+                events.extend(ctx.process_assistant_response("visible answer"));
+            }
+            events.extend(ctx.generate_final_events());
+            assert_eq!(collect_thinking_content(&events), "");
+            assert_eq!(collect_text_content(&events), if with_tool { "" } else { "visible answer" });
+            let terminal = events.iter().find(|e| e.event == "message_delta").unwrap();
+            assert_eq!(terminal.data["delta"]["stop_reason"], if with_tool { "tool_use" } else { "end_turn" });
+            assert!(!serde_json::to_string(&events.iter().map(|e| &e.data).collect::<Vec<_>>())
+                .unwrap().contains("private"));
+        }
     }
 
     #[test]

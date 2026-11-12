@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
-    HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
+    HistoryUserMessage, KiroImage, KiroReasoningContent, Message, UserInputMessage, UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::kiro::{
     AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig,
@@ -1030,7 +1030,7 @@ pub(crate) fn convert_request_with_purpose(
 
     // 14. Extract effort into AdditionalModelRequestFields only for models that accept it.
     //
-    // The system-prompt thinking prefix remains available for every thinking mode. The real
+    // The system-prompt thinking prefix is reserved for legacy models. The real
     // wire field is narrower: newer/non-adaptive models reject it with
     // `additionalModelRequestFields is not supported for this model`, so keep the field opt-in
     // by upstream model capability rather than by the mere presence of client output_config.
@@ -2028,6 +2028,11 @@ fn convert_tools(
 
 /// 生成thinking标签前缀
 fn generate_thinking_prefix(req: &MessagesRequest, model_id: &str) -> Option<String> {
+    // Skip prompt controls only when this request actually sends native controls.
+    // Opus 4.6 enabled mode still needs its legacy path (native effort is adaptive-only).
+    if build_additional_model_request_fields(req, model_id).is_some() {
+        return None;
+    }
     if let Some(t) = &req.thinking {
         if t.thinking_type == "adaptive"
             || (t.thinking_type == "enabled" && model_supports_native_reasoning(model_id))
@@ -2391,13 +2396,51 @@ fn merge_user_messages(
     })
 }
 
-/// 转换 assistant 消息
-///
-/// Kiro 历史 assistant 消息只有正文和 toolUses，没有放 thinking 的字段，
-/// 保留的 thinking 只能写成正文里的 <thinking> 标签。每段 thinking 单独成一段，
-/// 和正文按原来的先后顺序排列，段与段之间空一行。
-/// `keep_thinking` 为 false（已结束回合、模型不保留旧 thinking）时丢掉 thinking；
-/// redacted_thinking 是加密内容，Kiro 无法回放，一律丢掉。
+/// Select at most one complete reasoning block for the single-value wire field.
+/// This is deliberately conservative: unsigned/placeholder signatures cannot be
+/// authenticated, and a partial subset of an interleaved reasoning turn is unsafe.
+/// Count *all* reasoning blocks across consecutive assistant messages, not just
+/// valid candidates, so an unsigned block cannot be hidden by a later signed one.
+fn history_reasoning_content(
+    messages: &[&super::types::Message],
+    purpose: ConversionPurpose,
+    keep_thinking: bool,
+) -> Option<KiroReasoningContent> {
+    if !keep_thinking || purpose != ConversionPurpose::Generate {
+        return None;
+    }
+    let mut blocks = messages.iter().filter_map(|m| m.content.as_array()).flatten()
+        .filter(|b| matches!(b.get("type").and_then(|v| v.as_str()),
+            Some("thinking" | "redacted_thinking")));
+    let block = blocks.next()?;
+    if blocks.next().is_some() {
+        return None;
+    }
+    match block.get("type")?.as_str()? {
+        "thinking" => {
+            let text = block.get("thinking")?.as_str()?;
+            let signature = block.get("signature")?.as_str()?;
+            if text.is_empty() || signature.trim().is_empty()
+                || signature.trim() == super::stream::THINKING_SIGNATURE_PLACEHOLDER
+            {
+                return None;
+            }
+            Some(KiroReasoningContent::ReasoningText {
+                text: text.to_owned(), signature: Some(signature.to_owned()),
+            })
+        }
+        "redacted_thinking" => {
+            use base64::Engine;
+            let data = block.get("data")?.as_str()?;
+            let decoded = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+            if decoded.is_empty() { return None; }
+            Some(KiroReasoningContent::RedactedContent(data.to_owned()))
+        }
+        _ => None,
+    }
+}
+
+/// Convert history without presenting reasoning as assistant answer text.
 fn convert_assistant_message(
     msg: &super::types::Message,
     tool_name_map: &mut HashMap<String, String>,
@@ -2405,7 +2448,7 @@ fn convert_assistant_message(
     purpose: ConversionPurpose,
     keep_thinking: bool,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
-    // 按原顺序排列的段落：<thinking>…</thinking> 或一段正文
+    // Keep text segments in order; native reasoning is carried separately.
     let mut segments: Vec<String> = Vec::new();
     // 连续的 text 块直接拼接（引用等会把一段话拆成多个 text 块）
     let mut text_run = String::new();
@@ -2422,17 +2465,10 @@ fn convert_assistant_message(
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     match block.block_type.as_str() {
                         "thinking" => {
-                            let Some(thinking) = block.thinking.filter(|t| !t.is_empty()) else {
-                                continue;
-                            };
                             if !text_run.is_empty() {
                                 segments.push(std::mem::take(&mut text_run));
                             }
-                            if keep_thinking {
-                                segments.push(format!("<thinking>{thinking}</thinking>"));
-                            } else {
-                                dropped_thinking += 1;
-                            }
+                            dropped_thinking += 1;
                         }
                         "redacted_thinking" => {
                             if !text_run.is_empty() {
@@ -2477,19 +2513,6 @@ fn convert_assistant_message(
     if !text_run.is_empty() {
         segments.push(text_run);
     }
-    if dropped_redacted > 0 {
-        tracing::debug!(
-            count = dropped_redacted,
-            "丢弃历史 redacted_thinking：加密内容，Kiro 无法回放"
-        );
-    }
-    if dropped_thinking > 0 {
-        tracing::debug!(
-            count = dropped_thinking,
-            "丢弃已结束回合的 thinking：该模型不保留旧回合 thinking"
-        );
-    }
-
     // 注意: Kiro API 要求 content 字段不能为空，当只有 tool_use（或 thinking 被丢掉）时需要占位符
     let final_content = if segments.is_empty()
         && (!tool_uses.is_empty() || dropped_thinking > 0 || dropped_redacted > 0)
@@ -2500,6 +2523,7 @@ fn convert_assistant_message(
     };
 
     let mut assistant = AssistantMessage::new(final_content);
+    assistant.reasoning_content = history_reasoning_content(&[msg], purpose, keep_thinking);
     if !tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(tool_uses);
     }
@@ -2538,13 +2562,14 @@ fn merge_assistant_messages(
         }
     }
 
-    let content = if content_parts.is_empty() && !all_tool_uses.is_empty() {
+    let content = if content_parts.is_empty() {
         " ".to_string()
     } else {
         content_parts.join("\n\n")
     };
 
     let mut assistant = AssistantMessage::new(content);
+    assistant.reasoning_content = history_reasoning_content(messages, purpose, keep_thinking);
     if !all_tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(all_tool_uses);
     }
@@ -4462,7 +4487,8 @@ mod tests {
         .expect("合并应成功");
 
         let content = &result.assistant_response_message.content;
-        assert!(content.contains("<thinking>"), "应包含 thinking 标签");
+        assert!(!content.contains("<thinking>"), "reasoning must not be answer text");
+        assert!(result.assistant_response_message.reasoning_content.is_none());
         assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
 
         let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
@@ -4732,9 +4758,12 @@ mod tests {
             assert!(assistants.iter().any(|c| c == "first task done"));
             assert_eq!(
                 assistants.last().map(String::as_str),
-                Some("<thinking>CURRENT_LOOP_PLAN_32</thinking>"),
-                "thinking of the turn still in the tool loop must be kept"
+                Some(" "),
+                "thinking-only tool turns need a nonempty content placeholder"
             );
+            let wire = serde_json::to_value(&r.conversation_state).unwrap();
+            assert!(wire.to_string().contains("CURRENT_LOOP_PLAN_32"));
+            assert!(!wire.to_string().contains("OLD_TURN_PLAN_31"));
         }
 
         #[test]
@@ -4793,16 +4822,19 @@ mod tests {
             }));
             let assistants = assistant_contents(&r);
             assert!(
-                assistants.iter().any(|c| c == "<thinking>OLD_TURN_PLAN_35</thinking>\n\nfirst done"),
+                assistants.iter().any(|c| c == "first done"),
                 "Opus 4.5+ keeps prior-turn thinking by default; got {assistants:?}"
             );
             assert_eq!(
                 assistants.last().map(String::as_str),
-                Some("<thinking>T1</thinking>\n\nX\n\n<thinking>T2</thinking>\n\nY"),
-                "interleaved thinking and text must keep their order and be separated"
+                Some("X\n\nY"),
+                "text must remain in order without reasoning tags"
             );
             let body = serde_json::to_string(&r.conversation_state).unwrap();
             assert!(!body.contains("REDACTED_SECRET_36"));
+            assert!(body.contains("OLD_TURN_PLAN_35"));
+            assert!(!body.contains("<thinking>"));
+            assert!(!body.contains("\"T1\"") && !body.contains("\"T2\""));
         }
 
         #[test]
@@ -4952,7 +4984,7 @@ mod tests {
         }
 
         #[test]
-        fn fixreq_l2_empty_system_text_keeps_thinking_prefix() {
+        fn fixreq_l2_empty_system_text_keeps_native_effort_without_prefix() {
             for system in [json!(""), json!([{"type": "text", "text": ""}])] {
                 let r = convert(json!({
                     "model": "claude-opus-5.5",
@@ -4962,16 +4994,14 @@ mod tests {
                     "output_config": {"effort": "xhigh"},
                     "messages": [{"role": "user", "content": "hi"}]
                 }));
-                let users = history_users(&r);
-                let first = users.first().expect("thinking prefix pair should exist");
-                assert!(first.content.contains(
-                    "<thinking_mode>adaptive</thinking_mode><thinking_effort>xhigh</thinking_effort>"
-                ));
+                assert!(history_users(&r).is_empty());
+                assert_eq!(r.additional_model_request_fields.as_ref().unwrap()
+                    .output_config.as_ref().unwrap().effort, "xhigh");
             }
         }
 
         #[test]
-        fn fixreq_l2_adaptive_prefix_effort_matches_wire_effort() {
+        fn fixreq_l2_native_effort_does_not_duplicate_prompt_tags() {
             let r = convert(json!({
                 "model": "claude-opus-4.7",
                 "max_tokens": 1024,
@@ -4984,8 +5014,8 @@ mod tests {
                 .and_then(|f| f.output_config.as_ref())
                 .map(|c| c.effort.clone());
             assert_eq!(wire.as_deref(), Some("low"));
-            let first = &history_users(&r)[0].content;
-            assert!(first.contains("<thinking_effort>low</thinking_effort>"), "{first}");
+            assert!(history_users(&r).is_empty());
+            assert!(!current(&r).content.contains("<thinking_effort>"));
         }
 
         #[test]
@@ -5364,5 +5394,148 @@ mod tests {
             assert_eq!(name, "WebSearch");
             assert_eq!(restored, json!({"query": "q"}));
         }
+    }
+}
+
+#[cfg(test)]
+mod native_history_reasoning_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn message(blocks: serde_json::Value) -> super::super::types::Message {
+        super::super::types::Message { role: "assistant".into(), content: blocks }
+    }
+
+    fn convert(messages: &[&super::super::types::Message], purpose: ConversionPurpose, keep: bool) -> AssistantMessage {
+        merge_assistant_messages(messages, &mut HashMap::new(), ToolCompatibilityMode::Raw, purpose, keep)
+            .unwrap().assistant_response_message
+    }
+
+    #[test]
+    fn signed_reasoning_is_separate_and_preserved_exactly() {
+        let m = message(json!([
+            {"type":"thinking","thinking":"  private plan\n", "signature":" sig \n"},
+            {"type":"text","text":"answer"}
+        ]));
+        let wire = serde_json::to_value(convert(&[&m], ConversionPurpose::Generate, true)).unwrap();
+        assert_eq!(wire["content"], "answer");
+        assert_eq!(wire["reasoningContent"], json!({"reasoningText":{
+            "text":"  private plan\n", "signature":" sig \n"
+        }}));
+    }
+
+    #[test]
+    fn redacted_reasoning_roundtrips_without_double_encoding() {
+        let m = message(json!([{"type":"redacted_thinking","data":"c2VjcmV0"}]));
+        let wire = serde_json::to_value(convert(&[&m], ConversionPurpose::Generate, true)).unwrap();
+        assert_eq!(wire["content"], " ");
+        assert_eq!(wire["reasoningContent"], json!({"redactedContent":"c2VjcmV0"}));
+        let roundtrip: AssistantMessage = serde_json::from_value(wire).unwrap();
+        assert_eq!(roundtrip.reasoning_content, Some(KiroReasoningContent::RedactedContent("c2VjcmV0".into())));
+    }
+
+    #[test]
+    fn unsigned_placeholder_empty_or_invalid_redacted_is_not_replayed() {
+        for block in [
+            json!({"type":"thinking","thinking":"secret"}),
+            json!({"type":"thinking","thinking":"secret","signature":"   "}),
+            json!({"type":"thinking","thinking":"secret","signature":super::super::stream::THINKING_SIGNATURE_PLACEHOLDER}),
+            json!({"type":"thinking","thinking":"","signature":"sig"}),
+            json!({"type":"redacted_thinking","data":"invalid!"}),
+            json!({"type":"redacted_thinking","data":""}),
+        ] {
+            let m = message(json!([block]));
+            let a = convert(&[&m], ConversionPurpose::Generate, true);
+            assert!(a.reasoning_content.is_none());
+            assert_eq!(a.content, " ");
+        }
+    }
+
+    #[test]
+    fn multiple_blocks_never_replay_a_partial_signed_subset() {
+        let signed = json!({"type":"thinking","thinking":"signed","signature":"sig"});
+        let unsigned = json!({"type":"thinking","thinking":"unsigned"});
+        let redacted = json!({"type":"redacted_thinking","data":"c2VjcmV0"});
+        for blocks in [json!([unsigned, signed]), json!([signed, unsigned]),
+            json!([signed, signed]), json!([signed, redacted])] {
+            let m = message(blocks);
+            let a = convert(&[&m], ConversionPurpose::Generate, true);
+            assert!(a.reasoning_content.is_none());
+            assert_eq!(a.content, " ");
+        }
+        let a = message(json!([unsigned]));
+        let b = message(json!([signed]));
+        for messages in [&[&a, &b][..], &[&b, &a][..]] {
+            let m = convert(messages, ConversionPurpose::Generate, true);
+            assert_eq!(m.content, " ");
+            assert!(m.reasoning_content.is_none());
+        }
+    }
+
+    #[test]
+    fn one_signed_block_survives_merge_with_text_and_tool_use() {
+        let a = message(json!([{"type":"thinking","thinking":"plan","signature":"sig"}]));
+        let b = message(json!([{"type":"text","text":"answer"},
+            {"type":"tool_use","id":"t1","name":"read","input":{}}]));
+        let result = convert(&[&a, &b], ConversionPurpose::Generate, true);
+        assert_eq!(result.content, "answer");
+        assert!(result.reasoning_content.is_some());
+        assert_eq!(result.tool_uses.unwrap()[0].tool_use_id, "t1");
+    }
+
+    #[test]
+    fn compaction_and_finished_legacy_turns_omit_reasoning_not_answer() {
+        let m = message(json!([{"type":"thinking","thinking":"plan","signature":"sig"},
+            {"type":"text","text":"answer"}]));
+        for (purpose, keep) in [(ConversionPurpose::Compact, true),
+            (ConversionPurpose::CompactFallback, true), (ConversionPurpose::Generate, false)] {
+            let result = convert(&[&m], purpose, keep);
+            assert_eq!(result.content, "answer");
+            assert!(result.reasoning_content.is_none());
+        }
+    }
+
+    #[test]
+    fn native_history_does_not_mutate_request_or_disable_current_effort() {
+        let raw = json!({"model":"claude-opus-5.5","max_tokens":1024,
+            "thinking":{"type":"adaptive"},"output_config":{"effort":"high"},
+            "messages":[{"role":"user","content":"hello"},
+                {"role":"assistant","content":[{"type":"thinking","thinking":"plan","signature":"sig",
+                    "cache_control":{"type":"ephemeral"}}, {"type":"text","text":"answer"}]},
+                {"role":"user","content":"continue"}]});
+        let req: MessagesRequest = serde_json::from_value(raw).unwrap();
+        let before = format!("{req:?}");
+        let result = convert_request(&req).unwrap();
+        assert_eq!(format!("{req:?}"), before);
+        assert_eq!(result.additional_model_request_fields.unwrap().output_config.unwrap().effort, "high");
+        let wire = serde_json::to_string(&result.conversation_state).unwrap();
+        assert!(wire.contains("reasoningContent"));
+        assert!(!wire.contains("<thinking>") && !wire.contains("<thinking_mode>"));
+    }
+
+    #[test]
+    fn opus_46_enabled_keeps_legacy_prefix_when_native_effort_is_unavailable() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model":"claude-opus-4.6", "max_tokens":1024,
+            "thinking":{"type":"enabled","budget_tokens":2048},
+            "messages":[{"role":"user","content":"hello"}]
+        })).unwrap();
+        assert!(build_additional_model_request_fields(&req, "claude-opus-4.6").is_none());
+        let prefix = generate_thinking_prefix(&req, "claude-opus-4.6")
+            .expect("enabled mode must retain its legacy thinking controls");
+        assert!(prefix.contains("<thinking_mode>adaptive</thinking_mode>"));
+        assert!(prefix.contains("<thinking_effort>"));
+        let result = convert_request(&req).unwrap();
+        assert!(result.additional_model_request_fields.is_none());
+        assert!(serde_json::to_string(&result.conversation_state).unwrap().contains(&prefix));
+    }
+
+    #[test]
+    fn legacy_enabled_models_keep_budget_prefix() {
+        let req: MessagesRequest = serde_json::from_value(json!({"model":"claude-sonnet-4.5",
+            "max_tokens":1024,"thinking":{"type":"enabled","budget_tokens":2048},
+            "messages":[{"role":"user","content":"hello"}]})).unwrap();
+        assert_eq!(generate_thinking_prefix(&req, "claude-sonnet-4.5").as_deref(),
+            Some("<thinking_mode>enabled</thinking_mode><max_thinking_length>2048</max_thinking_length>"));
     }
 }
