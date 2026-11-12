@@ -269,10 +269,13 @@ enum AttemptError {
 async fn run_attempt(
     state: AppState,
     key_ctx: KeyContext,
-    anthropic_req: MessagesRequest,
+    mut anthropic_req: MessagesRequest,
     model: &str,
     purpose: ConversionPurpose,
 ) -> Result<ParsedResponse, AttemptError> {
+    // compaction 直接走本函数，不经过 post_messages，需单独应用 disableThinkingModels
+    // （每次尝试包括重试都会重新进入这里）。
+    super::super::converter::force_disable_thinking(&mut anthropic_req, &state.disable_thinking_models);
     let provider = match &state.kiro_provider {
         Some(provider) => provider.clone(),
         None => {

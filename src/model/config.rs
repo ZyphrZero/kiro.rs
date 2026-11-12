@@ -340,6 +340,7 @@ pub struct Config {
     /// 强制关闭 thinking 的模型列表（上游模型 id，如 `claude-opus-5.5`，大小写不敏感）。
     /// 命中的请求按 thinking 关闭处理：不注入 `<thinking_mode>` 前缀、不下发原生 effort，
     /// 并丢弃历史里的 thinking / redacted_thinking 块。默认空（不干预）。
+    /// 实验性规避手段：对上游 `REASONING_EXTRACTION` 拒答的效果尚未在真实上游验证。
     #[serde(default)]
     pub disable_thinking_models: Vec<String>,
 

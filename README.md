@@ -387,7 +387,7 @@ Admin API 鉴权同样支持：
 | `selfHealMaxConsecutiveRounds` | `5` | 连续自愈且无成功的最大轮数（`0`=不限），超限即停并提示人工介入 |
 | `modelCacheTtlSecs` | `3600` | 每个凭据的上游可用模型缓存 TTL（秒） |
 | `extractThinking` | `true` | 非流式响应是否把旧 `<thinking>` 文本提取成 thinking block |
-| `disableThinkingModels` | `[]` | 强制关闭 thinking 的模型列表（上游 id，如 `["claude-opus-5.5"]`，大小写不敏感）。命中的请求不注入 `<thinking_mode>`、不下发原生 effort，并丢弃历史 thinking 块；用于规避上游对 Opus 5.5 的 `REASONING_EXTRACTION` 拒答 |
+| `disableThinkingModels` | `[]` | 强制关闭 thinking 的模型列表（上游 id，如 `["claude-opus-5.5"]`，大小写不敏感）。命中的请求不注入 `<thinking_mode>`、不下发原生 effort，并丢弃历史 thinking 块；**实验性规避手段**：用于尝试规避上游对 Opus 5.5 的 `REASONING_EXTRACTION` 拒答，该效果**尚未在真实上游验证**，请勿视为已确认的修复；会让命中模型在工具循环里看不到自己之前的推理 |
 | `cacheMeteringCapacity` | `262144` | prompt cache 计量条目上限，钳到 `[1024, 8388608]`；见下方「计量容量选型」 |
 | `cacheMeteringPersistEnabled` | `false` | 是否把计量快照落到 `cache_metering.json`（**0.9.x 起默认关闭**） |
 | `cacheMeteringFlushIntervalSecs` | `300` | 快照落盘间隔（秒），钳到 `[10, 3600]`，仅在落盘开启时有意义 |

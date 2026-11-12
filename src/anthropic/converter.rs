@@ -834,6 +834,12 @@ pub fn force_disable_thinking(req: &mut MessagesRequest, disabled_models: &[Stri
                 )
             });
             stripped += before - blocks.len();
+            // 只含 thinking 的 assistant 消息剥完会变成空数组，而 Kiro 要求 assistant content
+            // 非空（convert_assistant_message 的占位逻辑依赖「看到被丢弃的 thinking」，这里已经
+            // 提前剥掉了），所以补一个空白文本块占位。
+            if before > 0 && blocks.is_empty() && msg.role == "assistant" {
+                blocks.push(serde_json::json!({"type": "text", "text": " "}));
+            }
         }
     }
     tracing::info!(
@@ -4888,10 +4894,58 @@ mod tests {
                 assert!(!body.contains(needle), "{needle} leaked: {body}");
             }
             assert!(!body.contains("thinking_mode"), "{body}");
-            assert!(!body.contains("effort"), "{body}");
+            // effort 走 additionalModelRequestFields，不在 conversation_state 里，要单独断言。
+            assert!(
+                r.additional_model_request_fields.is_none(),
+                "native effort must not be sent: {:?}",
+                r.additional_model_request_fields
+            );
             let assistants = assistant_contents(&r);
             assert!(assistants.iter().any(|c| c == "first done"), "{assistants:?}");
             assert!(assistants.iter().any(|c| c == "running"), "{assistants:?}");
+        }
+
+        #[test]
+        fn disable_thinking_models_keeps_nonempty_content_for_thinking_only_turns() {
+            let mut req: MessagesRequest = serde_json::from_value(json!({
+                "model": "claude-opus-5.5",
+                "max_tokens": 1024,
+                "thinking": {"type": "adaptive"},
+                "messages": [
+                    {"role": "user", "content": "q1"},
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "ONLY_THINKING_61", "signature": "sig"}
+                    ]},
+                    {"role": "user", "content": "q2"},
+                    {"role": "assistant", "content": [
+                        {"type": "redacted_thinking", "data": "ONLY_REDACTED_62"}
+                    ]},
+                    {"role": "user", "content": "q3"}
+                ]
+            }))
+            .unwrap();
+            assert!(force_disable_thinking(&mut req, &["claude-opus-5.5".to_string()]));
+            let r = convert_request(&req).unwrap();
+            let assistants = assistant_contents(&r);
+            assert_eq!(assistants.len(), 2, "{assistants:?}");
+            assert!(
+                assistants.iter().all(|c| !c.is_empty()),
+                "assistant content must stay non-empty: {assistants:?}"
+            );
+            let body = serde_json::to_string(&r.conversation_state).unwrap();
+            assert!(!body.contains("ONLY_THINKING_61") && !body.contains("ONLY_REDACTED_62"), "{body}");
+        }
+
+        #[test]
+        fn disable_thinking_models_applies_to_compaction_conversion() {
+            let mut req = thinking_history_request("claude-opus-5.5");
+            assert!(force_disable_thinking(&mut req, &["claude-opus-5.5".to_string()]));
+            for purpose in [ConversionPurpose::Compact, ConversionPurpose::CompactFallback] {
+                let r = convert_request_with_purpose(&req, ToolCompatibilityMode::Raw, purpose).unwrap();
+                let body = serde_json::to_string(&r.conversation_state).unwrap();
+                assert!(!body.contains("thinking_mode") && !body.contains("<thinking"), "{body}");
+                assert!(r.additional_model_request_fields.is_none());
+            }
         }
 
         #[test]
@@ -4908,6 +4962,10 @@ mod tests {
             let body = serde_json::to_string(&r.conversation_state).unwrap();
             assert!(body.contains("LOOP_PLAN_52"), "{body}");
             assert!(body.contains("thinking_mode"), "{body}");
+            assert!(
+                r.additional_model_request_fields.is_some(),
+                "未命中的模型仍应下发原生 effort（对照用）"
+            );
         }
 
         #[test]
