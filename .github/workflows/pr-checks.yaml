@@ -45,18 +45,31 @@ jobs:
           set -euo pipefail
           [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
           [[ "$EXPECTED_HEAD" =~ ^[0-9a-f]{40}$ ]]
-          pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
-          [[ "$(jq -r .state <<< "$pr")" == open ]]
-          [[ "$(jq -r .base.ref <<< "$pr")" == master ]]
-          head="$(jq -r .head.sha <<< "$pr")"
-          base="$(jq -r .base.sha <<< "$pr")"
-          merge="$(jq -r .merge_commit_sha <<< "$pr")"
-          [[ "$head" == "$EXPECTED_HEAD" ]]
-          [[ "$merge" =~ ^[0-9a-f]{40}$ ]]
-          commit="$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$merge")"
-          jq -e --arg base "$base" --arg head "$head" \
-            '.parents | length == 2 and .[0].sha == $base and .[1].sha == $head' \
-            <<< "$commit" >/dev/null
+          # GitHub may need a few seconds to refresh a synthetic merge commit.
+          resolved=false
+          for attempt in 1 2 3 4 5 6; do
+            pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
+            [[ "$(jq -r .state <<< "$pr")" == open ]]
+            [[ "$(jq -r .base.ref <<< "$pr")" == master ]]
+            head="$(jq -r .head.sha <<< "$pr")"
+            base="$(jq -r .base.sha <<< "$pr")"
+            merge="$(jq -r .merge_commit_sha <<< "$pr")"
+            [[ "$head" == "$EXPECTED_HEAD" ]]
+            if [[ "$merge" =~ ^[0-9a-f]{40}$ ]]; then
+              commit="$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$merge")"
+              if jq -e --arg base "$base" --arg head "$head" \
+                '.parents | length == 2 and .[0].sha == $base and .[1].sha == $head' \
+                <<< "$commit" >/dev/null; then
+                resolved=true
+                break
+              fi
+            fi
+            sleep 5
+          done
+          if [[ "$resolved" != true ]]; then
+            echo "::error::No current merge revision; resolve conflicts or rerun after GitHub refreshes it."
+            exit 1
+          fi
           echo "head=$head" >> "$GITHUB_OUTPUT"
           echo "merge=$merge" >> "$GITHUB_OUTPUT"
           printf 'PR #%s\nHead: %s\nBase: %s\nMerge: %s\n' \
