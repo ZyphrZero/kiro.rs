@@ -40,6 +40,8 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 强制关闭 thinking 的上游模型 id 列表（见 `Config::disable_thinking_models`）
+    pub disable_thinking_models: Vec<String>,
     /// 工具兼容模式（ClaudeCode 内置工具名/入参双向适配 / Raw 透传）
     pub tool_compatibility_mode: crate::model::config::ToolCompatibilityMode,
     /// 客户端 Key 管理器（可选，未启用 Admin 时为 None）
@@ -73,6 +75,7 @@ impl AppState {
         Self {
             kiro_provider: None,
             extract_thinking,
+            disable_thinking_models: Vec::new(),
             tool_compatibility_mode,
             client_keys: None,
             usage_recorder: None,

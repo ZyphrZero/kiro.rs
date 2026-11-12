@@ -9,6 +9,7 @@
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
   "defaultEndpoint": "ide",
+  "disableThinkingModels": [],
   "toolCompatibilityMode": "raw",
   "apiDomain": "amazonaws",
   "updateAutoApply": false,

@@ -337,6 +337,12 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
+    /// 强制关闭 thinking 的模型列表（上游模型 id，如 `claude-opus-5.5`，大小写不敏感）。
+    /// 命中的请求按 thinking 关闭处理：不注入 `<thinking_mode>` 前缀、不下发原生 effort，
+    /// 并丢弃历史里的 thinking / redacted_thinking 块。默认空（不干预）。
+    #[serde(default)]
+    pub disable_thinking_models: Vec<String>,
+
     /// 工具兼容模式。默认 `raw` 保留客户端工具定义与参数；`claude-code` 显式启用旧映射。
     #[serde(default = "default_tool_compatibility_mode")]
     pub tool_compatibility_mode: ToolCompatibilityMode,
@@ -614,6 +620,7 @@ impl Default for Config {
             proxy_direct_fallback_enabled: false,
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
             extract_thinking: default_extract_thinking(),
+            disable_thinking_models: Vec::new(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
             api_domain: ApiDomain::default(),

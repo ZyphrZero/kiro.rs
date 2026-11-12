@@ -800,6 +800,50 @@ fn sorted_ids(ids: &std::collections::HashSet<String>) -> Vec<String> {
     ids
 }
 
+/// 按配置强制关闭某些模型的 thinking。
+///
+/// `disabled_models` 里的条目与请求模型映射后的上游 id（如 `claude-opus-5.5`）或原始模型名
+/// 比较，大小写不敏感。命中后：`thinking` 置为 `disabled`（不注入 `<thinking_mode>` 前缀、
+/// 不下发原生 effort），并丢弃历史 assistant 消息里的 `thinking` / `redacted_thinking` 块，
+/// 避免推理原文被当作正文回放给上游。返回是否命中。
+pub fn force_disable_thinking(req: &mut MessagesRequest, disabled_models: &[String]) -> bool {
+    if disabled_models.is_empty() {
+        return false;
+    }
+    let raw = req.model.trim().to_ascii_lowercase();
+    let mapped = map_model(&req.model).map(|m| m.to_ascii_lowercase());
+    let hit = disabled_models.iter().any(|m| {
+        let m = m.trim().to_ascii_lowercase();
+        !m.is_empty() && (m == raw || mapped.as_deref() == Some(m.as_str()))
+    });
+    if !hit {
+        return false;
+    }
+    req.thinking = Some(super::types::Thinking {
+        thinking_type: "disabled".to_string(),
+        budget_tokens: 0,
+    });
+    let mut stripped = 0usize;
+    for msg in &mut req.messages {
+        if let serde_json::Value::Array(blocks) = &mut msg.content {
+            let before = blocks.len();
+            blocks.retain(|b| {
+                !matches!(
+                    b.get("type").and_then(|t| t.as_str()),
+                    Some("thinking" | "redacted_thinking")
+                )
+            });
+            stripped += before - blocks.len();
+        }
+    }
+    tracing::info!(
+        model = %req.model,
+        stripped_thinking_blocks = stripped,
+        "命中 disableThinkingModels，已强制关闭 thinking"
+    );
+    true
+}
+
 /// 将 Anthropic 请求转换为 Kiro 请求
 /// 便捷入口（测试用）：默认按 ClaudeCode 模式转换。
 #[cfg(test)]
@@ -4803,6 +4847,75 @@ mod tests {
             );
             let body = serde_json::to_string(&r.conversation_state).unwrap();
             assert!(!body.contains("REDACTED_SECRET_36"));
+        }
+
+        fn thinking_history_request(model: &str) -> MessagesRequest {
+            serde_json::from_value(json!({
+                "model": model,
+                "max_tokens": 1024,
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "medium"},
+                "messages": [
+                    {"role": "user", "content": "first task"},
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "OLD_TURN_PLAN_51", "signature": "sig"},
+                        {"type": "text", "text": "first done"}
+                    ]},
+                    {"role": "user", "content": "second task"},
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "LOOP_PLAN_52", "signature": "sig"},
+                        {"type": "redacted_thinking", "data": "REDACTED_53"},
+                        {"type": "text", "text": "running"},
+                        {"type": "tool_use", "id": "toolu_o55", "name": "run_code", "input": {}}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_o55", "content": "out"}
+                    ]}
+                ],
+                "tools": [run_code_tool()]
+            }))
+            .unwrap()
+        }
+
+        #[test]
+        fn disable_thinking_models_forces_off_for_matching_model() {
+            // 客户端发的是连字符写法 claude-opus-5-5，配置写上游 id claude-opus-5.5。
+            let mut req = thinking_history_request("claude-opus-5-5");
+            assert!(force_disable_thinking(&mut req, &["Claude-Opus-5.5".to_string()]));
+            let r = convert_request(&req).unwrap();
+            let body = serde_json::to_string(&r.conversation_state).unwrap();
+            for needle in ["OLD_TURN_PLAN_51", "LOOP_PLAN_52", "REDACTED_53", "<thinking"] {
+                assert!(!body.contains(needle), "{needle} leaked: {body}");
+            }
+            assert!(!body.contains("thinking_mode"), "{body}");
+            assert!(!body.contains("effort"), "{body}");
+            let assistants = assistant_contents(&r);
+            assert!(assistants.iter().any(|c| c == "first done"), "{assistants:?}");
+            assert!(assistants.iter().any(|c| c == "running"), "{assistants:?}");
+        }
+
+        #[test]
+        fn disable_thinking_models_matches_raw_model_name() {
+            let mut req = thinking_history_request("claude-opus-5-5");
+            assert!(force_disable_thinking(&mut req, &["claude-opus-5-5".to_string()]));
+        }
+
+        #[test]
+        fn disable_thinking_models_leaves_other_models_alone() {
+            let mut req = thinking_history_request("claude-opus-4.6");
+            assert!(!force_disable_thinking(&mut req, &["claude-opus-5.5".to_string()]));
+            let r = convert_request(&req).unwrap();
+            let body = serde_json::to_string(&r.conversation_state).unwrap();
+            assert!(body.contains("LOOP_PLAN_52"), "{body}");
+            assert!(body.contains("thinking_mode"), "{body}");
+        }
+
+        #[test]
+        fn disable_thinking_models_empty_config_is_noop() {
+            let mut req = thinking_history_request("claude-opus-5.5");
+            assert!(!force_disable_thinking(&mut req, &[]));
+            assert!(!force_disable_thinking(&mut req, &["  ".to_string()]));
+            assert_eq!(req.thinking.as_ref().unwrap().thinking_type, "adaptive");
         }
 
         #[test]

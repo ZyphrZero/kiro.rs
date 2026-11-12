@@ -380,6 +380,7 @@ async fn main() {
         Some(cache_meter.clone()),
         trace_store.clone(),
         Some(custom_headers_manager.clone()),
+        config.disable_thinking_models.clone(),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）

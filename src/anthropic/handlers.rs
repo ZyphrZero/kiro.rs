@@ -973,6 +973,7 @@ pub async fn post_messages(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    super::converter::force_disable_thinking(&mut payload, &state.disable_thinking_models);
     warn_structured_output_with_web_search(&payload);
 
     // 检查是否为 WebSearch 请求
@@ -2498,6 +2499,7 @@ pub async fn post_messages_cc(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    super::converter::force_disable_thinking(&mut payload, &state.disable_thinking_models);
     warn_structured_output_with_web_search(&payload);
 
     // 检查是否为 WebSearch 请求

@@ -45,6 +45,7 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
+        Vec::new(),
     )
 }
 
@@ -60,6 +61,7 @@ pub fn create_router(
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
     custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
+    disable_thinking_models: Vec<String>,
 ) -> Router {
     create_router_with_shared_provider(
         kiro_provider.map(Arc::new),
@@ -71,6 +73,7 @@ pub fn create_router(
         cache_meter,
         trace_store,
         custom_headers,
+        disable_thinking_models,
     )
 }
 
@@ -86,8 +89,10 @@ pub fn create_router_with_shared_provider(
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
     custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
+    disable_thinking_models: Vec<String>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
+    state.disable_thinking_models = disable_thinking_models;
     if let Some(provider) = kiro_provider {
         state = state.with_shared_kiro_provider(provider);
     }
