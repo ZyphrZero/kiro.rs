@@ -1,0 +1,118 @@
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Open PR number to verify'
+        required: true
+        type: string
+      head_sha:
+        description: 'Expected full PR head SHA (rejects stale requests)'
+        required: true
+        type: string
+
+# No publish credentials, write permissions, shared caches or deployment steps.
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    name: Resolve immutable revisions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      head: ${{ steps.refs.outputs.head }}
+      merge: ${{ steps.refs.outputs.merge }}
+    steps:
+      # This job never checks out or executes PR code. Its token stays here.
+      - name: Verify current PR and merge parents
+        id: refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          [[ "$EXPECTED_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          # GitHub may need a few seconds to refresh a synthetic merge commit.
+          resolved=false
+          for attempt in 1 2 3 4 5 6; do
+            pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
+            [[ "$(jq -r .state <<< "$pr")" == open ]]
+            [[ "$(jq -r .base.ref <<< "$pr")" == master ]]
+            head="$(jq -r .head.sha <<< "$pr")"
+            base="$(jq -r .base.sha <<< "$pr")"
+            merge="$(jq -r .merge_commit_sha <<< "$pr")"
+            [[ "$head" == "$EXPECTED_HEAD" ]]
+            if [[ "$merge" =~ ^[0-9a-f]{40}$ ]]; then
+              commit="$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$merge")"
+              if jq -e --arg base "$base" --arg head "$head" \
+                '.parents | length == 2 and .[0].sha == $base and .[1].sha == $head' \
+                <<< "$commit" >/dev/null; then
+                resolved=true
+                break
+              fi
+            fi
+            sleep 5
+          done
+          if [[ "$resolved" != true ]]; then
+            echo "::error::No current merge revision; resolve conflicts or rerun after GitHub refreshes it."
+            exit 1
+          fi
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "merge=$merge" >> "$GITHUB_OUTPUT"
+          printf 'PR #%s\nHead: %s\nBase: %s\nMerge: %s\n' \
+            "$PR_NUMBER" "$head" "$base" "$merge" >> "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    name: Test and build (${{ matrix.revision }})
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: [head, merge]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact revision without credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ matrix.revision == 'head' && needs.resolve.outputs.head || needs.resolve.outputs.merge }}
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Install pnpm
+        run: npm install --global pnpm@12.11.2
+      - name: Install locked frontend dependencies
+        working-directory: admin-ui
+        run: pnpm install --frozen-lockfile
+      - name: Frontend unit tests
+        working-directory: admin-ui
+        run: node --test src/lib/*.test.mjs
+      - name: Frontend typecheck and production build
+        working-directory: admin-ui
+        run: pnpm run build
+      - name: Set up Rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Rust tests
+        run: cargo +stable test --locked --all-targets
+      # Existing warnings are reported, not hidden or promoted to unrelated failures.
+      - name: Rust lint
+        run: cargo +stable clippy --locked --all-targets
+      - name: Rust release build
+        run: cargo +stable build --release --locked
