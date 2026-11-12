@@ -6083,7 +6083,9 @@ mod tests {
         let mut all = ctx.generate_initial_events();
         all.extend(ctx.process_kiro_event(&reasoning("只有推理")));
         all.extend(ctx.generate_final_events());
-        assert_eq!(collect_text_content(&all), "只有推理");
+        assert_eq!(collect_text_content(&all), "");
+        assert!(!all.iter().any(|e| e.data.to_string().contains("只有推理")));
+        assert_eq!(fr_stop_reason(&all), json!("end_turn"));
     }
 
     #[test]
