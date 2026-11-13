@@ -6,6 +6,58 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.9] - 2026-11-13
+
+主题：**Grok 4.7 的 500K 上下文与原生推理、历史 reasoning 安全回传，以及隔离的 PR 测试流水线**。本版汇总 `v0.9.8` 之后合并的 3 个 PR（#159、#166、#167），不包含仍未合并的 #165 强制禁用 thinking 配置。
+
+### 🧠 Grok 4.7 上下文与原生推理
+
+> 来源：[PR #159](https://github.com/ZyphrZero/kiro.rs/pull/159)，提交人：[@yeeyon](https://github.com/yeeyon)，感谢贡献。
+
+- 将 `grok-4.7` 的上下文窗口从默认的 `200_000` 修正为 `500_000`，用于把上游 `ContextUsage` 百分比换算为 Token 数；README 同步列出窗口大小，模型 ID 继续原样透传。
+- 原生推理强度经 `additionalModelRequestFields.reasoning.effort` 下发，不发送 Grok schema 不接受的 `output_config`；覆盖 `low / medium / high / xhigh`。
+- 客户端指定 `max` 时映射为 `xhigh`，GPT-5.6 的 `max` 保持不变。`none` 沿用非 GPT 模型的 `high` 回退，不宣称 Grok 支持关闭推理。
+- PR 作者报告 `medium / xhigh` 实际请求成功、未经映射的 `max` 被上游拒绝。模型仍为 Experimental preview，可用性以账号与上游服务为准；未据此宣称完整 500K 输入已通过端到端验收。
+
+### 🔐 原生 reasoning 历史回传与安全降级
+
+> 来源：[PR #167](https://github.com/ZyphrZero/kiro.rs/pull/167)，提交人：[@ZyphrZero](https://github.com/ZyphrZero)；方案讨论见 [#165](https://github.com/ZyphrZero/kiro.rs/pull/165)。
+
+- assistant 历史使用独立的 `reasoningContent` union，不再把 thinking 拼成普通正文中的标签。符合原有历史保留条件时，仅回传单个带非空、非占位签名的 thinking 块，或单个有效且解码后非空的 base64 redacted 块；签名与载荷原样保留。
+- 连续 assistant 消息中的多个推理块、无签名或占位签名、无效 redacted 数据保守省略，不选择性拼接签名片段；压缩用途不回传 reasoning，正文、工具与原有历史裁剪策略保留。
+- 请求实际下发原生 effort 时去掉重复的 thinking prompt；legacy 模型与 Opus 4.6 enabled 模式保留原有路径。
+- HTTP 400 明确返回 `THINKING_SIGNATURE_INVALID` 且仍有重试预算时，只移除 assistant 历史的 `reasoningContent` 后重试一次。保留当前输入、effort、工具与路由字段，重新执行端点转换，不把此错误作为凭据失效处理，也不增加原有重试总预算。普通签名错误、无相关历史或再次失败不触发该降级重试。
+- thinking 关闭时，流式与非流式响应均不再把原生推理伪装成普通 text 输出；只有推理、没有可见正文或工具输出的响应可以为空，不用推理内容兜底。
+- **验证边界：未使用真实 Kiro 凭据验证服务端对历史签名的接受行为。** 协议结构参考 AWS 官方实现；要求非空签名是本项目的保守策略，不是协议硬性要求。多块省略策略也不保证保留所有思考质量。
+
+### 🧪 隔离的 PR 检查
+
+> 来源：[PR #166](https://github.com/ZyphrZero/kiro.rs/pull/166)，提交人：[@ZyphrZero](https://github.com/ZyphrZero)。
+
+- 新增 PR Checks，分别检验明确的 PR head 与对应合并版本，执行前端单元测试、类型检查与生产构建，以及 Rust tests、Clippy 和 release 构建。
+- 解析修订的任务不执行 PR 代码；测试任务不持久化 checkout 凭据，不使用发布 secrets、写权限、共享缓存或部署步骤。手动触发要求 PR 编号与完整 head SHA，拒绝过期请求。
+- #167 最终 head `7e79811` 及对应 merge 的 [CI 验证](https://github.com/ZyphrZero/kiro.rs/actions/runs/43273454556) 已通过；PR 记录为 Rust 1,220 通过、0 失败、2 ignored，前端 5 项通过，Clippy 仍有原有 warnings。合并提交 `1fa535b` 与该 head 代码树一致。这是合并前的验证记录，不替代发布准备提交自身的检查。
+
+### 🔧 发布维护
+
+- 发布工作流使用仓库内共用并发组，保留 `cancel-in-progress: false`，避免不同版本同时更新 Docker `latest`。该机制不保证排队版本顺序，发布入口仍需检查重复版本、未完成发布与目标提交。
+
+### 🙏 本版 PR 贡献者
+
+| 贡献者 | 已合并 PR |
+| --- | --- |
+| [@yeeyon](https://github.com/yeeyon) | [#159](https://github.com/ZyphrZero/kiro.rs/pull/159) |
+| [@ZyphrZero](https://github.com/ZyphrZero) | [#166](https://github.com/ZyphrZero/kiro.rs/pull/166)、[#167](https://github.com/ZyphrZero/kiro.rs/pull/167) |
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 统一为 `0.9.9`；没有新增依赖，无需手动迁移配置或用量日志。
+- Grok 客户端可继续指定 `max`，服务端会转换为 `xhigh`。关闭 thinking 的客户端应接受没有可见输出时的空响应，不再依赖推理转正文的旧兜底。
+- 本版没有新增 `disableThinkingModels` 配置，也不修复 0.9.8 已说明的在线更新器独立代理凭据百分号限制。
+- Docker 部署拉取 `0.9.9` 或 `latest` 后重建容器；仅重启旧容器不会更新二进制。不改写已发布的 `v0.9.8` 标签或产物。
+
+完整变更：[v0.9.8...v0.9.9](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.8...v0.9.9)。
+
 ## [0.9.8] - 2026-11-07
 
 主题：**账号缓存用量与加权命中率、在线更新代理认证修复、通用 HTTP 客户端的代理密码百分号保真，以及缓存计量排查文档校正**。本版汇总 `v0.9.7` 之后合并的 4 个 PR。缓存指标来自现有用量记录，可能包含本地估算，不代表上游真实 KV cache 命中或积分折扣；在线更新器的独立代理凭据仍有下述百分号兼容边界。

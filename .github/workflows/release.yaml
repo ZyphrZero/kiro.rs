@@ -20,7 +20,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.ref_name }}
+  group: release-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
