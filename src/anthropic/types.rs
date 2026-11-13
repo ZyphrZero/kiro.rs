@@ -318,6 +318,12 @@ pub struct ContentBlock {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    /// Upstream signature, preserved byte-for-byte when replaying reasoning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// Base64-encoded opaque redacted reasoning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
