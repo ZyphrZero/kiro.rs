@@ -12,7 +12,7 @@ use serde::Deserialize;
 #[serde(rename_all = "camelCase")]
 pub struct ListAvailableModelsResponse {
     /// 可用模型列表
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::null_vec")]
     pub models: Vec<UpstreamModel>,
 }
 

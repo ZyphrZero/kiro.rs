@@ -977,7 +977,7 @@ credential.apiRegion -> credential.region -> config.apiRegion -> config.region
 | `amazonaws`（默认） | `q.{apiRegion}.amazonaws.com` | 原有行为 |
 | `kiro` | `runtime.{apiRegion}.kiro.dev` | 新版 Kiro IDE / Kiro CLI 使用的域名；官方客户端只内置 `us-east-1`、`eu-central-1` 等少数区域 |
 
-Token 刷新、用量查询、`ListAvailableProfiles` 等 REST 接口不受影响。可在 Admin 面板「调度设置 → 上游域名」切换，或调用 `PUT /api/admin/config/api-domain`（Body：`{"domain":"kiro"}`），立即生效并写回 `config.json`，无需重启。
+用量、模型列表、Profile 查询及偏好设置随域名选择切换：`kiro` 使用 `management.{region}.kiro.dev`，`amazonaws` 使用 `q.{region}.amazonaws.com`，只保留域内区域回退。Token 刷新不受影响。切换及失败回滚均清空模型缓存，旧的在途请求不会回填缓存，但原调用仍可能收到旧域响应。已有持久化 Profile ARN 保留，不会自动重新选取；首次发现则使用当前域。可在 Admin 面板「调度设置 → 上游域名」切换，或调用 `PUT /api/admin/config/api-domain`（Body：`{"domain":"kiro"}`），立即生效并写回 `config.json`，无需重启。
 
 ### 代理优先级
 
