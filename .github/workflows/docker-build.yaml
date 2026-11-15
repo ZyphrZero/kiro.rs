@@ -23,6 +23,13 @@ on:
 permissions:
   contents: read
 
+# Share the repository-wide writer lock with release.yaml (including latest).
+# This is mutual exclusion, not a durable release queue: pending runs may be
+# replaced. Finish/verify each release before dispatching the next one.
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   pre-check:
     runs-on: ubuntu-latest
