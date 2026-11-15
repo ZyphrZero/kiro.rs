@@ -31,6 +31,14 @@ pub enum ApiDomain {
 }
 
 impl ApiDomain {
+    /// Management APIs use a separate host from streaming requests on Kiro.
+    pub fn management_host(self, region: &str) -> String {
+        match self {
+            Self::Amazonaws => format!("q.{}.amazonaws.com", region),
+            Self::Kiro => format!("management.{}.kiro.dev", region),
+        }
+    }
+
     pub fn runtime_host(self, region: &str) -> String {
         match self {
             Self::Amazonaws => format!("q.{}.amazonaws.com", region),

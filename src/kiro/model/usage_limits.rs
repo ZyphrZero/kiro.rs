@@ -17,7 +17,7 @@ pub struct UsageLimitsResponse {
     pub subscription_info: Option<SubscriptionInfo>,
 
     /// 使用量明细列表
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::null_vec")]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
 
     /// 超额配置（用户当前是否开启了超额；可能不存在）
@@ -81,7 +81,7 @@ pub struct UsageBreakdown {
     pub current_usage_with_precision: Option<f64>,
 
     /// 奖励额度列表
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::null_vec")]
     pub bonuses: Vec<Bonus>,
 
     /// 免费试用信息

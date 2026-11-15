@@ -6,6 +6,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- 修复 #169：四个管理接口遵循运行时 apiDomain，kiro 使用 management 域；保留域内区域回退，不跨域回退。
+- 域切换及持久化失败回滚使模型缓存失效；兼容管理响应中的 null 数组。
+- 保留已存储的 Profile ARN；真实上游多账号/区域验证尚未执行。本修复不宣称解决 #170。
+
 ## [0.9.9] - 2026-11-13
 
 主题：**Grok 4.7 的 500K 上下文与原生推理、历史 reasoning 安全回传，以及隔离的 PR 测试流水线**。本版汇总 `v0.9.8` 之后合并的 3 个 PR（#159、#166、#167），不包含仍未合并的 #165 强制禁用 thinking 配置。

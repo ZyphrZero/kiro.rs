@@ -591,6 +591,7 @@ fn set_user_preference_body(
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
     config: &Config,
+    api_domain: ApiDomain,
     token: &str,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<UsageLimitsResponse> {
@@ -620,7 +621,7 @@ pub(crate) async fn get_usage_limits(
 
     let mut last_error: Option<String> = None;
     for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
-        let host = format!("q.{}.amazonaws.com", region);
+        let host = api_domain.management_host(region);
         let url = usage_limits_url(&host, *profile_arn);
 
         let mut request = client
@@ -696,6 +697,7 @@ pub(crate) async fn get_usage_limits(
 pub(crate) async fn get_available_models(
     credentials: &KiroCredentials,
     config: &Config,
+    api_domain: ApiDomain,
     token: &str,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<ListAvailableModelsResponse> {
@@ -723,7 +725,7 @@ pub(crate) async fn get_available_models(
 
     let mut last_error: Option<String> = None;
     for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
-        let host = format!("q.{}.amazonaws.com", region);
+        let host = api_domain.management_host(region);
         let url = available_models_url(&host, *profile_arn);
 
         let mut request = client
@@ -806,6 +808,7 @@ pub(crate) async fn get_available_models(
 pub(crate) async fn list_available_profiles(
     credentials: &KiroCredentials,
     config: &Config,
+    api_domain: ApiDomain,
     token: &str,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<ListAvailableProfilesResponse> {
@@ -829,7 +832,7 @@ pub(crate) async fn list_available_profiles(
     let mut last_error: Option<String> = None;
     let mut empty_seen = false;
     for region in candidates.iter() {
-        let host = format!("q.{}.amazonaws.com", region);
+        let host = api_domain.management_host(region);
         let url = format!("https://{}/", host);
 
         let mut request = client
@@ -900,6 +903,7 @@ pub(crate) async fn list_available_profiles(
 pub(crate) async fn set_user_preference(
     credentials: &KiroCredentials,
     config: &Config,
+    api_domain: ApiDomain,
     token: &str,
     proxy: Option<&ProxyConfig>,
     overage_status: &str, // "ENABLED" or "DISABLED"
@@ -928,7 +932,7 @@ pub(crate) async fn set_user_preference(
 
     let mut last_error: Option<String> = None;
     for (idx, region) in candidates.iter().enumerate() {
-        let host = format!("q.{}.amazonaws.com", region);
+        let host = api_domain.management_host(region);
         let url = format!("https://{}/setUserPreference", host);
 
         let mut request = client
@@ -1881,7 +1885,7 @@ impl MultiTokenManager {
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
-        get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref()).await
+        get_available_models(&credentials, &self.config, self.api_domain(), &token, effective_proxy.as_ref()).await
     }
 
     #[cfg(test)]
@@ -4007,7 +4011,7 @@ impl MultiTokenManager {
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         let profiles =
-            list_available_profiles(&credentials, &self.config, token, effective_proxy.as_ref())
+            list_available_profiles(&credentials, &self.config, self.api_domain(), token, effective_proxy.as_ref())
                 .await?;
 
         let Some(arn) = profiles.first_arn().map(|s| s.to_string()) else {
@@ -4116,7 +4120,7 @@ impl MultiTokenManager {
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         let usage_limits =
-            get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+            get_usage_limits(&credentials, &self.config, self.api_domain(), &token, effective_proxy.as_ref()).await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -4380,6 +4384,7 @@ impl MultiTokenManager {
         set_user_preference(
             &credentials,
             &self.config,
+            self.api_domain(),
             &token,
             effective_proxy.as_ref(),
             overage_status,
@@ -4979,8 +4984,10 @@ impl MultiTokenManager {
             return Ok(());
         }
         *self.api_domain.lock() = domain;
+        self.invalidate_all_model_caches();
         if let Err(err) = self.update_config_file(move |config| config.api_domain = domain) {
             *self.api_domain.lock() = previous;
+            self.invalidate_all_model_caches();
             return Err(err);
         }
         tracing::info!("上游域名已设置为: {:?}", domain);
@@ -6992,7 +6999,11 @@ mod tests {
         )
         .unwrap();
         for domain in [ApiDomain::Kiro, ApiDomain::Amazonaws, ApiDomain::Kiro] {
+            seed_model_cache(&manager, 1, &["old"]);
+            let epoch = manager.model_cache_epoch.load(Ordering::Relaxed);
             manager.set_api_domain(domain).unwrap();
+            assert!(manager.model_cache.lock().is_empty());
+            assert!(manager.model_cache_epoch.load(Ordering::Relaxed) > epoch);
             assert_eq!(manager.api_domain(), domain);
             let persisted = Config::load(&config_path).unwrap();
             assert_eq!(persisted.api_domain, domain);
@@ -7024,7 +7035,11 @@ mod tests {
         )
         .unwrap();
         std::fs::write(&config_path, "invalid json").unwrap();
+        seed_model_cache(&manager, 1, &["old"]);
+        let epoch = manager.model_cache_epoch.load(Ordering::Relaxed);
         assert!(manager.set_api_domain(ApiDomain::Kiro).is_err());
+        assert!(manager.model_cache.lock().is_empty());
+        assert_eq!(manager.model_cache_epoch.load(Ordering::Relaxed), epoch + 2);
         assert_eq!(manager.api_domain(), ApiDomain::Amazonaws);
         std::fs::write(&config_path, "{}").unwrap();
         #[cfg(windows)]
@@ -9627,5 +9642,46 @@ mod tests {
         let (mode, invert) = manager.resolve_load_balancing_for_group(Some("group_balanced"));
         assert_eq!(mode, "balanced");
         assert!(invert);
+    }
+}
+
+#[cfg(test)]
+mod management_transport_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn management_requests_use_selected_domain_and_region() {
+        for domain in [ApiDomain::Amazonaws, ApiDomain::Kiro] {
+            for region in ["us-east-1", "eu-central-1"] {
+                for operation in 0..4 {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let proxy = ProxyConfig { url: format!("http://{}", listener.local_addr().unwrap()), username: None, password: None };
+                    let expected = format!("CONNECT {}:443 HTTP/1.1\r\n", domain.management_host(region));
+                    let server = tokio::spawn(async move {
+                        let (stream, _) = listener.accept().await.unwrap();
+                        let mut stream = BufReader::new(stream);
+                        let mut line = String::new();
+                        stream.read_line(&mut line).await.unwrap();
+                        assert_eq!(line, expected);
+                        stream.get_mut().write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+                    });
+                    // Deliberately disagree with the runtime argument to catch static config use.
+                    let mut config = Config::default();
+                    config.api_domain = if domain == ApiDomain::Kiro { ApiDomain::Amazonaws } else { ApiDomain::Kiro };
+                    let credentials = KiroCredentials { auth_region: Some(region.into()), ..KiroCredentials::default() };
+                    let request = async {
+                        match operation {
+                            0 => assert!(get_usage_limits(&credentials, &config, domain, "test", Some(&proxy)).await.is_err()),
+                            1 => assert!(get_available_models(&credentials, &config, domain, "test", Some(&proxy)).await.is_err()),
+                            2 => assert!(list_available_profiles(&credentials, &config, domain, "test", Some(&proxy)).await.is_err()),
+                            _ => assert!(set_user_preference(&credentials, &config, domain, "test", Some(&proxy), "DISABLED").await.is_err()),
+                        }
+                    };
+                    tokio::time::timeout(std::time::Duration::from_secs(5), request).await.unwrap();
+                    tokio::time::timeout(std::time::Duration::from_secs(5), server).await.unwrap().unwrap();
+                }
+            }
+        }
     }
 }

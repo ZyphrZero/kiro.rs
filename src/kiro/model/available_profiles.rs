@@ -15,7 +15,7 @@ use serde::Deserialize;
 #[serde(rename_all = "camelCase")]
 pub struct ListAvailableProfilesResponse {
     /// 该凭据可用的 profile 列表
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::null_vec")]
     pub profiles: Vec<AvailableProfile>,
 
     /// 分页 token（本项目只取第一个 profile，通常无需翻页）

@@ -127,7 +127,7 @@ function ApiDomainGroup() {
         label="API 域名"
         hint={
           data?.domain === 'kiro'
-            ? '发往 runtime.{区域}.kiro.dev（新版 Kiro IDE / CLI 用的域名）'
+            ? '对话使用 runtime.{区域}.kiro.dev，管理接口使用 management.{区域}.kiro.dev'
             : '发往 q.{区域}.amazonaws.com（kiro-rs 原默认）'
         }
         value={data?.domain ?? 'amazonaws'}
