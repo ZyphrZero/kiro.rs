@@ -95,7 +95,11 @@ pub fn create_router_with_shared_provider(
     state = state.with_cache_meter(cache_meter);
     state = state.with_trace_store(trace_store);
     state = state.with_custom_headers(custom_headers);
+    create_router_with_state(state)
+}
 
+/// 基于已构造好的 [`AppState`] 创建 Anthropic API 路由（供需要注入可选热重载管理器的场景使用）。
+pub fn create_router_with_state(state: AppState) -> Router {
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()
         .route("/models", get(get_models))

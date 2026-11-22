@@ -736,6 +736,10 @@ export interface TraceRecord {
   usageSource?: UsageSource | null
   /** 客户端 IP（X-Forwarded-For / X-Real-IP 优先，回落到 TCP 对端）；老记录为 null */
   clientIp?: string | null
+  /** 触发拒答自动回退或会话粘性回退时实际执行的上游模型 */
+  fallbackModel?: string | null
+  /** 上游内容过滤拒答说明或粘性回退标记（如 CYBER: ... / sticky_session_fallback） */
+  refusalDetail?: string | null
   attempts: TraceAttempt[]
 }
 
@@ -873,3 +877,18 @@ export interface UpdateGroupRequest {
   /** 重置优先级反转为继承全局 */
   resetInvertPriority?: boolean
 }
+
+// ============ 内容过滤拒答自动回退 ============
+
+export interface RefusalFallbackConfig {
+  enabled: boolean
+  models: Record<string, string>
+  sessionTtlSecs: number
+  fallbackTriggered: number
+  stickyHits: number
+  activeSessions: number
+}
+
+export type RefusalFallbackConfigPatch = Partial<
+  Pick<RefusalFallbackConfig, 'enabled' | 'models' | 'sessionTtlSecs'>
+>

@@ -97,6 +97,8 @@ struct RoundOutcome {
     last_metering: Option<MeteringEvent>,
     /// stop_reason override (refusal / max_tokens / model_context_window_exceeded)
     stop_reason_override: Option<String>,
+    /// 上游内容过滤拒答的结构化信息（若有）
+    refusal_info: Option<crate::kiro::model::events::Refusal>,
     /// Upstream body-read error, if any. Content decoded before this error is
     /// partial and must not be treated as a successful round.
     stream_error: Option<String>,
@@ -288,6 +290,7 @@ async fn decode_round(
     let mut credits = 0.0;
     let mut last_metering: Option<MeteringEvent> = None;
     let mut stop_reason_override: Option<String> = None;
+    let mut refusal_info: Option<crate::kiro::model::events::Refusal> = None;
     let mut native_stop_reason: Option<String> = None;
     let mut context_window_full = false;
     let mut stream_error = None;
@@ -349,9 +352,13 @@ async fn decode_round(
                         // 单条流内重复 metadata 是快照，取最后一份。
                         provider_token_usage = Some(usage.sanitized());
                     }
-                    if let Some(refusal) = metadata.content_filter_refusal() {
-                        tracing::warn!("上游内容过滤拒答: {}", refusal);
+                    if let Some(info) = metadata.content_filter_refusal_info() {
+                        tracing::warn!(
+                            "上游内容过滤拒答: {}",
+                            crate::kiro::model::events::MetadataEvent::format_refusal_detail(&info)
+                        );
                         stop_reason_override = Some(REFUSAL_STOP_REASON.to_string());
+                        refusal_info = Some(info);
                     }
                 }
                 Event::ContextUsage(cu) => {
@@ -443,6 +450,7 @@ async fn decode_round(
         credits,
         last_metering,
         stop_reason_override,
+        refusal_info,
         stream_error,
         // Populated by the caller (run_round) from the conversation state sent upstream.
         invoke_tool_schemas: super::stream::InvokeToolSchemas::new(),
@@ -1371,9 +1379,18 @@ fn finalize_aggregated_trace(
     );
 }
 
+/// web_search 循环中的拒答自动回退上下文
+pub(super) struct WebSearchRefusalFallback {
+    pub manager: crate::model::refusal_fallback::RefusalFallbackManager,
+    pub original_model: String,
+    pub target_model: String,
+    pub conversation_id: String,
+}
+
 /// web_search loop entry point
 ///
 /// `stream_client`: whether the client wants SSE (true) or a single JSON response (false).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_web_search_loop(
     provider: Arc<KiroProvider>,
     payload: MessagesRequest,
@@ -1385,6 +1402,7 @@ pub(super) async fn run_web_search_loop(
     cache_meter: Option<SharedCacheMeter>,
     key_id: u64,
     custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
+    refusal_fallback: Option<WebSearchRefusalFallback>,
 ) -> Response {
     if !stream_client {
         let mut resp = run_web_search_loop_inner(
@@ -1397,6 +1415,7 @@ pub(super) async fn run_web_search_loop(
             cache_meter,
             key_id,
             None,
+            refusal_fallback,
         )
         .await;
         super::handlers::attach_custom_headers(
@@ -1436,6 +1455,7 @@ pub(super) async fn run_web_search_loop(
                 cache_meter,
                 key_id,
                 Some(&mut emitter),
+                refusal_fallback,
             ))
             .catch_unwind(),
         )
@@ -1474,6 +1494,7 @@ pub(super) async fn run_web_search_loop(
     resp
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_web_search_loop_inner(
     provider: Arc<KiroProvider>,
     mut payload: MessagesRequest,
@@ -1484,6 +1505,7 @@ async fn run_web_search_loop_inner(
     cache_meter: Option<SharedCacheMeter>,
     key_id: u64,
     mut emitter: Option<&mut WebSearchSseEmitter>,
+    mut refusal_fallback: Option<WebSearchRefusalFallback>,
 ) -> Response {
     let mut presentation: Vec<Value> = Vec::new();
     let mut settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
@@ -1589,6 +1611,44 @@ async fn run_web_search_loop_inner(
                         )),
                     )
                         .into_response();
+                }
+            }
+
+            // 若本轮命中内容过滤拒答且允许自动回退（且尚未向客户端输出正文），切目标模型重跑本轮
+            if is_refusal(&round.stop_reason_override) {
+                let category = round
+                    .refusal_info
+                    .as_ref()
+                    .and_then(|r| r.category.as_deref());
+                if crate::model::refusal_fallback::RefusalFallbackManager::is_fallback_eligible_category(category) {
+                    if let Some(fb) = refusal_fallback.take() {
+                        let detail = round
+                            .refusal_info
+                            .as_ref()
+                            .map(crate::kiro::model::events::MetadataEvent::format_refusal_detail)
+                            .unwrap_or_else(|| {
+                                crate::kiro::model::events::CONTENT_FILTERED_STOP_REASON.to_string()
+                            });
+                        tracing::warn!(
+                            original_model = %fb.original_model,
+                            fallback_model = %fb.target_model,
+                            refusal = %detail,
+                            "web_search 循环命中内容过滤拒答，自动回退至目标模型重跑本轮"
+                        );
+                        fb.manager.record_session_fallback(
+                            &fb.conversation_id,
+                            &fb.original_model,
+                            &fb.target_model,
+                        );
+                        tracer.record_refusal_fallback(&fb.target_model, detail);
+                        payload.model = fb.target_model;
+                        continue;
+                    }
+                }
+                if let Some(ref info) = round.refusal_info {
+                    tracer.set_refusal_detail(
+                        crate::kiro::model::events::MetadataEvent::format_refusal_detail(info),
+                    );
                 }
             }
 
@@ -2399,6 +2459,7 @@ mod tests {
             credits: 0.0,
             last_metering: None,
             stop_reason_override: None,
+            refusal_info: None,
             stream_error: None,
             invoke_tool_schemas: super::super::stream::InvokeToolSchemas::new(),
             tool_name_map: std::collections::HashMap::new(),

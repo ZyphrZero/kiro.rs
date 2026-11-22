@@ -437,6 +437,14 @@ pub struct Config {
     #[serde(default = "crate::model::custom_headers::default_custom_headers")]
     pub custom_headers: Vec<crate::model::custom_headers::CustomHeaderRule>,
 
+    /// 上游内容过滤拒答（CONTENT_FILTERED）自动回退配置（默认关闭，可选开启）。
+    ///
+    /// 开启后，当映射中的源模型（默认预置 `claude-opus-5.5 -> claude-opus-4.8`）在尚未输出
+    /// 正文/工具调用前收到 `CONTENT_FILTERED`（空类别或 `CYBER`）时，自动回退到目标模型重试一次，
+    /// 并可按 `sessionTtlSecs` 为同一会话建立短 TTL 粘性回退。
+    #[serde(default)]
+    pub refusal_fallback: crate::model::refusal_fallback::RefusalFallbackConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -637,6 +645,7 @@ impl Default for Config {
             custom_models: Vec::new(),
             credential_metadata_schema: None,
             custom_headers: crate::model::custom_headers::default_custom_headers(),
+            refusal_fallback: crate::model::refusal_fallback::RefusalFallbackConfig::default(),
             config_path: None,
         }
     }
@@ -991,5 +1000,50 @@ mod tests {
         let explicit: Config =
             serde_json::from_str(r#"{"invertPriority": true}"#).unwrap();
         assert!(explicit.invert_priority);
+    }
+
+    #[test]
+    fn refusal_fallback_defaults_and_roundtrips() {
+        for config in [Config::default(), serde_json::from_str("{}").unwrap()] {
+            assert!(!config.refusal_fallback.enabled);
+            assert_eq!(
+                config
+                    .refusal_fallback
+                    .models
+                    .get("claude-opus-5.5")
+                    .map(String::as_str),
+                Some("claude-opus-4.8")
+            );
+            assert_eq!(config.refusal_fallback.session_ttl_secs, 900);
+        }
+
+        let explicit: Config = serde_json::from_str(
+            r#"{
+                "refusalFallback": {
+                    "enabled": true,
+                    "models": { "claude-opus-5.5": "claude-opus-5" },
+                    "sessionTtlSecs": 300
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(explicit.refusal_fallback.enabled);
+        assert_eq!(
+            explicit
+                .refusal_fallback
+                .models
+                .get("claude-opus-5.5")
+                .map(String::as_str),
+            Some("claude-opus-5")
+        );
+        assert_eq!(explicit.refusal_fallback.session_ttl_secs, 300);
+
+        let serialized = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(serialized["refusalFallback"]["enabled"], true);
+        assert_eq!(
+            serialized["refusalFallback"]["models"]["claude-opus-5.5"],
+            "claude-opus-5"
+        );
+        assert_eq!(serialized["refusalFallback"]["sessionTtlSecs"], 300);
     }
 }

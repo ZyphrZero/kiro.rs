@@ -46,6 +46,8 @@ import type {
   GitHubRateLimitInfo,
   UpdateAdminKeyRequest,
   CredentialMetadataSchemaConfig,
+  RefusalFallbackConfig,
+  RefusalFallbackConfigPatch,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -625,6 +627,20 @@ export async function setQuotaResetRecoveryConfig(
   patch: Partial<QuotaResetRecoveryConfig>,
 ): Promise<QuotaResetRecoveryConfig> {
   const { data } = await api.put<QuotaResetRecoveryConfig>('/config/quota-reset-recovery', patch)
+  return data
+}
+
+// 获取内容过滤拒答自动回退配置
+export async function getRefusalFallbackConfig(): Promise<RefusalFallbackConfig> {
+  const { data } = await api.get<RefusalFallbackConfig>('/config/refusal-fallback')
+  return data
+}
+
+// 更新内容过滤拒答自动回退配置
+export async function setRefusalFallbackConfig(
+  patch: RefusalFallbackConfigPatch,
+): Promise<RefusalFallbackConfig> {
+  const { data } = await api.put<RefusalFallbackConfig>('/config/refusal-fallback', patch)
   return data
 }
 

@@ -29,6 +29,8 @@ import {
   setAccountRpmLimitConfig,
   getQuotaResetRecoveryConfig,
   setQuotaResetRecoveryConfig,
+  getRefusalFallbackConfig,
+  setRefusalFallbackConfig,
   getSelfHealConfig,
   setSelfHealConfig,
   getLogGovernanceConfig,
@@ -60,6 +62,7 @@ import type {
   UpdateRefreshTokenRequest,
   CredentialMetadataSchemaConfig,
   CredentialQueryParams,
+  RefusalFallbackConfigPatch,
 } from '@/types/api'
 
 // 查询凭据列表（支持分页、搜索、过滤、排序）
@@ -395,6 +398,27 @@ export function useSetQuotaResetRecoveryConfig() {
     mutationFn: setQuotaResetRecoveryConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['quotaResetRecoveryConfig'] })
+    },
+  })
+}
+
+// 获取内容过滤拒答自动回退配置（30s 刷新以观察回退/粘性统计）
+export function useRefusalFallbackConfig() {
+  return useQuery({
+    queryKey: ['refusalFallbackConfig'],
+    queryFn: getRefusalFallbackConfig,
+    refetchInterval: 30_000,
+  })
+}
+
+// 更新内容过滤拒答自动回退配置
+export function useSetRefusalFallbackConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (patch: RefusalFallbackConfigPatch) => setRefusalFallbackConfig(patch),
+    onSuccess: (data) => {
+      queryClient.setQueryData(['refusalFallbackConfig'], data)
+      queryClient.invalidateQueries({ queryKey: ['refusalFallbackConfig'] })
     },
   })
 }

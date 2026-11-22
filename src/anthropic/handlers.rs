@@ -141,6 +141,10 @@ pub(crate) struct RequestTracer {
     /// 首次选号的路由决策。web_search 一条 trace 内多次 provider 调用，
     /// 「是否沿用了上一轮账号」只看第一次。
     route: parking_lot::Mutex<Option<TraceRoute>>,
+    /// 若触发了拒答自动回退或会话粘性回退，记录实际执行请求的回退目标模型
+    fallback_model: parking_lot::Mutex<Option<String>>,
+    /// 上游内容过滤拒答的原始说明（如 `CYBER: ...` / `CONTENT_FILTERED` / `sticky_session_fallback`）
+    refusal_detail: parking_lot::Mutex<Option<String>>,
     /// 是否已落库。[`finalize`](Self::finalize) 首次进入即置位，保证同一条 trace
     /// 只写一行；[`Drop`] 兜底时据此判断「本请求从未正常收尾」。
     finalized: std::sync::atomic::AtomicBool,
@@ -224,9 +228,35 @@ impl RequestTracer {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            fallback_model: parking_lot::Mutex::new(None),
+            refusal_detail: parking_lot::Mutex::new(None),
             finalized: std::sync::atomic::AtomicBool::new(false),
             upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// 记录上游内容过滤拒答的说明详情（仅在尚未记录回退原因时写入）。
+    pub(crate) fn set_refusal_detail(&self, detail: impl Into<String>) {
+        let mut slot = self.refusal_detail.lock();
+        if slot.is_none() {
+            *slot = Some(detail.into());
+        }
+    }
+
+    /// 记录本次请求触发了拒答自动回退（含目标模型与原始拒答详情）。
+    pub(crate) fn record_refusal_fallback(
+        &self,
+        target_model: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        *self.fallback_model.lock() = Some(target_model.into());
+        *self.refusal_detail.lock() = Some(detail.into());
+    }
+
+    /// 记录本次请求命中会话粘性回退，直接路由至回退模型。
+    pub(crate) fn record_sticky_fallback(&self, target_model: impl Into<String>) {
+        *self.fallback_model.lock() = Some(target_model.into());
+        *self.refusal_detail.lock() = Some("sticky_session_fallback".to_string());
     }
 
     /// 标记 provider 已成功返回响应头。应在取得 `reqwest::Response` 后立刻调用，
@@ -310,6 +340,8 @@ impl RequestTracer {
             .lock()
             .map(|t| t.duration_since(self.started_at).as_millis() as u64);
         let route = self.route.lock().take();
+        let fallback_model = self.fallback_model.lock().clone();
+        let refusal_detail = self.refusal_detail.lock().clone();
         let rec = TraceRecord {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
@@ -335,6 +367,8 @@ impl RequestTracer {
             previous_credential_id: route.as_ref().and_then(|r| r.previous_credential_id),
             usage_source: usage.source.as_db().map(|s| s.to_string()),
             client_ip: self.client_ip.clone(),
+            fallback_model,
+            refusal_detail,
             attempts,
         };
         store.insert(&rec);
@@ -906,6 +940,98 @@ pub async fn get_models(
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
+
+
+/// 请求入口处对拒答回退策略的预判定结果
+enum RefusalFallbackResolution {
+    None,
+    /// 命中会话级粘性回退：请求已直接改写为回退目标模型
+    Sticky { target_model: String },
+    /// 按原模型发起请求，若触发符合条件的 CONTENT_FILTERED 则自动回退至 target_model
+    Armed {
+        manager: crate::model::refusal_fallback::RefusalFallbackManager,
+        original_model: String,
+        target_model: String,
+        conversation_id: String,
+    },
+}
+
+/// 持有原始请求的回退计划（按移动语义接管 `MessagesRequest`，正常路径零克隆）。
+struct RefusalFallbackPlan {
+    manager: crate::model::refusal_fallback::RefusalFallbackManager,
+    original_model: String,
+    target_model: String,
+    conversation_id: String,
+    payload: MessagesRequest,
+    tool_compatibility_mode: crate::model::config::ToolCompatibilityMode,
+}
+
+struct PreparedFallbackRequest {
+    request_body: String,
+    tool_name_map: std::collections::HashMap<String, String>,
+    known_tool_names: std::collections::HashSet<String>,
+    invoke_tool_schemas: super::stream::InvokeToolSchemas,
+}
+
+impl RefusalFallbackPlan {
+    fn prepare(&mut self) -> Result<PreparedFallbackRequest, String> {
+        self.payload.model = self.target_model.clone();
+        let conversion = convert_request_with_mode(&self.payload, self.tool_compatibility_mode)
+            .map_err(|e| format!("回退模型转换请求失败: {e}"))?;
+        let invoke_tool_schemas = super::stream::invoke_tool_schemas_from_state(
+            &conversion.conversation_state,
+            &conversion.known_tool_names,
+        );
+        let kiro_request = KiroRequest {
+            conversation_state: conversion.conversation_state,
+            profile_arn: None,
+            additional_model_request_fields: conversion.additional_model_request_fields,
+        };
+        let request_body = serde_json::to_string(&kiro_request)
+            .map_err(|e| format!("回退模型序列化请求失败: {e}"))?;
+        Ok(PreparedFallbackRequest {
+            request_body,
+            tool_name_map: conversion.tool_name_map,
+            known_tool_names: conversion.known_tool_names,
+            invoke_tool_schemas,
+        })
+    }
+}
+
+/// 解析本次请求的拒答回退策略：若命中会话粘性则直接改写 `payload.model` 并返回 `Sticky`；
+/// 否则若配置了回退映射则返回 `Armed`。
+fn resolve_refusal_fallback(
+    state: &AppState,
+    payload: &mut MessagesRequest,
+    original_model: &str,
+) -> RefusalFallbackResolution {
+    let Some(mgr) = state.refusal_fallback.as_ref() else {
+        return RefusalFallbackResolution::None;
+    };
+    let Some(target_model) = mgr.lookup_target_model(original_model) else {
+        return RefusalFallbackResolution::None;
+    };
+    let conversation_id = super::converter::resolve_conversation_id(payload);
+    if let Some(sticky_target) = mgr.lookup_sticky_session(&conversation_id, original_model) {
+        tracing::info!(
+            original_model = %original_model,
+            fallback_model = %sticky_target,
+            conversation_id = %conversation_id,
+            "命中会话粘性拒答回退，直接路由至回退模型"
+        );
+        payload.model = sticky_target.clone();
+        return RefusalFallbackResolution::Sticky {
+            target_model: sticky_target,
+        };
+    }
+    RefusalFallbackResolution::Armed {
+        manager: mgr.clone(),
+        original_model: original_model.to_string(),
+        target_model,
+        conversation_id,
+    }
+}
+
 pub async fn post_messages(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
@@ -934,7 +1060,8 @@ pub async fn post_messages(
             "incoming image payload is large; if upstream rejects with CONTENT_LENGTH_EXCEEDS_THRESHOLD, reduce image count or use lower-resolution screenshots"
         );
     }
-    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    let original_model = payload.model.clone();
+    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, original_model.clone());
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -952,6 +1079,10 @@ pub async fn post_messages(
         }
     };
 
+    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置（须在粘性回退改写 model 之前执行）
+    override_thinking_from_model_name(&mut payload);
+    let fallback_resolution = resolve_refusal_fallback(&state, &mut payload, &original_model);
+
     // 检查是否有可用凭据（无可用账号直接返回 401，避免创建 tracer 和写入日志）
     if request_has_no_credentials(&provider, &payload, key_ctx.group.as_deref()) {
         tracing::warn!(
@@ -967,12 +1098,10 @@ pub async fn post_messages(
             )),
         ).into_response();
         let trace_id = Uuid::new_v4().to_string();
-        attach_custom_headers(&mut resp, state.custom_headers.as_ref(), &early_header_context(&trace_id, &payload.model, &key_ctx, None));
+        attach_custom_headers(&mut resp, state.custom_headers.as_ref(), &early_header_context(&trace_id, &original_model, &key_ctx, None));
         return resp;
     }
 
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
     warn_structured_output_with_web_search(&payload);
 
     // 检查是否为 WebSearch 请求
@@ -1007,7 +1136,7 @@ pub async fn post_messages(
         attach_custom_headers(
             &mut resp,
             state.custom_headers.as_ref(),
-            &early_header_context(&trace_id, &payload.model, &key_ctx, None),
+            &early_header_context(&trace_id, &original_model, &key_ctx, None),
         );
         return resp;
     }
@@ -1023,10 +1152,28 @@ pub async fn post_messages(
             &state,
             RequestTraceOptions {
                 key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
+                model: original_model.clone(),
                 is_stream: payload_stream,
             },
         ));
+        let ws_fallback = match fallback_resolution {
+            RefusalFallbackResolution::Sticky { target_model } => {
+                tracer.record_sticky_fallback(target_model);
+                None
+            }
+            RefusalFallbackResolution::Armed {
+                manager,
+                original_model,
+                target_model,
+                conversation_id,
+            } => Some(super::websearch_loop::WebSearchRefusalFallback {
+                manager,
+                original_model,
+                target_model,
+                conversation_id,
+            }),
+            RefusalFallbackResolution::None => None,
+        };
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
@@ -1038,6 +1185,7 @@ pub async fn post_messages(
             state.cache_meter.clone(),
             key_ctx.key_id,
             state.custom_headers.clone(),
+            ws_fallback,
         )
         .await;
     }
@@ -1148,23 +1296,49 @@ pub async fn post_messages(
         None => super::cache_metering::CacheUsage::default(),
     };
 
-    if payload.stream {
+    let tracer = std::sync::Arc::new(RequestTracer::new(
+        &state,
+        RequestTraceOptions {
+            key_ctx: key_ctx.clone(),
+            model: original_model.clone(),
+            is_stream: payload.stream,
+        },
+    ));
+
+    let extract_thinking =
+        (state.extract_thinking || payload.output_config.is_some()) && thinking_enabled;
+    let effective_model = payload.model.clone();
+    let is_stream = payload.stream;
+    let refusal_fallback = match fallback_resolution {
+        RefusalFallbackResolution::Sticky { target_model } => {
+            tracer.record_sticky_fallback(target_model);
+            None
+        }
+        RefusalFallbackResolution::Armed {
+            manager,
+            original_model,
+            target_model,
+            conversation_id,
+        } => Some(RefusalFallbackPlan {
+            manager,
+            original_model,
+            target_model,
+            conversation_id,
+            payload,
+            tool_compatibility_mode: state.tool_compatibility_mode,
+        }),
+        RefusalFallbackResolution::None => None,
+    };
+
+    if is_stream {
         // 流式响应
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
-                is_stream: true,
-            },
-        ));
         handle_stream_request(
             provider,
             &request_body,
-            &payload.model,
+            &effective_model,
             total_input_tokens,
             // L7：流式与非流式一致，遵守 extractThinking 配置。
-            (state.extract_thinking || payload.output_config.is_some()) && thinking_enabled,
+            extract_thinking,
             tool_name_map,
             known_tool_names,
             invoke_tool_schemas,
@@ -1174,26 +1348,17 @@ pub async fn post_messages(
             key_ctx.group.clone(),
             structured_schema.clone(),
             state.custom_headers.clone(),
+            refusal_fallback,
         )
         .await
     } else {
         // Responses reasoning requests must expose native reasoning even when the
         // global Anthropic compatibility flag is disabled; the Responses adapter
         // explicitly opted into it via `thinking`/`output_config`.
-        let extract_thinking =
-            (state.extract_thinking || payload.output_config.is_some()) && thinking_enabled;
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
-                is_stream: false,
-            },
-        ));
         handle_non_stream_request(
             provider,
             &request_body,
-            &payload.model,
+            &effective_model,
             total_input_tokens,
             extract_thinking,
             tool_name_map,
@@ -1205,12 +1370,14 @@ pub async fn post_messages(
             key_ctx.group.clone(),
             structured_schema.clone(),
             state.custom_headers.clone(),
+            refusal_fallback,
         )
         .await
     }
 }
 
 /// 处理流式请求
+#[allow(clippy::too_many_arguments)]
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -1226,6 +1393,7 @@ async fn handle_stream_request(
     group: Option<String>,
     structured_schema: Option<serde_json::Value>,
     custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
+    refusal_fallback: Option<RefusalFallbackPlan>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
@@ -1285,6 +1453,9 @@ async fn handle_stream_request(
         tracer.clone(),
         structured_schema.map(|schema| StructuredCollector::new(schema, model)),
         in_flight,
+        provider,
+        group.clone(),
+        refusal_fallback,
     );
 
     // 返回 SSE 响应
@@ -1316,6 +1487,7 @@ fn create_ping_sse() -> Bytes {
 }
 
 /// 创建 SSE 事件流
+#[allow(clippy::too_many_arguments)]
 fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
@@ -1325,6 +1497,9 @@ fn create_sse_stream(
     tracer: std::sync::Arc<RequestTracer>,
     mut structured: Option<StructuredCollector>,
     in_flight: Option<std::sync::Arc<crate::kiro::token_manager::InFlightGuard>>,
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    group: Option<String>,
+    refusal_fallback: Option<RefusalFallbackPlan>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 结构化输出模式：只先发 message_start，其余初始事件与后续内容缓冲到流结束再改写发出。
     let initial_events = match structured.as_mut() {
@@ -1348,8 +1523,32 @@ fn create_sse_stream(
     settlement.structured = structured;
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), settlement, 0u64),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut settlement, mut sent_bytes)| async move {
+        (
+            body_stream,
+            ctx,
+            EventStreamDecoder::new(),
+            false,
+            interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            settlement,
+            0u64,
+            0u64,
+            provider,
+            group,
+            refusal_fallback,
+        ),
+        |(
+            mut body_stream,
+            mut ctx,
+            mut decoder,
+            finished,
+            mut ping_interval,
+            mut settlement,
+            mut sent_bytes,
+            mut attempt_bytes,
+            provider,
+            group,
+            mut refusal_fallback,
+        )| async move {
             if finished {
                 return None;
             }
@@ -1360,11 +1559,13 @@ fn create_sse_stream(
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
-                            sent_bytes += chunk.len() as u64;
+                            let len = chunk.len() as u64;
+                            sent_bytes += len;
+                            attempt_bytes += len;
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
                                 let bytes = settlement.interrupt(&mut ctx, Vec::new(), &StreamFailure::interrupted("malformed event frame from upstream"), &e.to_string(), sent_bytes);
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, attempt_bytes, provider, group, refusal_fallback)));
                             }
 
                             let mut events = Vec::new();
@@ -1375,7 +1576,7 @@ fn create_sse_stream(
                                             Ok(event) => {
                                                 if let Some((error, failure)) = upstream_event_error(&event) {
                                                     let bytes = settlement.interrupt(&mut ctx, events, &failure, &error, sent_bytes);
-                                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
+                                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, attempt_bytes, provider, group, refusal_fallback)));
                                                 }
                                                 let generated = ctx.process_kiro_event(&event);
                                                 // 结构化模式下内容被缓冲，首字时间在流末真正发出时再记
@@ -1386,13 +1587,13 @@ fn create_sse_stream(
                                             }
                                             Err(error) => {
                                                 let bytes = settlement.interrupt(&mut ctx, events, &StreamFailure::interrupted("malformed event frame from upstream"), &error.to_string(), sent_bytes);
-                                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
+                                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, attempt_bytes, provider, group, refusal_fallback)));
                                             }
                                         }
                                     }
                                     Err(e) => {
                                         let bytes = settlement.interrupt(&mut ctx, events, &StreamFailure::interrupted("malformed event frame from upstream"), &e.to_string(), sent_bytes);
-                                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
+                                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, attempt_bytes, provider, group, refusal_fallback)));
                                     }
                                 }
                             }
@@ -1405,21 +1606,108 @@ fn create_sse_stream(
                                 .collect();
                             settlement.update(&ctx, sent_bytes);
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes, attempt_bytes, provider, group, refusal_fallback)))
                         }
                         Some(Err(e)) => {
                             let failure = body_read_failure(&e);
                             let bytes = settlement.interrupt(&mut ctx, Vec::new(), &failure, &format!("{:#}", anyhow::Error::new(e)), sent_bytes);
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, attempt_bytes, provider, group, refusal_fallback)))
                         }
                         None => {
-                            if sent_bytes == 0 {
+                            if attempt_bytes == 0 {
                                 let bytes = settlement.interrupt(&mut ctx, Vec::new(), &StreamFailure::interrupted("upstream returned an empty event stream"), "Upstream returned an empty event stream", sent_bytes);
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, attempt_bytes, provider, group, refusal_fallback)));
                             }
                             if decoder.has_pending_data() {
                                 let bytes = settlement.interrupt(&mut ctx, Vec::new(), &StreamFailure::interrupted("upstream ended with an incomplete event frame"), "Upstream ended with an incomplete event frame", sent_bytes);
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, attempt_bytes, provider, group, refusal_fallback)));
+                            }
+                            // 命中 CONTENT_FILTERED 且尚未输出可见正文/工具调用时，按配置无缝回退到目标模型。
+                            if ctx.can_refusal_fallback() {
+                                if let Some(mut plan) = refusal_fallback.take() {
+                                    let refusal_text = ctx.refusal_detail().unwrap_or_else(|| {
+                                        crate::kiro::model::events::CONTENT_FILTERED_STOP_REASON.to_string()
+                                    });
+                                    match plan.prepare() {
+                                        Ok(prepared) => {
+                                            tracing::warn!(
+                                                original_model = %plan.original_model,
+                                                fallback_model = %plan.target_model,
+                                                refusal = %refusal_text,
+                                                "流式请求命中内容过滤拒答（未输出可见正文），自动回退至目标模型"
+                                            );
+                                            match provider
+                                                .call_api_stream(
+                                                    &prepared.request_body,
+                                                    Some(settlement.tracer.as_ref()),
+                                                    group.as_deref(),
+                                                )
+                                                .await
+                                            {
+                                                Ok(fb_call) => {
+                                                    plan.manager.record_session_fallback(
+                                                        &plan.conversation_id,
+                                                        &plan.original_model,
+                                                        &plan.target_model,
+                                                    );
+                                                    settlement.credential_id = fb_call.credential_id;
+                                                    settlement._in_flight = fb_call._in_flight;
+                                                    settlement.tracer.record_refusal_fallback(
+                                                        &plan.target_model,
+                                                        refusal_text,
+                                                    );
+                                                    let close_events = ctx.prepare_for_refusal_fallback(
+                                                        plan.target_model,
+                                                        prepared.tool_name_map,
+                                                        prepared.known_tool_names,
+                                                        prepared.invoke_tool_schemas,
+                                                    );
+                                                    let close_events = settlement.hold_if_structured(close_events);
+                                                    let bytes: Vec<Result<Bytes, Infallible>> = close_events
+                                                        .into_iter()
+                                                        .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                                        .collect();
+                                                    body_stream = fb_call.response.bytes_stream();
+                                                    decoder = EventStreamDecoder::new();
+                                                    attempt_bytes = 0;
+                                                    return Some((
+                                                        stream::iter(bytes),
+                                                        (
+                                                            body_stream,
+                                                            ctx,
+                                                            decoder,
+                                                            false,
+                                                            ping_interval,
+                                                            settlement,
+                                                            sent_bytes,
+                                                            attempt_bytes,
+                                                            provider,
+                                                            group,
+                                                            refusal_fallback,
+                                                        ),
+                                                    ));
+                                                }
+                                                Err(err) => {
+                                                    tracing::warn!(
+                                                        fallback_model = %plan.target_model,
+                                                        error = %err,
+                                                        "拒答自动回退调用上游失败，保留原始拒答响应"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            tracing::warn!(
+                                                fallback_model = %plan.target_model,
+                                                error = %err,
+                                                "拒答自动回退构造请求失败，保留原始拒答响应"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(detail) = ctx.refusal_detail() {
+                                settlement.tracer.set_refusal_detail(detail);
                             }
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
@@ -1456,7 +1744,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes, attempt_bytes, provider, group, refusal_fallback)))
                         }
                     }
                 }
@@ -1464,7 +1752,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, settlement, sent_bytes, attempt_bytes, provider, group, refusal_fallback)))
                 }
             }
         },
@@ -1658,6 +1946,7 @@ pub(crate) fn new_non_stream_request_tracer(
 }
 
 /// 处理非流式请求
+#[allow(clippy::too_many_arguments)]
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -1675,27 +1964,28 @@ async fn handle_non_stream_request(
     group: Option<String>,
     structured_schema: Option<serde_json::Value>,
     custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
+    refusal_fallback: Option<RefusalFallbackPlan>,
 ) -> Response {
-    // L11：与流式同一套 `<invoke>` 文本识别规则（H2）。
-    let reclaim_name_map = tool_name_map.clone();
-    let (mut resp, credential_id) = match execute_non_stream_request(
+    let (mut resp, credential_id) = match execute_non_stream_request_inner(
         provider,
         request_body,
         model,
         input_tokens,
         thinking_enabled,
         tool_name_map,
+        invoke_tool_schemas,
         hook,
         cache_usage,
         tracer.clone(),
         group.clone(),
+        refusal_fallback,
     )
     .await
     {
-        Ok((mut response_body, credential_id)) => {
-            reclaim_trailing_invoke_text(&mut response_body, &invoke_tool_schemas, &reclaim_name_map);
+        Ok((mut response_body, credential_id, reclaim_name_map, effective_invoke_schemas, effective_model)) => {
+            reclaim_trailing_invoke_text(&mut response_body, &effective_invoke_schemas, &reclaim_name_map);
             if let Some(schema) = &structured_schema {
-                rewrite_message_json(&mut response_body, schema, model);
+                rewrite_message_json(&mut response_body, schema, &effective_model);
             }
             ((StatusCode::OK, Json(response_body)).into_response(), Some(credential_id))
         }
@@ -1870,6 +2160,7 @@ fn non_stream_read_failure(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -1882,118 +2173,158 @@ pub(crate) async fn execute_non_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Result<(serde_json::Value, u64), NonStreamExecutionError> {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
-        .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            if is_no_available_credentials_error(&e) {
-                tracer.discard();
-            } else {
-                hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-                tracer.finalize(
-                    "error",
-                    last_attempt_outcome(&tracer),
-                    Some(&format!("{e:#}")),
-                    None,
-                    TraceUsage::zero(),
-                );
-            }
-            return Err(NonStreamExecutionError::Provider(e));
-        }
-    };
-    tracer.mark_upstream_headers_received();
-    let response = call_result.response;
-    let credential_id = call_result.credential_id;
+    execute_non_stream_request_inner(
+        provider,
+        request_body,
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        super::stream::InvokeToolSchemas::new(),
+        hook,
+        cache_usage,
+        tracer,
+        group,
+        None,
+    )
+    .await
+    .map(|(body, cred_id, _, _, _)| (body, cred_id))
+}
 
-    let mut body_stream = response.bytes_stream();
-    let mut decoder = EventStreamDecoder::new();
-    let mut received_data = false;
+#[allow(clippy::too_many_arguments)]
+async fn execute_non_stream_request_inner(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    initial_request_body: &str,
+    initial_model: &str,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    initial_tool_name_map: std::collections::HashMap<String, String>,
+    initial_invoke_tool_schemas: super::stream::InvokeToolSchemas,
+    hook: UsageRecordHook,
+    cache_usage: super::cache_metering::CacheUsage,
+    tracer: std::sync::Arc<RequestTracer>,
+    group: Option<String>,
+    mut refusal_fallback: Option<RefusalFallbackPlan>,
+) -> Result<
+    (
+        serde_json::Value,
+        u64,
+        std::collections::HashMap<String, String>,
+        super::stream::InvokeToolSchemas,
+        String,
+    ),
+    NonStreamExecutionError,
+> {
+    let mut current_body = initial_request_body.to_string();
+    let mut current_model = initial_model.to_string();
+    let mut current_tool_name_map = initial_tool_name_map;
+    let mut current_invoke_tool_schemas = initial_invoke_tool_schemas;
+    let mut accumulated_credits: f64 = 0.0;
 
-    let mut text_content = String::new();
-    let mut native_thinking = String::new();
-    let mut native_thinking_signature: Option<String> = None;
-    let mut native_redacted_thinking: Vec<String> = Vec::new();
-    let mut tool_uses: Vec<serde_json::Value> = Vec::new();
-    let mut has_tool_use = false;
-    let mut stop_reason = "end_turn".to_string();
-    let mut native_stop_reason: Option<String> = None;
-    let mut context_window_full = false;
-    // 从 contextUsageEvent 计算的实际输入 tokens
-    let mut context_input_tokens: Option<i32> = None;
-    // metadataEvent.tokenUsage 是本次 provider 调用的精确最终快照。
-    let mut provider_token_usage: Option<TokenUsage> = None;
-    // meteringEvent 上报的 credit 计费量（上游真实下发）；
-    // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
-    let mut credits: f64 = 0.0;
-    // 最近一次 meteringEvent 的完整 payload，用于在响应体 usage 中透传
-    // credit_usage / credit_unit / credit_unit_plural 字段，与 /v1/messages
-    // 流式（message_delta）行为一致；如果上游多次下发则取最后一次。
-    let mut metering: Option<crate::kiro::model::events::MeteringEvent> = None;
-
-    // 工具调用参数 JSON 累积器：按 tool_use_id 缓冲分片，stop 时整体解析。
-    // 半截 / 非法 JSON 显式暴露为错误（返回 502），不再静默回退 {} 或丢弃。
-    let mut tool_accumulator = super::stream::ToolJsonAccumulator::new();
-    let mut tool_json_error: Option<super::stream::ToolJsonAccumulatorError> = None;
-    // 上游内容过滤拒答：拦截后只剩 reasoning，必须显式标成 refusal，
-    // 否则会被当成正常 end_turn 的空响应返回。
-    let mut refused = false;
-
-    while let Some(chunk) = body_stream.next().await {
-        let body_bytes = match chunk {
-            Ok(bytes) => bytes,
+    loop {
+        let request_body = current_body.as_str();
+        let model = current_model.as_str();
+        let tool_name_map = &current_tool_name_map;
+        // 调用 Kiro API（支持多凭据故障转移）
+        let call_result = match provider
+            .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
+            .await
+        {
+            Ok(resp) => resp,
             Err(e) => {
-                let failure = body_read_failure(&e);
+                if is_no_available_credentials_error(&e) {
+                    tracer.discard();
+                } else {
+                    hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+                    tracer.finalize(
+                        "error",
+                        last_attempt_outcome(&tracer),
+                        Some(&format!("{e:#}")),
+                        None,
+                        TraceUsage::zero(),
+                    );
+                }
+                return Err(NonStreamExecutionError::Provider(e));
+            }
+        };
+        tracer.mark_upstream_headers_received();
+        let response = call_result.response;
+        let credential_id = call_result.credential_id;
+
+        let mut body_stream = response.bytes_stream();
+        let mut decoder = EventStreamDecoder::new();
+        let mut received_data = false;
+
+        let mut text_content = String::new();
+        let mut native_thinking = String::new();
+        let mut native_thinking_signature: Option<String> = None;
+        let mut native_redacted_thinking: Vec<String> = Vec::new();
+        let mut tool_uses: Vec<serde_json::Value> = Vec::new();
+        let mut has_tool_use = false;
+        let mut stop_reason = "end_turn".to_string();
+        let mut native_stop_reason: Option<String> = None;
+        let mut context_window_full = false;
+        let mut context_input_tokens: Option<i32> = None;
+        let mut provider_token_usage: Option<TokenUsage> = None;
+        let mut credits: f64 = accumulated_credits;
+        let mut metering: Option<crate::kiro::model::events::MeteringEvent> = None;
+
+        let mut tool_accumulator = super::stream::ToolJsonAccumulator::new();
+        let mut tool_json_error: Option<super::stream::ToolJsonAccumulatorError> = None;
+        let mut refusal_info: Option<crate::kiro::model::events::Refusal> = None;
+
+        while let Some(chunk) = body_stream.next().await {
+            let body_bytes = match chunk {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    let failure = body_read_failure(&e);
+                    return Err(non_stream_read_failure(
+                        &hook,
+                        &tracer,
+                        credential_id,
+                        input_tokens,
+                        &format!("{:#}", anyhow::Error::new(e)),
+                        failure,
+                    ));
+                }
+            };
+            received_data |= !body_bytes.is_empty();
+            if let Err(e) = decoder.feed(&body_bytes) {
                 return Err(non_stream_read_failure(
                     &hook,
                     &tracer,
                     credential_id,
                     input_tokens,
-                    &format!("{:#}", anyhow::Error::new(e)),
-                    failure,
+                    &e.to_string(),
+                    StreamFailure::interrupted("malformed event frame from upstream"),
                 ));
             }
-        };
-        received_data |= !body_bytes.is_empty();
-        if let Err(e) = decoder.feed(&body_bytes) {
-            return Err(non_stream_read_failure(
-                &hook,
-                &tracer,
-                credential_id,
-                input_tokens,
-                &e.to_string(),
-                StreamFailure::interrupted("malformed event frame from upstream"),
-            ));
-        }
-        for result in decoder.decode_iter() {
-            match result {
-                Ok(frame) => {
-                    let event = match Event::from_frame(frame) {
-                        Ok(event) => event,
-                        Err(e) => {
+            for result in decoder.decode_iter() {
+                match result {
+                    Ok(frame) => {
+                        let event = match Event::from_frame(frame) {
+                            Ok(event) => event,
+                            Err(e) => {
+                                return Err(non_stream_read_failure(
+                                    &hook,
+                                    &tracer,
+                                    credential_id,
+                                    input_tokens,
+                                    &e.to_string(),
+                                    StreamFailure::interrupted("malformed event frame from upstream"),
+                                ));
+                            }
+                        };
+                        if let Some((error, failure)) = upstream_event_error(&event) {
                             return Err(non_stream_read_failure(
                                 &hook,
                                 &tracer,
                                 credential_id,
                                 input_tokens,
-                                &e.to_string(),
-                                StreamFailure::interrupted("malformed event frame from upstream"),
+                                &error,
+                                failure,
                             ));
                         }
-                    };
-                    if let Some((error, failure)) = upstream_event_error(&event) {
-                        return Err(non_stream_read_failure(
-                            &hook,
-                            &tracer,
-                            credential_id,
-                            input_tokens,
-                            &error,
-                            failure,
-                        ));
-                    }
-                    {
                         match event {
                             Event::AssistantResponse(resp) => {
                                 text_content.push_str(&resp.content);
@@ -2017,7 +2348,7 @@ pub(crate) async fn execute_non_stream_request(
                             }
                             Event::ToolUse(tool_use) => {
                                 has_tool_use = true;
-                                match tool_accumulator.push(&tool_use, &tool_name_map) {
+                                match tool_accumulator.push(&tool_use, tool_name_map) {
                                     Ok(Some(completed)) => {
                                         tool_uses.push(completed.to_anthropic_block());
                                     }
@@ -2041,16 +2372,17 @@ pub(crate) async fn execute_non_stream_request(
                                         output_tokens = usage.output_tokens,
                                         "收到 metadataEvent.tokenUsage 精确用量"
                                     );
-                                    // 单条 provider 流内是最终快照，重复事件取最后一份。
                                     provider_token_usage = Some(usage);
                                 }
-                                if let Some(refusal) = metadata.content_filter_refusal() {
-                                    tracing::warn!("上游内容过滤拒答: {}", refusal);
-                                    refused = true;
+                                if let Some(info) = metadata.content_filter_refusal_info() {
+                                    tracing::warn!(
+                                        "上游内容过滤拒答: {}",
+                                        crate::kiro::model::events::MetadataEvent::format_refusal_detail(&info)
+                                    );
+                                    refusal_info = Some(info);
                                 }
                             }
                             Event::ContextUsage(context_usage) => {
-                                // 从上下文使用百分比计算实际的 input_tokens
                                 let window_size = get_context_window_size(model);
                                 let actual_input_tokens =
                                     (context_usage.context_usage_percentage * (window_size as f64)
@@ -2066,7 +2398,6 @@ pub(crate) async fn execute_non_stream_request(
                                 );
                             }
                             Event::Metering(event_metering) => {
-                                // 上游只下发 credit；token / cache 字段不存在
                                 credits += event_metering.usage;
                                 tracing::debug!(
                                     usage = event_metering.usage,
@@ -2084,202 +2415,265 @@ pub(crate) async fn execute_non_stream_request(
                             _ => {}
                         }
                     }
+                    Err(e) => {
+                        return Err(non_stream_read_failure(
+                            &hook,
+                            &tracer,
+                            credential_id,
+                            input_tokens,
+                            &e.to_string(),
+                            StreamFailure::interrupted("malformed event frame from upstream"),
+                        ));
+                    }
+                }
+            }
+        }
+
+        if !received_data || decoder.has_pending_data() {
+            return Err(non_stream_read_failure(
+                &hook,
+                &tracer,
+                credential_id,
+                input_tokens,
+                if received_data {
+                    "Upstream ended with an incomplete event frame"
+                } else {
+                    "Upstream returned an empty event stream"
+                },
+                StreamFailure::interrupted(if received_data {
+                    "upstream ended with an incomplete event frame"
+                } else {
+                    "upstream returned an empty event stream"
+                }),
+            ));
+        }
+
+        let refused = refusal_info.is_some();
+
+        // 非流式路径尚未向客户端发送任何字节：若命中允许回退的 CONTENT_FILTERED 且未产出可见正文/工具，
+        // 自动切换目标模型重跑一次。
+        if refused && text_content.trim().is_empty() && !has_tool_use {
+            let category = refusal_info
+                .as_ref()
+                .and_then(|r| r.category.as_deref());
+            if crate::model::refusal_fallback::RefusalFallbackManager::is_fallback_eligible_category(category) {
+                if let Some(mut plan) = refusal_fallback.take() {
+                    let refusal_text = refusal_info
+                        .as_ref()
+                        .map(crate::kiro::model::events::MetadataEvent::format_refusal_detail)
+                        .unwrap_or_else(|| {
+                            crate::kiro::model::events::CONTENT_FILTERED_STOP_REASON.to_string()
+                        });
+                    match plan.prepare() {
+                        Ok(prepared) => {
+                            tracing::warn!(
+                                original_model = %plan.original_model,
+                                fallback_model = %plan.target_model,
+                                refusal = %refusal_text,
+                                "非流式请求命中内容过滤拒答，自动回退至目标模型重试"
+                            );
+                            plan.manager.record_session_fallback(
+                                &plan.conversation_id,
+                                &plan.original_model,
+                                &plan.target_model,
+                            );
+                            tracer.record_refusal_fallback(&plan.target_model, refusal_text);
+                            accumulated_credits = credits;
+                            current_body = prepared.request_body;
+                            current_model = plan.target_model;
+                            current_tool_name_map = prepared.tool_name_map;
+                            current_invoke_tool_schemas = prepared.invoke_tool_schemas;
+                            continue;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                fallback_model = %plan.target_model,
+                                error = %err,
+                                "非流式拒答回退构造请求失败，保留原始拒答响应"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if refused {
+            tool_json_error = None;
+        } else if tool_json_error.is_none() {
+            match tool_accumulator.finish(tool_name_map) {
+                Ok(recovered) => {
+                    for completed in recovered {
+                        tool_uses.push(completed.to_anthropic_block());
+                    }
                 }
                 Err(e) => {
-                    return Err(non_stream_read_failure(
-                        &hook,
-                        &tracer,
-                        credential_id,
-                        input_tokens,
-                        &e.to_string(),
-                        StreamFailure::interrupted("malformed event frame from upstream"),
-                    ));
+                    tracing::error!("{}", e);
+                    tool_json_error = Some(e);
                 }
             }
         }
-    }
 
-    if !received_data || decoder.has_pending_data() {
-        return Err(non_stream_read_failure(
-            &hook,
-            &tracer,
+        if let Some(err) = tool_json_error {
+            let message = err.message();
+            if let Some(usage) = provider_token_usage {
+                let usage = usage.sanitized();
+                let trace_usage = TraceUsage {
+                    input_tokens: usage.uncached_input_tokens as u64,
+                    output_tokens: usage.output_tokens as u64,
+                    cache_creation_tokens: usage.cache_write_input_tokens as u64,
+                    cache_read_tokens: usage.cache_read_input_tokens as u64,
+                    credits: if credits.is_finite() && credits > 0.0 {
+                        credits
+                    } else {
+                        0.0
+                    },
+                    source: UsageSource::Provider,
+                };
+                hook.record(
+                    credential_id,
+                    usage.uncached_input_tokens,
+                    usage.output_tokens,
+                    usage.cache_write_input_tokens,
+                    usage.cache_read_input_tokens,
+                    credits,
+                    "error",
+                );
+                tracer.finalize(
+                    "error",
+                    Some(outcome::BAD_REQUEST),
+                    Some(&message),
+                    None,
+                    trace_usage,
+                );
+            } else {
+                hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+                tracer.finalize(
+                    "error",
+                    Some(outcome::BAD_REQUEST),
+                    Some(&message),
+                    None,
+                    TraceUsage::zero(),
+                );
+            }
+            return Err(NonStreamExecutionError::Response(
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ErrorResponse::new("upstream_tool_json_error", message)),
+                )
+                    .into_response(),
+            ));
+        }
+
+        // 确定 stop_reason：拒答是终态，优先于同流内的 max_tokens / 上下文溢出 / tool_use。
+        if refused {
+            stop_reason = super::stream::REFUSAL_STOP_REASON.to_string();
+        } else {
+            match native_stop_reason.as_deref() {
+                Some("MAX_TOKENS") => stop_reason = "max_tokens".to_string(),
+                Some("MODEL_CONTEXT_WINDOW_EXCEEDED") => {
+                    stop_reason = "model_context_window_exceeded".to_string()
+                }
+                Some("STOP_SEQUENCE") => stop_reason = "stop_sequence".to_string(),
+                None if context_window_full && stop_reason == "end_turn" => {
+                    stop_reason = "model_context_window_exceeded".to_string();
+                }
+                _ => {}
+            }
+            if has_tool_use && stop_reason == "end_turn" {
+                stop_reason = "tool_use".to_string();
+            }
+        }
+
+        // 剥离混入文本的字面 <tool_use> XML 泄漏（非流式：整段文本已就绪，一次性剥离）。
+        let text_content = crate::kiro::model::events::strip_tool_use_xml_leaks(&text_content);
+
+        // 构建响应内容
+        let mut content = build_non_stream_content(
+            thinking_enabled,
+            text_content,
+            native_thinking,
+            native_thinking_signature,
+            native_redacted_thinking,
+        );
+        content.extend(tool_uses);
+
+        let fallback_output_tokens = token::estimate_output_tokens(&content);
+        let (final_input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens) =
+            resolve_non_stream_usage(
+                input_tokens,
+                context_input_tokens,
+                fallback_output_tokens,
+                cache_usage,
+                provider_token_usage,
+            );
+
+        let mut usage_json = json!({
+            "input_tokens": final_input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": cache_creation_tokens,
+            "cache_read_input_tokens": cache_read_tokens
+        });
+        if let Some(m) = &metering {
+            usage_json["credit_usage"] = json!(m.usage);
+            usage_json["credit_unit"] = json!(m.unit);
+            usage_json["credit_unit_plural"] = json!(m.unit_plural);
+        }
+        let mut response_body = json!({
+            "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+            "type": "message",
+            "role": "assistant",
+            "content": content,
+            "model": model,
+            "stop_reason": stop_reason,
+            "stop_sequence": null,
+            "usage": usage_json
+        });
+        if let Some(ref info) = refusal_info {
+            tracer.set_refusal_detail(
+                crate::kiro::model::events::MetadataEvent::format_refusal_detail(info),
+            );
+            if let Some(details) =
+                crate::kiro::model::events::MetadataEvent::anthropic_stop_details(info)
+            {
+                response_body["stop_details"] = details;
+            }
+        }
+
+        hook.record(
             credential_id,
-            input_tokens,
-            if received_data { "Upstream ended with an incomplete event frame" } else { "Upstream returned an empty event stream" },
-            StreamFailure::interrupted(if received_data { "upstream ended with an incomplete event frame" } else { "upstream returned an empty event stream" }),
-        ));
-    }
-
-    // 收尾：无参工具的 0 字节滞留缓冲在此还原为 {} 补进 content；累积了非空内容
-    // 却从未收到 stop=true 的（上游在参数写到一半时截断）返回 IncompleteJson。
-    // 已有错误则保持不变。
-    if refused {
-        // A filter refusal can cut off tool arguments. Do not recover pending
-        // calls or replace the authoritative refusal with their JSON errors.
-        tool_json_error = None;
-    } else if tool_json_error.is_none() {
-        match tool_accumulator.finish(&tool_name_map) {
-            Ok(recovered) => {
-                for completed in recovered {
-                    tool_uses.push(completed.to_anthropic_block());
-                }
-            }
-            Err(e) => {
-                tracing::error!("{}", e);
-                tool_json_error = Some(e);
-            }
-        }
-    }
-
-    // 工具调用 JSON 半截 / 非法：非流式路径尚未发送任何字节，直接回 502，
-    // 明确暴露上游问题，而不是把无法解析的参数当成完整调用返回。
-    if let Some(err) = tool_json_error {
-        let message = err.message();
-        if let Some(usage) = provider_token_usage {
-            let usage = usage.sanitized();
-            let trace_usage = TraceUsage {
-                input_tokens: usage.uncached_input_tokens as u64,
-                output_tokens: usage.output_tokens as u64,
-                cache_creation_tokens: usage.cache_write_input_tokens as u64,
-                cache_read_tokens: usage.cache_read_input_tokens as u64,
+            final_input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+            credits,
+            "success",
+        );
+        tracer.finalize(
+            "success",
+            None,
+            None,
+            None,
+            TraceUsage {
+                input_tokens: final_input_tokens.max(0) as u64,
+                output_tokens: output_tokens.max(0) as u64,
+                cache_creation_tokens: cache_creation_tokens.max(0) as u64,
+                cache_read_tokens: cache_read_tokens.max(0) as u64,
                 credits: if credits.is_finite() && credits > 0.0 {
                     credits
                 } else {
                     0.0
                 },
-                source: UsageSource::Provider,
-            };
-            hook.record(
-                credential_id,
-                usage.uncached_input_tokens,
-                usage.output_tokens,
-                usage.cache_write_input_tokens,
-                usage.cache_read_input_tokens,
-                credits,
-                "error",
-            );
-            tracer.finalize(
-                "error",
-                Some(outcome::BAD_REQUEST),
-                Some(&message),
-                None,
-                trace_usage,
-            );
-        } else {
-            // metadata 缺失时保留原有错误口径，不把不完整工具输出估算成已消费量。
-            hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "error",
-                Some(outcome::BAD_REQUEST),
-                Some(&message),
-                None,
-                TraceUsage::zero(),
-            );
-        }
-        return Err(NonStreamExecutionError::Response(
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new("upstream_tool_json_error", message)),
-            )
-                .into_response(),
+                source: UsageSource::resolve(provider_token_usage.is_some(), &cache_usage),
+            },
+        );
+        return Ok((
+            response_body,
+            credential_id,
+            current_tool_name_map,
+            current_invoke_tool_schemas,
+            current_model,
         ));
     }
-
-    // 确定 stop_reason：拒答是终态，优先于同流内的 max_tokens / 上下文溢出 / tool_use。
-    if refused {
-        stop_reason = super::stream::REFUSAL_STOP_REASON.to_string();
-    } else {
-        match native_stop_reason.as_deref() {
-            Some("MAX_TOKENS") => stop_reason = "max_tokens".to_string(),
-            Some("MODEL_CONTEXT_WINDOW_EXCEEDED") => stop_reason = "model_context_window_exceeded".to_string(),
-            Some("STOP_SEQUENCE") => stop_reason = "stop_sequence".to_string(),
-            None if context_window_full && stop_reason == "end_turn" => {
-                stop_reason = "model_context_window_exceeded".to_string();
-            }
-            _ => {}
-        }
-        if has_tool_use && stop_reason == "end_turn" {
-            stop_reason = "tool_use".to_string();
-        }
-    }
-
-    // 剥离混入文本的字面 <tool_use> XML 泄漏（非流式：整段文本已就绪，一次性剥离）。
-    let text_content = crate::kiro::model::events::strip_tool_use_xml_leaks(&text_content);
-
-    // 构建响应内容
-    let mut content = build_non_stream_content(
-        thinking_enabled,
-        text_content,
-        native_thinking,
-        native_thinking_signature,
-        native_redacted_thinking,
-    );
-    content.extend(tool_uses);
-
-    // provider 未下发 metadataEvent 时才使用本地输出估算。
-    let fallback_output_tokens = token::estimate_output_tokens(&content);
-    let (final_input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens) =
-        resolve_non_stream_usage(
-            input_tokens,
-            context_input_tokens,
-            fallback_output_tokens,
-            cache_usage,
-            provider_token_usage,
-        );
-
-    // 构建 Anthropic 响应
-    let mut usage_json = json!({
-        "input_tokens": final_input_tokens,
-        "output_tokens": output_tokens,
-        "cache_creation_input_tokens": cache_creation_tokens,
-        "cache_read_input_tokens": cache_read_tokens
-    });
-    // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro
-    // 后端口径一致的计费元数据；只在收到过 meteringEvent 时才追加。
-    if let Some(m) = &metering {
-        usage_json["credit_usage"] = json!(m.usage);
-        usage_json["credit_unit"] = json!(m.unit);
-        usage_json["credit_unit_plural"] = json!(m.unit_plural);
-    }
-    let response_body = json!({
-        "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
-        "type": "message",
-        "role": "assistant",
-        "content": content,
-        "model": model,
-        "stop_reason": stop_reason,
-        "stop_sequence": null,
-        "usage": usage_json
-    });
-
-    hook.record(
-        credential_id,
-        final_input_tokens,
-        output_tokens,
-        cache_creation_tokens,
-        cache_read_tokens,
-        credits,
-        "success",
-    );
-    tracer.finalize(
-        "success",
-        None,
-        None,
-        None,
-        TraceUsage {
-            input_tokens: final_input_tokens.max(0) as u64,
-            output_tokens: output_tokens.max(0) as u64,
-            cache_creation_tokens: cache_creation_tokens.max(0) as u64,
-            cache_read_tokens: cache_read_tokens.max(0) as u64,
-            credits: if credits.is_finite() && credits > 0.0 {
-                credits
-            } else {
-                0.0
-            },
-            source: UsageSource::resolve(provider_token_usage.is_some(), &cache_usage),
-        },
-    );
-    Ok((response_body, credential_id))
 }
 
 fn build_non_stream_content(
@@ -2456,7 +2850,8 @@ pub async fn post_messages_cc(
     if let Err(error) = validate_max_tokens(payload.max_tokens) {
         return (StatusCode::BAD_REQUEST, Json(error)).into_response();
     }
-    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    let original_model = payload.model.clone();
+    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, original_model.clone());
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -2475,6 +2870,10 @@ pub async fn post_messages_cc(
         }
     };
 
+    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置（须在粘性回退改写 model 之前执行）
+    override_thinking_from_model_name(&mut payload);
+    let fallback_resolution = resolve_refusal_fallback(&state, &mut payload, &original_model);
+
     // 检查是否有可用凭据（无可用账号直接返回 401，避免创建 tracer 和写入日志）
     if request_has_no_credentials(&provider, &payload, key_ctx.group.as_deref()) {
         tracing::warn!(
@@ -2490,12 +2889,10 @@ pub async fn post_messages_cc(
             )),
         ).into_response();
         let trace_id = Uuid::new_v4().to_string();
-        attach_custom_headers(&mut resp, state.custom_headers.as_ref(), &early_header_context(&trace_id, &payload.model, &key_ctx, None));
+        attach_custom_headers(&mut resp, state.custom_headers.as_ref(), &early_header_context(&trace_id, &original_model, &key_ctx, None));
         return resp;
     }
 
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
     warn_structured_output_with_web_search(&payload);
 
     // 检查是否为 WebSearch 请求
@@ -2526,7 +2923,7 @@ pub async fn post_messages_cc(
             hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         }
         let trace_id = Uuid::new_v4().to_string();
-        attach_custom_headers(&mut resp, state.custom_headers.as_ref(), &early_header_context(&trace_id, &payload.model, &key_ctx, None));
+        attach_custom_headers(&mut resp, state.custom_headers.as_ref(), &early_header_context(&trace_id, &original_model, &key_ctx, None));
         return resp;
     }
 
@@ -2541,10 +2938,28 @@ pub async fn post_messages_cc(
             &state,
             RequestTraceOptions {
                 key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
+                model: original_model.clone(),
                 is_stream: payload_stream,
             },
         ));
+        let ws_fallback = match fallback_resolution {
+            RefusalFallbackResolution::Sticky { target_model } => {
+                tracer.record_sticky_fallback(target_model);
+                None
+            }
+            RefusalFallbackResolution::Armed {
+                manager,
+                original_model,
+                target_model,
+                conversation_id,
+            } => Some(super::websearch_loop::WebSearchRefusalFallback {
+                manager,
+                original_model,
+                target_model,
+                conversation_id,
+            }),
+            RefusalFallbackResolution::None => None,
+        };
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
@@ -2556,6 +2971,7 @@ pub async fn post_messages_cc(
             state.cache_meter.clone(),
             key_ctx.key_id,
             state.custom_headers.clone(),
+            ws_fallback,
         )
         .await;
     }
@@ -2665,22 +3081,48 @@ pub async fn post_messages_cc(
         None => super::cache_metering::CacheUsage::default(),
     };
 
-    if payload.stream {
+    let tracer = std::sync::Arc::new(RequestTracer::new(
+        &state,
+        RequestTraceOptions {
+            key_ctx: key_ctx.clone(),
+            model: original_model.clone(),
+            is_stream: payload.stream,
+        },
+    ));
+
+    let extract_thinking =
+        (state.extract_thinking || payload.output_config.is_some()) && thinking_enabled;
+    let effective_model = payload.model.clone();
+    let is_stream = payload.stream;
+    let refusal_fallback = match fallback_resolution {
+        RefusalFallbackResolution::Sticky { target_model } => {
+            tracer.record_sticky_fallback(target_model);
+            None
+        }
+        RefusalFallbackResolution::Armed {
+            manager,
+            original_model,
+            target_model,
+            conversation_id,
+        } => Some(RefusalFallbackPlan {
+            manager,
+            original_model,
+            target_model,
+            conversation_id,
+            payload,
+            tool_compatibility_mode: state.tool_compatibility_mode,
+        }),
+        RefusalFallbackResolution::None => None,
+    };
+
+    if is_stream {
         // Stream content immediately; final usage arrives in message_delta.
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
-                is_stream: true,
-            },
-        ));
         handle_cc_stream_request(
             provider,
             &request_body,
-            &payload.model,
+            &effective_model,
             // L7：流式与非流式一致，遵守 extractThinking 配置。
-            (state.extract_thinking || payload.output_config.is_some()) && thinking_enabled,
+            extract_thinking,
             tool_name_map,
             known_tool_names,
             invoke_tool_schemas,
@@ -2691,23 +3133,15 @@ pub async fn post_messages_cc(
             key_ctx.group.clone(),
             structured_schema.clone(),
             state.custom_headers.clone(),
+            refusal_fallback,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = (state.extract_thinking || payload.output_config.is_some()) && thinking_enabled;
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
-                is_stream: false,
-            },
-        ));
         handle_non_stream_request(
             provider,
             &request_body,
-            &payload.model,
+            &effective_model,
             total_input_tokens,
             extract_thinking,
             tool_name_map,
@@ -2719,6 +3153,7 @@ pub async fn post_messages_cc(
             key_ctx.group.clone(),
             structured_schema.clone(),
             state.custom_headers.clone(),
+            refusal_fallback,
         )
         .await
     }
@@ -2726,6 +3161,7 @@ pub async fn post_messages_cc(
 
 /// Claude Code uses the live stream too. Initial usage is an estimate;
 /// message_delta carries the final provider usage without delaying content.
+#[allow(clippy::too_many_arguments)]
 async fn handle_cc_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -2741,6 +3177,7 @@ async fn handle_cc_stream_request(
     group: Option<String>,
     structured_schema: Option<serde_json::Value>,
     custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
+    refusal_fallback: Option<RefusalFallbackPlan>,
 ) -> Response {
     handle_stream_request(
         provider,
@@ -2757,6 +3194,7 @@ async fn handle_cc_stream_request(
         group,
         structured_schema,
         custom_headers,
+        refusal_fallback,
     )
     .await
 }
@@ -3046,6 +3484,8 @@ mod tests {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            fallback_model: parking_lot::Mutex::new(None),
+            refusal_detail: parking_lot::Mutex::new(None),
             finalized: std::sync::atomic::AtomicBool::new(false),
             upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         };
@@ -3119,6 +3559,8 @@ mod tests {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            fallback_model: parking_lot::Mutex::new(None),
+            refusal_detail: parking_lot::Mutex::new(None),
             finalized: std::sync::atomic::AtomicBool::new(false),
             upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         };
@@ -3153,6 +3595,8 @@ mod tests {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            fallback_model: parking_lot::Mutex::new(None),
+            refusal_detail: parking_lot::Mutex::new(None),
             finalized: std::sync::atomic::AtomicBool::new(false),
             upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         };
@@ -3209,6 +3653,8 @@ mod tests {
                 attempts: parking_lot::Mutex::new(Vec::new()),
                 client_ip: None,
                 route: parking_lot::Mutex::new(None),
+                fallback_model: parking_lot::Mutex::new(None),
+                refusal_detail: parking_lot::Mutex::new(None),
                 finalized: std::sync::atomic::AtomicBool::new(false),
                 upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
             };
@@ -3252,6 +3698,8 @@ mod tests {
                 attempts: parking_lot::Mutex::new(Vec::new()),
                 client_ip: None,
                 route: parking_lot::Mutex::new(None),
+                fallback_model: parking_lot::Mutex::new(None),
+                refusal_detail: parking_lot::Mutex::new(None),
                 finalized: std::sync::atomic::AtomicBool::new(false),
                 upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
             };
@@ -3292,6 +3740,8 @@ mod tests {
                 attempts: parking_lot::Mutex::new(Vec::new()),
                 client_ip: None,
                 route: parking_lot::Mutex::new(None),
+                fallback_model: parking_lot::Mutex::new(None),
+                refusal_detail: parking_lot::Mutex::new(None),
                 finalized: std::sync::atomic::AtomicBool::new(false),
                 upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
             };
@@ -3326,6 +3776,8 @@ mod tests {
                 first_token_at: parking_lot::Mutex::new(None),
                 attempts: parking_lot::Mutex::new(Vec::new()),
                 route: parking_lot::Mutex::new(None),
+                fallback_model: parking_lot::Mutex::new(None),
+                refusal_detail: parking_lot::Mutex::new(None),
                 finalized: std::sync::atomic::AtomicBool::new(false),
                 upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
             };

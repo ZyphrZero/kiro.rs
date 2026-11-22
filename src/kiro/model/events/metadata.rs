@@ -108,19 +108,64 @@ impl MetadataEvent {
     ///
     /// 拦截后上游只下发 reasoning、不下发正文和 meteringEvent；不识别这一信号会把
     /// 拒答伪装成「成功的空响应」，客户端只能盲目重试同一段被拦截的历史。
+    #[cfg(test)]
     pub fn content_filter_refusal(&self) -> Option<String> {
+        let refusal = self.content_filter_refusal_info()?;
+        Some(Self::format_refusal_detail(&refusal))
+    }
+
+    /// 返回上游内容过滤拒答的结构化信息（仅保留标准 `category` / `explanation` 字段，
+    /// 绝不透传上游私有字段）。非 `CONTENT_FILTERED` 返回 `None`。
+    pub fn content_filter_refusal_info(&self) -> Option<Refusal> {
         if self.stop_reason.as_deref() != Some(CONTENT_FILTERED_STOP_REASON) {
             return None;
         }
-        let refusal = self.stop_details.as_ref().and_then(|d| d.refusal.as_ref());
-        let category = refusal.and_then(|r| r.category.as_deref());
-        let explanation = refusal.and_then(|r| r.explanation.as_deref());
-        Some(match (category, explanation) {
+        Some(
+            self.stop_details
+                .as_ref()
+                .and_then(|d| d.refusal.clone())
+                .unwrap_or_default(),
+        )
+    }
+
+    /// 将 [`Refusal`] 格式化为日志与 trace 使用的可读说明串。
+    pub fn format_refusal_detail(refusal: &Refusal) -> String {
+        let category = refusal.category.as_deref().filter(|s| !s.trim().is_empty());
+        let explanation = refusal
+            .explanation
+            .as_deref()
+            .filter(|s| !s.trim().is_empty());
+        match (category, explanation) {
             (Some(c), Some(e)) => format!("{c}: {e}"),
             (Some(c), None) => c.to_string(),
             (None, Some(e)) => e.to_string(),
             (None, None) => CONTENT_FILTERED_STOP_REASON.to_string(),
-        })
+        }
+    }
+
+    /// 构造符合 Anthropic Messages API 规范的 `stop_details` 对象。
+    /// 仅当上游返回了标准 `category` 或 `explanation` 时返回 `Some`，避免泄露私有字段。
+    pub fn anthropic_stop_details(refusal: &Refusal) -> Option<serde_json::Value> {
+        let category = refusal.category.as_deref().filter(|s| !s.trim().is_empty());
+        let explanation = refusal
+            .explanation
+            .as_deref()
+            .filter(|s| !s.trim().is_empty());
+        if category.is_none() && explanation.is_none() {
+            return None;
+        }
+        let mut obj = serde_json::Map::new();
+        obj.insert("type".to_string(), serde_json::json!("refusal"));
+        if let Some(c) = category {
+            obj.insert(
+                "category".to_string(),
+                serde_json::json!(c.to_ascii_lowercase()),
+            );
+        }
+        if let Some(e) = explanation {
+            obj.insert("explanation".to_string(), serde_json::json!(e));
+        }
+        Some(serde_json::Value::Object(obj))
     }
 
     /// 上游 `stopReason` 中表示生成被截断的部分，映射到 Anthropic `stop_reason`。
@@ -209,6 +254,38 @@ mod tests {
         assert_eq!(
             event.content_filter_refusal().as_deref(),
             Some("CYBER: cannot continue")
+        );
+        let refusal = event.content_filter_refusal_info().unwrap();
+        assert_eq!(
+            MetadataEvent::anthropic_stop_details(&refusal),
+            Some(serde_json::json!({
+                "type": "refusal",
+                "category": "cyber",
+                "explanation": "cannot continue"
+            }))
+        );
+    }
+
+    #[test]
+    fn anthropic_stop_details_omits_bare_and_private_fields() {
+        let bare: MetadataEvent = serde_json::from_str(
+            r#"{"stopReason":"CONTENT_FILTERED","stopDetails":{"privateDetail":"secret"}}"#,
+        )
+        .unwrap();
+        let refusal = bare.content_filter_refusal_info().unwrap();
+        assert_eq!(MetadataEvent::anthropic_stop_details(&refusal), None);
+
+        let category_only: MetadataEvent = serde_json::from_str(
+            r#"{"stopReason":"CONTENT_FILTERED","stopDetails":{"refusal":{"category":"BIO"}}}"#,
+        )
+        .unwrap();
+        let refusal = category_only.content_filter_refusal_info().unwrap();
+        assert_eq!(
+            MetadataEvent::anthropic_stop_details(&refusal),
+            Some(serde_json::json!({
+                "type": "refusal",
+                "category": "bio"
+            }))
         );
     }
 

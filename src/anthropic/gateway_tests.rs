@@ -72,6 +72,12 @@ enum Mode {
     RefusedWithInvalidTool,
     RefusedWithEmptyTool,
     RefusedBare,
+    /// `claude-opus-5.5` 返回思考后 CYBER 拒答；回退到 `claude-opus-4.8` 时正常作答。
+    RefusalFallbackCyber,
+    /// `claude-opus-5.5` 返回 BIO 拒答（显式高危类别，不应自动回退）。
+    RefusalFallbackBio,
+    /// `claude-opus-5.5` 已输出可见正文后才拒答（流式不可回退）。
+    RefusalFallbackAfterText,
     /// 上游按给定片段依次返回 assistantResponseEvent，随后 metadataEvent（用量 13/17）。
     Reply(&'static [&'static str]),
     ReplyWithCredits(&'static [&'static str]),
@@ -476,9 +482,55 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
         let release_arguments = release_arguments.clone();
         async move {
             calls.fetch_add(1, Ordering::Relaxed);
-            if let Ok(value) = serde_json::from_slice(&body) { seen_bodies.lock().push(value); }
+            let parsed_body: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+            if let Some(value) = parsed_body.clone() { seen_bodies.lock().push(value); }
             connections.lock().insert(peer);
             if headers.get("connection").is_some_and(|v| v == "close") { close.fetch_add(1, Ordering::Relaxed); }
+            if matches!(mode, Mode::RefusalFallbackCyber | Mode::RefusalFallbackBio | Mode::RefusalFallbackAfterText) {
+                let model_id = parsed_body
+                    .as_ref()
+                    .and_then(|v| v.pointer("/conversationState/currentMessage/userInputMessage/modelId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let mut bytes = Vec::new();
+                if model_id == "claude-opus-4.8" {
+                    for part in [
+                        frame("reasoningContentEvent", json!({"text":"Thinking on 4.8..."})),
+                        frame("assistantResponseEvent", json!({"content":"Fallback answer from 4.8"})),
+                        frame("metadataEvent", json!({
+                            "stopReason":"END_TURN",
+                            "tokenUsage":{"uncachedInputTokens":20,"outputTokens":12,"cacheReadInputTokens":5,"cacheWriteInputTokens":1}
+                        })),
+                        frame("meteringEvent", json!({"unit":"credit","unitPlural":"credits","usage":0.15})),
+                    ] { bytes.extend_from_slice(&part); }
+                } else if matches!(mode, Mode::RefusalFallbackBio) {
+                    for part in [
+                        frame("reasoningContentEvent", json!({"text":"Thinking..."})),
+                        frame("metadataEvent", json!({
+                            "stopReason":"CONTENT_FILTERED",
+                            "stopDetails":{"refusal":{"category":"BIO","explanation":"Safety policy refusal."}}
+                        })),
+                    ] { bytes.extend_from_slice(&part); }
+                } else if matches!(mode, Mode::RefusalFallbackAfterText) {
+                    for part in [
+                        frame("assistantResponseEvent", json!({"content":"partial visible text"})),
+                        frame("metadataEvent", json!({
+                            "stopReason":"CONTENT_FILTERED",
+                            "stopDetails":{"refusal":{"category":"CYBER","explanation":"Late refusal."}}
+                        })),
+                    ] { bytes.extend_from_slice(&part); }
+                } else {
+                    for part in [
+                        frame("reasoningContentEvent", json!({"text":"Thinking on 5.5..."})),
+                        frame("metadataEvent", json!({
+                            "stopReason":"CONTENT_FILTERED",
+                            "stopDetails":{"refusal":{"category":"CYBER","explanation":"Cannot continue on 5.5."}}
+                        })),
+                        frame("contextUsageEvent", json!({"contextUsagePercentage":100.0})),
+                    ] { bytes.extend_from_slice(&part); }
+                }
+                return Response::new(Body::from(bytes));
+            }
             if matches!(mode, Mode::Overloaded) {
                 return Response::builder().status(500).body(Body::from(r#"{"message":"high load","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#)).unwrap();
             }
@@ -2124,4 +2176,415 @@ async fn gateway_dsh_master_key_reports_cache_hits_without_session_header() {
     let (read_other, create_other) = send(other).await;
     assert_eq!(read_other, 0, "不同会话不应命中");
     assert!(create_other > 0);
+}
+
+#[tokio::test]
+async fn gateway_refusal_fallback_streaming_and_sticky_session() {
+    use crate::model::refusal_fallback::{RefusalFallbackConfig, RefusalFallbackManager};
+
+    let f = fixture(Mode::RefusalFallbackCyber).await;
+    let store = Arc::new(TraceStore::open_in_memory().unwrap());
+    let mgr = RefusalFallbackManager::new(RefusalFallbackConfig {
+        enabled: true,
+        session_ttl_secs: 900,
+        ..Default::default()
+    });
+    let state = f
+        .state
+        .clone()
+        .with_trace_store(Some(store.clone()))
+        .with_refusal_fallback(Some(mgr.clone()));
+
+    let session_user = "user_0000000000000000000000000000000000000000000000000000000000000000_account__session_11111111-2222-3333-4444-555555555555";
+    let make_req = |prompt: &str| {
+        json!({
+            "model": "claude-opus-5.5",
+            "max_tokens": 1024,
+            "stream": true,
+            "thinking": { "type": "adaptive" },
+            "output_config": { "effort": "high" },
+            "metadata": { "user_id": session_user },
+            "messages": [{ "role": "user", "content": prompt }]
+        })
+    };
+
+    // 第 1 轮：5.5 仅输出思考后触发 CYBER 拒答 → 无缝关闭思考块 #0，回退到 4.8 完成作答
+    let resp1 = post_messages(
+        axum::extract::State(state.clone()),
+        Extension(key()),
+        Json(serde_json::from_value(make_req("turn 1")).unwrap()),
+    )
+    .await;
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let sse1 = body_string(resp1).await;
+    let events1 = parse_sse(&sse1);
+    let shape1 = sse_shape(&events1);
+    assert_eq!(shape1.first().map(String::as_str), Some("message_start"));
+    assert_eq!(shape1.last().map(String::as_str), Some("message_stop"));
+    assert!(
+        events1.iter().any(|(ev, data)| {
+            ev == "content_block_delta"
+                && data["index"] == 0
+                && data["delta"]["type"] == "signature_delta"
+        }),
+        "5.5 思考块 #0 回退前应以 signature_delta 正常收尾: {events1:?}"
+    );
+    assert!(
+        shape1.contains(&"content_block_stop#0".to_owned())
+            && shape1.contains(&"content_block_start#1".to_owned())
+            && shape1.contains(&"content_block_start#2".to_owned()),
+        "回退后块索引应单调递增且不重叠: {shape1:?}"
+    );
+    assert!(
+        sse_text(&events1).contains("Fallback answer from 4.8"),
+        "{events1:?}"
+    );
+    let delta1 = events1
+        .iter()
+        .find(|(ev, _)| ev == "message_delta")
+        .map(|(_, d)| d)
+        .unwrap();
+    assert_eq!(delta1["delta"]["stop_reason"], "end_turn", "{delta1}");
+    assert!(delta1["delta"].get("stop_details").is_none(), "{delta1}");
+
+    {
+        let bodies = f.bodies.lock();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(
+            bodies[0]["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
+            "claude-opus-5.5"
+        );
+        assert_eq!(
+            bodies[1]["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
+            "claude-opus-4.8"
+        );
+    }
+
+    // 第 2 轮：同一会话命中粘性回退 → 直接路由到 4.8，不再请求 5.5
+    let resp2 = post_messages(
+        axum::extract::State(state.clone()),
+        Extension(key()),
+        Json(serde_json::from_value(make_req("turn 2")).unwrap()),
+    )
+    .await;
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let events2 = parse_sse(&body_string(resp2).await);
+    assert!(
+        sse_text(&events2).contains("Fallback answer from 4.8"),
+        "{events2:?}"
+    );
+    {
+        let bodies = f.bodies.lock();
+        assert_eq!(bodies.len(), 3, "粘性命中应跳过 5.5 直接走 4.8");
+        assert_eq!(
+            bodies[2]["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
+            "claude-opus-4.8"
+        );
+    }
+
+    let stats = mgr.stats();
+    assert_eq!(stats.fallback_triggered, 1);
+    assert_eq!(stats.sticky_hits, 1);
+    assert_eq!(stats.active_sessions, 1);
+
+    let mut records = Vec::new();
+    for _ in 0..50 {
+        records = store
+            .query_paged(&TraceQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .0;
+        if records.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(records.len(), 2, "两轮均应写入 trace: {records:?}");
+    let details: Vec<Option<&str>> = records
+        .iter()
+        .map(|r| r.refusal_detail.as_deref())
+        .collect();
+    assert!(details.contains(&Some("CYBER: Cannot continue on 5.5.")), "{details:?}");
+    assert!(details.contains(&Some("sticky_session_fallback")), "{details:?}");
+    assert!(records.iter().all(|r| r.fallback_model.as_deref() == Some("claude-opus-4.8")));
+}
+
+#[tokio::test]
+async fn gateway_refusal_fallback_non_stream() {
+    use crate::model::refusal_fallback::{RefusalFallbackConfig, RefusalFallbackManager};
+
+    let f = fixture(Mode::RefusalFallbackCyber).await;
+    let store = Arc::new(TraceStore::open_in_memory().unwrap());
+    let mgr = RefusalFallbackManager::new(RefusalFallbackConfig {
+        enabled: true,
+        session_ttl_secs: 0,
+        ..Default::default()
+    });
+    let state = f
+        .state
+        .clone()
+        .with_trace_store(Some(store.clone()))
+        .with_refusal_fallback(Some(mgr.clone()));
+
+    let payload = json!({
+        "model": "claude-opus-5.5",
+        "max_tokens": 512,
+        "stream": false,
+        "messages": [{ "role": "user", "content": "hello" }]
+    });
+    let resp = post_messages(
+        axum::extract::State(state),
+        Extension(key()),
+        Json(serde_json::from_value(payload).unwrap()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["stop_reason"], "end_turn", "{body}");
+    assert!(body.get("stop_details").is_none(), "{body}");
+    let texts: String = body["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+        .collect();
+    assert!(texts.contains("Fallback answer from 4.8"), "{body}");
+    assert_eq!(f.calls.load(Ordering::Relaxed), 2);
+    assert_eq!(mgr.stats().fallback_triggered, 1);
+    assert_eq!(mgr.stats().active_sessions, 0, "TTL=0 时不应写入粘性表");
+
+    let mut records = Vec::new();
+    for _ in 0..50 {
+        records = store
+            .query_paged(&TraceQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .0;
+        if !records.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].fallback_model.as_deref(), Some("claude-opus-4.8"));
+    assert_eq!(
+        records[0].refusal_detail.as_deref(),
+        Some("CYBER: Cannot continue on 5.5.")
+    );
+}
+
+#[tokio::test]
+async fn gateway_refusal_fallback_skips_non_cyber_and_forwards_stop_details() {
+    use crate::model::refusal_fallback::{RefusalFallbackConfig, RefusalFallbackManager};
+
+    let f = fixture(Mode::RefusalFallbackBio).await;
+    let mgr = RefusalFallbackManager::new(RefusalFallbackConfig {
+        enabled: true,
+        session_ttl_secs: 900,
+        ..Default::default()
+    });
+    let state = f.state.clone().with_refusal_fallback(Some(mgr.clone()));
+
+    // 非流式：BIO 拒答绝不回退，并透传标准 stop_details
+    let non_stream_resp = post_messages(
+        axum::extract::State(state.clone()),
+        Extension(key()),
+        Json(
+            serde_json::from_value(json!({
+                "model": "claude-opus-5.5",
+                "max_tokens": 512,
+                "stream": false,
+                "messages": [{ "role": "user", "content": "hello" }]
+            }))
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(non_stream_resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(non_stream_resp).await).unwrap();
+    assert_eq!(body["stop_reason"], "refusal", "{body}");
+    assert_eq!(
+        body["stop_details"],
+        json!({
+            "type": "refusal",
+            "category": "bio",
+            "explanation": "Safety policy refusal."
+        }),
+        "{body}"
+    );
+    assert_eq!(f.calls.load(Ordering::Relaxed), 1, "BIO 不得触发回退");
+
+    // 流式：BIO 拒答同样绝不回退，并在 message_delta 中透传 stop_details
+    let stream_resp = post_messages(
+        axum::extract::State(state),
+        Extension(key()),
+        Json(
+            serde_json::from_value(json!({
+                "model": "claude-opus-5.5",
+                "max_tokens": 512,
+                "stream": true,
+                "messages": [{ "role": "user", "content": "hello" }]
+            }))
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(stream_resp.status(), StatusCode::OK);
+    let events = parse_sse(&body_string(stream_resp).await);
+    let delta = events
+        .iter()
+        .find(|(ev, _)| ev == "message_delta")
+        .map(|(_, d)| d)
+        .unwrap();
+    assert_eq!(delta["delta"]["stop_reason"], "refusal", "{delta}");
+    assert_eq!(
+        delta["delta"]["stop_details"],
+        json!({
+            "type": "refusal",
+            "category": "bio",
+            "explanation": "Safety policy refusal."
+        }),
+        "{delta}"
+    );
+    assert_eq!(f.calls.load(Ordering::Relaxed), 2);
+    assert_eq!(mgr.stats().fallback_triggered, 0);
+}
+
+#[tokio::test]
+async fn gateway_refusal_fallback_skips_after_visible_text() {
+    use crate::model::refusal_fallback::{RefusalFallbackConfig, RefusalFallbackManager};
+
+    let f = fixture(Mode::RefusalFallbackAfterText).await;
+    let mgr = RefusalFallbackManager::new(RefusalFallbackConfig {
+        enabled: true,
+        session_ttl_secs: 900,
+        ..Default::default()
+    });
+    let state = f.state.clone().with_refusal_fallback(Some(mgr.clone()));
+
+    let resp = post_messages(
+        axum::extract::State(state),
+        Extension(key()),
+        Json(
+            serde_json::from_value(json!({
+                "model": "claude-opus-5.5",
+                "max_tokens": 512,
+                "stream": true,
+                "messages": [{ "role": "user", "content": "hello" }]
+            }))
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let events = parse_sse(&body_string(resp).await);
+    assert!(sse_text(&events).contains("partial visible text"), "{events:?}");
+    let delta = events
+        .iter()
+        .find(|(ev, _)| ev == "message_delta")
+        .map(|(_, d)| d)
+        .unwrap();
+    assert_eq!(delta["delta"]["stop_reason"], "refusal", "{delta}");
+    assert_eq!(delta["delta"]["stop_details"]["category"], "cyber", "{delta}");
+    assert_eq!(f.calls.load(Ordering::Relaxed), 1, "已输出可见正文后不可回退");
+    assert_eq!(mgr.stats().fallback_triggered, 0);
+}
+
+#[tokio::test]
+async fn refusal_fallback_admin_config_api_validates_persists_and_hot_reloads() {
+    use crate::admin::{
+        AdminService, AdminState, ClientKeyManager, GroupManager, UsageAggregator,
+        create_admin_router,
+    };
+    use crate::model::refusal_fallback::RefusalFallbackManager;
+
+    let path = std::env::temp_dir().join(format!(
+        "refusal-fallback-api-{}.json",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&path, "{}").unwrap();
+    let cfg = Config::load(&path).unwrap();
+    let fb_mgr = RefusalFallbackManager::new(cfg.refusal_fallback.clone());
+    let fixture = fixture_with_config(Mode::Reply(&["ok"]), cfg).await;
+    let manager = fixture.state.kiro_provider.as_ref().unwrap().token_manager();
+    let service = AdminService::new(manager.clone(), vec!["fixture".into()])
+        .with_refusal_fallback(Some(fb_mgr.clone()));
+    let state = AdminState::new(
+        "fixture-admin-only",
+        service,
+        Arc::new(ClientKeyManager::new()),
+        Arc::new(UsageAggregator::new()),
+        Arc::new(TraceStore::open_in_memory().unwrap()),
+        Arc::new(GroupManager::new()),
+    );
+    let app = create_admin_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}/config/refusal-fallback",
+        listener.local_addr().unwrap()
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    // 未鉴权必须返回 401
+    assert_eq!(
+        client.get(&url).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 默认配置
+    let initial: serde_json::Value = client
+        .get(&url)
+        .header("x-api-key", "fixture-admin-only")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(initial["enabled"], false);
+    assert_eq!(initial["models"]["claude-opus-5.5"], "claude-opus-4.8");
+    assert_eq!(initial["sessionTtlSecs"], 900);
+
+    // 校验非法配置：自环 / 互环 / 超长 TTL
+    for invalid in [
+        json!({"models": {"claude-opus-5.5": "claude-opus-5-5"}}),
+        json!({"models": {"claude-opus-5.5": "claude-opus-4.8", "claude-opus-4.8": "claude-opus-5.5"}}),
+        json!({"sessionTtlSecs": 999_999}),
+    ] {
+        let resp = client
+            .put(&url)
+            .header("x-api-key", "fixture-admin-only")
+            .json(&invalid)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{invalid}");
+    }
+
+    // 开启并修改 TTL，验证热更新与落盘持久化
+    let updated_resp = client
+        .put(&url)
+        .header("x-api-key", "fixture-admin-only")
+        .json(&json!({"enabled": true, "sessionTtlSecs": 600}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(updated_resp.status(), StatusCode::OK);
+    let updated: serde_json::Value = updated_resp.json().await.unwrap();
+    assert_eq!(updated["enabled"], true);
+    assert_eq!(updated["sessionTtlSecs"], 600);
+    assert_eq!(
+        fb_mgr.lookup_target_model("claude-opus-5.5").as_deref(),
+        Some("claude-opus-4.8")
+    );
+
+    let reloaded = Config::load(&path).unwrap();
+    assert!(reloaded.refusal_fallback.enabled);
+    assert_eq!(reloaded.refusal_fallback.session_ttl_secs, 600);
+
+    server.abort();
+    std::fs::remove_file(&path).unwrap();
 }
