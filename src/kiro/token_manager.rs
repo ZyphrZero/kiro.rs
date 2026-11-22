@@ -508,6 +508,21 @@ fn is_builder_id_unsupported(status: u16, body: &str) -> bool {
     status == 403 && body.contains("AWS Builder ID is not supported")
 }
 
+/// 判断上游是否因 Kiro IDE 版本号过旧拒绝请求（403 `FEATURE_NOT_SUPPORTED`）。
+///
+/// 这类 403 与账号权限/区域无关，不应继续盲目回退到另一个区域端点（否则会被另一区域的
+/// `User is not authorized to make this call.` 覆盖，掩盖真实的版本过期原因）。
+fn is_unsupported_kiro_version(status: u16, body: &str) -> bool {
+    status == 403
+        && (body.contains("FEATURE_NOT_SUPPORTED")
+            || body.contains("This version of Kiro is no longer supported"))
+}
+
+/// `ListAvailableModels` 使用的 Kiro IDE 版本号：取实时拉取的最新版本（回退到 `config.kiro_version`）。
+fn available_models_kiro_version(config: &Config) -> String {
+    crate::kiro::kiro_version::effective(&config.kiro_version)
+}
+
 fn profile_arn_query(profile_arn: Option<&str>) -> String {
     match profile_arn {
         Some(arn) => format!("&profileArn={}", urlencoding::encode(arn)),
@@ -595,6 +610,43 @@ pub(crate) async fn get_usage_limits(
     token: &str,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<UsageLimitsResponse> {
+    match get_usage_limits_with_version(
+        credentials,
+        config,
+        api_domain,
+        token,
+        proxy,
+        USAGE_API_KIRO_VERSION,
+    )
+    .await
+    {
+        Ok(data) => Ok(data),
+        Err((true, first_err)) => {
+            let latest = crate::kiro::kiro_version::effective(&config.kiro_version);
+            if latest == USAGE_API_KIRO_VERSION {
+                return Err(first_err);
+            }
+            tracing::info!(
+                old_version = USAGE_API_KIRO_VERSION,
+                new_version = %latest,
+                "getUsageLimits 遇到上游版本淘汰（FEATURE_NOT_SUPPORTED），自动切换新版 Kiro UA 重试"
+            );
+            get_usage_limits_with_version(credentials, config, api_domain, token, proxy, &latest)
+                .await
+                .map_err(|(_, err)| err)
+        }
+        Err((false, err)) => Err(err),
+    }
+}
+
+async fn get_usage_limits_with_version(
+    credentials: &KiroCredentials,
+    config: &Config,
+    api_domain: ApiDomain,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+    kiro_version: &str,
+) -> Result<UsageLimitsResponse, (bool, anyhow::Error)> {
     tracing::debug!("正在获取使用额度信息...");
 
     // getUsageLimits 仅在 us-east-1 / eu-central-1 提供服务，
@@ -602,9 +654,6 @@ pub(crate) async fn get_usage_limits(
     let sso_region = credentials.effective_auth_region(config);
     let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    // 用量类接口固定用 USAGE_API_KIRO_VERSION：新版 IDE 会强制要求 profileArn，
-    // 对 Enterprise/IdC 账号失败；该版本无需 profileArn。
-    let kiro_version = USAGE_API_KIRO_VERSION;
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
@@ -615,7 +664,7 @@ pub(crate) async fn get_usage_limits(
     );
     let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
+    let client = build_client(proxy, 60, config.tls_backend).map_err(|e| (false, e))?;
 
     let attempts = usage_api_attempts(credentials, &candidates);
 
@@ -638,19 +687,32 @@ pub(crate) async fn get_usage_limits(
             request = request.header("tokentype", token_type);
         }
 
-        let response = request.send().await?;
+        let response = request.send().await.map_err(|e| (false, e.into()))?;
 
         let status = response.status();
         let rate_limit_error = (status.as_u16() == 429)
             .then(|| UpstreamRateLimitError::from_headers(response.headers()));
         if status.is_success() {
-            let data: UsageLimitsResponse = response.json().await?;
+            let data: UsageLimitsResponse =
+                response.json().await.map_err(|e| (false, e.into()))?;
             return Ok(data);
         }
 
         let body_text = response.text().await.unwrap_or_default();
         if let Some(error) = rate_limit_error {
-            return Err(error.into());
+            return Err((false, error.into()));
+        }
+
+        if is_unsupported_kiro_version(status.as_u16(), &body_text) {
+            return Err((
+                true,
+                anyhow::anyhow!(
+                    "当前 Kiro IDE 版本 ({}) 已不被上游支持: {} {}",
+                    kiro_version,
+                    status,
+                    body_text
+                ),
+            ));
         }
 
         // 带 ARN 遇到租户兼容性错误时回退：带 profileArn → 不带 → 备用区域端点。
@@ -679,14 +741,17 @@ pub(crate) async fn get_usage_limits(
             500..=599 => "服务器错误，AWS 服务暂时不可用",
             _ => "获取使用额度失败",
         };
-        bail!("{}: {} {}", error_msg, status, body_text);
+        return Err((false, anyhow::anyhow!("{}: {} {}", error_msg, status, body_text)));
     }
 
     // 所有候选端点均失败（理论上循环内已 return / bail，此处为兜底）
-    bail!(
-        "权限不足，无法获取使用额度: {}",
-        last_error.unwrap_or_else(|| "无可用端点".to_string())
-    );
+    Err((
+        false,
+        anyhow::anyhow!(
+            "权限不足，无法获取使用额度: {}",
+            last_error.unwrap_or_else(|| "无可用端点".to_string())
+        ),
+    ))
 }
 
 /// 获取该凭据当前可用的模型列表
@@ -705,10 +770,11 @@ pub(crate) async fn get_available_models(
 
     // ListAvailableModels 仅在 us-east-1 / eu-central-1 提供服务，
     // 依据凭据 SSO 区域选择主端点，403 时回退到另一个端点。
+    // 上游已淘汰 0.9.2 等老版 Kiro IDE UA（403 FEATURE_NOT_SUPPORTED），此处使用实时版本。
     let sso_region = credentials.effective_auth_region(config);
     let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = USAGE_API_KIRO_VERSION;
+    let kiro_version = available_models_kiro_version(config);
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
@@ -755,6 +821,15 @@ pub(crate) async fn get_available_models(
         let body_text = response.text().await.unwrap_or_default();
         if let Some(error) = rate_limit_error {
             return Err(error.into());
+        }
+
+        if is_unsupported_kiro_version(status.as_u16(), &body_text) {
+            bail!(
+                "当前 Kiro IDE 版本 ({}) 已不被上游支持，无法获取可用模型: {} {}",
+                kiro_version,
+                status,
+                body_text
+            );
         }
 
         // 带 ARN 遇到租户兼容性错误时回退：带 profileArn → 不带 → 备用区域端点。
@@ -7640,6 +7715,26 @@ mod tests {
         assert!(is_builder_id_unsupported(403, body));
         assert!(!is_builder_id_unsupported(403, r#"{"message":"Invalid token"}"#));
         assert!(!is_builder_id_unsupported(500, body));
+    }
+
+    #[test]
+    fn test_unsupported_kiro_version_detection() {
+        let body = r#"{"message":"This version of Kiro is no longer supported. Please update to the latest version of Kiro to continue.","reason":"FEATURE_NOT_SUPPORTED"}"#;
+        assert!(is_unsupported_kiro_version(403, body));
+        assert!(!is_unsupported_kiro_version(
+            403,
+            r#"{"message":"User is not authorized to make this call.","reason":null}"#
+        ));
+        assert!(!is_unsupported_kiro_version(400, body));
+        assert!(!is_unsupported_kiro_version(500, body));
+    }
+
+    #[test]
+    fn test_available_models_uses_effective_kiro_version_not_legacy_usage_version() {
+        let config = Config::default();
+        let ver = available_models_kiro_version(&config);
+        assert_ne!(ver, USAGE_API_KIRO_VERSION);
+        assert_eq!(ver, crate::kiro::kiro_version::effective(&config.kiro_version));
     }
 
     #[test]
