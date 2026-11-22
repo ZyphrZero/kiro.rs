@@ -54,6 +54,8 @@ pub struct AppState {
     pub trace_store: Option<SharedTraceStore>,
     /// 自定义响应头管理器（热重载）
     pub custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
+    /// 上游内容过滤拒答自动回退管理器（热重载）
+    pub refusal_fallback: Option<crate::model::refusal_fallback::RefusalFallbackManager>,
 }
 
 impl AppState {
@@ -80,6 +82,7 @@ impl AppState {
             cache_meter: None,
             trace_store: None,
             custom_headers: None,
+            refusal_fallback: None,
         }
     }
 
@@ -120,6 +123,15 @@ impl AppState {
         custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
     ) -> Self {
         self.custom_headers = custom_headers;
+        self
+    }
+
+    /// 注入上游内容过滤拒答自动回退管理器
+    pub fn with_refusal_fallback(
+        mut self,
+        refusal_fallback: Option<crate::model::refusal_fallback::RefusalFallbackManager>,
+    ) -> Self {
+        self.refusal_fallback = refusal_fallback;
         self
     }
 }

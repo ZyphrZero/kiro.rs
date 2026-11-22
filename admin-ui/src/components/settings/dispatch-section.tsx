@@ -18,6 +18,8 @@ import {
   useSetAccountRpmLimitConfig,
   useQuotaResetRecoveryConfig,
   useSetQuotaResetRecoveryConfig,
+  useRefusalFallbackConfig,
+  useSetRefusalFallbackConfig,
   useLoadBalancingMode,
   useSetLoadBalancingMode,
   useApiDomain,
@@ -53,6 +55,7 @@ export function DispatchSection() {
       <LoadBalancingGroup />
       <ApiDomainGroup />
       <RateLimitHandlingGroup />
+      <RefusalFallbackGroup />
       <RpmLimitGroup />
       <QuotaResetRecoveryGroup />
       <div id="dispatch-ban-detect">
@@ -204,6 +207,202 @@ function RateLimitHandlingGroup() {
         disabled={retryLoading}
       />
     </SettingGroup>
+  )
+}
+
+function RefusalFallbackGroup() {
+  const { data, isLoading } = useRefusalFallbackConfig()
+  const { mutate } = useSetRefusalFallbackConfig()
+  const saver = useFieldSaver(mutate, reportSaveError)
+  const enabled = data?.enabled ?? false
+  const sessionTtlSecs = data?.sessionTtlSecs ?? 15 * SECS_PER_MIN
+  const models = data?.models ?? {}
+
+  return (
+    <SettingGroup
+      title="内容过滤拒答回退"
+      description="上游返回 CONTENT_FILTERED（裸拒答或 CYBER 类）且尚未向客户端输出正文/工具调用时，自动切换至映射目标模型重试；显式 BIO/CBRN 等高危类别绝不回退"
+    >
+      <SettingSwitch
+        label="启用拒答自动回退"
+        hint={
+          enabled
+            ? '已开启：命中下方映射且满足安全边界时自动回退（每请求最多 1 次）；结果记入请求日志'
+            : '未开启（默认）：直接返回上游 refusal 与标准 stop_details，不自动切换模型'
+        }
+        checked={enabled}
+        onChange={(next) => saver.save('enabled', { enabled: next })}
+        pending={saver.isSaving('enabled')}
+        saved={saver.isSaved('enabled')}
+        disabled={isLoading}
+      />
+      <SettingNumber
+        label="会话粘性回退时长"
+        hint="同一会话触发拒答并回退后，在该时长内后续轮次直接路由到回退模型（避免反复等待撞墙并复用缓存）。0 = 关闭粘性仅单轮回退"
+        value={sessionTtlSecs}
+        toDisplay={(secs) => Math.round(secs / SECS_PER_MIN)}
+        fromDisplay={(min) => min * SECS_PER_MIN}
+        onCommit={(secs) => saver.save('sessionTtl', { sessionTtlSecs: secs })}
+        min={0}
+        max={1440}
+        unit="分钟"
+        presets={[0, 5, 15, 30]}
+        pending={saver.isSaving('sessionTtl')}
+        saved={saver.isSaved('sessionTtl')}
+        disabled={isLoading || !enabled}
+      />
+      <RefusalFallbackModelsTable
+        models={models}
+        onCommit={(nextModels) => saver.save('models', { models: nextModels })}
+        pending={saver.isSaving('models')}
+        saved={saver.isSaved('models')}
+        disabled={isLoading}
+      />
+      <SettingReadout
+        label="运行统计"
+        hint="自进程启动以来的拒答自动回退次数、粘性命中次数及当前活跃粘性会话数"
+      >
+        触发回退 {data?.fallbackTriggered ?? 0} 次 · 粘性命中 {data?.stickyHits ?? 0} 次 · 活跃会话{' '}
+        {data?.activeSessions ?? 0} 个
+      </SettingReadout>
+    </SettingGroup>
+  )
+}
+
+function RefusalFallbackModelsTable({
+  models,
+  onCommit,
+  pending,
+  saved,
+  disabled,
+}: {
+  models: Record<string, string>
+  onCommit: (models: Record<string, string>) => void
+  pending?: boolean
+  saved?: boolean
+  disabled?: boolean
+}) {
+  const [srcDraft, setSrcDraft] = useState('')
+  const [dstDraft, setDstDraft] = useState('')
+  const entries = Object.entries(models).sort(([a], [b]) => a.localeCompare(b))
+
+  const handleAdd = () => {
+    const src = srcDraft.trim()
+    const dst = dstDraft.trim()
+    if (!src || !dst) return
+    onCommit({ ...models, [src]: dst })
+    setSrcDraft('')
+    setDstDraft('')
+  }
+
+  const handleRemove = (srcKey: string) => {
+    const next = { ...models }
+    delete next[srcKey]
+    onCommit(next)
+  }
+
+  return (
+    <div className="py-3.5 space-y-3">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5">
+        <div>
+          <div className="flex items-center gap-2">
+            <span className="text-[13.5px] font-medium text-foreground">回退模型映射表</span>
+            {pending && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
+            {!pending && saved && <Check className="h-3.5 w-3.5 text-emerald-500" />}
+            <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-4 text-muted-foreground font-mono">
+              共 {entries.length} 条
+            </Badge>
+          </div>
+          <p className="mt-0.5 text-xs text-muted-foreground leading-relaxed">
+            匹配时会自动兼容模型别名（如 claude-opus-5-5 / claude-opus-5.5），保存后立即热生效并写入 config.json。
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+          <Input
+            value={srcDraft}
+            disabled={disabled || pending}
+            onChange={(e) => setSrcDraft(e.target.value)}
+            placeholder="源模型 (如 claude-opus-5.5)"
+            className="h-8 w-44 text-xs font-mono bg-background"
+          />
+          <span className="text-xs text-muted-foreground">→</span>
+          <Input
+            value={dstDraft}
+            disabled={disabled || pending}
+            onChange={(e) => setDstDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                handleAdd()
+              }
+            }}
+            placeholder="回退目标 (如 claude-opus-4.8)"
+            className="h-8 w-44 text-xs font-mono bg-background"
+          />
+          <Button
+            type="button"
+            size="sm"
+            className="h-8 px-3 text-xs gap-1 shrink-0 cursor-pointer"
+            disabled={disabled || pending || !srcDraft.trim() || !dstDraft.trim()}
+            onClick={handleAdd}
+          >
+            <Plus className="h-3.5 w-3.5" />
+            保存映射
+          </Button>
+        </div>
+      </div>
+
+      <div className="rounded-lg border border-border/70 overflow-hidden bg-card/60 shadow-2xs">
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs border-collapse">
+            <thead>
+              <tr className="border-b border-border/60 bg-muted/40 text-muted-foreground text-[11px]">
+                <th className="py-2 px-3.5 font-medium">源模型</th>
+                <th className="py-2 px-3.5 font-medium">回退目标模型</th>
+                <th className="py-2 px-3.5 font-medium text-right w-20">操作</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border/40 text-xs">
+              {entries.map(([src, dst]) => (
+                <tr key={src} className="hover:bg-muted/20 transition-colors">
+                  <td className="py-2 px-3.5">
+                    <code className="font-mono text-[11.5px] font-medium text-foreground bg-muted/70 px-1.5 py-0.5 rounded border border-border/60">
+                      {src}
+                    </code>
+                  </td>
+                  <td className="py-2 px-3.5">
+                    <code className="font-mono text-[11.5px] font-medium text-amber-700 dark:text-amber-300 bg-amber-500/10 px-1.5 py-0.5 rounded border border-amber-500/30">
+                      {dst}
+                    </code>
+                  </td>
+                  <td className="py-2 px-3.5 text-right">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="h-6 w-6 text-muted-foreground hover:text-destructive hover:bg-destructive/10 cursor-pointer"
+                      onClick={() => handleRemove(src)}
+                      disabled={disabled || pending}
+                      title="删除该映射"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
+                  </td>
+                </tr>
+              ))}
+              {entries.length === 0 && (
+                <tr>
+                  <td colSpan={3} className="py-4 px-3.5 text-center text-muted-foreground text-xs bg-muted/5">
+                    暂无回退映射。可添加如 claude-opus-5.5 → claude-opus-4.8。
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
   )
 }
 

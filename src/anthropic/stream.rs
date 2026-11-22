@@ -1307,6 +1307,8 @@ pub struct SseStateManager {
     next_block_index: i32,
     /// 当前 stop_reason
     stop_reason: Option<String>,
+    /// 上游拒答结构化详情（符合 Anthropic `stop_details` 规范，仅拒答时随 message_delta 下发）
+    refusal_stop_details: Option<serde_json::Value>,
     /// 是否有工具调用
     has_tool_use: bool,
 }
@@ -1326,6 +1328,7 @@ impl SseStateManager {
             message_ended: false,
             next_block_index: 0,
             stop_reason: None,
+            refusal_stop_details: None,
             has_tool_use: false,
         }
     }
@@ -1356,6 +1359,18 @@ impl SseStateManager {
             return;
         }
         self.stop_reason = Some(reason.into());
+    }
+
+    /// 记录上游拒答的标准化 `stop_details`（仅 `stop_reason == "refusal"` 时随 `message_delta` 发送）。
+    pub fn set_refusal_stop_details(&mut self, details: Option<serde_json::Value>) {
+        self.refusal_stop_details = details;
+    }
+
+    /// 拒答自动回退到目标模型前清除上一轮尝试的终止状态，同时保留 `message_started` 与块索引单调性。
+    pub fn clear_stop_reason_for_fallback(&mut self) {
+        self.stop_reason = None;
+        self.refusal_stop_details = None;
+        self.has_tool_use = false;
     }
 
     /// 获取最终的 stop_reason
@@ -1509,14 +1524,21 @@ impl SseStateManager {
                 usage_json["credit_unit"] = json!(m.unit);
                 usage_json["credit_unit_plural"] = json!(m.unit_plural);
             }
+            let stop_reason = self.get_stop_reason();
+            let mut delta_json = json!({
+                "stop_reason": stop_reason,
+                "stop_sequence": null
+            });
+            if stop_reason == REFUSAL_STOP_REASON {
+                if let Some(ref details) = self.refusal_stop_details {
+                    delta_json["stop_details"] = details.clone();
+                }
+            }
             events.push(SseEvent::new(
                 "message_delta",
                 json!({
                     "type": "message_delta",
-                    "delta": {
-                        "stop_reason": self.get_stop_reason(),
-                        "stop_sequence": null
-                    },
+                    "delta": delta_json,
                     "usage": usage_json
                 }),
             ));
@@ -1649,6 +1671,10 @@ pub struct StreamContext {
     native_stop_reason: Option<String>,
     /// contextUsageEvent 报告上下文用量达到 100%。
     context_window_full: bool,
+    /// 上游内容过滤拒答的结构化详情（若发生 CONTENT_FILTERED）
+    refusal_info: Option<crate::kiro::model::events::Refusal>,
+    /// 是否已向客户端吐出任何可见正文或 tool_use（仅思考或 0 输出时为 false，允许无缝拒答回退）
+    emitted_visible_output: bool,
 }
 
 impl StreamContext {
@@ -1742,7 +1768,96 @@ impl StreamContext {
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
             native_stop_reason: None,
             context_window_full: false,
+            refusal_info: None,
+            emitted_visible_output: false,
         }
+    }
+
+    /// 当前流是否命中上游 `CONTENT_FILTERED` 拒答。
+    pub fn is_refused(&self) -> bool {
+        self.state_manager.get_stop_reason() == REFUSAL_STOP_REASON
+    }
+
+    /// 返回上游拒答的可读说明（`category: explanation` 或 `CONTENT_FILTERED`）。
+    pub fn refusal_detail(&self) -> Option<String> {
+        self.refusal_info
+            .as_ref()
+            .map(crate::kiro::model::events::MetadataEvent::format_refusal_detail)
+    }
+
+    /// 是否允许在同一条 SSE 流内无缝执行拒答自动回退：
+    /// 1. 确实命中了 `CONTENT_FILTERED`；
+    /// 2. 尚未向客户端吐出任何可见正文（text_delta）或工具调用（tool_use）；
+    /// 3. 拒答分类属于允许回退的范围（空分类或 `CYBER`）。
+    pub fn can_refusal_fallback(&self) -> bool {
+        if !self.is_refused() || self.emitted_visible_output {
+            return false;
+        }
+        let category = self
+            .refusal_info
+            .as_ref()
+            .and_then(|r| r.category.as_deref());
+        crate::model::refusal_fallback::RefusalFallbackManager::is_fallback_eligible_category(
+            category,
+        )
+    }
+
+    /// 为同一条 SSE 流切换到回退模型做准备：
+    /// - 若前一次尝试已打开 thinking 块，先补发 `signature_delta` 与 `content_block_stop` 合法闭合；
+    /// - 清空单次尝试状态，保留 `message_start`、`next_block_index`（单调递增）以及已打开的空文本块。
+    pub fn prepare_for_refusal_fallback(
+        &mut self,
+        fallback_model: String,
+        tool_name_map: HashMap<String, String>,
+        known_tool_names: std::collections::HashSet<String>,
+        invoke_tool_schemas: InvokeToolSchemas,
+    ) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        if self.in_thinking_block {
+            if let Some(thinking_index) = self.thinking_block_index {
+                let remaining = std::mem::take(&mut self.thinking_buffer);
+                if !remaining.is_empty() {
+                    events.push(self.create_thinking_delta_event(thinking_index, &remaining));
+                }
+                events.push(self.create_thinking_delta_event(thinking_index, ""));
+                events.push(self.create_signature_delta_event(thinking_index));
+                if let Some(stop_event) = self
+                    .state_manager
+                    .handle_content_block_stop(thinking_index)
+                {
+                    events.push(stop_event);
+                }
+            }
+            self.in_thinking_block = false;
+        } else if self.is_thinking_block_open() {
+            events.extend(self.close_open_thinking_block());
+        }
+
+        self.model = fallback_model;
+        self.tool_name_map = tool_name_map;
+        self.known_tool_names = known_tool_names;
+        self.set_invoke_tool_schemas(invoke_tool_schemas);
+        self.thinking_buffer.clear();
+        self.in_thinking_block = false;
+        self.thinking_extracted = false;
+        self.thinking_block_index = None;
+        self.pending_thinking_signature = None;
+        self.strip_thinking_leading_newline = false;
+        self.invoke_sniffer = InvokeSniffer::default();
+        self.repeat_guard_last_line.clear();
+        self.repeat_guard_run = 0;
+        self.repeat_guard_tripped = false;
+        self.tool_json_accumulator = ToolJsonAccumulator::new();
+        self.tool_json_error = None;
+        self.tool_stream_refused = false;
+        self.tool_use_xml_filter = ToolUseXmlLeakFilter::default();
+        self.native_stop_reason = None;
+        self.context_window_full = false;
+        self.context_input_tokens = None;
+        self.provider_token_usage = None;
+        self.refusal_info = None;
+        self.state_manager.clear_stop_reason_for_fallback();
+        events
     }
 
     /// 设置允许从 `<invoke>` 文本合成工具调用的工具 schema（H2），只保留本次请求声明的工具。
@@ -1874,9 +1989,14 @@ impl StreamContext {
                 if let Some(reason) = metadata.stop_reason.as_deref() {
                     self.native_stop_reason = Some(reason.to_string());
                 }
-                if let Some(refusal) = metadata.content_filter_refusal() {
+                if let Some(info) = metadata.content_filter_refusal_info() {
+                    let refusal = crate::kiro::model::events::MetadataEvent::format_refusal_detail(&info);
                     tracing::warn!("上游内容过滤拒答: {}", refusal);
                     self.state_manager.set_stop_reason(REFUSAL_STOP_REASON);
+                    self.state_manager.set_refusal_stop_details(
+                        crate::kiro::model::events::MetadataEvent::anthropic_stop_details(&info),
+                    );
+                    self.refusal_info = Some(info);
                 }
                 Vec::new()
             }
@@ -2215,6 +2335,7 @@ impl StreamContext {
         if kept.is_empty() {
             return events;
         }
+        self.emitted_visible_output = true;
         let text: &str = &kept;
 
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
@@ -2464,6 +2585,7 @@ impl StreamContext {
     }
 
     fn start_tool_use(&mut self, id: &str, name: &str) -> (i32, Vec<SseEvent>) {
+        self.emitted_visible_output = true;
         if let Some(&index) = self.tool_block_indices.get(id) {
             return (index, Vec::new());
         }

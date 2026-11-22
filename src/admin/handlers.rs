@@ -31,6 +31,7 @@ use super::{
         SetLoadBalancingModeRequest, SetLoadFactorRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetModelApiRetryConfigRequest, SetProxyFailoverConfigRequest,
         SetQuotaResetRecoveryConfigRequest,
+        SetRefusalFallbackConfigRequest,
         SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
@@ -912,6 +913,24 @@ pub async fn set_custom_models(
     Json(payload): Json<SetCustomModelsRequest>,
 ) -> impl IntoResponse {
     match state.service.set_custom_models(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/refusal-fallback
+/// 获取上游内容过滤拒答自动回退配置与运行统计
+pub async fn get_refusal_fallback_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_refusal_fallback_config())
+}
+
+/// PUT /api/admin/config/refusal-fallback
+/// 更新上游内容过滤拒答自动回退配置（运行时生效 + 持久化 config.json）
+pub async fn set_refusal_fallback_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetRefusalFallbackConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_refusal_fallback_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -1900,6 +1919,8 @@ pub async fn list_traces(
                 "previousCredentialId": r.previous_credential_id,
                 "usageSource": r.usage_source,
                 "clientIp": r.client_ip,
+                "fallbackModel": r.fallback_model,
+                "refusalDetail": r.refusal_detail,
                 "attempts": attempts,
             })
         })

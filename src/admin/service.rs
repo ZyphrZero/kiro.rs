@@ -52,12 +52,14 @@ use super::types::{
     LoadBalancingModeResponse, LogGovernanceConfigResponse, ModelApiRetryConfigResponse,
     ModelSelectionMode, ModelTestRequest, ModelTestResponse, PollIdcLoginResponse,
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyFailoverConfigResponse, ProxyPoolEntry, ProxyPoolResponse, ProxyRotationResponse,
-    QuotaExceededResult, QuotaResetRecoveryConfigResponse, SelfHealConfigResponse,
+    QuotaExceededResult, QuotaResetRecoveryConfigResponse, RefusalFallbackConfigResponse,
+    SelfHealConfigResponse,
     SessionAffinityConfigResponse, SetAccountRpmLimitConfigRequest,
     SetAccountThrottleConfigRequest, SetCacheMeteringConfigRequest, SetCustomHeadersRequest, SetCustomModelsRequest,
     SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelApiRetryConfigRequest,
     SetProxyFailoverConfigRequest,
-    SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest, SetSessionAffinityConfigRequest,
+    SetQuotaResetRecoveryConfigRequest, SetRefusalFallbackConfigRequest, SetSelfHealConfigRequest,
+    SetSessionAffinityConfigRequest,
     SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
     StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
     ToolCompatibilityConfig, UpdateRefreshTokenRequest,
@@ -332,6 +334,9 @@ pub struct AdminService {
     /// 自定义响应头管理器（热重载）
     custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
     custom_headers_update_lock: Mutex<()>,
+    /// 上游内容过滤拒答自动回退管理器（热重载）
+    refusal_fallback: Option<crate::model::refusal_fallback::RefusalFallbackManager>,
+    refusal_fallback_update_lock: Mutex<()>,
     quota_alerts: Result<Arc<QuotaAlerts>, String>,
 }
 
@@ -688,6 +693,8 @@ impl AdminService {
             cache_meter: None,
             custom_headers: None,
             custom_headers_update_lock: Mutex::new(()),
+            refusal_fallback: None,
+            refusal_fallback_update_lock: Mutex::new(()),
             quota_alerts: Err("额度告警服务尚未初始化".into()),
         };
 
@@ -766,6 +773,15 @@ impl AdminService {
         custom_headers: Option<crate::model::custom_headers::CustomHeadersManager>,
     ) -> Self {
         self.custom_headers = custom_headers;
+        self
+    }
+
+    /// 注入上游内容过滤拒答自动回退管理器
+    pub fn with_refusal_fallback(
+        mut self,
+        refusal_fallback: Option<crate::model::refusal_fallback::RefusalFallbackManager>,
+    ) -> Self {
+        self.refusal_fallback = refusal_fallback;
         self
     }
 
@@ -2332,6 +2348,73 @@ impl AdminService {
         self.token_manager.invalidate_all_model_caches();
 
         Ok(self.get_custom_models())
+    }
+
+    /// 获取内容过滤拒答自动回退配置与运行期统计
+    pub fn get_refusal_fallback_config(&self) -> RefusalFallbackConfigResponse {
+        if let Some(mgr) = &self.refusal_fallback {
+            let cfg = mgr.config();
+            let stats = mgr.stats();
+            RefusalFallbackConfigResponse {
+                enabled: cfg.enabled,
+                models: cfg.models,
+                session_ttl_secs: cfg.session_ttl_secs,
+                fallback_triggered: stats.fallback_triggered,
+                sticky_hits: stats.sticky_hits,
+                active_sessions: stats.active_sessions,
+            }
+        } else {
+            let cfg = self.token_manager.config().refusal_fallback.clone();
+            RefusalFallbackConfigResponse {
+                enabled: cfg.enabled,
+                models: cfg.models,
+                session_ttl_secs: cfg.session_ttl_secs,
+                fallback_triggered: 0,
+                sticky_hits: 0,
+                active_sessions: 0,
+            }
+        }
+    }
+
+    /// 更新内容过滤拒答自动回退配置（校验 → 持久化 config.json → 热更新内存配置）
+    pub fn set_refusal_fallback_config(
+        &self,
+        req: SetRefusalFallbackConfigRequest,
+    ) -> Result<RefusalFallbackConfigResponse, AdminServiceError> {
+        use crate::model::refusal_fallback::{RefusalFallbackConfig, RefusalFallbackManager};
+
+        let _guard = self.refusal_fallback_update_lock.lock();
+        let current = self
+            .refusal_fallback
+            .as_ref()
+            .map(RefusalFallbackManager::config)
+            .unwrap_or_else(|| self.token_manager.config().refusal_fallback.clone());
+
+        let next = RefusalFallbackManager::sanitized_config(RefusalFallbackConfig {
+            enabled: req.enabled.unwrap_or(current.enabled),
+            models: req.models.unwrap_or(current.models),
+            session_ttl_secs: req.session_ttl_secs.unwrap_or(current.session_ttl_secs),
+        });
+        RefusalFallbackManager::validate_config(&next)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        let cfg_for_disk = next.clone();
+        self.token_manager
+            .update_config_file(move |c| {
+                c.refusal_fallback = cfg_for_disk;
+            })
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        if let Some(mgr) = &self.refusal_fallback {
+            mgr.set_config(next.clone());
+        }
+        tracing::info!(
+            enabled = next.enabled,
+            rules = next.models.len(),
+            session_ttl_secs = next.session_ttl_secs,
+            "内容过滤拒答自动回退配置已更新"
+        );
+        Ok(self.get_refusal_fallback_config())
     }
 
     /// 获取当前配置的自定义响应头列表

@@ -23,12 +23,12 @@
 //! ```
 
 pub mod cache_metering;
-mod converter;
+pub(crate) mod converter;
 mod handlers;
-mod middleware;
+pub(crate) mod middleware;
 mod openai;
 mod responses;
-mod router;
+pub(crate) mod router;
 mod structured_output;
 mod structured_rewrite;
 pub mod stream;

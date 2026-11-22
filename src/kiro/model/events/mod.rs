@@ -14,7 +14,7 @@ pub use assistant::AssistantResponseEvent;
 pub(crate) use assistant::{MarkdownCodeTracker, ToolUseXmlLeakFilter, strip_tool_use_xml_leaks};
 pub use base::Event;
 pub use context_usage::ContextUsageEvent;
-pub use metadata::{MetadataEvent, TokenUsage};
+pub use metadata::{CONTENT_FILTERED_STOP_REASON, MetadataEvent, Refusal, TokenUsage};
 pub use metering::MeteringEvent;
 pub use reasoning::ReasoningContentEvent;
 pub use tool_use::ToolUseEvent;

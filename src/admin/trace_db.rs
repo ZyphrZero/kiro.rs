@@ -142,6 +142,12 @@ pub struct TraceRecord {
     /// 客户端 IP（转发头优先，回落到 TCP 对端）。None = 老记录 / 无法确定。
     #[serde(default)]
     pub client_ip: Option<String>,
+    /// 若触发了拒答自动回退或会话粘性回退，记录实际执行请求的回退目标模型（如 `claude-opus-4.8`）
+    #[serde(default)]
+    pub fallback_model: Option<String>,
+    /// 上游内容过滤拒答的原始说明（如 `CYBER: ...` / `CONTENT_FILTERED` / `sticky_session_fallback`）
+    #[serde(default)]
+    pub refusal_detail: Option<String>,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
 }
@@ -327,7 +333,7 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 12] = [
+        let columns: [(&str, &str); 14] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -340,6 +346,8 @@ impl TraceStore {
             ("previous_credential_id", "INTEGER"),
             ("usage_source", "TEXT"),
             ("client_ip", "TEXT"),
+            ("fallback_model", "TEXT"),
+            ("refusal_detail", "TEXT"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
@@ -410,9 +418,9 @@ impl TraceStore {
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
                  credits, first_token_ms, session_id, sticky_outcome, previous_credential_id, \
-                 usage_source, client_ip) \
+                 usage_source, client_ip, fallback_model, refusal_detail) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,\
-                 ?21,?22,?23,?24,?25)",
+                 ?21,?22,?23,?24,?25,?26,?27)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -439,6 +447,8 @@ impl TraceStore {
                     rec.previous_credential_id.map(|v| v as i64),
                     rec.usage_source,
                     rec.client_ip,
+                    rec.fallback_model,
+                    rec.refusal_detail,
                 ],
             )?;
             for a in &rec.attempts {
@@ -609,7 +619,8 @@ impl TraceStore {
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, \
-             session_id, sticky_outcome, previous_credential_id, usage_source, client_ip \
+             session_id, sticky_outcome, previous_credential_id, usage_source, client_ip, \
+             fallback_model, refusal_detail \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -641,6 +652,8 @@ impl TraceStore {
                 previous_credential_id: row.get::<_, Option<i64>>(21)?.map(|v| v as u64),
                 usage_source: row.get(22)?,
                 client_ip: row.get(23)?,
+                fallback_model: row.get(24)?,
+                refusal_detail: row.get(25)?,
                 attempts: Vec::new(),
             })
         })?;
@@ -844,7 +857,9 @@ CREATE TABLE IF NOT EXISTS traces (
     sticky_outcome    TEXT,
     previous_credential_id INTEGER,
     usage_source      TEXT,
-    client_ip         TEXT
+    client_ip         TEXT,
+    fallback_model    TEXT,
+    refusal_detail    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -916,6 +931,8 @@ mod tests {
             previous_credential_id: Some(input.credential_id),
             usage_source: Some(usage_source::SIMULATED.to_string()),
             client_ip: Some("203.0.113.9".to_string()),
+            fallback_model: None,
+            refusal_detail: None,
             attempts: vec![
                 TraceAttempt {
                     attempt: 0,
@@ -1452,5 +1469,53 @@ mod tests {
         // LIKE 元字符被转义：% 不再是通配符，不应匹配任何记录
         assert!(ids("%").is_empty(), "% 应按字面量处理");
         assert!(ids("_").is_empty(), "_ 应按字面量处理");
+    }
+
+    #[test]
+    fn refusal_fallback_columns_roundtrip_and_migrate_from_25_cols() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE traces (trace_id TEXT PRIMARY KEY, ts TEXT NOT NULL, ts_epoch INTEGER NOT NULL, \
+             key_id INTEGER NOT NULL, key_source TEXT, model TEXT NOT NULL, is_stream INTEGER NOT NULL, \
+             final_status TEXT NOT NULL, final_credential_id INTEGER NOT NULL, error_type TEXT, \
+             error_message TEXT, total_attempts INTEGER NOT NULL, duration_ms INTEGER NOT NULL, \
+             interrupted_after_bytes INTEGER, input_tokens INTEGER NOT NULL DEFAULT 0, \
+             output_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0, \
+             cache_read_tokens INTEGER NOT NULL DEFAULT 0, credits REAL NOT NULL DEFAULT 0, \
+             first_token_ms INTEGER, session_id TEXT, sticky_outcome TEXT, previous_credential_id INTEGER, \
+             usage_source TEXT, client_ip TEXT);
+             CREATE TABLE trace_attempts (trace_id TEXT NOT NULL, attempt INTEGER NOT NULL, \
+             credential_id INTEGER NOT NULL, endpoint TEXT NOT NULL, http_status INTEGER, \
+             outcome TEXT NOT NULL, error_snippet TEXT, duration_ms INTEGER NOT NULL, \
+             PRIMARY KEY (trace_id, attempt));",
+        )
+        .unwrap();
+        TraceStore::migrate(&conn).unwrap();
+        TraceStore::migrate(&conn).unwrap();
+
+        let store = TraceStore {
+            conn: Mutex::new(conn),
+            enabled: AtomicBool::new(true),
+            retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
+        };
+
+        let mut recovered = sample(TraceSample {
+            trace_id: "fallback-ok",
+            status: "success",
+            credential_id: 5,
+            model: "claude-opus-5.5",
+        });
+        recovered.fallback_model = Some("claude-opus-4.8".to_string());
+        recovered.refusal_detail = Some("CYBER: blocked".to_string());
+        store.insert(&recovered);
+
+        let rows = store.query(&TraceQuery {
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].trace_id, "fallback-ok");
+        assert_eq!(rows[0].fallback_model.as_deref(), Some("claude-opus-4.8"));
+        assert_eq!(rows[0].refusal_detail.as_deref(), Some("CYBER: blocked"));
     }
 }

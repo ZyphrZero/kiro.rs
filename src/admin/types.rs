@@ -1770,6 +1770,36 @@ impl From<CustomHeaderItem> for crate::model::custom_headers::CustomHeaderRule {
 pub struct SetCustomHeadersRequest {
     pub headers: Vec<CustomHeaderItem>,
 }
+
+/// 内容过滤拒答自动回退配置响应（含运行统计）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefusalFallbackConfigResponse {
+    /// 是否启用拒答自动回退
+    pub enabled: bool,
+    /// 源模型 → 回退目标模型映射
+    pub models: std::collections::HashMap<String, String>,
+    /// 同会话粘性回退时长（秒；0 表示关闭粘性仅单轮回退）
+    pub session_ttl_secs: u64,
+    /// 已触发拒答自动回退的总次数
+    pub fallback_triggered: u64,
+    /// 会话粘性命中、直接路由至回退模型的总次数
+    pub sticky_hits: u64,
+    /// 当前活跃的粘性回退会话数
+    pub active_sessions: usize,
+}
+
+/// 更新内容过滤拒答自动回退配置请求（部分更新）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRefusalFallbackConfigRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub models: Option<std::collections::HashMap<String, String>>,
+    #[serde(default)]
+    pub session_ttl_secs: Option<u64>,
+}
 #[cfg(test)]
 mod query_tests {
     use super::*;

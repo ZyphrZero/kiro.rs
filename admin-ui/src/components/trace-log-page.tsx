@@ -14,6 +14,7 @@ import {
   Pin,
   ArrowLeftRight,
   Shuffle,
+  ShieldAlert,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -92,11 +93,18 @@ function outcomeDot(outcome: string): string {
 /** 整条 trace 的严重度 → 左侧色轨 */
 function traceTone(rec: TraceRecord): RailTone {
   if (rec.finalStatus === 'success') {
+    // 触发了拒答回退值得关注
+    if (rec.fallbackModel) return 'warn'
     // 成功但重试过：请求被救回来了，可池子里有凭据在失败 —— 值得看一眼，但不是故障
     return rec.totalAttempts > 1 ? 'warn' : 'none'
   }
   if (rec.finalStatus === 'interrupted') return 'warn'
   return outcomeTone(rec.errorType ?? '')
+}
+
+/** 列表单元格里的紧凑回退模型名（去 claude- 前缀） */
+function shortModelLabel(model: string): string {
+  return model.replace(/^claude-/, '')
 }
 
 /** 最终状态 → 徽章 */
@@ -723,6 +731,19 @@ function TraceExpandedDetail({
             </Badge>
           )}
           <span className="font-semibold text-foreground">{rec.model}</span>
+          {rec.fallbackModel && (
+            <Badge
+              variant="warning"
+              className="text-[10px] px-1.5 py-0 font-mono"
+              title={
+                rec.refusalDetail === 'sticky_session_fallback'
+                  ? `会话粘性直达回退模型 ${rec.fallbackModel}`
+                  : `触发内容过滤拒答并自动回退至 ${rec.fallbackModel}${rec.refusalDetail ? ` (${rec.refusalDetail})` : ''}`
+              }
+            >
+              → {rec.fallbackModel}
+            </Badge>
+          )}
           {rec.isStream && (
             <Badge variant="outline" className="text-[10px] px-1 py-0">流式</Badge>
           )}
@@ -794,6 +815,34 @@ function TraceExpandedDetail({
 
       {/* 核心：Token 与缓存构成面板 */}
       <TokenAndCachePanel rec={rec} />
+
+      {/* 内容过滤拒答 / 自动回退说明（若存在） */}
+      {(rec.fallbackModel || rec.refusalDetail) && (
+        <div
+          className={`flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-lg border px-3 py-2 text-xs ${
+            rec.fallbackModel
+              ? 'border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-300'
+              : 'border-destructive/30 bg-destructive/5 text-destructive'
+          }`}
+        >
+          <span className="inline-flex items-center gap-1 font-medium">
+            <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
+            {rec.fallbackModel ? '内容过滤回退' : '内容过滤拒答'}
+          </span>
+          {rec.fallbackModel && (
+            <span className="font-mono">
+              {rec.model} → <span className="font-semibold">{rec.fallbackModel}</span>
+            </span>
+          )}
+          {rec.refusalDetail && (
+            <span className="font-mono text-[11.5px] opacity-90 break-all">
+              {rec.refusalDetail === 'sticky_session_fallback'
+                ? '会话粘性直达回退模型（TTL 内避免重复撞墙）'
+                : rec.refusalDetail}
+            </span>
+          )}
+        </div>
+      )}
 
       {/* 报错信息（若存在） */}
       {rec.errorMessage && (
@@ -921,8 +970,20 @@ function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
         id: 'model',
         header: '模型',
         cell: (r) => (
-          <span className="inline-flex max-w-[200px] items-center gap-1.5">
+          <span className="inline-flex max-w-[240px] items-center gap-1.5">
             <span className="truncate">{r.model}</span>
+            {r.fallbackModel && (
+              <span
+                title={
+                  r.refusalDetail === 'sticky_session_fallback'
+                    ? `会话粘性直达回退模型：${r.model} → ${r.fallbackModel}`
+                    : `内容过滤拒答自动回退：${r.model} → ${r.fallbackModel}${r.refusalDetail ? `\n原因：${r.refusalDetail}` : ''}`
+                }
+                className="inline-flex shrink-0 items-center rounded border border-amber-500/40 bg-amber-500/10 px-1 py-px font-mono text-[10px] font-medium text-amber-700 dark:text-amber-300"
+              >
+                →{shortModelLabel(r.fallbackModel)}
+              </span>
+            )}
             {r.isStream && (
               <span
                 className="shrink-0 text-[10px] text-muted-foreground"

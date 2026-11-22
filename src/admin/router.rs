@@ -19,6 +19,7 @@ use super::{
         get_account_throttle_config, get_all_credentials,
         get_credential_balance, get_credential_metadata_schema, get_credential_models,
         get_current_models, get_global_proxy, get_custom_models, get_custom_headers,
+        get_refusal_fallback_config, set_refusal_fallback_config,
         get_api_domain, get_cache_metering_config, get_session_affinity_config,
         get_tool_compatibility_mode, set_tool_compatibility_mode,
         get_load_balancing_mode, get_log_governance_config, get_model_api_retry_config,
@@ -189,6 +190,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/custom-headers",
             get(get_custom_headers).put(set_custom_headers),
+        )
+        .route(
+            "/config/refusal-fallback",
+            get(get_refusal_fallback_config).put(set_refusal_fallback_config),
         )
         .route(
             "/config/update",

@@ -742,6 +742,15 @@ pub(crate) fn derive_conversation_id(req: &MessagesRequest) -> String {
     Uuid::new_v5(&Uuid::NAMESPACE_OID, digest.as_bytes()).to_string()
 }
 
+/// 解析请求的稳定会话 ID（优先 `metadata.user_id` 中的 session UUID，回退到内容派生 ID）。
+pub(crate) fn resolve_conversation_id(req: &MessagesRequest) -> String {
+    req.metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_ref())
+        .and_then(|user_id| extract_session_id(user_id))
+        .unwrap_or_else(|| derive_conversation_id(req))
+}
+
 /// 由 conversationId 确定性派生 agentContinuationId（UUID v5，命名空间固定）。
 /// 同一会话在进程重启、多副本之间都得到同一个值。
 fn derive_agent_continuation_id(conversation_id: &str) -> String {
@@ -884,12 +893,7 @@ pub(crate) fn convert_request_with_purpose(
     // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
     // 没有会话 id 时按内容派生稳定 id（系统提示 + 第一条 user 消息），不再每次随机：
     // 随机 id 让按会话固定凭据的粘性路由永远不命中。
-    let conversation_id = req
-        .metadata
-        .as_ref()
-        .and_then(|m| m.user_id.as_ref())
-        .and_then(|user_id| extract_session_id(user_id))
-        .unwrap_or_else(|| derive_conversation_id(req));
+    let conversation_id = resolve_conversation_id(req);
     // agentContinuationId 从 conversationId 确定性派生，让同一会话的请求体在会话 id 之外
     // 完全一致。实测上游 prompt cache 按内容前缀匹配、与会话 id 无关，所以这一步对缓存
     // 没有直接收益；保留确定性只是为了请求可复现、便于排查。

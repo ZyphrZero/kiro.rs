@@ -369,18 +369,43 @@ async fn main() {
     let custom_headers_manager = model::custom_headers::CustomHeadersManager::new(
         config.custom_headers.clone(),
     );
+    let refusal_fallback_manager = model::refusal_fallback::RefusalFallbackManager::new(
+        config.refusal_fallback.clone(),
+    );
+    {
+        let fb_cfg = refusal_fallback_manager.config();
+        if fb_cfg.enabled {
+            tracing::info!(
+                rules = fb_cfg.models.len(),
+                session_ttl_secs = fb_cfg.session_ttl_secs,
+                "内容过滤拒答自动回退已开启"
+            );
+        }
+        let mgr = refusal_fallback_manager.clone();
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(300);
+            loop {
+                tokio::time::sleep(interval).await;
+                mgr.evict_expired();
+            }
+        });
+    }
 
-    let anthropic_app = anthropic::create_router_with_shared_provider(
-        Some(kiro_provider.clone()),
+    let anthropic_state = anthropic::middleware::AppState::new(
         config.extract_thinking,
         config.tool_compatibility_mode,
+    )
+    .with_shared_kiro_provider(kiro_provider.clone())
+    .with_usage(
         Some(client_key_manager.clone()),
         Some(usage_recorder.clone()),
         Some(usage_aggregator.clone()),
-        Some(cache_meter.clone()),
-        trace_store.clone(),
-        Some(custom_headers_manager.clone()),
-    );
+    )
+    .with_cache_meter(Some(cache_meter.clone()))
+    .with_trace_store(trace_store.clone())
+    .with_custom_headers(Some(custom_headers_manager.clone()))
+    .with_refusal_fallback(Some(refusal_fallback_manager.clone()));
+    let anthropic_app = anthropic::router::create_router_with_state(anthropic_state);
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
     // 安全检查：空字符串被视为未配置，防止空 key 绕过认证
@@ -404,7 +429,8 @@ async fn main() {
                         Some(usage_recorder.clone()),
                     )
                     .with_cache_meter(cache_meter.clone())
-                    .with_custom_headers(Some(custom_headers_manager.clone()));
+                    .with_custom_headers(Some(custom_headers_manager.clone()))
+                    .with_refusal_fallback(Some(refusal_fallback_manager.clone()));
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,
