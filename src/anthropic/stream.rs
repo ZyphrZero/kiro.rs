@@ -1602,6 +1602,8 @@ pub struct StreamContext {
     pub invoke_tool_schemas: InvokeToolSchemas,
     /// thinking 是否启用
     pub thinking_enabled: bool,
+    /// 允许在未显式请求 thinking 时也流式透传上游原生 `reasoningContentEvent`
+    pub stream_native_reasoning: bool,
     /// thinking 内容缓冲区
     pub thinking_buffer: String,
     /// 明文里 `<invoke>` 工具调用的识别器（H2）。
@@ -1722,6 +1724,7 @@ impl StreamContext {
             known_tool_names,
             invoke_tool_schemas: InvokeToolSchemas::new(),
             thinking_enabled,
+            stream_native_reasoning: false,
             thinking_buffer: String::new(),
             invoke_sniffer: InvokeSniffer::default(),
             in_thinking_block: false,
@@ -1743,6 +1746,11 @@ impl StreamContext {
             native_stop_reason: None,
             context_window_full: false,
         }
+    }
+
+    /// 设置是否允许在未显式请求 thinking 时也流式透传上游原生 `reasoningContentEvent`
+    pub fn set_stream_native_reasoning(&mut self, enabled: bool) {
+        self.stream_native_reasoning = enabled;
     }
 
     /// 设置允许从 `<invoke>` 文本合成工具调用的工具 schema（H2），只保留本次请求声明的工具。
@@ -2344,7 +2352,7 @@ impl StreamContext {
         &mut self,
         reasoning: &crate::kiro::model::events::ReasoningContentEvent,
     ) -> Vec<SseEvent> {
-        if !self.thinking_enabled {
+        if !self.thinking_enabled && !self.stream_native_reasoning {
             if let Some(text) = reasoning.text.as_deref()
                 && !text.is_empty()
             {
@@ -6086,6 +6094,34 @@ mod tests {
         assert_eq!(collect_text_content(&all), "");
         assert!(!all.iter().any(|e| e.data.to_string().contains("只有推理")));
         assert_eq!(fr_stop_reason(&all), json!("end_turn"));
+    }
+
+    #[test]
+    fn stream_native_reasoning_emits_thinking_deltas_when_thinking_disabled() {
+        let reasoning = |t: &str| {
+            Event::ReasoningContent(crate::kiro::model::events::ReasoningContentEvent {
+                text: Some(t.to_string()),
+                signature: None,
+                redacted_content: None,
+            })
+        };
+        let mut ctx = fr_ctx(false);
+        ctx.set_stream_native_reasoning(true);
+        let mut all = ctx.generate_initial_events();
+        let r_events = ctx.process_kiro_event(&reasoning("内部推理"));
+        assert!(r_events.iter().any(|e| {
+            e.event == "content_block_delta"
+                && e.data.pointer("/delta/type").and_then(|v| v.as_str()) == Some("thinking_delta")
+                && e.data.pointer("/delta/thinking").and_then(|v| v.as_str()) == Some("内部推理")
+        }));
+        all.extend(r_events);
+        all.extend(ctx.process_assistant_response("最终回答"));
+        all.extend(ctx.generate_final_events());
+        assert_eq!(collect_text_content(&all), "最终回答");
+        assert!(all.iter().any(|e| {
+            e.event == "content_block_delta"
+                && e.data.pointer("/delta/type").and_then(|v| v.as_str()) == Some("signature_delta")
+        }));
     }
 
     #[test]

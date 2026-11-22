@@ -226,3 +226,63 @@ async fn issue98_http_interruption_never_reports_successful_completion() {
             .is_some_and(|reason| !reason.is_null())
     }));
 }
+
+#[tokio::test]
+async fn chat_stream_streams_native_reasoning_incrementally_without_reasoning_effort() {
+    let fixture = fixture(Mode::GatedChatReasoning).await;
+    let gateway = Gateway::start(&fixture).await;
+    let response = gateway.request(json!({})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.bytes_stream();
+    let mut received = Vec::new();
+    receive_until(&mut body, &mut received, |text| {
+        chunks(text).iter().any(|chunk| {
+            chunk
+                .pointer("/choices/0/delta/reasoning_content")
+                .and_then(serde_json::Value::as_str)
+                == Some("first reasoning")
+        })
+    })
+    .await;
+    let early = std::str::from_utf8(&received).unwrap();
+    assert!(!early.contains("final answer"));
+    assert!(!early.contains("[DONE]"));
+
+    fixture.release_tool_arguments.notify_one();
+    receive_until(&mut body, &mut received, |text| {
+        chunks(text).iter().any(|chunk| {
+            chunk
+                .pointer("/choices/0/delta/content")
+                .and_then(serde_json::Value::as_str)
+                == Some("final answer")
+        })
+    })
+    .await;
+
+    fixture.release_tool_arguments.notify_one();
+    while let Some(chunk) = body.next().await {
+        received.extend_from_slice(&chunk.unwrap());
+    }
+    let text = std::str::from_utf8(&received).unwrap();
+    let chunks = chunks(text);
+    let reasoning: Vec<_> = chunks
+        .iter()
+        .filter_map(|chunk| {
+            chunk
+                .pointer("/choices/0/delta/reasoning_content")
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect();
+    let content: Vec<_> = chunks
+        .iter()
+        .filter_map(|chunk| {
+            chunk
+                .pointer("/choices/0/delta/content")
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect();
+    assert_eq!(reasoning, vec!["first reasoning"]);
+    assert_eq!(content, vec!["final answer"]);
+    assert_eq!(chunks.last().unwrap()["choices"][0]["finish_reason"], "stop");
+    assert_eq!(text.matches("data: [DONE]").count(), 1);
+}

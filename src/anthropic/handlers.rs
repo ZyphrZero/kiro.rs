@@ -909,7 +909,18 @@ pub async fn get_models(
 pub async fn post_messages(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
+) -> Response {
+    post_messages_with_native_reasoning(State(state), Extension(key_ctx), JsonExtractor(payload), false).await
+}
+
+/// 内部通用消息创建入口：允许调用方（如 OpenAI Chat Completions 流式适配）
+/// 在未显式启用 thinking 时也实时透传上游原生 reasoningContentEvent。
+pub(super) async fn post_messages_with_native_reasoning(
+    State(state): State<AppState>,
+    Extension(key_ctx): Extension<KeyContext>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    stream_native_reasoning: bool,
 ) -> Response {
     let state = state.snapshot_tool_compatibility_mode();
     // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
@@ -1165,6 +1176,7 @@ pub async fn post_messages(
             total_input_tokens,
             // L7：流式与非流式一致，遵守 extractThinking 配置。
             (state.extract_thinking || payload.output_config.is_some()) && thinking_enabled,
+            stream_native_reasoning,
             tool_name_map,
             known_tool_names,
             invoke_tool_schemas,
@@ -1217,6 +1229,7 @@ async fn handle_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    stream_native_reasoning: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
     invoke_tool_schemas: super::stream::InvokeToolSchemas,
@@ -1269,6 +1282,7 @@ async fn handle_stream_request(
         tool_name_map,
         known_tool_names,
     );
+    ctx.set_stream_native_reasoning(stream_native_reasoning);
     ctx.set_invoke_tool_schemas(invoke_tool_schemas);
     ctx.cache_usage = cache_usage;
 
@@ -2748,6 +2762,7 @@ async fn handle_cc_stream_request(
         model,
         fallback_input_tokens,
         thinking_enabled,
+        false,
         tool_name_map,
         known_tool_names,
         invoke_tool_schemas,

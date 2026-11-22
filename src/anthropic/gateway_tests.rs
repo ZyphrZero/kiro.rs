@@ -56,6 +56,7 @@ enum Mode {
     Empty,
     Tools,
     GatedChatText,
+    GatedChatReasoning,
     GatedToolArguments,
     CompactionRetry,
     Filtered,
@@ -547,6 +548,24 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
             if matches!(mode, Mode::GatedChatText) {
                 let first = frame("assistantResponseEvent", json!({"content": chat_stream_tests::first_text()}));
                 let second = frame("assistantResponseEvent", json!({"content": chat_stream_tests::second_text()}));
+                let metadata = frame("metadataEvent", json!({"tokenUsage": {
+                    "uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2
+                }}));
+                let second_gate = release_arguments.clone();
+                let chunks = stream::once(async move { Ok::<_, Infallible>(first) })
+                    .chain(stream::once(async move {
+                        second_gate.notified().await;
+                        Ok::<_, Infallible>(second)
+                    }))
+                    .chain(stream::once(async move {
+                        release_arguments.notified().await;
+                        Ok::<_, Infallible>(metadata)
+                    }));
+                return Response::new(Body::from_stream(chunks));
+            }
+            if matches!(mode, Mode::GatedChatReasoning) {
+                let first = frame("reasoningContentEvent", json!({"text": "first reasoning"}));
+                let second = frame("assistantResponseEvent", json!({"content": "final answer"}));
                 let metadata = frame("metadataEvent", json!({"tokenUsage": {
                     "uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2
                 }}));
