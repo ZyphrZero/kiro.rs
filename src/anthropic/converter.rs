@@ -612,6 +612,211 @@ fn build_additional_model_request_fields(
     }
 }
 
+/// 描述客户端原始请求中的思考强度/模式（必须在 `override_thinking_from_model_name` 之前调用）。
+///
+/// 返回紧凑可读标签：
+/// - `disabled`：显式关闭 thinking
+/// - `adaptive:<effort|default>`：Anthropic adaptive thinking
+/// - `enabled:<effort|budget>`：Anthropic enabled thinking
+/// - `effort:<effort>`：仅带 `output_config.effort` 或 OpenAI `reasoning_effort`
+/// - `suffix:high`：通过 `-thinking` 模型名后缀触发
+/// - `none`：未请求思考
+pub(crate) fn describe_client_effort(req: &MessagesRequest) -> String {
+    let explicit_effort = req
+        .output_config
+        .as_ref()
+        .map(|oc| oc.effort.trim())
+        .filter(|e| !e.is_empty())
+        .map(|e| e.to_ascii_lowercase());
+
+    if let Some(t) = &req.thinking {
+        match t.thinking_type.as_str() {
+            "disabled" => return "disabled".to_string(),
+            "adaptive" => {
+                return match explicit_effort {
+                    Some(effort) => format!("adaptive:{effort}"),
+                    None => "adaptive:default".to_string(),
+                };
+            }
+            "enabled" => {
+                return match explicit_effort {
+                    Some(effort) => format!("enabled:{effort}"),
+                    None => format!("enabled:{}", t.budget_tokens),
+                };
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(effort) = explicit_effort {
+        return format!("effort:{effort}");
+    }
+
+    if req.model.to_ascii_lowercase().contains("thinking") {
+        return "suffix:high".to_string();
+    }
+
+    "none".to_string()
+}
+
+/// 描述实际发给上游 Kiro 的思考控制通道与档位。
+///
+/// 与 wire payload 和 system-prompt 前缀保持完全一致：
+/// - `output_config:<effort>`：Claude 原生 `additionalModelRequestFields.output_config.effort`
+/// - `reasoning:<effort>`：GPT-5.6 / Grok 4.7 原生 `additionalModelRequestFields.reasoning.effort`
+/// - `prompt:adaptive:<effort>`：降级通过 `<thinking_mode>adaptive</thinking_mode>` 提示词注入
+/// - `prompt:enabled:<budget>`：旧模型 `<thinking_mode>enabled</thinking_mode><max_thinking_length>` 注入
+/// - `none`：未下发任何思考控制
+fn describe_upstream_thinking(
+    req: &MessagesRequest,
+    model_id: &str,
+    additional: Option<&AdditionalModelRequestFields>,
+) -> String {
+    if let Some(fields) = additional {
+        if let Some(oc) = &fields.output_config {
+            return format!("output_config:{}", oc.effort);
+        }
+        if let Some(rc) = &fields.reasoning {
+            return format!("reasoning:{}", rc.effort);
+        }
+    }
+    if let Some(t) = &req.thinking {
+        if t.thinking_type == "adaptive"
+            || (t.thinking_type == "enabled" && model_supports_native_reasoning(model_id))
+        {
+            let effort = select_native_reasoning_effort(req, model_id);
+            return format!("prompt:adaptive:{effort}");
+        } else if t.thinking_type == "enabled" {
+            return format!("prompt:enabled:{}", t.budget_tokens);
+        }
+    }
+    "none".to_string()
+}
+
+/// 三段式思考一致性判定：对比「客户端请求」「上游实际下发」「上游实际返回」。
+///
+/// - 仅在 `final_status == "success"` 时给出判定；失败/中断请求返回 `None`。
+/// - `match`：三段一致（请求了且按预期下发并收到思考；或未请求/禁用且无异常思考/抑制）。
+/// - `downgraded`：因模型能力/协议约束做了安全改写或降级（如 `xhigh → high`、`max → xhigh`、`enabled → prompt:adaptive`），且仍收到思考。
+/// - `mismatch`：明显异常（请求思考但上游未下发 / 返回 0 字 / 思考被网关吞掉，或显式禁用/effort=none 却仍下发或泄出思考）。
+pub(crate) fn compute_thinking_match(
+    client_effort: Option<&str>,
+    upstream_effort: Option<&str>,
+    returned_mode: Option<&str>,
+    returned_chars: u64,
+    final_status: &str,
+) -> Option<&'static str> {
+    use crate::admin::trace_db::{returned_thinking_mode as rtm, thinking_match as tm};
+
+    if final_status != "success" {
+        return None;
+    }
+    let client = client_effort?;
+    let upstream = upstream_effort?;
+    let mode = returned_mode.unwrap_or(rtm::NONE);
+    let has_returned = matches!(mode, rtm::NATIVE | rtm::REDACTED | rtm::TAG) && returned_chars > 0;
+    let is_suppressed = mode == rtm::SUPPRESSED && returned_chars > 0;
+
+    enum UpstreamControl {
+        None,
+        Native(Option<EffortTier>),
+        PromptAdaptive,
+        PromptEnabled,
+    }
+
+    let up = if upstream == "none" {
+        UpstreamControl::None
+    } else if let Some(rest) = upstream
+        .strip_prefix("output_config:")
+        .or_else(|| upstream.strip_prefix("reasoning:"))
+    {
+        UpstreamControl::Native(EffortTier::parse(rest))
+    } else if upstream.starts_with("prompt:adaptive:") {
+        UpstreamControl::PromptAdaptive
+    } else if upstream.starts_with("prompt:enabled:") {
+        UpstreamControl::PromptEnabled
+    } else {
+        UpstreamControl::None
+    };
+
+    // 1. 未请求思考
+    if client == "none" {
+        return Some(match up {
+            UpstreamControl::None if !is_suppressed => tm::MATCH,
+            _ => tm::MISMATCH,
+        });
+    }
+
+    // 2. 显式禁用思考
+    if client == "disabled" {
+        return Some(match up {
+            UpstreamControl::None if !has_returned && !is_suppressed => tm::MATCH,
+            _ => tm::MISMATCH,
+        });
+    }
+
+    // 3. 显式 effort=none（如 OpenAI reasoning_effort="none"）
+    if client == "effort:none" {
+        let up_is_none = matches!(
+            up,
+            UpstreamControl::None | UpstreamControl::Native(Some(EffortTier::None))
+        );
+        return Some(if up_is_none && !has_returned && !is_suppressed {
+            tm::MATCH
+        } else {
+            tm::MISMATCH
+        });
+    }
+
+    // 4. 客户端请求了思考（adaptive / enabled / effort / suffix）
+    let (client_kind, client_raw_val) = match client.split_once(':') {
+        Some((k, v)) => (k, v),
+        None => return Some(tm::MISMATCH),
+    };
+    let is_numeric_budget = client_kind == "enabled" && client_raw_val.parse::<i32>().is_ok();
+    let client_tier: Option<EffortTier> = if client_kind == "adaptive" && client_raw_val == "default"
+    {
+        None
+    } else if is_numeric_budget {
+        let budget = client_raw_val.parse::<i32>().unwrap_or(20000);
+        EffortTier::parse(effort_from_budget_tokens(budget))
+    } else {
+        EffortTier::parse(client_raw_val)
+    };
+
+    // 上游未下发控制，或网关吞掉思考，或上游 0 思考返回 -> 异常
+    if matches!(
+        up,
+        UpstreamControl::None | UpstreamControl::Native(Some(EffortTier::None))
+    ) {
+        return Some(tm::MISMATCH);
+    }
+    if is_suppressed || !has_returned {
+        return Some(tm::MISMATCH);
+    }
+
+    let verdict = match up {
+        UpstreamControl::Native(up_tier) => match (client_tier, up_tier) {
+            (Some(ct), Some(ut)) if ct != ut => tm::DOWNGRADED,
+            (None, Some(_)) => tm::MATCH,
+            (Some(_), Some(_)) => tm::MATCH,
+            _ => tm::DOWNGRADED,
+        },
+        // 降级为 prompt 注入的 adaptive 标签（例如 Opus 4.6 enabled 路径）
+        UpstreamControl::PromptAdaptive => tm::DOWNGRADED,
+        // 旧模型（如 Sonnet 4.5）的 enabled:<budget> 走 prompt:enabled:<budget> 属协议原生语义
+        UpstreamControl::PromptEnabled => {
+            if is_numeric_budget {
+                tm::MATCH
+            } else {
+                tm::DOWNGRADED
+            }
+        }
+        UpstreamControl::None => tm::MISMATCH,
+    };
+    Some(verdict)
+}
+
 /// 转换结果
 #[derive(Debug)]
 pub struct ConversionResult {
@@ -626,6 +831,8 @@ pub struct ConversionResult {
     /// Additional model request fields (including `output_config.effort`), translated from the
     /// `output_config` field of the client's Anthropic request. Not sent when empty.
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
+    /// 实际发给上游的思考控制描述（`output_config:<tier>` / `reasoning:<tier>` / `prompt:adaptive:<tier>` / `prompt:enabled:<budget>` / `none`）
+    pub upstream_thinking: String,
 }
 
 /// Internal conversion purpose. Clients cannot select this directly; the
@@ -1035,6 +1242,8 @@ pub(crate) fn convert_request_with_purpose(
     // `additionalModelRequestFields is not supported for this model`, so keep the field opt-in
     // by upstream model capability rather than by the mere presence of client output_config.
     let additional_model_request_fields = build_additional_model_request_fields(req, &model_id);
+    let upstream_thinking =
+        describe_upstream_thinking(req, &model_id, additional_model_request_fields.as_ref());
 
     let upstream_effort = additional_model_request_fields.as_ref().and_then(|f| {
         f.output_config
@@ -1048,6 +1257,7 @@ pub(crate) fn convert_request_with_purpose(
         budget_tokens = req.thinking.as_ref().map(|t| t.budget_tokens).unwrap_or(0),
         client_effort = req.output_config.as_ref().map(|c| c.effort.as_str()).unwrap_or("-"),
         upstream_effort = upstream_effort.unwrap_or("-"),
+        upstream_thinking = %upstream_thinking,
         "thinking 配置"
     );
 
@@ -1056,6 +1266,7 @@ pub(crate) fn convert_request_with_purpose(
         tool_name_map,
         known_tool_names,
         additional_model_request_fields,
+        upstream_thinking,
     })
 }
 
@@ -5537,5 +5748,167 @@ mod native_history_reasoning_tests {
             "messages":[{"role":"user","content":"hello"}]})).unwrap();
         assert_eq!(generate_thinking_prefix(&req, "claude-sonnet-4.5").as_deref(),
             Some("<thinking_mode>enabled</thinking_mode><max_thinking_length>2048</max_thinking_length>"));
+    }
+
+    #[test]
+    fn describe_client_and_upstream_thinking_covers_all_modes() {
+        let mk = |v: serde_json::Value| serde_json::from_value::<MessagesRequest>(v).unwrap();
+
+        let adaptive_xhigh = mk(json!({
+            "model": "claude-opus-4.7", "max_tokens": 1024,
+            "thinking": {"type": "adaptive"}, "output_config": {"effort": "xhigh"},
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(describe_client_effort(&adaptive_xhigh), "adaptive:xhigh");
+        assert_eq!(
+            convert_request(&adaptive_xhigh).unwrap().upstream_thinking,
+            "output_config:xhigh"
+        );
+
+        let opus46_xhigh = mk(json!({
+            "model": "claude-opus-4.6", "max_tokens": 1024,
+            "thinking": {"type": "adaptive"}, "output_config": {"effort": "xhigh"},
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(describe_client_effort(&opus46_xhigh), "adaptive:xhigh");
+        assert_eq!(
+            convert_request(&opus46_xhigh).unwrap().upstream_thinking,
+            "output_config:high"
+        );
+
+        let grok_max = mk(json!({
+            "model": "grok-4.7", "max_tokens": 1024,
+            "output_config": {"effort": "max"},
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(describe_client_effort(&grok_max), "effort:max");
+        assert_eq!(
+            convert_request(&grok_max).unwrap().upstream_thinking,
+            "reasoning:xhigh"
+        );
+
+        let opus46_enabled = mk(json!({
+            "model": "claude-opus-4.6", "max_tokens": 1024,
+            "thinking": {"type": "enabled", "budget_tokens": 20000},
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(describe_client_effort(&opus46_enabled), "enabled:20000");
+        assert_eq!(
+            convert_request(&opus46_enabled).unwrap().upstream_thinking,
+            "prompt:adaptive:high"
+        );
+
+        let sonnet45_enabled = mk(json!({
+            "model": "claude-sonnet-4.5", "max_tokens": 1024,
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(describe_client_effort(&sonnet45_enabled), "enabled:4096");
+        assert_eq!(
+            convert_request(&sonnet45_enabled).unwrap().upstream_thinking,
+            "prompt:enabled:4096"
+        );
+
+        let disabled = mk(json!({
+            "model": "claude-opus-4.7", "max_tokens": 1024,
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(describe_client_effort(&disabled), "disabled");
+        assert_eq!(convert_request(&disabled).unwrap().upstream_thinking, "none");
+
+        let suffix = mk(json!({
+            "model": "claude-opus-4-6-thinking", "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(describe_client_effort(&suffix), "suffix:high");
+
+        let plain = mk(json!({
+            "model": "claude-opus-4.7", "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(describe_client_effort(&plain), "none");
+        assert_eq!(convert_request(&plain).unwrap().upstream_thinking, "none");
+    }
+
+    #[test]
+    fn compute_thinking_match_verdicts() {
+        use crate::admin::trace_db::{returned_thinking_mode as rtm, thinking_match as tm};
+
+        // 正常匹配
+        assert_eq!(
+            compute_thinking_match(Some("adaptive:xhigh"), Some("output_config:xhigh"), Some(rtm::NATIVE), 1200, "success"),
+            Some(tm::MATCH)
+        );
+        assert_eq!(
+            compute_thinking_match(Some("adaptive:default"), Some("output_config:high"), Some(rtm::NATIVE), 500, "success"),
+            Some(tm::MATCH)
+        );
+        assert_eq!(
+            compute_thinking_match(Some("enabled:8000"), Some("prompt:enabled:8000"), Some(rtm::TAG), 300, "success"),
+            Some(tm::MATCH)
+        );
+        assert_eq!(
+            compute_thinking_match(Some("none"), Some("none"), Some(rtm::NONE), 0, "success"),
+            Some(tm::MATCH)
+        );
+        assert_eq!(
+            compute_thinking_match(Some("disabled"), Some("none"), Some(rtm::NONE), 0, "success"),
+            Some(tm::MATCH)
+        );
+        assert_eq!(
+            compute_thinking_match(Some("effort:none"), Some("reasoning:none"), Some(rtm::NONE), 0, "success"),
+            Some(tm::MATCH)
+        );
+
+        // 安全降级 / 改写
+        assert_eq!(
+            compute_thinking_match(Some("adaptive:xhigh"), Some("output_config:high"), Some(rtm::NATIVE), 900, "success"),
+            Some(tm::DOWNGRADED)
+        );
+        assert_eq!(
+            compute_thinking_match(Some("effort:max"), Some("reasoning:xhigh"), Some(rtm::NATIVE), 600, "success"),
+            Some(tm::DOWNGRADED)
+        );
+        assert_eq!(
+            compute_thinking_match(Some("enabled:20000"), Some("prompt:adaptive:high"), Some(rtm::TAG), 450, "success"),
+            Some(tm::DOWNGRADED)
+        );
+
+        // 异常 mismatch
+        assert_eq!(
+            compute_thinking_match(Some("effort:high"), Some("none"), Some(rtm::NONE), 0, "success"),
+            Some(tm::MISMATCH)
+        );
+        assert_eq!(
+            compute_thinking_match(Some("adaptive:high"), Some("output_config:high"), Some(rtm::NONE), 0, "success"),
+            Some(tm::MISMATCH)
+        );
+        assert_eq!(
+            compute_thinking_match(Some("effort:high"), Some("output_config:high"), Some(rtm::SUPPRESSED), 820, "success"),
+            Some(tm::MISMATCH)
+        );
+        assert_eq!(
+            compute_thinking_match(Some("disabled"), Some("none"), Some(rtm::NATIVE), 120, "success"),
+            Some(tm::MISMATCH)
+        );
+        assert_eq!(
+            compute_thinking_match(Some("effort:none"), Some("output_config:high"), Some(rtm::NATIVE), 200, "success"),
+            Some(tm::MISMATCH)
+        );
+        assert_eq!(
+            compute_thinking_match(Some("none"), Some("none"), Some(rtm::SUPPRESSED), 300, "success"),
+            Some(tm::MISMATCH)
+        );
+
+        // 失败/中断不判一致性
+        assert_eq!(
+            compute_thinking_match(Some("adaptive:high"), Some("output_config:high"), Some(rtm::NONE), 0, "error"),
+            None
+        );
+        assert_eq!(
+            compute_thinking_match(Some("adaptive:high"), Some("output_config:high"), Some(rtm::NATIVE), 50, "interrupted"),
+            None
+        );
     }
 }

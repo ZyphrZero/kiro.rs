@@ -1649,6 +1649,10 @@ pub struct StreamContext {
     native_stop_reason: Option<String>,
     /// contextUsageEvent 报告上下文用量达到 100%。
     context_window_full: bool,
+    /// 上游实际返回的思考形式（native / redacted / tag / suppressed）
+    returned_thinking_mode: Option<&'static str>,
+    /// 上游实际返回的思考字符数（按 Unicode 字符数计）
+    returned_thinking_chars: u64,
 }
 
 impl StreamContext {
@@ -1742,8 +1746,49 @@ impl StreamContext {
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
             native_stop_reason: None,
             context_window_full: false,
+            returned_thinking_mode: None,
+            returned_thinking_chars: 0,
         }
     }
+
+    /// 记录上游实际返回的思考形式与字符数（优先级：native > redacted > tag > suppressed）。
+    fn record_returned_thinking(&mut self, mode: &'static str, text: &str) {
+        let chars = text.chars().count() as u64;
+        if chars == 0 {
+            return;
+        }
+        self.returned_thinking_chars = self.returned_thinking_chars.saturating_add(chars);
+        let priority = |m: &str| -> u8 {
+            use crate::admin::trace_db::returned_thinking_mode as rtm;
+            match m {
+                rtm::NATIVE => 4,
+                rtm::REDACTED => 3,
+                rtm::TAG => 2,
+                rtm::SUPPRESSED => 1,
+                _ => 0,
+            }
+        };
+        if self
+            .returned_thinking_mode
+            .is_none_or(|cur| priority(mode) > priority(cur))
+        {
+            self.returned_thinking_mode = Some(mode);
+        }
+    }
+
+    /// 获取上游实际返回的思考形式与字符数（用于 trace 落库）。
+    pub fn returned_thinking(&self) -> (&'static str, u64) {
+        match self.returned_thinking_mode {
+            Some(mode) => (mode, self.returned_thinking_chars),
+            None => (crate::admin::trace_db::returned_thinking_mode::NONE, 0),
+        }
+    }
+
+    /// 获取当前判定的最终 stop_reason（用于 trace 落库）。
+    pub fn final_stop_reason(&self) -> String {
+        self.state_manager.get_stop_reason()
+    }
+
 
     /// 设置允许从 `<invoke>` 文本合成工具调用的工具 schema（H2），只保留本次请求声明的工具。
     pub fn set_invoke_tool_schemas(&mut self, schemas: InvokeToolSchemas) {
@@ -2058,6 +2103,10 @@ impl StreamContext {
                     // 提取 thinking 内容
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
                     if !thinking_content.is_empty() {
+                        self.record_returned_thinking(
+                            crate::admin::trace_db::returned_thinking_mode::TAG,
+                            &thinking_content,
+                        );
                         if let Some(thinking_index) = self.thinking_block_index {
                             events.push(
                                 self.create_thinking_delta_event(thinking_index, &thinking_content),
@@ -2102,6 +2151,10 @@ impl StreamContext {
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
                         if !safe_content.is_empty() {
+                            self.record_returned_thinking(
+                                crate::admin::trace_db::returned_thinking_mode::TAG,
+                                &safe_content,
+                            );
                             if let Some(thinking_index) = self.thinking_block_index {
                                 events.push(
                                     self.create_thinking_delta_event(thinking_index, &safe_content),
@@ -2344,15 +2397,23 @@ impl StreamContext {
         &mut self,
         reasoning: &crate::kiro::model::events::ReasoningContentEvent,
     ) -> Vec<SseEvent> {
+        use crate::admin::trace_db::returned_thinking_mode as rtm;
+
         if !self.thinking_enabled {
             if let Some(text) = reasoning.text.as_deref()
                 && !text.is_empty()
             {
                 self.output_tokens += estimate_tokens(text);
-                // Count upstream work, but never expose suppressed reasoning as
-                // ordinary text, including reasoning-only responses.
-                return Vec::new();
+                self.record_returned_thinking(rtm::SUPPRESSED, text);
             }
+            if let Some(redacted) = reasoning.redacted_content.as_deref()
+                && !redacted.is_empty()
+            {
+                self.output_tokens += 8;
+                self.record_returned_thinking(rtm::SUPPRESSED, redacted);
+            }
+            // Count upstream work, but never expose suppressed reasoning as
+            // ordinary text, including reasoning-only responses.
             return Vec::new();
         }
 
@@ -2368,6 +2429,7 @@ impl StreamContext {
             && !text.is_empty()
         {
             self.output_tokens += estimate_tokens(text);
+            self.record_returned_thinking(rtm::NATIVE, text);
             events.extend(self.ensure_thinking_block());
             if let Some(idx) = self.thinking_block_index {
                 events.push(self.create_thinking_delta_event(idx, text));
@@ -2378,6 +2440,7 @@ impl StreamContext {
             && !redacted.is_empty()
         {
             self.output_tokens += 8;
+            self.record_returned_thinking(rtm::REDACTED, redacted);
             events.extend(self.create_redacted_thinking_events(redacted));
         }
 
@@ -2534,6 +2597,10 @@ impl StreamContext {
             if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer) {
                 let thinking_content = self.thinking_buffer[..end_pos].to_string();
                 if !thinking_content.is_empty() {
+                    self.record_returned_thinking(
+                        crate::admin::trace_db::returned_thinking_mode::TAG,
+                        &thinking_content,
+                    );
                     if let Some(thinking_index) = self.thinking_block_index {
                         events.push(
                             self.create_thinking_delta_event(thinking_index, &thinking_content),
@@ -2656,6 +2723,10 @@ impl StreamContext {
                 {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
                     if !thinking_content.is_empty() {
+                        self.record_returned_thinking(
+                            crate::admin::trace_db::returned_thinking_mode::TAG,
+                            &thinking_content,
+                        );
                         if let Some(thinking_index) = self.thinking_block_index {
                             events.push(
                                 self.create_thinking_delta_event(thinking_index, &thinking_content),
@@ -2686,9 +2757,16 @@ impl StreamContext {
                     }
                 } else {
                     // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
+                    let remaining_thinking = self.thinking_buffer.clone();
+                    if !remaining_thinking.is_empty() {
+                        self.record_returned_thinking(
+                            crate::admin::trace_db::returned_thinking_mode::TAG,
+                            &remaining_thinking,
+                        );
+                    }
                     if let Some(thinking_index) = self.thinking_block_index {
                         events.push(
-                            self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
+                            self.create_thinking_delta_event(thinking_index, &remaining_thinking),
                         );
                     }
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop

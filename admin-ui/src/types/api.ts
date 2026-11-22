@@ -736,11 +736,25 @@ export interface TraceRecord {
   usageSource?: UsageSource | null
   /** 客户端 IP（X-Forwarded-For / X-Real-IP 优先，回落到 TCP 对端）；老记录为 null */
   clientIp?: string | null
+  /** 客户端请求的思考配置（规范化前），如 adaptive:xhigh / enabled:20000 / effort:high / disabled / none */
+  clientEffort?: string | null
+  /** 实际下发给上游的思考控制，如 output_config:high / reasoning:xhigh / prompt:adaptive:high / none */
+  upstreamEffort?: string | null
+  /** 上游实际返回的思考形式：native / redacted / tag / suppressed / none */
+  returnedThinkingMode?: ReturnedThinkingMode | null
+  /** 上游实际返回的思考字符数（Unicode 字符数） */
+  returnedThinkingChars?: number | null
+  /** 思考强度三段式一致性判定：match / downgraded / mismatch */
+  thinkingMatch?: ThinkingMatch | null
+  /** 最终终止原因（end_turn / tool_use / refusal / max_tokens 等） */
+  stopReason?: string | null
   attempts: TraceAttempt[]
 }
 
 export type StickyOutcome = 'hit' | 'miss_first' | 'miss_unavailable' | 'off'
 export type UsageSource = 'provider' | 'simulated' | 'none'
+export type ThinkingMatch = 'match' | 'downgraded' | 'mismatch'
+export type ReturnedThinkingMode = 'native' | 'redacted' | 'tag' | 'suppressed' | 'none'
 
 /** 链路查询参数 */
 export interface TraceQuery {
@@ -759,6 +773,10 @@ export interface TraceQuery {
   sessionId?: string
   /** 仅返回换号请求（previousCredentialId 非空且 != finalCredentialId） */
   onlySwitched?: boolean
+  /** 仅返回思考强度不一致 / 降级改写 / 思考被吞的请求 */
+  onlyThinkingMismatch?: boolean
+  /** 仅返回上游内容过滤拒答（stop_reason = refusal）的请求 */
+  onlyRefusal?: boolean
   /** 客户端 IP 精确匹配 */
   clientIp?: string
   /** 时间窗口起点（Unix 秒，含）。与后端 traces.ts_epoch 同单位 */

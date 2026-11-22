@@ -509,6 +509,9 @@ async fn run_round(
         }
     };
 
+    // 记录首轮实际发给上游的思考控制描述
+    tracer.set_upstream_effort_if_unset(conversion.upstream_thinking);
+
     // H2: schemas of the tools declared upstream, taken before conversation_state is moved.
     let invoke_tool_schemas = super::stream::invoke_tool_schemas_from_state(
         &conversion.conversation_state,
@@ -1711,6 +1714,18 @@ async fn run_web_search_loop_inner(
 
         let final_usage = settlement.usage();
         let final_metering = settlement.response_metering(latest_metering.as_ref());
+        if !all_thinking.is_empty() {
+            tracer.set_returned_thinking(
+                crate::admin::trace_db::returned_thinking_mode::NATIVE,
+                all_thinking.chars().count() as u64,
+            );
+        } else {
+            tracer.set_returned_thinking(
+                crate::admin::trace_db::returned_thinking_mode::NONE,
+                0,
+            );
+        }
+        tracer.set_stop_reason(&stop_reason);
         settlement.finish("success", "success", None, None);
 
         return if let Some(emitter) = emitter.as_deref_mut() {

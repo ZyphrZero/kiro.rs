@@ -1803,6 +1803,14 @@ pub async fn list_traces(
             .get("onlySwitched")
             .map(|s| s == "true" || s == "1")
             .unwrap_or(false),
+        only_thinking_mismatch: params
+            .get("onlyThinkingMismatch")
+            .map(|s| s == "true" || s == "1")
+            .unwrap_or(false),
+        only_refusal: params
+            .get("onlyRefusal")
+            .map(|s| s == "true" || s == "1")
+            .unwrap_or(false),
         client_ip: params
             .get("clientIp")
             .map(|s| s.trim().to_string())
@@ -1900,6 +1908,12 @@ pub async fn list_traces(
                 "previousCredentialId": r.previous_credential_id,
                 "usageSource": r.usage_source,
                 "clientIp": r.client_ip,
+                "clientEffort": r.client_effort,
+                "upstreamEffort": r.upstream_effort,
+                "returnedThinkingMode": r.returned_thinking_mode,
+                "returnedThinkingChars": r.returned_thinking_chars,
+                "thinkingMatch": r.thinking_match,
+                "stopReason": r.stop_reason,
                 "attempts": attempts,
             })
         })

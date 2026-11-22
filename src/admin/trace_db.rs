@@ -142,8 +142,50 @@ pub struct TraceRecord {
     /// 客户端 IP（转发头优先，回落到 TCP 对端）。None = 老记录 / 无法确定。
     #[serde(default)]
     pub client_ip: Option<String>,
+    /// 客户端请求的思考配置（规范化前），如 `adaptive:high` / `enabled:20000` / `effort:xhigh` / `disabled` / `none`
+    #[serde(default)]
+    pub client_effort: Option<String>,
+    /// 实际发给上游的思考控制，如 `output_config:high` / `reasoning:xhigh` / `prompt:adaptive:high` / `prompt:enabled:20000` / `none`
+    #[serde(default)]
+    pub upstream_effort: Option<String>,
+    /// 上游实际返回的思考形式，见 [`returned_thinking_mode`]（native / redacted / tag / suppressed / none）
+    #[serde(default)]
+    pub returned_thinking_mode: Option<String>,
+    /// 上游实际返回的思考字符数（按 Unicode 字符数计）
+    #[serde(default)]
+    pub returned_thinking_chars: Option<u64>,
+    /// 思考强度三段式一致性判定，见 [`thinking_match`]（match / downgraded / mismatch）
+    #[serde(default)]
+    pub thinking_match: Option<String>,
+    /// 最终终止原因（end_turn / tool_use / max_tokens / refusal / stop_sequence 等）
+    #[serde(default)]
+    pub stop_reason: Option<String>,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
+}
+
+/// 思考强度三段式一致性判定（record.thinking_match 取值）
+pub mod thinking_match {
+    /// 传入、下发、实际返回三段一致
+    pub const MATCH: &str = "match";
+    /// 因模型能力或协议约束做了安全降级/改写（如 xhigh→high、max→xhigh、enabled→prompt）
+    pub const DOWNGRADED: &str = "downgraded";
+    /// 明显异常：请求思考但未下发/0思考返回/思考被吞，或禁用思考却泄出思考
+    pub const MISMATCH: &str = "mismatch";
+}
+
+/// 上游实际返回的思考形式（record.returned_thinking_mode 取值）
+pub mod returned_thinking_mode {
+    /// 上游原生 reasoningContentEvent.text 并已返回给客户端
+    pub const NATIVE: &str = "native";
+    /// 上游原生 redacted_content 并已返回给客户端
+    pub const REDACTED: &str = "redacted";
+    /// 从 `<thinking>` 文本标签提取并返回给客户端
+    pub const TAG: &str = "tag";
+    /// 上游返回了原生 reasoning，但因客户端未启用 thinking / extractThinking 关闭被网关抑制未透传
+    pub const SUPPRESSED: &str = "suppressed";
+    /// 未观察到任何思考内容
+    pub const NONE: &str = "none";
 }
 
 /// 会话粘性路由结果（record.sticky_outcome 取值）
@@ -256,6 +298,10 @@ pub struct TraceQuery {
     pub session_id: Option<String>,
     /// 仅返回「换号」请求：previous_credential_id 非空且 != final_credential_id
     pub only_switched: bool,
+    /// 仅返回思考异常/改写记录：thinking_match IN ('mismatch', 'downgraded')
+    pub only_thinking_mismatch: bool,
+    /// 仅返回上游内容过滤拒答记录：stop_reason = 'refusal'
+    pub only_refusal: bool,
     /// 客户端 IP 精确匹配
     pub client_ip: Option<String>,
     /// 返回条数上限
@@ -327,7 +373,7 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 12] = [
+        let columns: [(&str, &str); 18] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -340,6 +386,12 @@ impl TraceStore {
             ("previous_credential_id", "INTEGER"),
             ("usage_source", "TEXT"),
             ("client_ip", "TEXT"),
+            ("client_effort", "TEXT"),
+            ("upstream_effort", "TEXT"),
+            ("returned_thinking_mode", "TEXT"),
+            ("returned_thinking_chars", "INTEGER"),
+            ("thinking_match", "TEXT"),
+            ("stop_reason", "TEXT"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
@@ -350,10 +402,12 @@ impl TraceStore {
                 ))?;
             }
         }
-        // session_id / client_ip 索引放在 migrate 里而不是 SCHEMA：老库补列之后才能建
+        // session_id / client_ip / thinking_match / stop_reason 索引放在 migrate 里而不是 SCHEMA：老库补列之后才能建
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_traces_session ON traces(session_id);
-             CREATE INDEX IF NOT EXISTS idx_traces_client_ip ON traces(client_ip);",
+             CREATE INDEX IF NOT EXISTS idx_traces_client_ip ON traces(client_ip);
+             CREATE INDEX IF NOT EXISTS idx_traces_thinking_match ON traces(thinking_match);
+             CREATE INDEX IF NOT EXISTS idx_traces_stop_reason ON traces(stop_reason);",
         )?;
         // 老库 key_source 列首次添加后，按 key_id 语义回填：master apiKey (key_id=0) 之外都视为客户端 Key。
         if key_source_added {
@@ -410,9 +464,10 @@ impl TraceStore {
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
                  credits, first_token_ms, session_id, sticky_outcome, previous_credential_id, \
-                 usage_source, client_ip) \
+                 usage_source, client_ip, client_effort, upstream_effort, \
+                 returned_thinking_mode, returned_thinking_chars, thinking_match, stop_reason) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,\
-                 ?21,?22,?23,?24,?25)",
+                 ?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -439,6 +494,12 @@ impl TraceStore {
                     rec.previous_credential_id.map(|v| v as i64),
                     rec.usage_source,
                     rec.client_ip,
+                    rec.client_effort,
+                    rec.upstream_effort,
+                    rec.returned_thinking_mode,
+                    rec.returned_thinking_chars.map(|v| v as i64),
+                    rec.thinking_match,
+                    rec.stop_reason,
                 ],
             )?;
             for a in &rec.attempts {
@@ -552,6 +613,12 @@ impl TraceStore {
                     .to_string(),
             );
         }
+        if q.only_thinking_mismatch {
+            clauses.push("thinking_match IN ('mismatch', 'downgraded')".to_string());
+        }
+        if q.only_refusal {
+            clauses.push("stop_reason = 'refusal'".to_string());
+        }
         if let Some(ip) = &q.client_ip {
             clauses.push("client_ip = ?".to_string());
             params.push(Box::new(ip.clone()));
@@ -609,7 +676,9 @@ impl TraceStore {
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, \
-             session_id, sticky_outcome, previous_credential_id, usage_source, client_ip \
+             session_id, sticky_outcome, previous_credential_id, usage_source, client_ip, \
+             client_effort, upstream_effort, returned_thinking_mode, returned_thinking_chars, \
+             thinking_match, stop_reason \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -641,6 +710,12 @@ impl TraceStore {
                 previous_credential_id: row.get::<_, Option<i64>>(21)?.map(|v| v as u64),
                 usage_source: row.get(22)?,
                 client_ip: row.get(23)?,
+                client_effort: row.get(24)?,
+                upstream_effort: row.get(25)?,
+                returned_thinking_mode: row.get(26)?,
+                returned_thinking_chars: row.get::<_, Option<i64>>(27)?.map(|v| v as u64),
+                thinking_match: row.get(28)?,
+                stop_reason: row.get(29)?,
                 attempts: Vec::new(),
             })
         })?;
@@ -844,7 +919,13 @@ CREATE TABLE IF NOT EXISTS traces (
     sticky_outcome    TEXT,
     previous_credential_id INTEGER,
     usage_source      TEXT,
-    client_ip         TEXT
+    client_ip         TEXT,
+    client_effort     TEXT,
+    upstream_effort   TEXT,
+    returned_thinking_mode TEXT,
+    returned_thinking_chars INTEGER,
+    thinking_match    TEXT,
+    stop_reason       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -916,6 +997,20 @@ mod tests {
             previous_credential_id: Some(input.credential_id),
             usage_source: Some(usage_source::SIMULATED.to_string()),
             client_ip: Some("203.0.113.9".to_string()),
+            client_effort: Some("adaptive:high".to_string()),
+            upstream_effort: Some("output_config:high".to_string()),
+            returned_thinking_mode: Some(returned_thinking_mode::NATIVE.to_string()),
+            returned_thinking_chars: Some(420),
+            thinking_match: if input.status == "success" {
+                Some(thinking_match::MATCH.to_string())
+            } else {
+                None
+            },
+            stop_reason: if input.status == "success" {
+                Some("end_turn".to_string())
+            } else {
+                None
+            },
             attempts: vec![
                 TraceAttempt {
                     attempt: 0,
@@ -1452,5 +1547,127 @@ mod tests {
         // LIKE 元字符被转义：% 不再是通配符，不应匹配任何记录
         assert!(ids("%").is_empty(), "% 应按字面量处理");
         assert!(ids("_").is_empty(), "_ 应按字面量处理");
+    }
+
+    #[test]
+    fn thinking_and_stop_reason_roundtrip_and_filters() {
+        let store = mem_store();
+
+        let ok = sample(TraceSample {
+            trace_id: "think-ok",
+            status: "success",
+            credential_id: 5,
+            model: "claude-opus-4-7",
+        });
+        store.insert(&ok);
+
+        let mut downgraded = sample(TraceSample {
+            trace_id: "think-down",
+            status: "success",
+            credential_id: 5,
+            model: "claude-opus-4-6",
+        });
+        downgraded.client_effort = Some("adaptive:xhigh".to_string());
+        downgraded.upstream_effort = Some("output_config:high".to_string());
+        downgraded.returned_thinking_mode = Some(returned_thinking_mode::NATIVE.to_string());
+        downgraded.returned_thinking_chars = Some(300);
+        downgraded.thinking_match = Some(thinking_match::DOWNGRADED.to_string());
+        store.insert(&downgraded);
+
+        let mut mismatch = sample(TraceSample {
+            trace_id: "think-bad",
+            status: "success",
+            credential_id: 5,
+            model: "claude-opus-4-7",
+        });
+        mismatch.client_effort = Some("effort:high".to_string());
+        mismatch.upstream_effort = Some("output_config:high".to_string());
+        mismatch.returned_thinking_mode = Some(returned_thinking_mode::SUPPRESSED.to_string());
+        mismatch.returned_thinking_chars = Some(820);
+        mismatch.thinking_match = Some(thinking_match::MISMATCH.to_string());
+        mismatch.stop_reason = Some("refusal".to_string());
+        store.insert(&mismatch);
+
+        let ids = |q: TraceQuery| {
+            let mut v: Vec<String> = store.query(&q).into_iter().map(|r| r.trace_id).collect();
+            v.sort();
+            v
+        };
+
+        assert_eq!(
+            ids(TraceQuery {
+                only_thinking_mismatch: true,
+                limit: 50,
+                ..Default::default()
+            }),
+            vec!["think-bad", "think-down"]
+        );
+        assert_eq!(
+            ids(TraceQuery {
+                only_refusal: true,
+                limit: 50,
+                ..Default::default()
+            }),
+            vec!["think-bad"]
+        );
+
+        let all = store.query(&TraceQuery {
+            limit: 50,
+            ..Default::default()
+        });
+        let bad = all.iter().find(|r| r.trace_id == "think-bad").unwrap();
+        assert_eq!(bad.client_effort.as_deref(), Some("effort:high"));
+        assert_eq!(bad.upstream_effort.as_deref(), Some("output_config:high"));
+        assert_eq!(
+            bad.returned_thinking_mode.as_deref(),
+            Some(returned_thinking_mode::SUPPRESSED)
+        );
+        assert_eq!(bad.returned_thinking_chars, Some(820));
+        assert_eq!(bad.thinking_match.as_deref(), Some(thinking_match::MISMATCH));
+        assert_eq!(bad.stop_reason.as_deref(), Some("refusal"));
+    }
+
+    #[test]
+    fn migrate_is_idempotent_when_partial_thinking_columns_already_exist() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 模拟线上已存在 client_effort / upstream_effort / stop_reason 的 28 列数据库
+        conn.execute_batch(
+            "CREATE TABLE traces (trace_id TEXT PRIMARY KEY, ts TEXT NOT NULL, ts_epoch INTEGER NOT NULL, \
+             key_id INTEGER NOT NULL, key_source TEXT, model TEXT NOT NULL, is_stream INTEGER NOT NULL, \
+             final_status TEXT NOT NULL, final_credential_id INTEGER NOT NULL, error_type TEXT, \
+             error_message TEXT, total_attempts INTEGER NOT NULL, duration_ms INTEGER NOT NULL, \
+             interrupted_after_bytes INTEGER, input_tokens INTEGER NOT NULL DEFAULT 0, \
+             output_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0, \
+             cache_read_tokens INTEGER NOT NULL DEFAULT 0, credits REAL NOT NULL DEFAULT 0, \
+             first_token_ms INTEGER, session_id TEXT, sticky_outcome TEXT, previous_credential_id INTEGER, \
+             usage_source TEXT, client_ip TEXT, client_effort TEXT, upstream_effort TEXT, stop_reason TEXT);
+             CREATE TABLE trace_attempts (trace_id TEXT NOT NULL, attempt INTEGER NOT NULL, \
+             credential_id INTEGER NOT NULL, endpoint TEXT NOT NULL, http_status INTEGER, \
+             outcome TEXT NOT NULL, error_snippet TEXT, duration_ms INTEGER NOT NULL, \
+             PRIMARY KEY (trace_id, attempt));",
+        )
+        .unwrap();
+        TraceStore::migrate(&conn).unwrap();
+        // 重复迁移也必须幂等
+        TraceStore::migrate(&conn).unwrap();
+        let store = TraceStore {
+            conn: Mutex::new(conn),
+            enabled: AtomicBool::new(true),
+            retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
+        };
+        store.insert(&sample(TraceSample {
+            trace_id: "migrated-28",
+            status: "success",
+            credential_id: 5,
+            model: "claude-opus-4-7",
+        }));
+        let out = store.query(&TraceQuery {
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].thinking_match.as_deref(), Some(thinking_match::MATCH));
+        assert_eq!(out[0].returned_thinking_chars, Some(420));
+        assert_eq!(out[0].stop_reason.as_deref(), Some("end_turn"));
     }
 }
