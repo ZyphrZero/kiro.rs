@@ -26,7 +26,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::handlers::post_messages;
+use super::handlers::post_messages_with_native_reasoning;
 use super::middleware::{AppState, KeyContext};
 use super::stream::REFUSAL_STOP_REASON;
 use super::types::{
@@ -139,7 +139,13 @@ pub async fn post_chat_completions(
     };
 
     // 2. Reuse the Anthropic chain with the client's streaming preference.
-    let inner = post_messages(State(state.clone()), Extension(key_ctx), Json(anthropic_req)).await;
+    let inner = post_messages_with_native_reasoning(
+        State(state.clone()),
+        Extension(key_ctx),
+        Json(anthropic_req),
+        want_stream,
+    )
+    .await;
 
     // 把内层 Anthropic 响应上的自定义响应头透传到 OpenAI 响应。
     let mut configured_names = state
@@ -841,7 +847,7 @@ impl ChatStreamContext {
         }
         let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
         match event {
-            "ping" => vec![Bytes::from_static(b": ping\n\n")],
+            "ping" => vec![self.chunk(json!({}), None, None)],
             "message_start" => vec![self.chunk(json!({"role": "assistant"}), None, None)],
             "content_block_start" => {
                 let block = &data["content_block"];
@@ -869,6 +875,12 @@ impl ChatStreamContext {
             }
             "content_block_delta" => match data["delta"]["type"].as_str() {
                 Some("text_delta") => vec![self.chunk(json!({"content": data["delta"]["text"]}), None, None)],
+                Some("thinking_delta") => match data["delta"]["thinking"].as_str() {
+                    Some(thinking) if !thinking.is_empty() => {
+                        vec![self.chunk(json!({"reasoning_content": thinking}), None, None)]
+                    }
+                    _ => Vec::new(),
+                },
                 Some("input_json_delta") => match self.tools.get(&index) {
                     Some(tool_index) => vec![self.chunk(json!({"tool_calls": [{"index": tool_index, "function": {"arguments": data["delta"]["partial_json"]}}]}), None, None)],
                     None => self.fail(json!({"type": "api_error", "message": "Upstream tool delta has no matching tool"})),

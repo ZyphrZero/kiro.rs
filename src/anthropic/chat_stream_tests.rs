@@ -205,3 +205,66 @@ async fn issue98_invalid_frames_and_truncated_streams_never_emit_done() {
         assert!(!text.contains("[DONE]"));
     }
 }
+
+#[tokio::test]
+async fn chat_stream_translates_thinking_delta_and_ping() {
+    let wire = [
+        start(),
+        frame("ping", json!({"type":"ping"})),
+        frame(
+            "content_block_start",
+            json!({"index":0,"content_block":{"type":"thinking","thinking":""}}),
+        ),
+        frame(
+            "content_block_delta",
+            json!({"index":0,"delta":{"type":"thinking_delta","thinking":"step 1 "}}),
+        ),
+        frame(
+            "content_block_delta",
+            json!({"index":0,"delta":{"type":"thinking_delta","thinking":""}}),
+        ),
+        frame(
+            "content_block_delta",
+            json!({"index":0,"delta":{"type":"thinking_delta","thinking":"step 2"}}),
+        ),
+        frame(
+            "content_block_delta",
+            json!({"index":0,"delta":{"type":"signature_delta","signature":"sig"}}),
+        ),
+        frame("content_block_stop", json!({"index":0})),
+        frame(
+            "content_block_start",
+            json!({"index":1,"content_block":{"type":"text","text":""}}),
+        ),
+        frame(
+            "content_block_delta",
+            json!({"index":1,"delta":{"type":"text_delta","text":"answer"}}),
+        ),
+        frame("content_block_stop", json!({"index":1})),
+        finish(json!({"input_tokens":10,"output_tokens":5}), "end_turn"),
+        frame("message_stop", json!({})),
+    ]
+    .concat();
+
+    let text = output(Body::from(wire)).await;
+    let parsed = chunks(&text);
+    // ping emits an empty delta SSE data chunk with null finish_reason and no usage
+    assert_eq!(parsed[1]["choices"][0]["delta"], json!({}));
+    assert!(parsed[1]["choices"][0]["finish_reason"].is_null());
+    assert!(parsed[1].get("usage").is_none());
+
+    let reasoning: Vec<_> = parsed
+        .iter()
+        .filter_map(|c| c.pointer("/choices/0/delta/reasoning_content").and_then(Value::as_str))
+        .collect();
+    assert_eq!(reasoning, vec!["step 1 ", "step 2"]);
+
+    let content: Vec<_> = parsed
+        .iter()
+        .filter_map(|c| c.pointer("/choices/0/delta/content").and_then(Value::as_str))
+        .collect();
+    assert_eq!(content, vec!["answer"]);
+
+    assert_eq!(parsed.last().unwrap()["choices"][0]["finish_reason"], "stop");
+    assert_eq!(text.matches("data: [DONE]").count(), 1);
+}
