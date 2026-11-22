@@ -7,8 +7,10 @@
 //! - 跨平台 `currentRelease` 一致，固定使用 win32-x64 元数据即可；
 //! - 获取失败时调用方回退到 `config.kiro_version`，不阻塞启动。
 //!
-//! 注意：用量类 REST 接口（getUsageLimits / ListAvailableModels / setUserPreference）
-//! 不使用这里的「最新版本」，而是固定使用 [`USAGE_API_KIRO_VERSION`]，见该常量的说明。
+//! 注意：`getUsageLimits` / `ListAvailableProfiles` / `setUserPreference` 仍优先使用
+//! [`USAGE_API_KIRO_VERSION`]（兼容无真实 profileArn 的 BuilderID 账号），遇到上游
+//! `FEATURE_NOT_SUPPORTED` 时自动回退到最新版本；`ListAvailableModels` 已由上游强制要求
+//! 新版 IDE UA，直接使用 [`effective`] 获取最新版本号。
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -26,12 +28,12 @@ use crate::model::config::TlsBackend;
 const METADATA_URL: &str =
     "https://prod.download.desktop.kiro.dev/stable/metadata-linux-x64-stable.json";
 
-/// 用量类接口（getUsageLimits / ListAvailableModels / setUserPreference）固定使用的
-/// Kiro IDE 版本，避免 IDE 版本漂移影响用量查询。
+/// 用量类接口（`getUsageLimits` / `ListAvailableProfiles` / `setUserPreference`）默认
+/// 使用的兼容 Kiro IDE 版本，避免无真实 `profileArn` 的 BuilderID 账号因新版校验失败；
+/// 若上游对某接口下线该版本（返回 403 `FEATURE_NOT_SUPPORTED`），调用方会自动切到
+/// [`effective`] 最新版本。
 ///
-/// 该版本号只影响 User-Agent，不决定是否需要 profileArn：这些接口对
-/// Enterprise / IdC 账号始终要求真实 profileArn（缺失时 0.9.2 报 403、新版报
-/// 400 `Invalid profileArn.`），带上后两个版本返回的数据一致。
+/// `ListAvailableModels` 已被上游强制要求新版 IDE UA，不再使用本常量。
 pub const USAGE_API_KIRO_VERSION: &str = "0.9.2";
 
 static LATEST_VERSION: OnceLock<RwLock<Option<String>>> = OnceLock::new();
