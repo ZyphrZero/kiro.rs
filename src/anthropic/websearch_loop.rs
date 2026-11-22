@@ -1407,11 +1407,11 @@ pub(super) async fn run_web_search_loop(
         return resp;
     }
 
-    let initial_input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
+    let initial_input_tokens = token::count_all_tokens_ref(
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
     ) as i32;
     let initial_event = initial_stream_event(&payload.model, initial_input_tokens);
     let (sender, receiver) = mpsc::channel(WEB_SEARCH_PROGRESS_CAPACITY);
@@ -1493,11 +1493,11 @@ async fn run_web_search_loop_inner(
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
         let mut empty_retries = 0usize;
         let mut round = loop {
-            let round_fallback_input_tokens = token::count_all_tokens(
-                payload.model.clone(),
-                payload.system.clone(),
-                payload.messages.clone(),
-                payload.tools.clone(),
+            let round_fallback_input_tokens = token::count_all_tokens_ref(
+                &payload.model,
+                payload.system.as_deref(),
+                &payload.messages,
+                payload.tools.as_deref(),
             ) as i32;
             let round_cache_usage = match cache_meter.as_ref() {
                 Some(cache) => {

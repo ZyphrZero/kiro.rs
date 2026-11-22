@@ -2367,6 +2367,7 @@ impl StreamContext {
         if let Some(text) = reasoning.text.as_deref()
             && !text.is_empty()
         {
+            self.thinking_extracted = true;
             self.output_tokens += estimate_tokens(text);
             events.extend(self.ensure_thinking_block());
             if let Some(idx) = self.thinking_block_index {
@@ -2377,6 +2378,7 @@ impl StreamContext {
         if let Some(redacted) = reasoning.redacted_content.as_deref()
             && !redacted.is_empty()
         {
+            self.thinking_extracted = true;
             self.output_tokens += 8;
             events.extend(self.create_redacted_thinking_events(redacted));
         }

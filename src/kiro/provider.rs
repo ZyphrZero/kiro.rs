@@ -1424,26 +1424,44 @@ impl KiroProvider {
     /// - 模型 id（`conversationState.currentMessage.userInputMessage.modelId`），用于按模型过滤凭据
     /// - 会话 id（`conversationState.conversationId`），用于会话粘性路由
     fn extract_routing_hints(request_body: &str) -> (Option<String>, Option<String>) {
-        use serde_json::Value;
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RoutingUserInput {
+            model_id: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RoutingCurrentMessage {
+            user_input_message: Option<RoutingUserInput>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RoutingState {
+            conversation_id: Option<String>,
+            current_message: Option<RoutingCurrentMessage>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RoutingEnvelope {
+            conversation_state: Option<RoutingState>,
+        }
 
-        let Ok(json) = serde_json::from_str::<Value>(request_body) else {
+        let Ok(env) = serde_json::from_str::<RoutingEnvelope>(request_body) else {
             return (None, None);
         };
-        let Some(state) = json.get("conversationState") else {
+        let Some(state) = env.conversation_state else {
             return (None, None);
         };
         let model = state
-            .get("currentMessage")
-            .and_then(|m| m.get("userInputMessage"))
-            .and_then(|m| m.get("modelId"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .current_message
+            .and_then(|m| m.user_input_message)
+            .and_then(|u| u.model_id);
         let session = state
-            .get("conversationId")
-            .and_then(|v| v.as_str())
+            .conversation_id
+            .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+            .map(str::to_string);
         (model, session)
     }
 

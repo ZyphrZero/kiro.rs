@@ -112,12 +112,29 @@ impl KiroEndpoint for IdeEndpoint {
 
 /// 将 profile_arn 注入到请求体 JSON 根对象
 pub(super) fn inject_profile_arn(request_body: &str, profile_arn: Option<&str>) -> String {
-    if let Some(arn) = profile_arn {
-        if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
-            json["profileArn"] = serde_json::Value::String(arn.to_string());
-            if let Ok(body) = serde_json::to_string(&json) {
-                return body;
-            }
+    let Some(arn) = profile_arn else {
+        return request_body.to_string();
+    };
+    // Fast path for serialized KiroRequest without an existing profileArn:
+    // avoids deserializing & re-serializing multi-megabyte conversation JSON.
+    let trimmed = request_body.trim();
+    if trimmed.starts_with("{\"conversationState\":")
+        && trimmed.ends_with('}')
+        && !trimmed.contains("\"profileArn\":")
+    {
+        if let Ok(arn_json) = serde_json::to_string(arn) {
+            let mut out = String::with_capacity(trimmed.len() + arn_json.len() + 14);
+            out.push_str(&trimmed[..trimmed.len() - 1]);
+            out.push_str(",\"profileArn\":");
+            out.push_str(&arn_json);
+            out.push('}');
+            return out;
+        }
+    }
+    if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
+        json["profileArn"] = serde_json::Value::String(arn.to_string());
+        if let Ok(body) = serde_json::to_string(&json) {
+            return body;
         }
     }
     request_body.to_string()

@@ -103,7 +103,17 @@ fn client_builder(
     proxy: Option<&ProxyConfig>,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<reqwest::ClientBuilder> {
-    let mut builder = Client::builder();
+    // Keep warm HTTP/2 + TCP tunnels alive across the 5-minute AWS prompt-cache
+    // window so follow-up turns skip repeated SOCKS5 + TLS handshakes.
+    let mut builder = Client::builder()
+        .tcp_nodelay(true)
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .pool_idle_timeout(Some(Duration::from_secs(300)))
+        .pool_max_idle_per_host(8)
+        .http2_keep_alive_interval(Some(Duration::from_secs(20)))
+        .http2_keep_alive_timeout(Duration::from_secs(10))
+        .http2_keep_alive_while_idle(true)
+        .http2_adaptive_window(true);
 
     match tls_backend {
         TlsBackend::Rustls => {
