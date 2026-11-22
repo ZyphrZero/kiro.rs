@@ -14,6 +14,8 @@ import {
   Pin,
   ArrowLeftRight,
   Shuffle,
+  Brain,
+  ShieldAlert,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -45,7 +47,14 @@ import {
   railTextClass,
   type RailTone,
 } from '@/components/console/rail'
-import type { TraceAttempt, TraceQuery, TraceRecord, UsageSource } from '@/types/api'
+import type {
+  ReturnedThinkingMode,
+  ThinkingMatch,
+  TraceAttempt,
+  TraceQuery,
+  TraceRecord,
+  UsageSource,
+} from '@/types/api'
 
 /** 失败分类 → 中文标签 + Badge 颜色 */
 function outcomeStyle(outcome: string): {
@@ -91,7 +100,10 @@ function outcomeDot(outcome: string): string {
 
 /** 整条 trace 的严重度 → 左侧色轨 */
 function traceTone(rec: TraceRecord): RailTone {
+  if (rec.stopReason === 'refusal') return 'dead'
   if (rec.finalStatus === 'success') {
+    // 思考一致性异常（被吞 / 未下发 / 0思考 / 禁用泄出）值得立即关注
+    if (rec.thinkingMatch === 'mismatch') return 'warn'
     // 成功但重试过：请求被救回来了，可池子里有凭据在失败 —— 值得看一眼，但不是故障
     return rec.totalAttempts > 1 ? 'warn' : 'none'
   }
@@ -478,6 +490,280 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
   )
 }
 
+/** 思考字符数紧凑格式化 */
+function formatThinkingChars(chars?: number | null): string {
+  if (chars == null || chars <= 0) return '0字'
+  if (chars < 1000) return `${chars}字`
+  if (chars < 10_000) return `${(chars / 1000).toFixed(1)}k字`
+  return `${Math.round(chars / 1000)}k字`
+}
+
+/** 将 clientEffort / upstreamEffort 缩写成适合列表单元格的紧凑串 */
+function compactThinkingSpec(spec?: string | null): string {
+  if (!spec) return '—'
+  if (spec === 'none') return '关'
+  if (spec === 'disabled') return '禁'
+  if (spec === 'adaptive:default') return 'adaptive'
+  if (spec.startsWith('output_config:')) return spec.slice('output_config:'.length)
+  if (spec.startsWith('reasoning:')) return spec.slice('reasoning:'.length)
+  if (spec.startsWith('prompt:adaptive:')) return `prompt:${spec.slice('prompt:adaptive:'.length)}`
+  if (spec.startsWith('prompt:enabled:')) return `prompt:${spec.slice('prompt:enabled:'.length)}`
+  if (spec.startsWith('adaptive:')) return spec.slice('adaptive:'.length)
+  if (spec.startsWith('enabled:')) return spec.slice('enabled:'.length)
+  if (spec.startsWith('effort:')) return spec.slice('effort:'.length)
+  return spec
+}
+
+function returnedThinkingModeLabel(mode?: ReturnedThinkingMode | null): string {
+  switch (mode) {
+    case 'native':
+      return '原生'
+    case 'redacted':
+      return '加密'
+    case 'tag':
+      return '标签'
+    case 'suppressed':
+      return '被吞'
+    case 'none':
+      return '无思考'
+    default:
+      return '—'
+  }
+}
+
+function thinkingMatchStyle(match?: ThinkingMatch | null): {
+  label: string
+  desc: string
+  cls: string
+} | null {
+  switch (match) {
+    case 'match':
+      return {
+        label: '一致',
+        desc: '传入思考配置、上游实际下发与上游实际返回三段一致',
+        cls: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+      }
+    case 'downgraded':
+      return {
+        label: '改写',
+        desc: '因模型能力或协议限制做了安全降级/改写（如 xhigh→high、max→xhigh 或降级为提示词标签），且上游仍返回了思考',
+        cls: 'border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400',
+      }
+    case 'mismatch':
+      return {
+        label: '异常',
+        desc: '思考配置与返回不一致（请求思考但未下发 / 返回 0 字 / 被网关吞掉，或显式禁用却仍下发/返回思考）',
+        cls: 'border-destructive/40 bg-destructive/10 text-destructive',
+      }
+    default:
+      return null
+  }
+}
+
+function ThinkingMatchBadge({ match }: { match?: ThinkingMatch | null }) {
+  const style = thinkingMatchStyle(match)
+  if (!style) return null
+  return (
+    <span
+      title={style.desc}
+      className={`inline-flex shrink-0 items-center rounded border px-1 py-px text-[10px] font-medium leading-tight ${style.cls}`}
+    >
+      {style.label}
+    </span>
+  )
+}
+
+function StopReasonBadge({ reason }: { reason?: string | null }) {
+  if (!reason) return <span className="text-muted-foreground/50">—</span>
+  if (reason === 'refusal') {
+    return (
+      <Badge variant="destructive" className="h-5 px-1.5 text-[10px]" title="上游内容过滤拦截拒答（CONTENT_FILTERED）">
+        拒答
+      </Badge>
+    )
+  }
+  if (reason === 'max_tokens' || reason === 'model_context_window_exceeded') {
+    return (
+      <Badge variant="warning" className="h-5 px-1.5 text-[10px] font-mono">
+        {reason}
+      </Badge>
+    )
+  }
+  return (
+    <Badge variant="outline" className="h-5 px-1.5 text-[10px] font-mono text-muted-foreground">
+      {reason}
+    </Badge>
+  )
+}
+
+/**
+ * 思考回传与一致性单元格（两行）：
+ * - 第一行：[一致/改写/异常] 传入 → 下发
+ * - 第二行：上游实际返回形式与字数（原生 1.4k字 / 被吞 820字 / 无思考）
+ */
+function ThinkingCell({ rec }: { rec: TraceRecord }) {
+  if (!rec.clientEffort && !rec.upstreamEffort && !rec.returnedThinkingMode) {
+    return <span className="text-muted-foreground/50">—</span>
+  }
+  const clientRaw = rec.clientEffort ?? '—'
+  const upstreamRaw = rec.upstreamEffort ?? '—'
+  const mode = rec.returnedThinkingMode ?? 'none'
+  const chars = rec.returnedThinkingChars ?? 0
+  const matchInfo = thinkingMatchStyle(rec.thinkingMatch)
+
+  const isPlainOff =
+    clientRaw === 'none' &&
+    upstreamRaw === 'none' &&
+    mode === 'none' &&
+    chars === 0 &&
+    rec.thinkingMatch !== 'mismatch'
+
+  const titleLines = [
+    `客户端请求: ${clientRaw}`,
+    `实际下发上游: ${upstreamRaw}`,
+    `上游实际返回: ${returnedThinkingModeLabel(rec.returnedThinkingMode)} (${formatTokenFull(chars)} 字符)`,
+    matchInfo ? `一致性判定: ${matchInfo.label} — ${matchInfo.desc}` : '一致性判定: 无（非成功请求或老记录）',
+    rec.stopReason ? `终止原因: ${rec.stopReason}` : null,
+  ].filter(Boolean)
+
+  if (isPlainOff) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 text-[11px] text-muted-foreground/70 cursor-default"
+        title={titleLines.join('\n')}
+      >
+        <span>无</span>
+        {rec.stopReason === 'refusal' && <StopReasonBadge reason={rec.stopReason} />}
+      </span>
+    )
+  }
+
+  const returnedCls =
+    mode === 'suppressed'
+      ? 'text-destructive font-medium'
+      : mode === 'none' && rec.thinkingMatch === 'mismatch'
+        ? 'text-destructive'
+        : chars > 0
+          ? 'text-violet-600 dark:text-violet-400'
+          : 'text-muted-foreground/70'
+
+  const returnedText =
+    mode === 'none'
+      ? '无思考'
+      : `${returnedThinkingModeLabel(rec.returnedThinkingMode)} ${formatThinkingChars(chars)}`
+
+  return (
+    <span
+      className="inline-flex flex-col text-[11px] leading-tight cursor-default"
+      title={titleLines.join('\n')}
+    >
+      <span className="inline-flex items-center gap-1 whitespace-nowrap">
+        <ThinkingMatchBadge match={rec.thinkingMatch} />
+        <span className="font-mono text-foreground">
+          {compactThinkingSpec(clientRaw)}
+          <span className="text-muted-foreground/60">→</span>
+          {compactThinkingSpec(upstreamRaw)}
+        </span>
+      </span>
+      <span className={`inline-flex items-center gap-1 whitespace-nowrap text-[10px] ${returnedCls}`}>
+        <span>{returnedText}</span>
+        {rec.stopReason === 'refusal' && (
+          <span className="rounded bg-destructive/15 px-1 text-[9px] font-medium text-destructive">
+            拒答
+          </span>
+        )}
+      </span>
+    </span>
+  )
+}
+
+/** 展开详情里的思考强度三段式核对面板 */
+function ThinkingDetailPanel({ rec }: { rec: TraceRecord }) {
+  if (!rec.clientEffort && !rec.upstreamEffort && !rec.returnedThinkingMode && !rec.stopReason) {
+    return null
+  }
+  const matchInfo = thinkingMatchStyle(rec.thinkingMatch)
+  const chars = rec.returnedThinkingChars ?? 0
+  const mode = rec.returnedThinkingMode
+
+  return (
+    <div className="rounded-lg border border-border/60 bg-card/60 p-3.5 space-y-2.5">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/40 pb-2">
+        <div className="flex items-center gap-2">
+          <Brain className="h-3.5 w-3.5 text-violet-500" />
+          <span className="text-[13px] font-semibold tracking-tight">思考强度与回传核对</span>
+          <ThinkingMatchBadge match={rec.thinkingMatch} />
+          {rec.stopReason && <StopReasonBadge reason={rec.stopReason} />}
+        </div>
+        {matchInfo && (
+          <span className="text-[11px] text-muted-foreground">{matchInfo.desc}</span>
+        )}
+      </div>
+
+      <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
+        <div className="rounded-md bg-secondary/40 p-2">
+          <div className="text-[11px] text-muted-foreground">① 客户端传入</div>
+          <div className="font-mono text-[13px] font-semibold text-foreground break-all">
+            {rec.clientEffort ?? '—'}
+          </div>
+          <div className="text-[10px] text-muted-foreground/80">规范化前的原始配置</div>
+        </div>
+
+        <div className="rounded-md bg-secondary/40 p-2">
+          <div className="text-[11px] text-muted-foreground">② 实际下发上游</div>
+          <div className="font-mono text-[13px] font-semibold text-foreground break-all">
+            {rec.upstreamEffort ?? '—'}
+          </div>
+          <div className="text-[10px] text-muted-foreground/80">wire 字段或提示词标签</div>
+        </div>
+
+        <div
+          className={`rounded-md p-2 ${
+            mode === 'suppressed'
+              ? 'bg-destructive/10 border border-destructive/25'
+              : chars > 0
+                ? 'bg-violet-500/10 border border-violet-500/20'
+                : 'bg-secondary/40'
+          }`}
+        >
+          <div className="text-[11px] text-muted-foreground">③ 上游实际返回</div>
+          <div className="font-mono text-[13px] font-semibold text-foreground">
+            {returnedThinkingModeLabel(mode)}{' '}
+            <span className="tabular-nums text-[12px] text-muted-foreground">
+              ({formatTokenFull(chars)} 字)
+            </span>
+          </div>
+          <div className="text-[10px] text-muted-foreground/80">
+            {mode === 'suppressed'
+              ? '上游有思考但因协议约束被网关吞掉'
+              : mode === 'native'
+                ? '上游原生 reasoningContentEvent'
+                : mode === 'redacted'
+                  ? '上游加密 redacted_thinking'
+                  : mode === 'tag'
+                    ? '文本 <thinking> 标签提取'
+                    : '未收到思考内容'}
+          </div>
+        </div>
+
+        <div className="rounded-md bg-secondary/40 p-2">
+          <div className="text-[11px] text-muted-foreground">终止原因 (stop_reason)</div>
+          <div className="mt-0.5 font-mono text-[13px] font-semibold text-foreground">
+            {rec.stopReason ?? '—'}
+          </div>
+          <div className="text-[10px] text-muted-foreground/80">
+            {rec.stopReason === 'refusal'
+              ? '上游内容过滤拒答'
+              : rec.stopReason
+                ? 'Anthropic 响应终止状态'
+                : '非成功请求或老记录'}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 /**
  * 耗时单元格，两行：`首字 {首 token 耗时}` / `总耗时 {端到端耗时}`。
  * 非流式没有首 token，首字行显示 `—` 但保留两行结构，避免相邻行错位。
@@ -795,6 +1081,9 @@ function TraceExpandedDetail({
       {/* 核心：Token 与缓存构成面板 */}
       <TokenAndCachePanel rec={rec} />
 
+      {/* 思考强度三段式核对面板 */}
+      <ThinkingDetailPanel rec={rec} />
+
       {/* 报错信息（若存在） */}
       {rec.errorMessage && (
         <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-[12.5px] text-destructive flex items-start gap-2">
@@ -866,6 +1155,8 @@ const URL_DEFAULTS = {
   q: '',
   session: '',
   switched: '',
+  thinkingMismatch: '',
+  refusal: '',
   ip: '',
   range: DEFAULT_RANGE_MINUTES,
   page: '0',
@@ -933,6 +1224,12 @@ function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
             )}
           </span>
         ),
+      },
+      {
+        id: 'thinking',
+        header: '思考',
+        hint: '传入思考强度 → 实际下发上游，以及上游实际返回形式/字数与一致性核对（一致 / 改写 / 异常）',
+        cell: (r) => <ThinkingCell rec={r} />,
       },
       {
         id: 'status',
@@ -1031,6 +1328,13 @@ function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
         cell: (r) => <UsageSourceBadge source={r.usageSource} /> ,
       },
       {
+        id: 'stopReason',
+        header: '终止原因',
+        optional: true,
+        hint: '最终 stop_reason（end_turn / tool_use / refusal / max_tokens 等）',
+        cell: (r) => <StopReasonBadge reason={r.stopReason} />,
+      },
+      {
         id: 'traceId',
         header: 'Trace ID',
         optional: true,
@@ -1098,6 +1402,8 @@ export function TraceLogPage() {
     q: url.q || undefined,
     sessionId: url.session || undefined,
     onlySwitched: url.switched === '1' || undefined,
+    onlyThinkingMismatch: url.thinkingMismatch === '1' || undefined,
+    onlyRefusal: url.refusal === '1' || undefined,
     clientIp: url.ip || undefined,
     startTime: url.session ? undefined : startTime,
     limit: PAGE_SIZE,
@@ -1119,6 +1425,8 @@ export function TraceLogPage() {
     url.q,
     url.session,
     url.switched,
+    url.thinkingMismatch,
+    url.refusal,
     url.ip,
   ].filter(Boolean).length
 
@@ -1219,6 +1527,28 @@ export function TraceLogPage() {
         >
           <ArrowLeftRight className="h-3.5 w-3.5" />
           仅换号
+        </Button>
+        <Button
+          size="sm"
+          variant={url.thinkingMismatch === '1' ? 'default' : 'outline'}
+          onClick={() =>
+            patchUrl({ thinkingMismatch: url.thinkingMismatch === '1' ? '' : '1', page: '0' })
+          }
+          title="只看思考强度不一致、被降级/改写、返回 0 字思考或思考被网关吞掉的请求"
+          className="gap-1.5"
+        >
+          <Brain className="h-3.5 w-3.5" />
+          思考异常
+        </Button>
+        <Button
+          size="sm"
+          variant={url.refusal === '1' ? 'default' : 'outline'}
+          onClick={() => patchUrl({ refusal: url.refusal === '1' ? '' : '1', page: '0' })}
+          title="只看上游内容过滤拒答（stop_reason = refusal）的请求"
+          className="gap-1.5"
+        >
+          <ShieldAlert className="h-3.5 w-3.5" />
+          仅拒答
         </Button>
         {url.session && (
           <span className="inline-flex h-8 items-center gap-1.5 rounded-md border border-primary/40 bg-primary/10 pl-2.5 pr-1.5 text-xs">

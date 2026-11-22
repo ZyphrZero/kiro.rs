@@ -141,6 +141,14 @@ pub(crate) struct RequestTracer {
     /// 首次选号的路由决策。web_search 一条 trace 内多次 provider 调用，
     /// 「是否沿用了上一轮账号」只看第一次。
     route: parking_lot::Mutex<Option<TraceRoute>>,
+    /// 客户端原始思考配置（规范化前）
+    client_effort: parking_lot::Mutex<Option<String>>,
+    /// 实际发给上游的思考控制
+    upstream_effort: parking_lot::Mutex<Option<String>>,
+    /// 上游实际返回的思考形式与字符数
+    returned_thinking: parking_lot::Mutex<Option<(&'static str, u64)>>,
+    /// 最终终止原因（end_turn / tool_use / refusal / max_tokens 等）
+    stop_reason: parking_lot::Mutex<Option<String>>,
     /// 是否已落库。[`finalize`](Self::finalize) 首次进入即置位，保证同一条 trace
     /// 只写一行；[`Drop`] 兜底时据此判断「本请求从未正常收尾」。
     finalized: std::sync::atomic::AtomicBool,
@@ -207,6 +215,7 @@ struct RequestTraceOptions {
     key_ctx: KeyContext,
     model: String,
     is_stream: bool,
+    started_at: Instant,
 }
 
 impl RequestTracer {
@@ -220,13 +229,46 @@ impl RequestTracer {
             client_ip: options.key_ctx.client_ip,
             model: options.model,
             is_stream: options.is_stream,
-            started_at: Instant::now(),
+            started_at: options.started_at,
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            client_effort: parking_lot::Mutex::new(None),
+            upstream_effort: parking_lot::Mutex::new(None),
+            returned_thinking: parking_lot::Mutex::new(None),
+            stop_reason: parking_lot::Mutex::new(None),
             finalized: std::sync::atomic::AtomicBool::new(false),
             upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// 记录客户端原始思考配置与实际下发给上游的思考控制。
+    pub(crate) fn set_thinking_request(&self, client: String, upstream: String) {
+        *self.client_effort.lock() = Some(client);
+        *self.upstream_effort.lock() = Some(upstream);
+    }
+
+    /// 仅记录客户端原始思考配置（用于 web_search 多轮循环在首轮转换前设置）。
+    pub(crate) fn set_client_effort(&self, client: String) {
+        *self.client_effort.lock() = Some(client);
+    }
+
+    /// 仅在尚未设置时记录实际下发给上游的思考控制（多轮循环取首轮）。
+    pub(crate) fn set_upstream_effort_if_unset(&self, upstream: String) {
+        let mut slot = self.upstream_effort.lock();
+        if slot.is_none() {
+            *slot = Some(upstream);
+        }
+    }
+
+    /// 记录上游实际返回的思考形式与字符数。
+    pub(crate) fn set_returned_thinking(&self, mode: &'static str, chars: u64) {
+        *self.returned_thinking.lock() = Some((mode, chars));
+    }
+
+    /// 记录最终终止原因（stop_reason）。
+    pub(crate) fn set_stop_reason(&self, reason: impl Into<String>) {
+        *self.stop_reason.lock() = Some(reason.into());
     }
 
     /// 标记 provider 已成功返回响应头。应在取得 `reqwest::Response` 后立刻调用，
@@ -310,6 +352,25 @@ impl RequestTracer {
             .lock()
             .map(|t| t.duration_since(self.started_at).as_millis() as u64);
         let route = self.route.lock().take();
+        let client_effort = self.client_effort.lock().clone();
+        let upstream_effort = self.upstream_effort.lock().clone();
+        let (returned_thinking_mode, returned_thinking_chars) = match *self.returned_thinking.lock() {
+            Some((mode, chars)) => (Some(mode.to_string()), Some(chars)),
+            None if final_status == "success" => (
+                Some(crate::admin::trace_db::returned_thinking_mode::NONE.to_string()),
+                Some(0),
+            ),
+            None => (None, None),
+        };
+        let thinking_match = super::converter::compute_thinking_match(
+            client_effort.as_deref(),
+            upstream_effort.as_deref(),
+            returned_thinking_mode.as_deref(),
+            returned_thinking_chars.unwrap_or(0),
+            final_status,
+        )
+        .map(|s| s.to_string());
+        let stop_reason = self.stop_reason.lock().clone();
         let rec = TraceRecord {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
@@ -335,6 +396,12 @@ impl RequestTracer {
             previous_credential_id: route.as_ref().and_then(|r| r.previous_credential_id),
             usage_source: usage.source.as_db().map(|s| s.to_string()),
             client_ip: self.client_ip.clone(),
+            client_effort,
+            upstream_effort,
+            returned_thinking_mode,
+            returned_thinking_chars,
+            thinking_match,
+            stop_reason,
             attempts,
         };
         store.insert(&rec);
@@ -911,6 +978,8 @@ pub async fn post_messages(
     Extension(key_ctx): Extension<KeyContext>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let request_started = Instant::now();
+    let client_effort = super::converter::describe_client_effort(&payload);
     let state = state.snapshot_tool_compatibility_mode();
     // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
     let img_stats = count_image_budget(&payload);
@@ -1025,8 +1094,10 @@ pub async fn post_messages(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: payload_stream,
+                started_at: request_started,
             },
         ));
+        tracer.set_client_effort(client_effort);
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
@@ -1090,6 +1161,7 @@ pub async fn post_messages(
         &conversion_result.conversation_state,
         &conversion_result.known_tool_names,
     );
+    let upstream_thinking = conversion_result.upstream_thinking;
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
@@ -1148,16 +1220,19 @@ pub async fn post_messages(
         None => super::cache_metering::CacheUsage::default(),
     };
 
+    let tracer = std::sync::Arc::new(RequestTracer::new(
+        &state,
+        RequestTraceOptions {
+            key_ctx: key_ctx.clone(),
+            model: payload.model.clone(),
+            is_stream: payload.stream,
+            started_at: request_started,
+        },
+    ));
+    tracer.set_thinking_request(client_effort, upstream_thinking);
+
     if payload.stream {
         // 流式响应
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
-                is_stream: true,
-            },
-        ));
         handle_stream_request(
             provider,
             &request_body,
@@ -1182,14 +1257,6 @@ pub async fn post_messages(
         // explicitly opted into it via `thinking`/`output_config`.
         let extract_thinking =
             (state.extract_thinking || payload.output_config.is_some()) && thinking_enabled;
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
-                is_stream: false,
-            },
-        ));
         handle_non_stream_request(
             provider,
             &request_body,
@@ -1566,6 +1633,9 @@ impl StreamSettlement {
     fn update(&mut self, ctx: &StreamContext, sent_bytes: u64) {
         self.usage = stream_trace_usage(ctx);
         self.sent_bytes = sent_bytes;
+        let (mode, chars) = ctx.returned_thinking();
+        self.tracer.set_returned_thinking(mode, chars);
+        self.tracer.set_stop_reason(ctx.final_stop_reason());
     }
 
     fn finish(
@@ -1653,6 +1723,7 @@ pub(crate) fn new_non_stream_request_tracer(
             key_ctx,
             model,
             is_stream: false,
+            started_at: Instant::now(),
         },
     ))
 }
@@ -2206,6 +2277,12 @@ pub(crate) async fn execute_non_stream_request(
     // 剥离混入文本的字面 <tool_use> XML 泄漏（非流式：整段文本已就绪，一次性剥离）。
     let text_content = crate::kiro::model::events::strip_tool_use_xml_leaks(&text_content);
 
+    let native_thinking_chars = native_thinking.chars().count() as u64;
+    let native_redacted_chars: u64 = native_redacted_thinking
+        .iter()
+        .map(|s| s.chars().count() as u64)
+        .sum();
+
     // 构建响应内容
     let mut content = build_non_stream_content(
         thinking_enabled,
@@ -2214,6 +2291,38 @@ pub(crate) async fn execute_non_stream_request(
         native_thinking_signature,
         native_redacted_thinking,
     );
+    let (returned_thinking_mode, returned_thinking_chars) = {
+        use crate::admin::trace_db::returned_thinking_mode as rtm;
+        if thinking_enabled {
+            if native_thinking_chars > 0 {
+                (rtm::NATIVE, native_thinking_chars + native_redacted_chars)
+            } else if native_redacted_chars > 0 {
+                let tag_chars: u64 = content
+                    .iter()
+                    .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("thinking"))
+                    .filter_map(|b| b.get("thinking").and_then(|v| v.as_str()))
+                    .map(|s| s.chars().count() as u64)
+                    .sum();
+                (rtm::REDACTED, native_redacted_chars + tag_chars)
+            } else {
+                let tag_chars: u64 = content
+                    .iter()
+                    .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("thinking"))
+                    .filter_map(|b| b.get("thinking").and_then(|v| v.as_str()))
+                    .map(|s| s.chars().count() as u64)
+                    .sum();
+                if tag_chars > 0 {
+                    (rtm::TAG, tag_chars)
+                } else {
+                    (rtm::NONE, 0)
+                }
+            }
+        } else if native_thinking_chars > 0 || native_redacted_chars > 0 {
+            (rtm::SUPPRESSED, native_thinking_chars + native_redacted_chars)
+        } else {
+            (rtm::NONE, 0)
+        }
+    };
     content.extend(tool_uses);
 
     // provider 未下发 metadataEvent 时才使用本地输出估算。
@@ -2261,6 +2370,8 @@ pub(crate) async fn execute_non_stream_request(
         credits,
         "success",
     );
+    tracer.set_returned_thinking(returned_thinking_mode, returned_thinking_chars);
+    tracer.set_stop_reason(&stop_reason);
     tracer.finalize(
         "success",
         None,
@@ -2445,6 +2556,8 @@ pub async fn post_messages_cc(
     Extension(key_ctx): Extension<KeyContext>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let request_started = Instant::now();
+    let client_effort = super::converter::describe_client_effort(&payload);
     let state = state.snapshot_tool_compatibility_mode();
     tracing::info!(
         model = %payload.model,
@@ -2543,8 +2656,10 @@ pub async fn post_messages_cc(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: payload_stream,
+                started_at: request_started,
             },
         ));
+        tracer.set_client_effort(client_effort);
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
@@ -2608,6 +2723,7 @@ pub async fn post_messages_cc(
         &conversion_result.conversation_state,
         &conversion_result.known_tool_names,
     );
+    let upstream_thinking = conversion_result.upstream_thinking;
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
@@ -2665,16 +2781,19 @@ pub async fn post_messages_cc(
         None => super::cache_metering::CacheUsage::default(),
     };
 
+    let tracer = std::sync::Arc::new(RequestTracer::new(
+        &state,
+        RequestTraceOptions {
+            key_ctx: key_ctx.clone(),
+            model: payload.model.clone(),
+            is_stream: payload.stream,
+            started_at: request_started,
+        },
+    ));
+    tracer.set_thinking_request(client_effort, upstream_thinking);
+
     if payload.stream {
         // Stream content immediately; final usage arrives in message_delta.
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
-                is_stream: true,
-            },
-        ));
         handle_cc_stream_request(
             provider,
             &request_body,
@@ -2696,14 +2815,6 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = (state.extract_thinking || payload.output_config.is_some()) && thinking_enabled;
-        let tracer = std::sync::Arc::new(RequestTracer::new(
-            &state,
-            RequestTraceOptions {
-                key_ctx: key_ctx.clone(),
-                model: payload.model.clone(),
-                is_stream: false,
-            },
-        ));
         handle_non_stream_request(
             provider,
             &request_body,
@@ -2947,6 +3058,7 @@ mod tests {
                 },
                 model: "test-model".to_string(),
                 is_stream: true,
+                started_at: Instant::now(),
             },
         ));
         let mut ctx = StreamContext::new_with_thinking(
@@ -2994,6 +3106,7 @@ mod tests {
                 },
                 model: "test-model".to_string(),
                 is_stream: true,
+                started_at: Instant::now(),
             },
         ));
         let mut ctx = StreamContext::new_with_thinking(
@@ -3046,6 +3159,10 @@ mod tests {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            client_effort: parking_lot::Mutex::new(None),
+            upstream_effort: parking_lot::Mutex::new(None),
+            returned_thinking: parking_lot::Mutex::new(None),
+            stop_reason: parking_lot::Mutex::new(None),
             finalized: std::sync::atomic::AtomicBool::new(false),
             upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         };
@@ -3119,6 +3236,10 @@ mod tests {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            client_effort: parking_lot::Mutex::new(None),
+            upstream_effort: parking_lot::Mutex::new(None),
+            returned_thinking: parking_lot::Mutex::new(None),
+            stop_reason: parking_lot::Mutex::new(None),
             finalized: std::sync::atomic::AtomicBool::new(false),
             upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         };
@@ -3153,6 +3274,10 @@ mod tests {
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
             route: parking_lot::Mutex::new(None),
+            client_effort: parking_lot::Mutex::new(None),
+            upstream_effort: parking_lot::Mutex::new(None),
+            returned_thinking: parking_lot::Mutex::new(None),
+            stop_reason: parking_lot::Mutex::new(None),
             finalized: std::sync::atomic::AtomicBool::new(false),
             upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
         };
@@ -3209,6 +3334,10 @@ mod tests {
                 attempts: parking_lot::Mutex::new(Vec::new()),
                 client_ip: None,
                 route: parking_lot::Mutex::new(None),
+                client_effort: parking_lot::Mutex::new(None),
+                upstream_effort: parking_lot::Mutex::new(None),
+                returned_thinking: parking_lot::Mutex::new(None),
+                stop_reason: parking_lot::Mutex::new(None),
                 finalized: std::sync::atomic::AtomicBool::new(false),
                 upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
             };
@@ -3252,6 +3381,10 @@ mod tests {
                 attempts: parking_lot::Mutex::new(Vec::new()),
                 client_ip: None,
                 route: parking_lot::Mutex::new(None),
+                client_effort: parking_lot::Mutex::new(None),
+                upstream_effort: parking_lot::Mutex::new(None),
+                returned_thinking: parking_lot::Mutex::new(None),
+                stop_reason: parking_lot::Mutex::new(None),
                 finalized: std::sync::atomic::AtomicBool::new(false),
                 upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
             };
@@ -3292,6 +3425,10 @@ mod tests {
                 attempts: parking_lot::Mutex::new(Vec::new()),
                 client_ip: None,
                 route: parking_lot::Mutex::new(None),
+                client_effort: parking_lot::Mutex::new(None),
+                upstream_effort: parking_lot::Mutex::new(None),
+                returned_thinking: parking_lot::Mutex::new(None),
+                stop_reason: parking_lot::Mutex::new(None),
                 finalized: std::sync::atomic::AtomicBool::new(false),
                 upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
             };
@@ -3326,6 +3463,10 @@ mod tests {
                 first_token_at: parking_lot::Mutex::new(None),
                 attempts: parking_lot::Mutex::new(Vec::new()),
                 route: parking_lot::Mutex::new(None),
+                client_effort: parking_lot::Mutex::new(None),
+                upstream_effort: parking_lot::Mutex::new(None),
+                returned_thinking: parking_lot::Mutex::new(None),
+                stop_reason: parking_lot::Mutex::new(None),
                 finalized: std::sync::atomic::AtomicBool::new(false),
                 upstream_headers_received: std::sync::atomic::AtomicBool::new(false),
             };
@@ -3333,6 +3474,57 @@ mod tests {
         }
         let (_, total) = store.query_paged(&TraceQuery { limit: 10, ..Default::default() });
         assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn tracer_persists_thinking_consistency_and_stop_reason() {
+        use crate::admin::trace_db::{
+            TraceQuery, TraceStore, returned_thinking_mode as rtm, thinking_match as tm,
+        };
+
+        let store = std::sync::Arc::new(TraceStore::open_in_memory().unwrap());
+        {
+            let tracer = RequestTracer {
+                store: Some(store.clone()),
+                trace_id: "thinking-trace".to_string(),
+                ts: Utc::now().to_rfc3339(),
+                key_id: 1,
+                key_source: TraceKeySource::ClientKey,
+                client_ip: None,
+                model: "claude-opus-4-6".to_string(),
+                is_stream: true,
+                started_at: Instant::now(),
+                first_token_at: parking_lot::Mutex::new(None),
+                attempts: parking_lot::Mutex::new(Vec::new()),
+                route: parking_lot::Mutex::new(None),
+                client_effort: parking_lot::Mutex::new(None),
+                upstream_effort: parking_lot::Mutex::new(None),
+                returned_thinking: parking_lot::Mutex::new(None),
+                stop_reason: parking_lot::Mutex::new(None),
+                finalized: std::sync::atomic::AtomicBool::new(false),
+                upstream_headers_received: std::sync::atomic::AtomicBool::new(true),
+            };
+            tracer.set_thinking_request(
+                "adaptive:xhigh".to_string(),
+                "output_config:high".to_string(),
+            );
+            tracer.set_returned_thinking(rtm::NATIVE, 650);
+            tracer.set_stop_reason("end_turn");
+            tracer.finalize("success", None, None, None, TraceUsage::zero());
+        }
+
+        let (records, total) = store.query_paged(&TraceQuery {
+            only_thinking_mismatch: true,
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1);
+        assert_eq!(records[0].client_effort.as_deref(), Some("adaptive:xhigh"));
+        assert_eq!(records[0].upstream_effort.as_deref(), Some("output_config:high"));
+        assert_eq!(records[0].returned_thinking_mode.as_deref(), Some(rtm::NATIVE));
+        assert_eq!(records[0].returned_thinking_chars, Some(650));
+        assert_eq!(records[0].thinking_match.as_deref(), Some(tm::DOWNGRADED));
+        assert_eq!(records[0].stop_reason.as_deref(), Some("end_turn"));
     }
 
     #[test]

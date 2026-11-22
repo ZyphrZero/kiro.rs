@@ -284,6 +284,7 @@ async fn run_attempt(
         }
     };
 
+    let client_effort = super::super::converter::describe_client_effort(&anthropic_req);
     let conversion = convert_request_with_purpose(
         &anthropic_req,
         state.tool_compatibility_mode,
@@ -296,6 +297,7 @@ async fn run_attempt(
             &error.to_string(),
         ))
     })?;
+    let upstream_thinking = conversion.upstream_thinking;
     let kiro_request = KiroRequest {
         conversation_state: conversion.conversation_state,
         profile_arn: None,
@@ -326,6 +328,7 @@ async fn run_attempt(
         None => super::super::cache_metering::CacheUsage::default(),
     };
     let tracer = new_non_stream_request_tracer(&state, key_ctx.clone(), model.to_string());
+    tracer.set_thinking_request(client_effort, upstream_thinking);
     let (anthropic, _credential_id) = execute_non_stream_request(
         provider,
         &request_body,
