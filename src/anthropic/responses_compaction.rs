@@ -310,11 +310,11 @@ async fn run_attempt(
     })?;
     tracing::debug!("Kiro compaction request body: {}", request_body);
 
-    let input_tokens = token::count_all_tokens(
-        anthropic_req.model.clone(),
-        anthropic_req.system.clone(),
-        anthropic_req.messages.clone(),
-        anthropic_req.tools.clone(),
+    let input_tokens = token::count_all_tokens_ref(
+        &anthropic_req.model,
+        anthropic_req.system.as_deref(),
+        &anthropic_req.messages,
+        anthropic_req.tools.as_deref(),
     ) as i32;
     let mut hook = UsageRecordHook::from_state(&state, key_ctx.key_id, model.to_string());
     hook.count_call = false;

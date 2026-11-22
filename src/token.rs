@@ -102,22 +102,30 @@ pub fn count_tokens(text: &str) -> u64 {
     acc_token
 }
 
-/// 估算请求的输入 tokens
+/// 估算请求的输入 tokens（借用版本，本地计算零深拷贝）
 ///
 /// 优先调用远程 API，失败时回退到本地计算
-pub(crate) fn count_all_tokens(
-    model: String,
-    system: Option<Vec<SystemMessage>>,
-    messages: Vec<Message>,
-    tools: Option<Vec<Tool>>,
+pub(crate) fn count_all_tokens_ref(
+    model: &str,
+    system: Option<&[SystemMessage]>,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
 ) -> u64 {
     // 检查是否配置了远程 API
     if let Some(config) = get_config() {
         if let Some(api_url) = &config.api_url {
+            let sys_owned = system.map(|s| s.to_vec());
+            let msgs_owned = messages.to_vec();
+            let tools_owned = tools.map(|t| t.to_vec());
             // 尝试调用远程 API
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(call_remote_count_tokens(
-                    api_url, config, model, &system, &messages, &tools,
+                    api_url,
+                    config,
+                    model.to_string(),
+                    &sys_owned,
+                    &msgs_owned,
+                    &tools_owned,
                 ))
             });
 
@@ -133,8 +141,20 @@ pub(crate) fn count_all_tokens(
         }
     }
 
-    // 本地计算
-    count_all_tokens_local(system, messages, tools)
+    // 本地计算（零深拷贝）
+    count_all_tokens_local_ref(system, messages, tools)
+}
+
+/// 估算请求的输入 tokens
+///
+/// 优先调用远程 API，失败时回退到本地计算
+pub(crate) fn count_all_tokens(
+    model: String,
+    system: Option<Vec<SystemMessage>>,
+    messages: Vec<Message>,
+    tools: Option<Vec<Tool>>,
+) -> u64 {
+    count_all_tokens_ref(&model, system.as_deref(), &messages, tools.as_deref())
 }
 
 /// 调用远程 count_tokens API
@@ -218,22 +238,22 @@ fn count_content_block_tokens(item: &serde_json::Value) -> u64 {
     }
 }
 
-fn count_all_tokens_local(
-    system: Option<Vec<SystemMessage>>,
-    messages: Vec<Message>,
-    tools: Option<Vec<Tool>>,
+fn count_all_tokens_local_ref(
+    system: Option<&[SystemMessage]>,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
 ) -> u64 {
     let mut total = 0;
 
     // 系统消息
-    if let Some(ref system) = system {
+    if let Some(system) = system {
         for msg in system {
             total += count_tokens(&msg.text);
         }
     }
 
     // 用户消息
-    for msg in &messages {
+    for msg in messages {
         if let serde_json::Value::String(s) = &msg.content {
             total += count_tokens(s);
         } else if let serde_json::Value::Array(arr) = &msg.content {
@@ -244,7 +264,7 @@ fn count_all_tokens_local(
     }
 
     // 工具定义
-    if let Some(ref tools) = tools {
+    if let Some(tools) = tools {
         for tool in tools {
             total += count_tokens(&tool.name);
             total += count_tokens(&tool.description);
@@ -254,6 +274,15 @@ fn count_all_tokens_local(
     }
 
     total.max(1)
+}
+
+#[cfg(test)]
+fn count_all_tokens_local(
+    system: Option<Vec<SystemMessage>>,
+    messages: Vec<Message>,
+    tools: Option<Vec<Tool>>,
+) -> u64 {
+    count_all_tokens_local_ref(system.as_deref(), &messages, tools.as_deref())
 }
 
 /// 估算输出 tokens
