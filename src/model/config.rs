@@ -403,6 +403,10 @@ pub struct Config {
     #[serde(default = "default_trace_enabled")]
     pub trace_enabled: bool,
 
+    /// 采集上游用量并启用独立的账号成本账本。
+    #[serde(default)]
+    pub cost_tracking_enabled: bool,
+
     /// 请求链路追踪记录保留天数（默认 7）。后台任务每天清理超期记录。
     #[serde(default = "default_trace_retention_days")]
     pub trace_retention_days: u32,
@@ -631,6 +635,7 @@ impl Default for Config {
             cache_metering_flush_interval_secs: None,
             cache_metering_miss_diagnostics: None,
             trace_enabled: default_trace_enabled(),
+            cost_tracking_enabled: false,
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             endpoints: HashMap::new(),

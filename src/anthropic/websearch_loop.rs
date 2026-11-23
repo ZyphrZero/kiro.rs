@@ -269,12 +269,13 @@ fn empty_tool_result_disposition(
 /// Buffer-decode one round of the upstream streaming response
 async fn decode_round(
     response: reqwest::Response,
+    cost_meter: Option<crate::admin::costs::CallMeter>,
     model: &str,
     tool_name_map: &std::collections::HashMap<String, String>,
     tracer: &RequestTracer,
 ) -> RoundOutcome {
     let mut body_stream = response.bytes_stream();
-    let mut decoder = EventStreamDecoder::new();
+    let mut decoder = EventStreamDecoder::new().with_cost_meter(cost_meter);
 
     let mut text = String::new();
     let mut thinking = String::new();
@@ -391,6 +392,8 @@ async fn decode_round(
             }
         }
     }
+
+    decoder.finish_cost(stream_error.is_none()).await;
 
     if !is_refusal(&stop_reason_override) {
         match native_stop_reason.as_deref() {
@@ -567,6 +570,7 @@ async fn run_round(
     let _in_flight = call_result._in_flight;
     let mut outcome = decode_round(
         call_result.response,
+        call_result.cost_meter,
         &payload.model,
         &conversion.tool_name_map,
         tracer,

@@ -17,7 +17,7 @@ axum = "0.8"
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "socks", "rustls-tls-webpki-roots", "rustls-tls-native-roots", "http2", "system-proxy", "charset"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
@@ -49,6 +49,7 @@ tar = "0.4"         # tar 解析（在线更新）
 zip = { version = "2", default-features = false, features = ["deflate"] }  # zip 解压（Windows 在线更新）
 rusqlite = { version = "0.32", features = ["bundled"] }  # 请求链路追踪持久化（自带 SQLite 源码）
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
+rust_decimal = { version = "1.43.0", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # 时间调度测试用虚拟时钟（#[tokio::test(start_paused = true)]）；

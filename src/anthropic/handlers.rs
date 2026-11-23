@@ -379,6 +379,8 @@ impl Drop for RequestTracer {
 }
 
 impl TraceSink for RequestTracer {
+    fn request_id(&self) -> Option<&str> { Some(&self.trace_id) }
+
     fn on_attempt(&self, mut attempt: TraceAttempt) {
         let mut attempts = self.attempts.lock();
         // Each provider call numbers retries from zero. A web-search request can make
@@ -1257,9 +1259,7 @@ async fn handle_stream_request(
         }
     };
     tracer.mark_upstream_headers_received();
-    let response = call_result.response;
     let credential_id = call_result.credential_id;
-    let in_flight = call_result._in_flight;
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(
@@ -1277,14 +1277,12 @@ async fn handle_stream_request(
 
     // 创建 SSE 流
     let stream = create_sse_stream(
-        response,
+        call_result,
         ctx,
         initial_events,
         hook,
-        credential_id,
         tracer.clone(),
         structured_schema.map(|schema| StructuredCollector::new(schema, model)),
-        in_flight,
     );
 
     // 返回 SSE 响应
@@ -1317,14 +1315,12 @@ fn create_ping_sse() -> Bytes {
 
 /// 创建 SSE 事件流
 fn create_sse_stream(
-    response: reqwest::Response,
+    call: crate::kiro::provider::KiroCallResult,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
     hook: UsageRecordHook,
-    credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
     mut structured: Option<StructuredCollector>,
-    in_flight: Option<std::sync::Arc<crate::kiro::token_manager::InFlightGuard>>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 结构化输出模式：只先发 message_start，其余初始事件与后续内容缓冲到流结束再改写发出。
     let initial_events = match structured.as_mut() {
@@ -1343,12 +1339,13 @@ fn create_sse_stream(
     );
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
-    let body_stream = response.bytes_stream();
-    let mut settlement = StreamSettlement::new(hook, credential_id, tracer, &ctx, in_flight);
+    let body_stream = call.response.bytes_stream();
+    let decoder = EventStreamDecoder::new().with_cost_meter(call.cost_meter);
+    let mut settlement = StreamSettlement::new(hook, call.credential_id, tracer, &ctx, call._in_flight);
     settlement.structured = structured;
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), settlement, 0u64),
+        (body_stream, ctx, decoder, false, interval(Duration::from_secs(PING_INTERVAL_SECS)), settlement, 0u64),
         |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut settlement, mut sent_bytes)| async move {
             if finished {
                 return None;
@@ -1423,6 +1420,7 @@ fn create_sse_stream(
                             }
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
+                            decoder.finish_cost(true).await;
                             let final_events = ctx.generate_final_events();
                             let final_events = settlement.finish_structured(final_events);
                             settlement.tracer.mark_first_content(&final_events);
@@ -1909,7 +1907,7 @@ pub(crate) async fn execute_non_stream_request(
     let credential_id = call_result.credential_id;
 
     let mut body_stream = response.bytes_stream();
-    let mut decoder = EventStreamDecoder::new();
+    let mut decoder = EventStreamDecoder::new().with_cost_meter(call_result.cost_meter);
     let mut received_data = false;
 
     let mut text_content = String::new();
@@ -2113,6 +2111,7 @@ pub(crate) async fn execute_non_stream_request(
     // 收尾：无参工具的 0 字节滞留缓冲在此还原为 {} 补进 content；累积了非空内容
     // 却从未收到 stop=true 的（上游在参数写到一半时截断）返回 IncompleteJson。
     // 已有错误则保持不变。
+    decoder.finish_cost(true).await;
     if refused {
         // A filter refusal can cut off tool arguments. Do not recover pending
         // calls or replace the authoritative refusal with their JSON errors.

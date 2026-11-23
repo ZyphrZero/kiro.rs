@@ -22,6 +22,9 @@ const OverviewPage = lazy(() =>
     default: m.OverviewPage,
   })),
 );
+const CostsPage = lazy(() =>
+  import("@/components/costs-page").then((m) => ({ default: m.CostsPage })),
+);
 const ClientKeysPage = lazy(() =>
   import("@/components/client-keys-page").then((m) => ({
     default: m.ClientKeysPage,
@@ -53,6 +56,7 @@ function readTabFromHash(): Tab {
     h === "keys" ||
     h === "groups" ||
     h === "overview" ||
+    h === "costs" ||
     h === "traces" ||
     h === "settings"
   )
@@ -201,6 +205,7 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
       }
     >
       {tab === "overview" && <OverviewPage />}
+      {tab === "costs" && <CostsPage />}
       {tab === "credentials" && <Dashboard onLogout={onLogout} embedded />}
       {tab === "keys" && <ClientKeysPage />}
       {tab === "groups" && <GroupsPage />}

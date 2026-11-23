@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import {
   Activity,
+  Wallet,
   KeyRound,
   Server,
   LogOut,
@@ -33,6 +34,7 @@ import type { ThemeId, ThemeMode, ThemeSelection } from "@/lib/theme";
 
 export type TabKey =
   | "overview"
+  | "costs"
   | "credentials"
   | "keys"
   | "groups"
@@ -59,6 +61,12 @@ export const TABS: readonly TabItem[] = [
     label: "仪表概览",
     description: "实时调用监控、Token 消耗分布与上游贡献",
     icon: Activity,
+  },
+  {
+    key: "costs",
+    label: "账号成本",
+    description: "采购批次、用量成本与到期损失",
+    icon: Wallet,
   },
   {
     key: "credentials",

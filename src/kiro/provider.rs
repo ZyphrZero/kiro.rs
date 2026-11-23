@@ -111,6 +111,7 @@ impl ClientCache {
 pub struct KiroCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
+    pub(crate) cost_meter: Option<crate::admin::costs::CallMeter>,
     /// 在途请求守卫，随响应流一起存活，流结束后自动递减并发计数
     pub _in_flight: Option<Arc<InFlightGuard>>,
 }
@@ -132,6 +133,7 @@ struct McpCallResult {
 /// 按凭据 `endpoint` 字段选择 [`KiroEndpoint`] 实现
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
+    cost_store: Option<crate::admin::costs::CostStore>,
     /// Client 缓存：key = effective proxy config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client。
     /// 带容量上限淘汰（全局代理 client 常驻），避免代理数量增长导致内存无界增长。
@@ -151,6 +153,14 @@ pub struct KiroProvider {
 }
 
 impl KiroProvider {
+    pub fn set_cost_store(&mut self, store: crate::admin::costs::CostStore) {
+        self.cost_store = Some(store);
+    }
+
+    pub fn cost_store(&self) -> Option<&crate::admin::costs::CostStore> {
+        self.cost_store.as_ref()
+    }
+
     /// 返回共享凭据管理器，供模型发现等只读控制面逻辑复用。
     pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
         &self.token_manager
@@ -188,6 +198,7 @@ impl KiroProvider {
 
         Self {
             token_manager,
+            cost_store: None,
             client_cache: Mutex::new(client_cache),
             tls_backend,
             endpoints,
@@ -324,6 +335,7 @@ impl KiroProvider {
         Ok(KiroCallResult {
             response: result.response,
             credential_id: result.credential_id,
+            cost_meter: None,
             _in_flight: result.in_flight,
         })
     }
@@ -527,7 +539,17 @@ impl KiroProvider {
                 .header("content-type", endpoint.content_type());
             let request = endpoint.decorate_mcp(base, &rctx);
 
-            let response = match request.send().await {
+            let cost_meter = if let Some(store) = &self.cost_store {
+                Some(store.start_call(ctx.id, "web_search", endpoint_name, attempt,
+                    "mcp", sink.and_then(TraceSink::request_id)).await)
+            } else {
+                None
+            };
+            let response = request.send().await;
+            if let Some(meter) = cost_meter {
+                meter.finish("metering_unavailable").await;
+            }
+            let response = match response {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
@@ -948,9 +970,19 @@ impl KiroProvider {
                     tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
                 }
             }
+            let cost_meter = if let Some(store) = &self.cost_store {
+                let kind = if sink.is_some() { "api" } else { "admin_test" };
+                Some(store.start_call(ctx.id, model.as_deref().unwrap_or(""), endpoint_name,
+                    attempt, kind, sink.and_then(TraceSink::request_id)).await)
+            } else {
+                None
+            };
             let response = match client.execute(request).await {
                 Ok(resp) => resp,
                 Err(e) => {
+                    if let Some(meter) = cost_meter {
+                        meter.finish("network_error").await;
+                    }
                     tracing::warn!(
                         "API 请求发送失败（尝试 {}/{}）: {}",
                         attempt + 1,
@@ -1004,10 +1036,14 @@ impl KiroProvider {
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
+                    cost_meter,
                     _in_flight: ctx._in_flight.clone(),
                 });
             }
 
+            if let Some(meter) = cost_meter {
+                meter.finish("http_error").await;
+            }
             let retry_after = UpstreamRateLimitError::from_headers(response.headers());
             // 失败响应：读取 body 用于日志/错误信息
             let body = match response.text().await {

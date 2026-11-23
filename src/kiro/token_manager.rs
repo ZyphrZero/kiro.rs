@@ -1501,7 +1501,11 @@ impl MultiTokenManager {
             .map(super::credential_dedup::reserved_id)
             .transpose()?
             .unwrap_or(0);
-        let mut next_id = max_existing_id.max(reserved_id)
+        let cost_reserved_id = credentials_path.as_deref().map(|path| {
+            let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            crate::admin::costs::CostStore::reserved_credential_id(&dir.join("costs.db"))
+        }).transpose()?.unwrap_or(0);
+        let mut next_id = max_existing_id.max(reserved_id).max(cost_reserved_id)
             .checked_add(1).ok_or_else(|| anyhow::anyhow!("凭据 ID 已耗尽"))?;
         let mut has_new_ids = false;
         let mut has_new_machine_ids = false;

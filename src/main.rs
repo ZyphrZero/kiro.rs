@@ -184,11 +184,19 @@ async fn main() {
     });
     let token_manager = Arc::new(token_manager);
     token_manager.start_model_cache_warmer();
-    let kiro_provider = Arc::new(KiroProvider::new(
+    let mut kiro_provider = KiroProvider::new(
         token_manager.clone(),
         endpoints,
         config.default_endpoint.clone(),
-    ));
+    );
+    if config.cost_tracking_enabled {
+        let dir = token_manager.cache_dir().unwrap_or_else(|| ".".into());
+        match admin::costs::CostStore::open(dir.join("costs.db")) {
+            Ok(store) => kiro_provider.set_cost_store(store),
+            Err(error) => tracing::error!(%error, "账号成本账本无法打开"),
+        }
+    }
+    let kiro_provider = Arc::new(kiro_provider);
 
     // 初始化自定义模型注册表（启动时装载一次，运行期只读）
     model::custom_models::init(config.custom_models.clone());
