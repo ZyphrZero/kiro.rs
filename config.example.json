@@ -1,6 +1,7 @@
 {
   "host": "127.0.0.1",
   "port": 8990,
+  "costTrackingEnabled": false,
   "apiKey": "sk-your-api-key",
   "tlsBackend": "rustls",
   "upstreamConnectTimeoutSecs": 15,

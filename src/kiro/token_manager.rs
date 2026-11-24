@@ -1300,6 +1300,10 @@ pub struct MultiTokenManager {
     /// 下一个待分配凭据 ID。进程内单调递增，避免删除账号后新账号复用旧 ID，
     /// 从而继承旧账号按 credential_id 聚合的 trace/usage 历史。
     next_id: AtomicU64,
+    /// An unreadable cost ledger may hold IDs of deleted credentials.
+    credential_id_allocation_blocked: bool,
+    /// Preserve unnumbered records while allocation is quarantined.
+    unassigned_credentials: Vec<KiroCredentials>,
     /// Token 刷新锁，确保同一时间只有一个刷新操作
     refresh_lock: TokioMutex<()>,
     /// 凭据文件路径（用于回写）
@@ -1501,14 +1505,34 @@ impl MultiTokenManager {
             .map(super::credential_dedup::reserved_id)
             .transpose()?
             .unwrap_or(0);
-        let mut next_id = max_existing_id.max(reserved_id)
+        let cost_reserved_id = credentials_path.as_deref().map(|path| {
+            let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            crate::admin::costs::CostStore::reserved_credential_id(&dir.join("costs.db"))
+        }).transpose();
+        let credential_id_allocation_blocked = cost_reserved_id.is_err();
+        let cost_reserved_id = match cost_reserved_id {
+            Ok(id) => id.unwrap_or(0),
+            Err(error) => {
+                tracing::error!(%error, "成本库无法读取，继续服务已有编号凭据；修复成本库并重启前禁止分配新凭据编号");
+                0
+            }
+        };
+        let mut next_id = max_existing_id.max(reserved_id).max(cost_reserved_id)
             .checked_add(1).ok_or_else(|| anyhow::anyhow!("凭据 ID 已耗尽"))?;
         let mut has_new_ids = false;
         let mut has_new_machine_ids = false;
         let config_ref = &config;
 
+        let mut unassigned_credentials = Vec::new();
         let entries: Vec<CredentialEntry> = credentials
             .into_iter()
+            .filter(|credential| {
+                if credential_id_allocation_blocked && credential.id.is_none() {
+                    tracing::error!("成本库异常：暂不加载没有编号的凭据，避免复用历史编号");
+                    unassigned_credentials.push(credential.clone());
+                    false
+                } else { true }
+            })
             .map(|mut cred| {
                 cred.canonicalize_auth_method();
                 let id = cred.id.unwrap_or_else(|| {
@@ -1642,6 +1666,8 @@ impl MultiTokenManager {
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
             next_id: AtomicU64::new(next_id),
+            credential_id_allocation_blocked,
+            unassigned_credentials,
             refresh_lock: TokioMutex::new(()),
             credentials_path,
             persist_lock: Mutex::new(()),
@@ -2760,7 +2786,8 @@ impl MultiTokenManager {
         let Some(path) = &self.credentials_path else { return Ok(false); };
 
         // 序列化为 pretty JSON
-        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
+        let persisted: Vec<_> = credentials.iter().chain(self.unassigned_credentials.iter()).collect();
+        let json = serde_json::to_string_pretty(&persisted).context("序列化凭据失败")?;
 
         // 原子落盘：先写临时文件再 rename（同目录 rename 原子），避免崩溃 / 并发导致半截文件。
         let tmp = path.with_extension("json.tmp");
@@ -4406,6 +4433,8 @@ impl MultiTokenManager {
     /// - `Ok(u64)` - 新凭据 ID
     /// - `Err(_)` - 验证失败或添加失败
     pub async fn add_credential(self: &Arc<Self>, new_cred: KiroCredentials) -> anyhow::Result<u64> {
+        anyhow::ensure!(!self.credential_id_allocation_blocked,
+            "成本库无法读取，暂不能安全分配凭据编号；请恢复 costs.db 并重启服务后重试");
         // 1. 基本验证
         if new_cred.is_api_key_credential() {
             let api_key = new_cred

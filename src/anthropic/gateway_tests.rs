@@ -206,6 +206,79 @@ async fn integration_repeat_guard_records_error() {
     assert_eq!(records[0].final_status, "error");
 }
 
+#[tokio::test]
+async fn account_costs_track_gateway_usage_and_require_admin_authentication() {
+    use crate::admin::{
+        AdminService, AdminState, ClientKeyManager, GroupManager, UsageAggregator,
+        costs::CostStore, create_admin_router,
+    };
+
+    let directory = std::env::temp_dir().join(format!("kiro-costs-api-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let mut fixture = fixture(Mode::ReplyWithCredits(&["hello"])).await;
+    let provider = Arc::get_mut(fixture.state.kiro_provider.as_mut().unwrap()).unwrap();
+    provider.set_cost_store(CostStore::open(directory.join("costs.db")).unwrap());
+    let provider = fixture.state.kiro_provider.as_ref().unwrap().clone();
+    let credential_id = provider.token_manager().snapshot().entries[0].id;
+    let admin = AdminState::new(
+        "fixture-admin-only",
+        AdminService::new(provider.token_manager().clone(), vec!["fixture".into()])
+            .with_kiro_provider(provider),
+        Arc::new(ClientKeyManager::new()),
+        Arc::new(UsageAggregator::new()),
+        Arc::new(TraceStore::open_in_memory().unwrap()),
+        Arc::new(GroupManager::new()),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, create_admin_router(admin)).await.unwrap();
+    });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let now = chrono::Utc::now();
+    let purchase_url = format!("{base}/costs/purchases");
+    let purchase = json!({
+        "id": uuid::Uuid::new_v4().to_string(), "credentialId": credential_id,
+        "amount": "8", "credits": "2",
+        "effectiveAt": now - chrono::Duration::minutes(1),
+        "paidAt": now - chrono::Duration::minutes(1), "kind": "purchase",
+    });
+    assert_eq!(client.post(&purchase_url).json(&purchase).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED);
+    client.post(&purchase_url).header("x-api-key", "fixture-admin-only")
+        .json(&purchase).send().await.unwrap().error_for_status().unwrap();
+    for stream in [false, true] {
+        let response = request(fixture.state.clone(), "messages", stream).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let overview_url = format!("{base}/costs/overview");
+    let window = [
+        ("from", (now - chrono::Duration::minutes(2)).to_rfc3339()),
+        ("to", (now + chrono::Duration::minutes(2)).to_rfc3339()),
+        ("credentialId", credential_id.to_string()),
+    ];
+    assert_eq!(client.get(&overview_url).query(&window).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED);
+    let report: serde_json::Value = client.get(&overview_url).query(&window)
+        .header("x-api-key", "fixture-admin-only").send().await.unwrap()
+        .error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(report["totals"]["reportedCredits"], "0.5");
+    assert_eq!(report["totals"]["usageCost"], "2");
+    assert_eq!(report["totals"]["missingMeteringCalls"], 0);
+    assert_eq!(report["recentCalls"].as_array().unwrap().len(), 2);
+    server.abort();
+    let _ = server.await;
+    drop(fixture);
+    for _ in 0..20 {
+        if std::fs::remove_dir_all(&directory).is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn assert_ungrouped_key_usage(is_system: bool) {
     use crate::admin::client_keys::ClientKeyManager;
 

@@ -220,6 +220,7 @@ pub fn truncate_snippet(body: &str) -> Option<String> {
 /// 链路上报接收端：provider 在重试循环里每跳调用 [`Self::on_attempt`]，
 /// 每次选定凭据后调用 [`Self::on_route`]。
 pub trait TraceSink: Send + Sync {
+    fn request_id(&self) -> Option<&str> { None }
     fn on_attempt(&self, attempt: TraceAttempt);
     /// 凭据选择结果（粘性命中 / 换号）。默认空实现，非 trace 场景零开销。
     fn on_route(&self, _route: TraceRoute) {}

@@ -295,6 +295,37 @@ impl UsageLimitsResponse {
         valid(used, limit).then_some((used, limit))
     }
 
+    /// A redacted balance observation for the cost ledger. Values retain
+    /// the precision of the balance API model and never create cost entries.
+    pub(crate) fn cost_balance_buckets(&self, now: f64) -> Vec<serde_json::Value> {
+        use serde_json::json;
+
+        let Some(primary) = self.primary_breakdown() else {
+            return Vec::new();
+        };
+        let mut buckets = vec![json!({
+            "kind": "plan",
+            "usedCredits": primary.current_usage_with_precision.or(primary.current_usage.map(|v| v as f64)),
+            "totalCredits": primary.usage_limit_with_precision.or(primary.usage_limit.map(|v| v as f64)),
+            "expiresAt": self.next_reset_at(),
+        })];
+        if let Some(trial) = primary.free_trial_info.as_ref().filter(|trial| trial.is_active_at(now)) {
+            buckets.push(json!({
+                "kind": "trial",
+                "usedCredits": trial.current_usage_with_precision.or(trial.current_usage.map(|v| v as f64)),
+                "totalCredits": trial.usage_limit_with_precision.or(trial.usage_limit.map(|v| v as f64)),
+                "expiresAt": trial.free_trial_expiry,
+            }));
+        }
+        buckets.extend(primary.bonuses.iter().filter(|bonus| bonus.is_active_at(now)).map(|bonus| json!({
+            "kind": "bonus",
+            "usedCredits": bonus.current_usage,
+            "totalCredits": bonus.usage_limit,
+            "expiresAt": bonus.expires_on,
+        })));
+        buckets
+    }
+
     pub fn credit_expiry_at(&self, now: f64) -> Option<f64> {
         let breakdown = self.primary_breakdown()?;
         let trial_expiry = breakdown

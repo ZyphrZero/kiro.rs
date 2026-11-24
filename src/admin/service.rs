@@ -709,6 +709,10 @@ impl AdminService {
         svc
     }
 
+    pub fn cost_store(&self) -> Option<&super::costs::CostStore> {
+        self.kiro_provider.as_ref()?.cost_store()
+    }
+
     pub fn with_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
         self.kiro_provider = Some(provider);
         self
@@ -1454,6 +1458,16 @@ impl AdminService {
         // 允许 remaining 显示为负值：开启超额后实际使用可能超过限额，
         // 直接保留差值便于在 UI 中体现"已欠多少"。
         let remaining = usage_limit - current_usage;
+        if let Some(store) = self.cost_store() {
+            store.observe_balance(id, serde_json::json!({
+                "usedCredits": current_usage,
+                "totalCredits": usage_limit,
+                "remainingCredits": remaining,
+                "nextResetAt": usage.next_reset_at(),
+                "overageEnabled": usage.overage_enabled(),
+                "buckets": usage.cost_balance_buckets(now),
+            }));
+        }
         // usage_percentage 同理保留真实值，超额时 > 100%。
         let usage_percentage = if usage_limit > 0.0 {
             current_usage / usage_limit * 100.0
@@ -1550,59 +1564,47 @@ impl AdminService {
         .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
 
         let started = std::time::Instant::now();
-        let (credential_id, bytes) =
+        let (credential_id, response_text, credit_usage, credit_unit) =
             tokio::time::timeout(std::time::Duration::from_secs(90), async {
-                let call = provider.call_api(&body, None, None).await?;
-                let credential_id = call.credential_id;
-                let bytes = call.response.bytes().await?;
-                Ok::<_, anyhow::Error>((credential_id, bytes))
-            })
-            .await
-            .map_err(|_| AdminServiceError::UpstreamError("模型测试请求超时".to_string()))?
-            .map_err(|error| AdminServiceError::UpstreamError(error.to_string()))?;
-
-        let mut decoder = EventStreamDecoder::new();
-        decoder
-            .feed(&bytes)
-            .map_err(|error| AdminServiceError::UpstreamError(error.to_string()))?;
-        let mut response_text = String::new();
-        let mut credit_usage = 0.0_f64;
-        let mut credit_unit = None;
-
-        for frame in decoder.decode_iter() {
-            let frame = frame.map_err(|error| {
-                AdminServiceError::UpstreamError(format!("模型响应解析失败: {error}"))
-            })?;
-            let event = Event::from_frame(frame).map_err(|error| {
-                AdminServiceError::UpstreamError(format!("模型事件解析失败: {error}"))
-            })?;
-            match event {
-                Event::AssistantResponse(response) => response_text.push_str(&response.content),
-                Event::Metering(metering) => {
-                    credit_usage += metering.usage;
-                    if !metering.unit.is_empty() {
-                        credit_unit = Some(metering.unit);
+                let mut call = provider.call_api(&body, None, None).await
+                    .map_err(|error| AdminServiceError::UpstreamError(error.to_string()))?;
+                let mut decoder = EventStreamDecoder::new().with_cost_meter(call.cost_meter.take());
+                let mut text = String::new();
+                let mut credits = 0.0;
+                let mut unit = None;
+                while let Some(chunk) = call.response.chunk().await
+                    .map_err(|error| AdminServiceError::UpstreamError(error.to_string()))? {
+                    decoder.feed(&chunk)
+                        .map_err(|error| AdminServiceError::UpstreamError(error.to_string()))?;
+                    for frame in decoder.decode_iter() {
+                        let frame = frame.map_err(|error| AdminServiceError::UpstreamError(
+                            format!("模型响应解析失败: {error}")))?;
+                        let event = Event::from_frame(frame).map_err(|error| AdminServiceError::UpstreamError(
+                            format!("模型事件解析失败: {error}")))?;
+                        match event {
+                            Event::AssistantResponse(response) => text.push_str(&response.content),
+                            Event::Metering(metering) => {
+                                credits += metering.usage;
+                                if !metering.unit.is_empty() {
+                                    unit = Some(metering.unit);
+                                }
+                            }
+                            Event::Error { error_code, error_message } =>
+                                return Err(AdminServiceError::UpstreamError(format!("{error_code}: {error_message}"))),
+                            Event::Exception { exception_type, message } =>
+                                return Err(AdminServiceError::UpstreamError(format!("{exception_type}: {message}"))),
+                            _ => {}
+                        }
                     }
                 }
-                Event::Error {
-                    error_code,
-                    error_message,
-                } => {
-                    return Err(AdminServiceError::UpstreamError(format!(
-                        "{error_code}: {error_message}"
-                    )));
+                if decoder.has_pending_data() {
+                    return Err(AdminServiceError::UpstreamError("模型事件流不完整".into()));
                 }
-                Event::Exception {
-                    exception_type,
-                    message,
-                } => {
-                    return Err(AdminServiceError::UpstreamError(format!(
-                        "{exception_type}: {message}"
-                    )));
-                }
-                _ => {}
-            }
-        }
+                decoder.finish_cost(true).await;
+                Ok((call.credential_id, text, credits, unit))
+            })
+            .await
+            .map_err(|_| AdminServiceError::UpstreamError("模型测试请求超时".to_string()))??;
 
         let response_text = strip_tool_use_xml_leaks(&response_text);
         if response_text.trim().is_empty() {

@@ -87,6 +87,7 @@ pub enum DecoderState {
 pub struct EventStreamDecoder {
     /// 内部缓冲区
     buffer: BytesMut,
+    cost_meter: Option<crate::admin::costs::CallMeter>,
     /// 当前状态
     state: DecoderState,
     /// 已处理的帧数量
@@ -108,6 +109,18 @@ impl Default for EventStreamDecoder {
 }
 
 impl EventStreamDecoder {
+    pub(crate) fn with_cost_meter(mut self, meter: Option<crate::admin::costs::CallMeter>) -> Self {
+        self.cost_meter = meter;
+        self
+    }
+
+    pub(crate) async fn finish_cost(&mut self, complete: bool) {
+        if let Some(meter) = self.cost_meter.take() {
+            let status = if complete && !self.has_pending_data() { "complete" } else { "partial" };
+            meter.finish(status).await;
+        }
+    }
+
     /// EOF with pending bytes means an event frame was truncated.
     pub fn has_pending_data(&self) -> bool {
         !self.buffer.is_empty()
@@ -122,6 +135,7 @@ impl EventStreamDecoder {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             buffer: BytesMut::with_capacity(capacity),
+            cost_meter: None,
             state: DecoderState::Ready,
             frames_decoded: 0,
             error_count: 0,
@@ -187,6 +201,9 @@ impl EventStreamDecoder {
                 self.state = DecoderState::Ready;
                 self.frames_decoded += 1;
                 self.error_count = 0; // 重置连续错误计数
+                if let Some(meter) = &mut self.cost_meter {
+                    meter.observe(&frame);
+                }
                 Ok(Some(frame))
             }
             Ok(None) => {
@@ -195,6 +212,9 @@ impl EventStreamDecoder {
                 Ok(None)
             }
             Err(e) => {
+                if let Some(meter) = &mut self.cost_meter {
+                    meter.mark_incomplete();
+                }
                 self.error_count += 1;
                 let error_msg = e.to_string();
 

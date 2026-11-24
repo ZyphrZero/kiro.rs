@@ -392,6 +392,7 @@ Admin API 鉴权同样支持：
 | `cacheMeteringFlushIntervalSecs` | `300` | 快照落盘间隔（秒），钳到 `[10, 3600]`，仅在落盘开启时有意义 |
 | `cacheMeteringMissDiagnostics` | `true` | 是否开启 miss 归因墓碑表（约 3MB 封顶），关闭后 `missEvicted` 退化为 `missNoEntry` |
 | `traceEnabled` | `true` | 是否写入 `traces.db` |
+| `costTrackingEnabled` | `false` | 启用账号成本采集和 `costs.db`，详见 [账号成本](docs/ACCOUNT-COSTS.md) |
 | `traceRetentionDays` | `7` | trace 保留天数 |
 | `usageLogRetentionDays` | `31` | `usage_log.*.jsonl` 保留天数 |
 | `countTokensApiUrl` | 无 | 外部 count_tokens API 地址 |

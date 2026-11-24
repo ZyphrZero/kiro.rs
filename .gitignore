@@ -25,6 +25,9 @@
 /traces.db
 /traces.db-shm
 /traces.db-wal
+/costs.db
+/costs.db-shm
+/costs.db-wal
 /quota_alerts.db
 /quota_alerts.db-shm
 /quota_alerts.db-wal

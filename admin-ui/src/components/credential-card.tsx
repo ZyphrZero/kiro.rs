@@ -703,6 +703,9 @@ function CredentialCardImpl({
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-48">
+        <DropdownMenuItem asChild>
+          <a href={`#/costs?credential=${credential.id}`}>查看账号成本</a>
+        </DropdownMenuItem>
         <DropdownMenuItem
           onSelect={(e) => {
             e.preventDefault();

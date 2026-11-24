@@ -76,6 +76,7 @@ const MAX_ADMIN_BODY_SIZE: usize = 50 * 1024 * 1024;
 pub fn create_admin_router(state: AdminState) -> Router {
     // 需要登录API密钥认证的路由
     let authenticated = Router::new()
+        .merge(super::costs::router())
         .route("/config/quota-alerts", get(get_alerts).put(update_alerts))
         .route("/config/quota-alerts/test", post(test_alerts))
         .route(
