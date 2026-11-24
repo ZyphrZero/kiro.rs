@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::CostStore;
+use super::checkpoints;
 
 pub(super) const SCHEMA: &str = "
 PRAGMA journal_mode=WAL;
@@ -129,11 +130,20 @@ fn decimal(raw: &str) -> Result<Decimal> {
     Ok(Decimal::from_str_exact(raw)?)
 }
 
+fn credit_decimal(raw: &str) -> Result<Decimal> {
+    let value = decimal(raw)?.normalize();
+    ensure!(
+        value >= Decimal::ZERO && value <= Decimal::from(1_000_000_000) && value.scale() <= 18,
+        "积分须在 0 至十亿之间且最多 18 位小数"
+    );
+    Ok(value)
+}
+
 impl Purchase {
     pub fn validate(&self) -> Result<()> {
         Uuid::parse_str(&self.id).context("无效采购单 ID")?;
         let amount = decimal(&self.amount)?;
-        let credits = decimal(&self.credits)?;
+        let credits = credit_decimal(&self.credits)?;
         ensure!(
             self.credential_id > 0 && self.credential_id <= i64::MAX as u64,
             "无效凭据"
@@ -162,7 +172,8 @@ impl Purchase {
     }
 }
 
-pub(super) fn insert_purchase(conn: &Connection, purchase: Purchase) -> Result<()> {
+pub(super) fn insert_purchase(conn: &Connection, purchase: &Purchase) -> Result<()> {
+    purchase.validate()?;
     let id = Uuid::parse_str(&purchase.id)?.to_string();
     let paid = purchase.paid_at.map(|t| t.timestamp_millis());
     let effective = purchase.effective_at.timestamp_millis();
@@ -184,11 +195,13 @@ pub(super) fn insert_purchase(conn: &Connection, purchase: Purchase) -> Result<(
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Window {
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     credential_id: Option<u64>,
+    #[serde(skip)]
+    detail_ids: HashSet<String>,
 }
 
 impl Window {
@@ -212,6 +225,7 @@ impl Window {
     }
 }
 
+#[derive(Clone)]
 struct Lot {
     id: String,
     paid_at: Option<i64>,
@@ -249,7 +263,7 @@ impl Lot {
     }
 }
 
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Totals {
     #[serde(serialize_with = "as_string")]
@@ -266,10 +280,13 @@ struct Totals {
     expiry_loss: Decimal,
     #[serde(serialize_with = "as_string")]
     pending_expiry_loss: Decimal,
+    #[serde(serialize_with = "as_string")]
+    pending_cost: Decimal,
     attempts: u64,
     missing_metering_calls: u64,
     partial_metering_calls: u64,
     unavailable_metering_calls: u64,
+    invalid_metering_calls: u64,
 }
 
 fn as_string<T: serde::Serializer>(value: &Decimal, serializer: T) -> Result<T::Ok, T::Error> {
@@ -285,20 +302,24 @@ impl Totals {
         self.remaining_cost = add(self.remaining_cost, other.remaining_cost)?;
         self.expiry_loss = add(self.expiry_loss, other.expiry_loss)?;
         self.pending_expiry_loss = add(self.pending_expiry_loss, other.pending_expiry_loss)?;
+        self.pending_cost = add(self.pending_cost, other.pending_cost)?;
         self.attempts += other.attempts;
         self.missing_metering_calls += other.missing_metering_calls;
         self.partial_metering_calls += other.partial_metering_calls;
         self.unavailable_metering_calls += other.unavailable_metering_calls;
+        self.invalid_metering_calls += other.invalid_metering_calls;
         Ok(())
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Account {
     lots: Vec<Lot>,
     totals: Totals,
+    totals_invalid: bool,
 }
 
+#[derive(Clone)]
 struct Call {
     id: String,
     credential: u64,
@@ -320,11 +341,38 @@ fn record_call(
     window: &Window,
     call: Call,
 ) -> Result<()> {
+    // Allocation is transactional in memory as well: a pathological value must
+    // neither take down the report nor leave half-applied lot consumption behind.
+    let previous = accounts.get(&call.credential).cloned().unwrap_or_default();
+    if let Err(error) = record_call_inner(accounts, details, window, call.clone()) {
+        tracing::warn!(%error, call_id=%call.id, "隔离无法精确计算的成本计量");
+        accounts.insert(call.credential, previous);
+        record_call_inner(
+            accounts,
+            details,
+            window,
+            Call {
+                credits: Decimal::ZERO,
+                valid: false,
+                invalid: true,
+                ..call
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn record_call_inner(
+    accounts: &mut BTreeMap<u64, Account>,
+    details: &mut VecDeque<Value>,
+    window: &Window,
+    call: Call,
+) -> Result<()> {
     let account = accounts.entry(call.credential).or_default();
     let mut remaining = call.credits;
     let mut cost = Decimal::ZERO;
     let mut allocations = Vec::new();
-    let detail = window.credential_id.is_some() && window.includes(call.at);
+    let detail = window.detail_ids.contains(&call.id);
     for lot in &mut account.lots {
         if remaining.is_zero() {
             break;
@@ -347,7 +395,7 @@ fn record_call(
             call.kind.as_str(),
         ) {
             (_, _, _, "mcp") => "unavailable",
-            (false, _, _, _) => "missing",
+            (false, false, _, _) => "missing",
             (true, false, Some("complete"), _) => "complete",
             _ => "partial",
         };
@@ -356,14 +404,29 @@ fn record_call(
         totals.missing_metering_calls += u64::from(metering == "missing");
         totals.partial_metering_calls += u64::from(metering == "partial");
         totals.unavailable_metering_calls += u64::from(metering == "unavailable");
-        totals.reported_credits = add(totals.reported_credits, call.credits)?;
-        totals.unpriced_credits = add(totals.unpriced_credits, remaining)?;
-        totals.usage_cost = add(totals.usage_cost, cost)?;
+        totals.invalid_metering_calls += u64::from(call.invalid);
+        let values = (|| -> Result<_> {
+            Ok((
+                add(totals.reported_credits, call.credits)?,
+                add(totals.unpriced_credits, remaining)?,
+                add(totals.usage_cost, cost)?,
+            ))
+        })();
+        match values {
+            Ok((reported, unpriced, usage)) => {
+                totals.reported_credits = reported;
+                totals.unpriced_credits = unpriced;
+                totals.usage_cost = usage;
+            }
+            // Totals depend on the requested window; allocation must never do so.
+            Err(_) => account.totals_invalid = true,
+        }
         if detail {
             details.push_back(json!({
                 "id": call.id, "model": call.model, "startedAt": call.at, "endpoint": call.endpoint,
                 "attempt": call.attempt, "trafficClass": call.kind, "requestId": call.request,
                 "metering": metering, "credits": call.valid.then(|| call.credits.to_string()),
+                "invalidMetering": call.invalid,
                 "cost": (call.valid && (remaining != call.credits || call.credits.is_zero()))
                     .then(|| cost.to_string()),
                 "unpricedCredits": remaining.to_string(), "allocations": allocations
@@ -376,14 +439,74 @@ fn record_call(
     Ok(())
 }
 
-pub(super) fn report(store: &CostStore, window: Window) -> Result<Value> {
+#[derive(Default, Serialize, Deserialize)]
+struct CheckpointState {
+    version: u32,
+    lots: BTreeMap<String, (String, String)>,
+    accounts: Vec<u64>,
+}
+
+fn checkpoint(accounts: &BTreeMap<u64, Account>) -> Result<String> {
+    let lots = accounts
+        .values()
+        .flat_map(|a| &a.lots)
+        .filter(|lot| !lot.used.is_zero())
+        .map(|lot| {
+            (
+                lot.id.clone(),
+                (lot.used.to_string(), lot.assigned.to_string()),
+            )
+        })
+        .collect();
+    Ok(serde_json::to_string(&CheckpointState {
+        version: 1,
+        lots,
+        accounts: accounts.keys().copied().collect(),
+    })?)
+}
+
+fn totals_json(totals: &Totals, available: bool) -> Result<Value> {
+    let mut value = serde_json::to_value(totals)?;
+    if !available {
+        for field in [
+            "paid",
+            "usageCost",
+            "reportedCredits",
+            "unpricedCredits",
+            "remainingCost",
+            "expiryLoss",
+            "pendingExpiryLoss",
+            "pendingCost",
+        ] {
+            value[field] = Value::Null;
+        }
+    }
+    Ok(value)
+}
+
+pub(super) fn report(store: &CostStore, mut window: Window) -> Result<Value> {
     let now = Utc::now();
     // Future end bounds (e.g. midnight) show a report through the current instant.
     let cutoff = window.to.min(now).timestamp_millis();
     let mut conn = Connection::open_with_flags(&store.path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(Duration::from_secs(2))?;
     let db = conn.transaction()?;
+    if let Some(id) = window.credential_id {
+        let mut query = db.prepare(
+            "SELECT id FROM cost_calls WHERE credential_id=?1
+            AND started_at>=?2 AND started_at<?3 ORDER BY started_at DESC,id DESC LIMIT 100",
+        )?;
+        window.detail_ids = query
+            .query_map(params![id, window.from.timestamp_millis(), cutoff], |r| {
+                r.get(0)
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+    }
+    let revision: i64 = db.query_row("SELECT revision FROM cost_revision WHERE id=1", [], |r| {
+        r.get(0)
+    })?;
     let mut accounts: BTreeMap<u64, Account> = BTreeMap::new();
+    let mut invalid_lots = Vec::new();
     let mut lots = db.prepare(
         "SELECT id, credential_id, paid_at, effective_at, expires_at, expiry_confirmed_at,
                 amount, credits, kind
@@ -394,35 +517,107 @@ pub(super) fn report(store: &CostStore, window: Window) -> Result<Value> {
     )?;
     let mut rows = lots.query(params![cutoff, window.credential_id])?;
     while let Some(row) = rows.next()? {
+        let amount_raw: String = row.get(6)?;
+        let credits_raw: String = row.get(7)?;
+        let values = decimal(&amount_raw).and_then(|amount| {
+            ensure!(
+                amount >= Decimal::ZERO
+                    && amount <= Decimal::from(1_000_000_000)
+                    && amount.normalize().scale() <= 8,
+                "采购金额无效"
+            );
+            let credits = credit_decimal(&credits_raw)?;
+            ensure!(credits > Decimal::ZERO, "采购积分须大于 0");
+            Ok((amount, credits))
+        });
+        let (amount, credits) = match values {
+            Ok(values) => values,
+            Err(error) => {
+                invalid_lots.push(json!({"id": row.get::<_,String>(0)?,
+                    "credentialId": row.get::<_,u64>(1)?, "reason": error.to_string(),
+                    "amount": amount_raw, "credits": credits_raw}));
+                continue;
+            }
+        };
         let lot = Lot {
             id: row.get(0)?,
             paid_at: row.get(2)?,
             starts: row.get(3)?,
             expires: row.get(4)?,
             confirmed: row.get(5)?,
-            amount: decimal(&row.get::<_, String>(6)?)?,
-            credits: decimal(&row.get::<_, String>(7)?)?,
+            amount,
+            credits,
             kind: row.get(8)?,
             assigned: Decimal::ZERO,
             used: Decimal::ZERO,
         };
         accounts.entry(row.get(1)?).or_default().lots.push(lot);
     }
-    let mut calls = db.prepare(
+    let scope = window.credential_id.unwrap_or(0);
+    let mut replay_from = i64::MIN;
+    if let Some((at, state)) = checkpoints::load(&db, scope, window.from.timestamp_millis())?
+        && let Ok(state) = serde_json::from_str::<CheckpointState>(&state)
+        && state.version == 1
+    {
+        // Parse every value first; a damaged derived cache falls back to raw facts.
+        let parsed: Result<BTreeMap<_, _>> = state
+            .lots
+            .into_iter()
+            .map(|(id, (used, assigned))| Ok((id, (decimal(&used)?, decimal(&assigned)?))))
+            .collect();
+        if let Ok(values) = parsed {
+            let valid = accounts.values().flat_map(|a| &a.lots).all(|lot| {
+                values.get(&lot.id).is_none_or(|(used, assigned)| {
+                    *used >= Decimal::ZERO
+                        && *used <= lot.credits
+                        && *assigned >= Decimal::ZERO
+                        && *assigned <= lot.amount
+                })
+            });
+            if valid {
+                for id in state.accounts {
+                    accounts.entry(id).or_default();
+                }
+                for lot in accounts.values_mut().flat_map(|a| &mut a.lots) {
+                    if let Some((used, assigned)) = values.get(&lot.id) {
+                        lot.used = *used;
+                        lot.assigned = *assigned;
+                    }
+                }
+                replay_from = at;
+            }
+        }
+    }
+    let mut checkpoints_to_save = Vec::new();
+    let mut last_checkpoint = replay_from;
+    let mut replayed_calls = 0u64;
+    let sql = format!(
         "SELECT c.id, c.credential_id, c.started_at, c.model, c.endpoint, c.attempt, c.kind,
                 c.request_id, c.status, m.sequence, m.raw
          FROM cost_calls c LEFT JOIN cost_meters m ON m.call_id=c.id
-         WHERE c.started_at < ?1 AND (?2 IS NULL OR c.credential_id=?2)
+         WHERE c.started_at < ?1 AND c.started_at >= ?2 {}
          ORDER BY c.started_at, c.id, m.sequence",
-    )?;
-    let mut rows = calls.query(params![cutoff, window.credential_id])?;
+        if window.credential_id.is_some() {
+            "AND c.credential_id=?3"
+        } else {
+            "AND ?3 IS NULL"
+        }
+    );
+    let mut calls = db.prepare(&sql)?;
+    let mut rows = calls.query(params![cutoff, replay_from, window.credential_id])?;
     let mut current: Option<Call> = None;
     let mut details = VecDeque::new();
     while let Some(row) = rows.next()? {
         let id: String = row.get(0)?;
         if current.as_ref().is_none_or(|call| call.id != id) {
             if let Some(call) = current.take() {
+                let boundary = call.at.div_euclid(checkpoints::DAY) * checkpoints::DAY;
+                if boundary > last_checkpoint {
+                    checkpoints_to_save.push((boundary, checkpoint(&accounts)?));
+                    last_checkpoint = boundary;
+                }
                 record_call(&mut accounts, &mut details, &window, call)?;
+                replayed_calls += 1;
             }
             current = Some(Call {
                 id,
@@ -442,8 +637,11 @@ pub(super) fn report(store: &CostStore, window: Window) -> Result<Value> {
         let call = current.as_mut().ok_or_else(|| anyhow!("缺少计量主体"))?;
         if row.get::<_, Option<u32>>(9)?.is_some() {
             let raw: Option<String> = row.get(10)?;
-            let value = raw.as_deref().and_then(|raw| decimal(raw).ok());
-            if let Some(value) = value.and_then(|v| add(call.credits, v).ok()) {
+            let value = raw.as_deref().and_then(|raw| credit_decimal(raw).ok());
+            if let Some(value) = value
+                .and_then(|v| add(call.credits, v).ok())
+                .filter(|v| *v <= Decimal::from(1_000_000_000))
+            {
                 call.valid = true;
                 call.credits = value;
             } else {
@@ -452,12 +650,28 @@ pub(super) fn report(store: &CostStore, window: Window) -> Result<Value> {
         }
     }
     if let Some(call) = current {
+        let boundary = call.at.div_euclid(checkpoints::DAY) * checkpoints::DAY;
+        if boundary > last_checkpoint {
+            checkpoints_to_save.push((boundary, checkpoint(&accounts)?));
+            last_checkpoint = boundary;
+        }
         record_call(&mut accounts, &mut details, &window, call)?;
+        replayed_calls += 1;
+    }
+    let boundary = cutoff.div_euclid(checkpoints::DAY) * checkpoints::DAY;
+    if boundary > last_checkpoint {
+        checkpoints_to_save.push((boundary, checkpoint(&accounts)?));
+    }
+    if let Err(error) = checkpoints::save(&store.path, scope, revision, &checkpoints_to_save) {
+        tracing::debug!(%error, "派生分摊检查点未保存，下次查询可从原始记录重建");
     }
     let mut totals = Totals::default();
+    let mut totals_available = true;
     let mut summary = Vec::new();
     let mut lot_details = Vec::new();
     for (id, account) in accounts {
+        let account_available = !account.totals_invalid;
+        totals_available &= account_available;
         let mut row = account.totals;
         for lot in account.lots {
             let unused = lot.amount - lot.assigned;
@@ -465,6 +679,7 @@ pub(super) fn report(store: &CostStore, window: Window) -> Result<Value> {
                 row.paid = add(row.paid, lot.amount)?;
             }
             let state = if lot.starts >= cutoff {
+                row.pending_cost = add(row.pending_cost, unused)?;
                 "pending"
             } else if lot.expires.is_some_and(|end| end <= cutoff) {
                 if let Some(at) = lot.confirmed.filter(|at| *at < cutoff) {
@@ -490,8 +705,16 @@ pub(super) fn report(store: &CostStore, window: Window) -> Result<Value> {
                 }));
             }
         }
-        totals.combine(&row)?;
-        summary.push(json!({"credentialId": id, "totals": row}));
+        let mut combined = totals.clone();
+        if combined.combine(&row).is_ok() {
+            totals = combined;
+        } else {
+            totals_available = false;
+        }
+        summary.push(
+            json!({"credentialId": id, "totalsAvailable": account_available,
+            "totals": totals_json(&row, account_available)?}),
+        );
     }
     let balance = if let Some(id) = window.credential_id {
         db.query_row(
@@ -508,15 +731,44 @@ pub(super) fn report(store: &CostStore, window: Window) -> Result<Value> {
         None
     };
     let capture_errors = store.capture_errors.load(Ordering::Relaxed);
-    let partial = capture_errors > 0
+    let persisted_errors: u64 = db.query_row(
+        "SELECT errors FROM cost_capture_health WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    let capture_errors_total =
+        persisted_errors.max(store.previous_capture_errors.saturating_add(capture_errors));
+    let partial = capture_errors_total > 0
+        || !invalid_lots.is_empty()
+        || !totals_available
         || totals.missing_metering_calls > 0
         || totals.partial_metering_calls > 0
         || totals.unavailable_metering_calls > 0
         || !totals.unpriced_credits.is_zero();
+    let mut totals_json = totals_json(&totals, totals_available)?;
+    if !totals_available {
+        for field in [
+            "attempts",
+            "missingMeteringCalls",
+            "partialMeteringCalls",
+            "unavailableMeteringCalls",
+            "invalidMeteringCalls",
+        ] {
+            totals_json[field] = json!(
+                summary
+                    .iter()
+                    .map(|v| v["totals"][field].as_u64().unwrap_or(0))
+                    .sum::<u64>()
+            );
+        }
+    }
     Ok(json!({
         "currency": "CNY", "from": window.from, "to": window.to, "generatedAt": now,
         "policyVersion": "prepaid-v1", "coverageState": if partial {"partial"} else {"unverified"},
-        "captureErrorsSinceStart": capture_errors, "totals": totals, "accounts": summary,
+        "captureErrorsSinceStart": capture_errors, "captureErrors": capture_errors_total,
+        "totalsAvailable": totals_available, "invalidLots": invalid_lots,
+        "replayedCalls": replayed_calls, "checkpointAt": (replay_from != i64::MIN).then_some(replay_from),
+        "totals": totals_json, "accounts": summary,
         "lots": lot_details, "recentCalls": details.into_iter().rev().collect::<Vec<_>>(),
         "latestBalance": balance,
     }))

@@ -472,12 +472,43 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     // with_connect_info：把 TCP 对端地址注入请求扩展，直连部署下作为客户端 IP 的兜底
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await
-    .unwrap();
+    let (stopping, stopped) = tokio::sync::oneshot::channel();
+    let server = async move {
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+            .with_graceful_shutdown(async move {
+                shutdown_signal().await;
+                tracing::info!("收到退出信号，停止接单并等待在途请求");
+                let _ = stopping.send(());
+            }).await
+    };
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => {
+            if let Err(error) = result { tracing::error!(%error, "HTTP 服务退出"); }
+        }
+        _ = stopped => {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), &mut server).await {
+                Ok(Ok(())) => {},
+                Ok(Err(error)) => tracing::error!(%error, "HTTP 服务退出"),
+                Err(_) => tracing::warn!("在途请求未在 30 秒内结束，将记录未完成的成本采集"),
+            }
+        }
+    }
+    if let Some(store) = kiro_provider.cost_store()
+        && let Err(error) = store.shutdown().await {
+            tracing::error!(%error, "成本账本未能完成停机排空");
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("安装 SIGTERM 处理器失败");
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    { let _ = tokio::signal::ctrl_c().await; }
 }
 
 fn merge_environment_api_key(credentials: &mut Vec<KiroCredentials>, api_key: String) {

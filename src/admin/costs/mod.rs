@@ -1,5 +1,6 @@
 //! 管理端账号成本账本。采集独立于请求日志和客户端 Key 用量。
 mod capture;
+mod checkpoints;
 mod ledger;
 #[cfg(test)]
 mod tests;
