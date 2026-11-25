@@ -841,6 +841,25 @@ fn aggregate_available_models_with_custom(
     models.into_values().collect()
 }
 
+/// Model list to serve when upstream discovery fails for every credential.
+///
+/// Some credential types (e.g. Kiro API keys) are rejected by
+/// `ListAvailableModels` even though chat requests succeed. If the operator
+/// declared `customModels`, serve those rather than failing `/v1/models`, so
+/// clients that probe the model list can still connect. Returns `None` when no
+/// custom models are configured, keeping the existing 502 behaviour.
+fn fallback_models_from_custom(
+    custom_models: &[crate::model::config::CustomModel],
+) -> Option<Vec<Model>> {
+    if custom_models.is_empty() {
+        return None;
+    }
+    Some(aggregate_available_models_with_custom(
+        Vec::new(),
+        custom_models,
+    ))
+}
+
 fn aggregate_available_models(upstream_models: Vec<UpstreamModel>) -> Vec<Model> {
     aggregate_available_models_with_custom(upstream_models, &crate::model::custom_models::all())
 }
@@ -882,6 +901,20 @@ pub async fn get_models(
                 .into_response();
         }
         Err(error @ ModelDiscoveryError::ColdStartFailed { .. }) => {
+            if let Some(models) =
+                fallback_models_from_custom(&crate::model::custom_models::all())
+            {
+                tracing::warn!(
+                    "Upstream model discovery failed ({}); serving {} customModels entries instead",
+                    error,
+                    models.len()
+                );
+                return Json(ModelsResponse {
+                    object: "list".to_string(),
+                    data: models,
+                })
+                .into_response();
+            }
             tracing::warn!("动态模型列表加载失败: {}", error);
             return (
                 StatusCode::BAD_GATEWAY,
@@ -3636,6 +3669,31 @@ mod tests {
         assert_eq!(models[0].owned_by, "configured-owner");
         assert_eq!(models[0].context_window, 500_000);
         assert_eq!(models[0].max_tokens, 12_345);
+    }
+
+    #[test]
+    fn discovery_failure_without_custom_models_has_no_fallback() {
+        assert!(fallback_models_from_custom(&[]).is_none());
+    }
+
+    #[test]
+    fn discovery_failure_falls_back_to_custom_models() {
+        let custom = crate::model::config::CustomModel {
+            id: "claude-sonnet-4-5".to_string(),
+            backend_id: "claude-sonnet-4.5".to_string(),
+            display_name: Some("Claude Sonnet 4.5".to_string()),
+            context_window: None,
+            max_tokens: None,
+            supports_reasoning: None,
+            owned_by: Some("anthropic".to_string()),
+        };
+        let models = fallback_models_from_custom(&[custom]).expect("fallback list");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "claude-sonnet-4-5");
+        assert_eq!(models[0].display_name, "Claude Sonnet 4.5");
+        assert_eq!(models[0].owned_by, "anthropic");
+        assert_eq!(models[0].max_tokens, 64_000);
     }
 
     #[test]
