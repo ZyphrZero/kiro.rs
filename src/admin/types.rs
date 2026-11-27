@@ -675,6 +675,12 @@ pub struct AccountThrottleConfigResponse {
     pub failover: bool,
     /// 冷却时长（秒）
     pub cooldown_secs: u64,
+    /// 窗口内累计多少次账号级 429 才冷却
+    pub min_hits: u32,
+    /// 未达阈值时重试前的退避毫秒数
+    pub retry_delay_ms: u64,
+    /// 账号级 429 命中计数的滑动窗口（秒）
+    pub hit_window_secs: u64,
 }
 
 /// 更新账号级 429 限流故障转移配置
@@ -687,6 +693,15 @@ pub struct SetAccountThrottleConfigRequest {
     /// 冷却时长（秒）；缺省表示不修改，1..=86400
     #[serde(default)]
     pub cooldown_secs: Option<u64>,
+    /// 窗口内累计多少次 429 才冷却；缺省表示不修改，1..=100
+    #[serde(default)]
+    pub min_hits: Option<u32>,
+    /// 未达阈值时重试前的退避毫秒数；缺省表示不修改，0..=60000
+    #[serde(default)]
+    pub retry_delay_ms: Option<u64>,
+    /// 429 命中计数窗口（秒）；缺省表示不修改，1..=3600
+    #[serde(default)]
+    pub hit_window_secs: Option<u64>,
 }
 
 /// 普通模型 API 429 自动重试配置响应
