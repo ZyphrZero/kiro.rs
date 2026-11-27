@@ -698,14 +698,56 @@ impl KiroProvider {
                 && self.token_manager.get_account_throttle_failover()
                 && endpoint.is_account_rate_limited(&body)
             {
+                let min_hits = self.token_manager.get_account_throttle_min_hits();
+                let hit_window = std::time::Duration::from_secs(
+                    self.token_manager
+                        .get_account_throttle_hit_window_secs()
+                        .max(1),
+                );
+                let (hits, should_cool) = self
+                    .token_manager
+                    .record_account_throttle_hit(ctx.id, hit_window, min_hits);
+                if !should_cool {
+                    let delay_ms = self.token_manager.get_account_throttle_retry_delay_ms();
+                    tracing::warn!(
+                        "MCP 请求失败（账号级限流，凭据 #{} 第 {}/{} 次命中，未达冷却阈值，退避 {}ms 后重试，尝试 {}/{}）: {}",
+                        ctx.id,
+                        hits,
+                        min_hits,
+                        delay_ms,
+                        attempt + 1,
+                        max_retries,
+                        body
+                    );
+                    Self::emit_attempt(
+                        sink,
+                        attempt,
+                        ctx.id,
+                        endpoint_name,
+                        Some(429),
+                        outcome::ACCOUNT_THROTTLED,
+                        Some(&body),
+                        attempt_start,
+                    );
+                    if delay_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                    last_error = Some(anyhow::anyhow!(
+                        "MCP 请求失败（账号级限流，未达冷却阈值）: {} {}",
+                        status,
+                        body
+                    ));
+                    continue;
+                }
                 let cooldown_secs = self
                     .token_manager
                     .get_account_throttle_cooldown_secs()
                     .max(1);
                 let cooldown = std::time::Duration::from_secs(cooldown_secs);
                 tracing::warn!(
-                    "MCP 请求失败（账号级限流，凭据 #{} 冷却 {}s 并切换，尝试 {}/{}）: {}",
+                    "MCP 请求失败（账号级限流，凭据 #{} 累计 {} 次命中，冷却 {}s 并切换，尝试 {}/{}）: {}",
                     ctx.id,
+                    hits,
                     cooldown_secs,
                     attempt + 1,
                     max_retries,
@@ -1210,14 +1252,58 @@ impl KiroProvider {
                     self.token_manager.get_model_api_429_retry_enabled(),
                 ) {
                     ModelApi429Action::Failover => {
+                        let min_hits = self.token_manager.get_account_throttle_min_hits();
+                        let hit_window = std::time::Duration::from_secs(
+                            self.token_manager
+                                .get_account_throttle_hit_window_secs()
+                                .max(1),
+                        );
+                        let (hits, should_cool) = self
+                            .token_manager
+                            .record_account_throttle_hit(ctx.id, hit_window, min_hits);
+                        if !should_cool {
+                            let delay_ms =
+                                self.token_manager.get_account_throttle_retry_delay_ms();
+                            tracing::warn!(
+                                "API 请求失败（账号级限流，凭据 #{} 第 {}/{} 次命中，未达冷却阈值，退避 {}ms 后重试，尝试 {}/{}）: {}",
+                                ctx.id,
+                                hits,
+                                min_hits,
+                                delay_ms,
+                                attempt + 1,
+                                max_retries,
+                                body
+                            );
+                            Self::emit_attempt(
+                                sink,
+                                attempt,
+                                ctx.id,
+                                endpoint_name,
+                                Some(429),
+                                outcome::ACCOUNT_THROTTLED,
+                                Some(&body),
+                                attempt_start,
+                            );
+                            if delay_ms > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                                    .await;
+                            }
+                            last_error = Some(
+                                rate_limit_error
+                                    .unwrap_or_else(|| UpstreamRateLimitError::new(None))
+                                    .into(),
+                            );
+                            continue;
+                        }
                         let cooldown_secs = self
                             .token_manager
                             .get_account_throttle_cooldown_secs()
                             .max(1);
                         let cooldown = std::time::Duration::from_secs(cooldown_secs);
                         tracing::warn!(
-                            "API 请求失败（账号级限流，凭据 #{} 冷却 {}s 并切换，尝试 {}/{}）: {}",
+                            "API 请求失败（账号级限流，凭据 #{} 累计 {} 次命中，冷却 {}s 并切换，尝试 {}/{}）: {}",
                             ctx.id,
+                            hits,
                             cooldown_secs,
                             attempt + 1,
                             max_retries,

@@ -1023,6 +1023,11 @@ struct CredentialEntry {
     /// `Some(t)` 且 `t > now()` 时视为不可用；`t <= now()` 时自动恢复。
     /// 不持久化，进程重启后清空。
     throttled_until: Option<Instant>,
+    /// 当前滑动窗口内累计的账号级 429 次数（未达 min_hits 时不冷却）。
+    /// 成功、窗口过期或实际冷却后清零；不持久化。
+    account_throttle_hits: u32,
+    /// 当前账号级 429 计数窗口的起点。
+    account_throttle_window_start: Option<Instant>,
     /// RPM 主动限流的滑动窗口：最近 60 秒内被选中发起请求的时间戳队列。
     /// 队列长度达到 `account_rpm_limit` 时该凭据本窗口内被排除出候选。
     /// 不持久化，进程重启后清空；限流关闭时始终为空。
@@ -1051,6 +1056,8 @@ impl CredentialEntry {
         self.disabled = false;
         self.disabled_reason = None;
         self.throttled_until = None;
+        self.account_throttle_hits = 0;
+        self.account_throttle_window_start = None;
         self.rpm_window.clear();
         self.clear_self_heal_streak();
         self.current_weight = 0;
@@ -1328,6 +1335,12 @@ pub struct MultiTokenManager {
     account_throttle_failover: AtomicBool,
     /// 账号级 429 限流冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
+    /// 窗口内累计多少次账号级 429 才冷却（运行时可修改）
+    account_throttle_min_hits: AtomicU32,
+    /// 未达阈值时重试前的退避毫秒数（运行时可修改）
+    account_throttle_retry_delay_ms: AtomicU64,
+    /// 账号级 429 命中计数的滑动窗口（秒，运行时可修改）
+    account_throttle_hit_window_secs: AtomicU64,
     /// 普通模型 API 429 自动重试开关（运行时可修改）
     model_api_429_retry_enabled: AtomicBool,
     /// 单账号 RPM 主动限流开关（运行时可修改）
@@ -1563,6 +1576,8 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     throttled_until: None,
+                    account_throttle_hits: 0,
+                    account_throttle_window_start: None,
                     rpm_window: VecDeque::new(),
                     self_heal_consecutive_rounds: cred.self_heal_consecutive_rounds,
                     self_heal_total_count: cred.self_heal_total_count,
@@ -1625,6 +1640,9 @@ impl MultiTokenManager {
         );
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        let throttle_min_hits = config.account_throttle_min_hits;
+        let throttle_retry_delay_ms = config.account_throttle_retry_delay_ms;
+        let throttle_hit_window_secs = config.account_throttle_hit_window_secs;
         let model_api_429_retry_enabled = config.model_api_429_retry_enabled;
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
         let rpm_limit = config.account_rpm_limit;
@@ -1656,6 +1674,9 @@ impl MultiTokenManager {
             session_affinity,
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
+            account_throttle_min_hits: AtomicU32::new(throttle_min_hits),
+            account_throttle_retry_delay_ms: AtomicU64::new(throttle_retry_delay_ms),
+            account_throttle_hit_window_secs: AtomicU64::new(throttle_hit_window_secs),
             model_api_429_retry_enabled: AtomicBool::new(model_api_429_retry_enabled),
             account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
             account_rpm_limit: AtomicU32::new(rpm_limit),
@@ -3020,6 +3041,8 @@ impl MultiTokenManager {
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 // 成功 = 风控已解除，提前结束冷却
                 entry.throttled_until = None;
+                entry.account_throttle_hits = 0;
+                entry.account_throttle_window_start = None;
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
                     id,
@@ -3777,6 +3800,45 @@ impl MultiTokenManager {
     /// 当前凭据先冷却 N 分钟，再故障转移到其它凭据。
     ///
     /// 标记凭据冷却，并在同一锁临界区内返回当前请求范围的剩余凭据数。
+    /// 记录一次账号级 429 命中，返回 `(窗口内命中次数, 是否应进入冷却)`。
+    ///
+    /// - `min_hits <= 1`：保持旧行为，首次命中即冷却。
+    /// - 窗口过期后计数从 1 重新开始；达到 `min_hits` 时清零并返回 `true`。
+    /// - 记录与实际冷却解耦：调用方拿到 `false` 时应退避后继续重试，
+    ///   拿到 `true` 时再调用 [`Self::report_account_throttled_for_request`]。
+    pub fn record_account_throttle_hit(
+        &self,
+        id: u64,
+        window: StdDuration,
+        min_hits: u32,
+    ) -> (u32, bool) {
+        if min_hits <= 1 {
+            return (1, true);
+        }
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+            return (1, true);
+        };
+        let expired = entry
+            .account_throttle_window_start
+            .map(|start| now.saturating_duration_since(start) > window)
+            .unwrap_or(true);
+        if expired {
+            entry.account_throttle_hits = 0;
+            entry.account_throttle_window_start = Some(now);
+        }
+        entry.account_throttle_hits = entry.account_throttle_hits.saturating_add(1);
+        let hits = entry.account_throttle_hits;
+        if hits >= min_hits {
+            entry.account_throttle_hits = 0;
+            entry.account_throttle_window_start = None;
+            (hits, true)
+        } else {
+            (hits, false)
+        }
+    }
+
     pub fn report_account_throttled_for_request(
         &self,
         id: u64,
@@ -3796,6 +3858,9 @@ impl MultiTokenManager {
                 });
                 // 计入累计失败（账号限流不动连续 failure_count，避免冷却结束后误禁用）
                 entry.total_failure_count += 1;
+                // 真正进入冷却后清零命中计数，冷却结束重新开始累计
+                entry.account_throttle_hits = 0;
+                entry.account_throttle_window_start = None;
                 tracing::warn!(
                     "凭据 #{} 触发账号级限流，冷却 {} 秒",
                     id,
@@ -3829,6 +3894,8 @@ impl MultiTokenManager {
             .find(|e| e.id == id)
             .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
         entry.throttled_until = None;
+        entry.account_throttle_hits = 0;
+        entry.account_throttle_window_start = None;
         tracing::info!("凭据 #{} 限流冷却已被手动解除", id);
         Ok(())
     }
@@ -4561,6 +4628,8 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 throttled_until: None,
+                account_throttle_hits: 0,
+                account_throttle_window_start: None,
                 rpm_window: VecDeque::new(),
                 self_heal_consecutive_rounds: 0,
                 self_heal_total_count: 0,
@@ -5126,13 +5195,32 @@ impl MultiTokenManager {
         self.account_throttle_cooldown_secs.load(Ordering::Relaxed)
     }
 
-    /// 设置账号级 429 限流故障转移配置（Admin API）
+    /// 获取"窗口内累计多少次账号级 429 才冷却"（Admin API）
+    pub fn get_account_throttle_min_hits(&self) -> u32 {
+        self.account_throttle_min_hits.load(Ordering::Relaxed)
+    }
+
+    /// 获取未达阈值时的重试退避毫秒数（Admin API）
+    pub fn get_account_throttle_retry_delay_ms(&self) -> u64 {
+        self.account_throttle_retry_delay_ms.load(Ordering::Relaxed)
+    }
+
+    /// 获取账号级 429 命中计数的滑动窗口秒数（Admin API）
+    pub fn get_account_throttle_hit_window_secs(&self) -> u64 {
+        self.account_throttle_hit_window_secs.load(Ordering::Relaxed)
+    }
+
+    /// 设置账号级 429 限流配置（Admin API）
     ///
     /// 任一参数传 `None` 表示不修改该字段。
+    #[allow(clippy::too_many_arguments)]
     pub fn set_account_throttle_config(
         &self,
         failover: Option<bool>,
         cooldown_secs: Option<u64>,
+        min_hits: Option<u32>,
+        retry_delay_ms: Option<u64>,
+        hit_window_secs: Option<u64>,
     ) -> anyhow::Result<()> {
         if let Some(secs) = cooldown_secs {
             // 限定一个合理范围：1 秒到 24 小时
@@ -5140,15 +5228,41 @@ impl MultiTokenManager {
                 anyhow::bail!("冷却时长必须在 1..=86400 秒内: {}", secs);
             }
         }
+        if let Some(hits) = min_hits {
+            if !(1..=100).contains(&hits) {
+                anyhow::bail!("触发冷却的 429 次数必须在 1..=100 内: {}", hits);
+            }
+        }
+        if let Some(delay) = retry_delay_ms {
+            if delay > 60_000 {
+                anyhow::bail!("重试退避必须在 0..=60000 毫秒内: {}", delay);
+            }
+        }
+        if let Some(window) = hit_window_secs {
+            if !(1..=3_600).contains(&window) {
+                anyhow::bail!("429 命中窗口必须在 1..=3600 秒内: {}", window);
+            }
+        }
 
         let _update_guard = self.runtime_config_update_lock.lock();
 
         let prev_failover = self.get_account_throttle_failover();
         let prev_cooldown = self.get_account_throttle_cooldown_secs();
+        let prev_min_hits = self.get_account_throttle_min_hits();
+        let prev_retry_delay = self.get_account_throttle_retry_delay_ms();
+        let prev_hit_window = self.get_account_throttle_hit_window_secs();
         let new_failover = failover.unwrap_or(prev_failover);
         let new_cooldown = cooldown_secs.unwrap_or(prev_cooldown);
+        let new_min_hits = min_hits.unwrap_or(prev_min_hits);
+        let new_retry_delay = retry_delay_ms.unwrap_or(prev_retry_delay);
+        let new_hit_window = hit_window_secs.unwrap_or(prev_hit_window);
 
-        if new_failover == prev_failover && new_cooldown == prev_cooldown {
+        if new_failover == prev_failover
+            && new_cooldown == prev_cooldown
+            && new_min_hits == prev_min_hits
+            && new_retry_delay == prev_retry_delay
+            && new_hit_window == prev_hit_window
+        {
             return Ok(());
         }
 
@@ -5156,32 +5270,60 @@ impl MultiTokenManager {
             .store(new_failover, Ordering::Relaxed);
         self.account_throttle_cooldown_secs
             .store(new_cooldown, Ordering::Relaxed);
+        self.account_throttle_min_hits
+            .store(new_min_hits, Ordering::Relaxed);
+        self.account_throttle_retry_delay_ms
+            .store(new_retry_delay, Ordering::Relaxed);
+        self.account_throttle_hit_window_secs
+            .store(new_hit_window, Ordering::Relaxed);
 
-        if let Err(err) = self.persist_account_throttle_config(new_failover, new_cooldown) {
+        if let Err(err) = self.persist_account_throttle_config(
+            new_failover,
+            new_cooldown,
+            new_min_hits,
+            new_retry_delay,
+            new_hit_window,
+        ) {
             // 回滚内存值
             self.account_throttle_failover
                 .store(prev_failover, Ordering::Relaxed);
             self.account_throttle_cooldown_secs
                 .store(prev_cooldown, Ordering::Relaxed);
+            self.account_throttle_min_hits
+                .store(prev_min_hits, Ordering::Relaxed);
+            self.account_throttle_retry_delay_ms
+                .store(prev_retry_delay, Ordering::Relaxed);
+            self.account_throttle_hit_window_secs
+                .store(prev_hit_window, Ordering::Relaxed);
             return Err(err);
         }
 
         tracing::info!(
-            "账号级 429 限流配置已更新: failover={}, cooldown_secs={}",
+            "账号级 429 限流配置已更新: failover={}, cooldown_secs={}, min_hits={}, retry_delay_ms={}, hit_window_secs={}",
             new_failover,
-            new_cooldown
+            new_cooldown,
+            new_min_hits,
+            new_retry_delay,
+            new_hit_window
         );
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn persist_account_throttle_config(
         &self,
         failover: bool,
         cooldown_secs: u64,
+        min_hits: u32,
+        retry_delay_ms: u64,
+        hit_window_secs: u64,
     ) -> anyhow::Result<()> {
         self.update_config_file(move |config| {
             config.account_throttle_failover = failover;
             config.account_throttle_cooldown_secs = cooldown_secs;
+            config.account_throttle_min_hits = min_hits;
+            config.account_throttle_retry_delay_ms = retry_delay_ms;
+            config.account_throttle_hit_window_secs = hit_window_secs;
         })
     }
 
@@ -5642,6 +5784,72 @@ impl Drop for MultiTokenManager {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn account_throttle_hits_accumulate_until_threshold() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("throttle-dummy-token", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let window = StdDuration::from_secs(60);
+        assert_eq!(manager.record_account_throttle_hit(1, window, 3), (1, false));
+        assert_eq!(manager.record_account_throttle_hit(1, window, 3), (2, false));
+        assert_eq!(manager.record_account_throttle_hit(1, window, 3), (3, true));
+        // 达到阈值后计数清零，冷却结束重新开始
+        assert_eq!(manager.record_account_throttle_hit(1, window, 3), (1, false));
+    }
+
+    #[test]
+    fn account_throttle_min_hits_one_keeps_original_behavior() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("throttle-dummy-token", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            manager.record_account_throttle_hit(1, StdDuration::from_secs(60), 1),
+            (1, true)
+        );
+    }
+
+    #[test]
+    fn account_throttle_hits_reset_after_window() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("throttle-dummy-token", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // 零长窗口：第二次命中必然已过期，计数值回到 1
+        let window = StdDuration::ZERO;
+        assert_eq!(manager.record_account_throttle_hit(1, window, 3), (1, false));
+        assert_eq!(manager.record_account_throttle_hit(1, window, 3), (1, false));
+    }
+
+    #[test]
+    fn account_throttle_hits_reset_on_success() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("throttle-dummy-token", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let window = StdDuration::from_secs(60);
+        assert_eq!(manager.record_account_throttle_hit(1, window, 3), (1, false));
+        manager.report_success_for_request(1, None);
+        assert_eq!(manager.record_account_throttle_hit(1, window, 3), (1, false));
+    }
 
     #[test]
     fn refresh_merge_preserves_concurrent_proxy_changes() {

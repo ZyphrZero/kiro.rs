@@ -248,6 +248,24 @@ pub struct Config {
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
+    /// 同一凭据在 `account_throttle_hit_window_secs` 窗口内累计多少次账号级 429
+    /// 才进入冷却（默认 1 = 首次命中即冷却，保持原有行为）。
+    ///
+    /// 设为 2 以上时，前几次账号级 429 不会冷却凭据，而是退避
+    /// `account_throttle_retry_delay_ms` 后继续重试；任意一次成功或窗口过期都会
+    /// 清零计数。用于吸收上游偶发的短时限流，避免单个 429 就把账号踢出调度。
+    #[serde(default = "default_account_throttle_min_hits")]
+    pub account_throttle_min_hits: u32,
+
+    /// 未达到 `account_throttle_min_hits` 时，同一请求重试前的退避毫秒数
+    /// （默认 800）。范围 0..=60000。
+    #[serde(default = "default_account_throttle_retry_delay_ms")]
+    pub account_throttle_retry_delay_ms: u64,
+
+    /// 账号级 429 命中计数的滑动窗口（秒，默认 60）。范围 1..=3600。
+    #[serde(default = "default_account_throttle_hit_window_secs")]
+    pub account_throttle_hit_window_secs: u64,
+
     /// 普通模型 API 429 是否由中转侧自动重试（默认 true）。
     ///
     /// 仅控制不需要切换凭据的容量类 429（如 `INSUFFICIENT_MODEL_CAPACITY`）。
@@ -509,6 +527,18 @@ fn default_account_throttle_cooldown_secs() -> u64 {
     30 * 60
 }
 
+fn default_account_throttle_min_hits() -> u32 {
+    1
+}
+
+fn default_account_throttle_retry_delay_ms() -> u64 {
+    800
+}
+
+fn default_account_throttle_hit_window_secs() -> u64 {
+    60
+}
+
 fn default_model_api_429_retry_enabled() -> bool {
     true
 }
@@ -609,6 +639,9 @@ impl Default for Config {
             session_affinity_ttl_secs: default_session_affinity_ttl_secs(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            account_throttle_min_hits: default_account_throttle_min_hits(),
+            account_throttle_retry_delay_ms: default_account_throttle_retry_delay_ms(),
+            account_throttle_hit_window_secs: default_account_throttle_hit_window_secs(),
             model_api_429_retry_enabled: default_model_api_429_retry_enabled(),
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
             account_rpm_limit: default_account_rpm_limit(),
@@ -991,5 +1024,25 @@ mod tests {
         let explicit: Config =
             serde_json::from_str(r#"{"invertPriority": true}"#).unwrap();
         assert!(explicit.invert_priority);
+    }
+
+    #[test]
+    fn account_throttle_hit_policy_defaults_and_explicit_values() {
+        let default = Config::default();
+        assert_eq!(default.account_throttle_min_hits, 1);
+        assert_eq!(default.account_throttle_retry_delay_ms, 800);
+        assert_eq!(default.account_throttle_hit_window_secs, 60);
+
+        let config: Config = serde_json::from_str(
+            r#"{
+                "accountThrottleMinHits": 3,
+                "accountThrottleRetryDelayMs": 1500,
+                "accountThrottleHitWindowSecs": 120
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.account_throttle_min_hits, 3);
+        assert_eq!(config.account_throttle_retry_delay_ms, 1500);
+        assert_eq!(config.account_throttle_hit_window_secs, 120);
     }
 }

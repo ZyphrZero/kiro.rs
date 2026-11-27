@@ -380,6 +380,9 @@ Admin API 鉴权同样支持：
 | `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
 | `accountThrottleFailover` | `true` | 账号级 429 是否冷却并切换凭据；覆盖 USER/CREDIT 请求限流和 suspicious activity |
 | `accountThrottleCooldownSecs` | `1800` | 账号级 429 限流冷却秒数 |
+| `accountThrottleMinHits` | `1` | 同一凭据在窗口内累计多少次账号级 429 才冷却；`1` 为首次即冷却（原行为），大于 1 时前几次只退避重试 |
+| `accountThrottleRetryDelayMs` | `800` | 未达 `accountThrottleMinHits` 时重试前的退避毫秒数，范围 0–60000 |
+| `accountThrottleHitWindowSecs` | `60` | 账号级 429 命中计数的滑动窗口秒数，范围 1–3600；成功或窗口过期清零 |
 | `modelApi429RetryEnabled` | `true` | 无需换号的容量类模型 API 429 是否由中转自动重试 |
 | `suspendedDetectionEnabled` | `true` | 是否识别 403 账号封禁文案（`suspended` + `locked your account`）并立即禁用该凭据、不参与自愈 |
 | `selfHealEnabled` | `true` | 全部凭据被自动禁用时是否重置失败计数并重新启用（自愈） |
@@ -1040,7 +1043,7 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 单凭据连续 API 失败会增加失败计数，达到阈值后跳过。
 - 402 / quota exhausted 会禁用该凭据并切换。
 - 401 / 403 中识别到 bearer token 失效时，会对该凭据强制刷新一次 token 后重试。
-- USER/CREDIT 请求限流和 suspicious activity 429 可触发账号级冷却并切换凭据。
+- USER/CREDIT 请求限流和 suspicious activity 429 可触发账号级冷却并切换凭据。默认首次命中即冷却；`accountThrottleMinHits` 设为 2 以上时，同一凭据在 `accountThrottleHitWindowSecs` 窗口内累计达到该次数才冷却，前几次按 `accountThrottleRetryDelayMs` 退避重试，成功或窗口过期会清零计数。
 - `INSUFFICIENT_MODEL_CAPACITY` 等容量类 429 不切换凭据，可配置是否在当前凭据上退避重试。
 - 400 客户端请求错误不会切换凭据。
 - 网关超时和部分不可恢复错误会快速失败，避免一次请求内无限放大重试。

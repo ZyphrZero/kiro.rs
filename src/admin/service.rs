@@ -3082,6 +3082,9 @@ impl AdminService {
         AccountThrottleConfigResponse {
             failover: self.token_manager.get_account_throttle_failover(),
             cooldown_secs: self.token_manager.get_account_throttle_cooldown_secs(),
+            min_hits: self.token_manager.get_account_throttle_min_hits(),
+            retry_delay_ms: self.token_manager.get_account_throttle_retry_delay_ms(),
+            hit_window_secs: self.token_manager.get_account_throttle_hit_window_secs(),
         }
     }
 
@@ -3090,14 +3093,25 @@ impl AdminService {
         &self,
         req: SetAccountThrottleConfigRequest,
     ) -> Result<AccountThrottleConfigResponse, AdminServiceError> {
-        if req.failover.is_none() && req.cooldown_secs.is_none() {
+        if req.failover.is_none()
+            && req.cooldown_secs.is_none()
+            && req.min_hits.is_none()
+            && req.retry_delay_ms.is_none()
+            && req.hit_window_secs.is_none()
+        {
             return Err(AdminServiceError::InvalidCredential(
-                "至少提供 failover 或 cooldownSecs 一个字段".to_string(),
+                "至少提供一个配置字段".to_string(),
             ));
         }
 
         self.token_manager
-            .set_account_throttle_config(req.failover, req.cooldown_secs)
+            .set_account_throttle_config(
+                req.failover,
+                req.cooldown_secs,
+                req.min_hits,
+                req.retry_delay_ms,
+                req.hit_window_secs,
+            )
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_throttle_config())

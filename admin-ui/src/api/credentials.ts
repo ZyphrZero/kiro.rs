@@ -559,6 +559,12 @@ export async function setApiDomain(domain: ApiDomain): Promise<{ domain: ApiDoma
 export interface AccountThrottleConfig {
   failover: boolean
   cooldownSecs: number
+  /** 窗口内累计多少次账号级 429 才冷却；1 表示首次命中即冷却 */
+  minHits: number
+  /** 未达阈值时重试前的退避毫秒数 */
+  retryDelayMs: number
+  /** 账号级 429 命中计数的滑动窗口（秒） */
+  hitWindowSecs: number
 }
 
 // 获取账号级 429 限流故障转移配置

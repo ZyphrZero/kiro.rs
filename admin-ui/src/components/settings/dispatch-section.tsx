@@ -153,12 +153,15 @@ function RateLimitHandlingGroup() {
   const retrySaver = useFieldSaver(setRetry, reportSaveError)
   const failover = throttle?.failover ?? true
   const cooldownSecs = throttle?.cooldownSecs ?? 30 * SECS_PER_MIN
+  const minHits = throttle?.minHits ?? 1
+  const retryDelayMs = throttle?.retryDelayMs ?? 800
+  const hitWindowSecs = throttle?.hitWindowSecs ?? 60
   const retryEnabled = retry?.enabled ?? true
 
   return (
     <SettingGroup
       title="上游 429 处理"
-      description="账号级限流按需切换凭据；容量类限流可由中转退避重试"
+      description="账号级限流按需切换凭据；可设置累计多次 429 才冷却；容量类限流由中转退避重试"
     >
       <SettingSwitch
         label="故障转移"
@@ -172,6 +175,53 @@ function RateLimitHandlingGroup() {
         pending={throttleSaver.isSaving('failover')}
         saved={throttleSaver.isSaved('failover')}
         disabled={throttleLoading}
+      />
+      <SettingNumber
+        label="触发冷却的 429 次数"
+        hint={
+          minHits <= 1
+            ? '首次账号级 429 就冷却并换号（原行为）'
+            : `同一凭据在统计窗口内累计 ${minHits} 次账号级 429 才冷却，前几次短暂退避后重试`
+        }
+        value={minHits}
+        onCommit={(n) => throttleSaver.save('minHits', { minHits: n })}
+        min={1}
+        max={100}
+        unit="次"
+        presets={[1, 2, 3, 5]}
+        pending={throttleSaver.isSaving('minHits')}
+        saved={throttleSaver.isSaved('minHits')}
+        disabled={throttleLoading || !failover}
+      />
+      <SettingNumber
+        label="429 统计窗口"
+        hint="命中次数在这个时间窗内累加；窗口过期后重新计数"
+        value={hitWindowSecs}
+        onCommit={(n) =>
+          throttleSaver.save('hitWindow', { hitWindowSecs: n })
+        }
+        min={1}
+        max={3600}
+        unit="秒"
+        presets={[30, 60, 120, 300]}
+        pending={throttleSaver.isSaving('hitWindow')}
+        saved={throttleSaver.isSaved('hitWindow')}
+        disabled={throttleLoading || !failover || minHits <= 1}
+      />
+      <SettingNumber
+        label="未达阈值退避"
+        hint="未达到冷却次数时，等这么久再重试；0 表示立即重试"
+        value={retryDelayMs}
+        onCommit={(n) =>
+          throttleSaver.save('retryDelay', { retryDelayMs: n })
+        }
+        min={0}
+        max={60000}
+        unit="毫秒"
+        presets={[0, 200, 500, 800, 1000, 2000]}
+        pending={throttleSaver.isSaving('retryDelay')}
+        saved={throttleSaver.isSaved('retryDelay')}
+        disabled={throttleLoading || !failover || minHits <= 1}
       />
       <SettingNumber
         label="账号冷却时长"
